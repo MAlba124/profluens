@@ -1,0 +1,26 @@
+[package]
+name = "pf-ps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_ps"
+
+[dependencies]
+profluens-core = { path = "../../../core" }
+profluens-audio = { path = "../../../lib/audio" }
+pf-registry = { path = "../../../lib/registry" }
+# PES headers, the 33-bit unwrapper, CRC-32 and the stream types.
+pf-mpegts = { path = "../ts" }
+# The grown seek index.
+pf-tsdemux = { path = "../tsdemux" }
+
+[dev-dependencies]
+pf-sim = { path = "../../../lib/sim", features = ["harness"] }
+pf-harness = { path = "../../../lib/harness" }
+pf-libav = { path = "../../libav" }
+pf-text = { path = "../../text" }
+pf-reactor = { path = "../../../lib/reactor" }
+profluens-elements = { path = "../../../lib/elements" }

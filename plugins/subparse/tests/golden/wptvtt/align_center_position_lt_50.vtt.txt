@@ -1,0 +1,5 @@
+cue 0: 0.000 +5.000
+  text: "foo"
+  layout: position=10 align=center
+  line:
+    span "foo"

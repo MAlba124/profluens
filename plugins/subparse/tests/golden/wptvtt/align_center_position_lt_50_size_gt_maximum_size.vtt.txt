@@ -1,0 +1,5 @@
+cue 0: 0.000 +5.000
+  text: "Awesome!!!"
+  layout: position=10 size=75 align=center
+  line:
+    span "Awesome!!!"

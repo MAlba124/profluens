@@ -1,0 +1,4 @@
+cue 0: 0.000 +10.000
+  text: "This is a test subtitle"
+  line:
+    span "This is a test subtitle" reveal=0ns [underline=true]

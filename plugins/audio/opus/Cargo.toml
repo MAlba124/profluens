@@ -1,0 +1,23 @@
+[package]
+name = "pf-opus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_opus"
+
+[dependencies]
+profluens-core = { path = "../../../core" }
+pf-registry = { path = "../../../lib/registry" }
+profluens-audio = { path = "../../../lib/audio" }
+libopus-sys = { path = "../../../sys/libopus-sys" }
+
+[dev-dependencies]
+pf-reactor = { path = "../../../lib/reactor" }
+pf-harness = { path = "../../../lib/harness" }
+profluens-elements = { path = "../../../lib/elements" }
+pf-libflac = { path = "../libflac" }
+pf-mkv = { path = "../../formats/mkv" }
+pf-sim = { path = "../../../lib/sim", features = ["harness"] }

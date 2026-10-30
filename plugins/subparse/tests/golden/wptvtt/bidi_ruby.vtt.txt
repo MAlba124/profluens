@@ -1,0 +1,5 @@
+cue 0: 0.000 +5.000
+  text: ".ab)"
+  line:
+    span "." ruby="אא"/over
+    span "ab)" ruby="x"/over

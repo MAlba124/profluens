@@ -1,0 +1,37 @@
+cue 0: 0.000 +10.000
+  text: "This is a test"
+  line:
+    span "This is a test"
+cue 1: 0.000 +10.000
+  text: "This is a test"
+  line:
+    span "This is a test"
+cue 2: 0.000 +10.000
+  text: "This is a test"
+  line:
+    span "This is a test"
+cue 3: 0.000 +10.000
+  text: "This is a test"
+  line:
+    span "This is a test"
+cue 4: 0.000 +10.000
+  text: "This is a test"
+  line:
+    span "This is a test"
+cue 5: 0.000 +10.000
+  text: "This is a test"
+  line:
+    span "This is a test"
+cue 6: 0.000 +10.000
+  text: "This is a test"
+  line:
+    span "This is a test"
+cue 7: 0.000 +10.000
+  text: "This is a test"
+  line:
+    span "This is a test"
+cue 8: 0.000 +10.000
+  text: "This is a test subtitle that wraps and the part after the first subtitle should be cut out"
+  layout: size=70
+  line:
+    span "This is a test subtitle that wraps and the part after the first subtitle should be cut out"

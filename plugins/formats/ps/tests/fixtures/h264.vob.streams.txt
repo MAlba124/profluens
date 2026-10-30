@@ -1,0 +1,1 @@
+stream|index=0|codec_name=h264|codec_type=video|id=0x1e2

@@ -1,0 +1,2 @@
+stream|index=0|codec_name=mpeg2video|codec_type=video|id=0x1e0|
+stream|index=1|codec_name=mp2|codec_type=audio|sample_rate=48000|channels=2|id=0x1c0

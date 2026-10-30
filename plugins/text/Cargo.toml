@@ -1,0 +1,23 @@
+[package]
+name = "pf-text"
+version.workspace = true
+edition.workspace = true
+license = "MIT AND OFL-1.1"
+repository.workspace = true
+
+[lib]
+name = "pf_text"
+
+[dependencies]
+profluens-core = { path = "../../core" }
+pf-registry = { path = "../../lib/registry" }
+profluens-video = { path = "../../lib/video" }
+pf-subparse = { path = "../subparse" }
+
+[dev-dependencies]
+pf-harness = { path = "../../lib/harness" }
+profluens-elements = { path = "../../lib/elements" }
+# The end-to-end examples, neither depends on pf-text.
+pf-mkv = { path = "../formats/mkv" }
+pf-libav = { path = "../libav" }
+pf-sim = { path = "../../lib/sim", features = ["harness"] }

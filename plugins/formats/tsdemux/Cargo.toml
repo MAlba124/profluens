@@ -1,0 +1,23 @@
+[package]
+name = "pf-tsdemux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_tsdemux"
+
+[dependencies]
+profluens-core = { path = "../../../core" }
+pf-registry = { path = "../../../lib/registry" }
+pf-mpegts = { path = "../ts" }
+pf-hdr = { path = "../../video/hdr" }
+
+[dev-dependencies]
+pf-sim = { path = "../../../lib/sim", features = ["harness"] }
+pf-harness = { path = "../../../lib/harness" }
+pf-libav = { path = "../../libav" }
+pf-text = { path = "../../text" }
+pf-reactor = { path = "../../../lib/reactor" }
+profluens-elements = { path = "../../../lib/elements" }

@@ -1,0 +1,24 @@
+[package]
+name = "pf-av1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_av1"
+
+[dependencies]
+profluens-core = { path = "../../../core" }
+pf-registry = { path = "../../../lib/registry" }
+profluens-video = { path = "../../../lib/video" }
+pf-hdr = { path = "../hdr" }
+# dav1d, built from a submodule and linked static.
+libdav1d-sys = { path = "../../../sys/libdav1d-sys" }
+# Pictures that do not fit a fed slot live in libc memory.
+libc = "0.2"
+
+[dev-dependencies]
+pf-harness = { path = "../../../lib/harness" }
+pf-sim = { path = "../../../lib/sim", features = ["harness"] }
+profluens-elements = { path = "../../../lib/elements" }

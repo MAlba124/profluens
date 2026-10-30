@@ -1,0 +1,5 @@
+cue 0: 0.000 +5.000
+  text: "This is a test"
+  layout: position=50 align=center
+  line:
+    span "This is a test"

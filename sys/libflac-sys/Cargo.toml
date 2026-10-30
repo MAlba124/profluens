@@ -1,0 +1,19 @@
+[package]
+name = "libflac-sys"
+version.workspace = true
+edition.workspace = true
+license = "MIT AND BSD-3-Clause"
+repository.workspace = true
+links = "FLAC"
+build = "build.rs"
+
+[lib]
+name = "libflac_sys"
+
+[features]
+default = []
+# Off, the archive holds the decoder only.
+encoder = []
+
+[build-dependencies]
+cc = "1"

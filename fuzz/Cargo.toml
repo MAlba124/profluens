@@ -1,0 +1,227 @@
+[package]
+name = "pf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+name = "pf_fuzz"
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+profluens-core = { path = "../core" }
+pf-mkv = { path = "../plugins/formats/mkv" }
+pf-mp4 = { path = "../plugins/formats/mp4" }
+pf-tsdemux = { path = "../plugins/formats/tsdemux" }
+pf-ps = { path = "../plugins/formats/ps" }
+pf-avi = { path = "../plugins/formats/avi" }
+pf-flv = { path = "../plugins/formats/flv" }
+pf-ogg = { path = "../plugins/formats/ogg" }
+pf-text = { path = "../plugins/text" }
+pf-subparse = { path = "../plugins/subparse" }
+pf-tags = { path = "../plugins/tags" }
+pf-hdr = { path = "../plugins/video/hdr" }
+pf-libflac = { path = "../plugins/audio/libflac", features = ["encoder"] }
+pf-mp3 = { path = "../plugins/audio/mp3" }
+profluens-video = { path = "../lib/video" }
+profluens-audio = { path = "../lib/audio" }
+pf-sim = { path = "../lib/sim" }
+pf-vaapi = { path = "../plugins/hw/vaapi" }
+pf-opus = { path = "../plugins/audio/opus" }
+pf-probe = { path = "../lib/probe" }
+pf-vpl = { path = "../plugins/hw/vpl" }
+pf-libav = { path = "../plugins/libav" }
+pf-harness = { path = "../lib/harness" }
+
+# Own workspace, so the root one neither builds nor excludes it.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "mkv_demux"
+path = "fuzz_targets/mkv_demux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mp4_demux"
+path = "fuzz_targets/mp4_demux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ts_demux"
+path = "fuzz_targets/ts_demux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ps_demux"
+path = "fuzz_targets/ps_demux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ps_packs"
+path = "fuzz_targets/ps_packs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "avi_demux"
+path = "fuzz_targets/avi_demux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flv_demux"
+path = "fuzz_targets/flv_demux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flv_tags"
+path = "fuzz_targets/flv_tags.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ogg_demux"
+path = "fuzz_targets/ogg_demux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "subparse"
+path = "fuzz_targets/subparse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "subparse_charset"
+path = "fuzz_targets/subparse_charset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgs"
+path = "fuzz_targets/pgs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vobsub"
+path = "fuzz_targets/vobsub.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dvbsub"
+path = "fuzz_targets/dvbsub.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tags"
+path = "fuzz_targets/tags.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hdr"
+path = "fuzz_targets/hdr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flac"
+path = "fuzz_targets/flac.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mp3"
+path = "fuzz_targets/mp3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vaapi_h264"
+path = "fuzz_targets/vaapi_h264.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vaapi_h265"
+path = "fuzz_targets/vaapi_h265.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vaapi_av1"
+path = "fuzz_targets/vaapi_av1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vaapi_vp9"
+path = "fuzz_targets/vaapi_vp9.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "libav_dec"
+path = "fuzz_targets/libav_dec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "opus_dec"
+path = "fuzz_targets/opus_dec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "probe"
+path = "fuzz_targets/probe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vpl_nal"
+path = "fuzz_targets/vpl_nal.rs"
+test = false
+doc = false
+bench = false

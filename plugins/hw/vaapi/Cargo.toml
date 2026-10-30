@@ -1,0 +1,28 @@
+[package]
+name = "pf-vaapi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Declared so cargo flags a double-link of the system libva.
+links = "va"
+
+[lib]
+name = "pf_vaapi"
+
+[dependencies]
+profluens-core = { path = "../../../core" }
+pf-registry = { path = "../../../lib/registry" }
+profluens-video = { path = "../../../lib/video" }
+pf-hdr = { path = "../../video/hdr" }
+
+[dev-dependencies]
+pf-reactor = { path = "../../../lib/reactor" }
+pf-harness = { path = "../../../lib/harness" }
+pf-mkv = { path = "../../formats/mkv" }
+# Software decoders for the encode round-trip and VP9 PSNR gates.
+pf-libav = { path = "../../libav" }
+profluens-elements = { path = "../../../lib/elements" }
+# dav1d for tests/av1_chain.rs and tests/av1_headers.rs, needs the dav1d submodule.
+pf-av1 = { path = "../../video/av1" }
+libdav1d-sys = { path = "../../../sys/libdav1d-sys" }

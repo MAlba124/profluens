@@ -1,0 +1,39 @@
+[package]
+name = "profluens-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# One test binary, `all` includes the suites.
+autotests = false
+
+[lib]
+name = "profluens_core"
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+[[bench]]
+name = "ring_hop"
+harness = false
+
+[[bench]]
+name = "pool"
+harness = false
+
+[[bench]]
+name = "solve"
+harness = false
+
+[dependencies]
+stein-arena = { workspace = true }
+
+# Loom model tests, in their own build dirs so the RUSTFLAGS spare the normal build:
+# CARGO_BUILD_BUILD_DIR='{cargo-cache-home}/build/{workspace-path-hash}-loom' CARGO_TARGET_DIR=target/loom \
+#   nix develop -c env RUSTFLAGS="-C link-arg=-fuse-ld=mold --cfg loom" cargo test -p profluens-core --release --lib loom_
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

@@ -1,0 +1,15 @@
+[submodule "libdav1d-sys/dav1d"]
+	path = sys/libdav1d-sys/dav1d
+	url = https://code.videolan.org/videolan/dav1d.git
+[submodule "libav-sys/ffmpeg"]
+	path = sys/libav-sys/ffmpeg
+	url = https://git.ffmpeg.org/ffmpeg.git
+	shallow = true
+[submodule "sys/libflac-sys/flac"]
+	path = sys/libflac-sys/flac
+	url = https://github.com/xiph/flac.git
+	shallow = true
+[submodule "sys/libopus-sys/opus"]
+	path = sys/libopus-sys/opus
+	url = https://github.com/xiph/opus.git
+	shallow = true

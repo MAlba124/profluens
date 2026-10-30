@@ -1,0 +1,55 @@
+[package]
+name = "pf-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# One integration-test binary, as in core. It mod-includes the sub-suites.
+autotests = false
+
+[lib]
+name = "pf_sim"
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+# Its own binary, since it installs the corruption rig's allocator.
+[[test]]
+name = "corrupt"
+path = "tests/corrupt.rs"
+
+# Hand-rolled bench, no criterion. `main` is the harness.
+[[bench]]
+name = "sweep"
+harness = false
+
+[[test]]
+name = "driver"
+path = "tests/driver.rs"
+required-features = ["driver"]
+
+[[test]]
+name = "topology"
+path = "tests/topology.rs"
+required-features = ["driver"]
+
+[[test]]
+name = "reactor"
+path = "tests/reactor.rs"
+required-features = ["driver"]
+
+[features]
+# `corrupt::harness` drivers that feed a case to a core element.
+harness = ["dep:profluens-core", "dep:pf-harness"]
+# Fake elements, run loop and seed farm over core's stepped driver.
+driver = ["dep:profluens-core"]
+
+[dependencies]
+profluens-core = { path = "../../core", optional = true }
+pf-harness = { path = "../harness", optional = true }
+
+# Tests turn `driver` and `harness` on, so `cargo test -p pf-sim` runs tests/harness.rs too. The
+# library alone builds without core.
+[dev-dependencies]
+pf-sim = { path = ".", features = ["driver", "harness"] }

@@ -1,0 +1,9 @@
+cue 0: 0.000 +5.000
+  text: "右に 見えるのは...\n二行目"
+  layout: vertical-rl
+  line:
+    span "右" ruby="みぎ"/over
+    span "に 見" ruby="み"/over
+    span "えるのは..."
+  line:
+    span "二行目"

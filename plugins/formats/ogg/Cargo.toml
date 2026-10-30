@@ -1,0 +1,22 @@
+[package]
+name = "pf-ogg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_ogg"
+
+[dependencies]
+# Core only for the elements, the reader/writer library is core-independent.
+profluens-core = { path = "../../../core" }
+pf-registry = { path = "../../../lib/registry" }
+
+[dev-dependencies]
+pf-reactor = { path = "../../../lib/reactor" }
+pf-harness = { path = "../../../lib/harness" }
+# Corruption rig and simulated reactor.
+pf-sim = { path = "../../../lib/sim", features = ["harness", "driver"] }
+# filesrc for the pipeline tests and the allocation audit.
+profluens-elements = { path = "../../../lib/elements" }

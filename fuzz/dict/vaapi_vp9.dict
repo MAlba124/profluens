@@ -1,0 +1,10 @@
+# VP9 frame marker, sync code and superframe index markers of plugins/hw/vaapi/src/vp9.
+sync="\x49\x83\x42"
+key_p0="\x82\x49\x83\x42\x00"
+key_p2="\xa2\x49\x83\x42\x00"
+inter_p0="\x86"
+show_existing="\x88"
+sf_two_1byte="\xc1"
+sf_two_2byte="\xc9"
+sf_index="\xc1\x00\x00\xc1"
+len_u16="\x00\x01"

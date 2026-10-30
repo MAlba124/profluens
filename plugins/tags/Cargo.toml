@@ -1,0 +1,36 @@
+[package]
+name = "pf-tags"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_tags"
+
+[[example]]
+name = "pftags"
+path = "examples/pftags.rs"
+
+[[example]]
+name = "scan_alloc_check"
+path = "examples/scan_alloc_check.rs"
+
+[[example]]
+name = "bench_scan"
+path = "examples/bench_scan.rs"
+
+[dependencies]
+profluens-core = { path = "../../core" }
+pf-reactor = { path = "../../lib/reactor" }
+# Metadata-only entry points, no decoders.
+pf-mkv = { path = "../formats/mkv" }
+pf-mp3 = { path = "../audio/mp3" }
+pf-mp4 = { path = "../formats/mp4" }
+pf-ogg = { path = "../formats/ogg" }
+
+[features]
+default = []
+
+[dev-dependencies]
+pf-sim = { path = "../../lib/sim" }

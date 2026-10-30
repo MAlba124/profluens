@@ -1,0 +1,26 @@
+[package]
+name = "pf-mkv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_mkv"
+
+[dependencies]
+profluens-core = { path = "../../../core" }
+pf-registry = { path = "../../../lib/registry" }
+profluens-audio = { path = "../../../lib/audio" }
+profluens-video = { path = "../../../lib/video" }
+pf-hdr = { path = "../../video/hdr" }
+
+[dev-dependencies]
+pf-reactor = { path = "../../../lib/reactor" }
+pf-harness = { path = "../../../lib/harness" }
+pf-sim = { path = "../../../lib/sim", features = ["harness"] }
+# Dev-only. pf-libflac reaches pf-mkv only through pf-tags, so no cycle.
+pf-libflac = { path = "../../audio/libflac", features = ["encoder"] }
+# Dev-only, VP8 playback test. pf-libav does not depend on pf-mkv.
+pf-libav = { path = "../../libav" }
+profluens-elements = { path = "../../../lib/elements" }

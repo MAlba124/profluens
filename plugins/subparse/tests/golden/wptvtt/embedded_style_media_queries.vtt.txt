@@ -1,0 +1,18 @@
+cue 0: 0.000 +5.000
+  text: "This is a test subtitle"
+  base: fg=#ff0000
+  line:
+    span "This " voice="Voice1"
+    span "is" voice="Voice1" [style=italic]
+    span " a " voice="Voice1"
+    span "test" voice="Voice1" [weight=700]
+    span " subtitle" voice="Voice1"
+cue 1: 0.000 +5.000
+  text: "Here is a second subtitle"
+  base: fg=#ff0000
+  line:
+    span "Here " voice="Voice2"
+    span "is" voice="Voice2" [style=italic]
+    span " a " voice="Voice2"
+    span "second" voice="Voice2" [weight=700]
+    span " subtitle" voice="Voice2"

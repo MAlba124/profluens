@@ -1,0 +1,22 @@
+[package]
+name = "pf-reactor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_reactor"
+
+[dependencies]
+profluens-core = { path = "../../core" }
+# Names pool regions in the process maps.
+pf-memory = { path = "../memory" }
+# Completion queue, io_uring or epoll.
+stein-io = { workspace = true }
+# Same version stein-io pins, so one copy is in the graph.
+rustix = { version = "1.1.5", features = ["event", "net", "fs", "process", "std"] }
+libc = "0.2"
+
+[dev-dependencies]
+profluens-elements = { path = "../elements" }

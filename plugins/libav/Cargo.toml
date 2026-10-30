@@ -1,0 +1,25 @@
+[package]
+name = "pf-libav"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_libav"
+
+[dependencies]
+profluens-core = { path = "../../core" }
+pf-registry = { path = "../../lib/registry" }
+profluens-video = { path = "../../lib/video" }
+pf-hdr = { path = "../video/hdr" }
+profluens-audio = { path = "../../lib/audio" }
+# FFmpeg as one static archive and a flat shim. FFI confined to src/lav.rs.
+libav-sys = { path = "../../sys/libav-sys" }
+pf-mp3 = { path = "../audio/mp3" }
+
+[dev-dependencies]
+pf-harness = { path = "../../lib/harness" }
+profluens-elements = { path = "../../lib/elements" }
+pf-ogg = { path = "../formats/ogg" }
+pf-mp4 = { path = "../formats/mp4" }

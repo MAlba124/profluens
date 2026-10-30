@@ -1,0 +1,10 @@
+cue 0: 0.000 +10.000
+  text: "This is a test subtitle"
+  layout: size=70
+  line:
+    span "This is a test subtitle"
+cue 1: 0.000 +10.000
+  text: "This test subtitle wraps and should be visible"
+  layout: size=70
+  line:
+    span "This test subtitle wraps and should be visible"

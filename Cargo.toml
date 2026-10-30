@@ -1,0 +1,87 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "lib/audio",
+    "lib/elements",
+    "lib/harness",
+    "lib/memory",
+    "lib/probe",
+    "lib/reactor",
+    "lib/registry",
+    "lib/sim",
+    "lib/video",
+    "plugins/audio/libflac",
+    "plugins/audio/mp3",
+    "plugins/audio/opus",
+    "plugins/formats/avi",
+    "plugins/formats/flv",
+    "plugins/formats/mkv",
+    "plugins/formats/mp4",
+    "plugins/formats/ogg",
+    "plugins/formats/ps",
+    "plugins/formats/ts",
+    "plugins/formats/tsdemux",
+    "plugins/hw/vaapi",
+    "plugins/hw/vpl",
+    "plugins/libav",
+    "plugins/subparse",
+    "plugins/tags",
+    "plugins/text",
+    "plugins/video/av1",
+    "plugins/video/hdr",
+    "sys/libav-sys",
+    "sys/libdav1d-sys",
+    "sys/libflac-sys",
+    "sys/libopus-sys",
+    "xtask",
+]
+
+[workspace.dependencies]
+stein-arena = { git = "https://github.com/MAlba124/steinlibs.git", rev = "db5588ef245cd0b2b20acfea79d5fc3583494dcd" }
+# No default driver feature.
+stein-io = { git = "https://github.com/MAlba124/steinlibs.git", rev = "db5588ef245cd0b2b20acfea79d5fc3583494dcd", default-features = false }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/MAlba124/profluens"
+
+# Opted into per crate with `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used       = "deny"
+expect_used       = "deny"
+panic             = "deny"
+todo              = "deny"
+unimplemented     = "deny"
+unreachable       = "deny"
+too_many_lines    = "deny"
+excessive_nesting = "warn"
+
+[profile.release]
+# Thin LTO: every element calls into profluens-core across crate boundaries on the
+# playback path, where cross-crate inlining pays.
+lto = "thin"
+# Enough DWARF for profilers to symbolize release captures (heaptrack, perf,
+# simprof): function names + line tables, without the full-variable debuginfo
+# that balloons build time and binary size. Runtime cost: none.
+debug = "line-tables-only"
+
+[profile.bench]
+debug = true
+
+# Tests: release speed without LTO, incremental, so a change rebuilds in seconds.
+# `cargo nextest run --cargo-profile fasttest`.
+[profile.fasttest]
+inherits = "release"
+lto = false
+incremental = true
+
+# Release with line tables, for perf.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"

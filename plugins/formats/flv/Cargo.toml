@@ -1,0 +1,20 @@
+[package]
+name = "pf-flv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_flv"
+
+[dependencies]
+profluens-core = { path = "../../../core" }
+pf-registry = { path = "../../../lib/registry" }
+# Shared avcC/hvcC reframers and the per-codec offer menus.
+pf-mkv = { path = "../mkv" }
+
+[dev-dependencies]
+pf-sim = { path = "../../../lib/sim", features = ["harness"] }
+pf-harness = { path = "../../../lib/harness" }
+pf-libav = { path = "../../libav" }

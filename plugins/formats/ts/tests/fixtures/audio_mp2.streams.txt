@@ -1,0 +1,3 @@
+program|stream|index=0|codec_name=mp2|codec_type=audio|id=0x100
+
+stream|index=0|codec_name=mp2|codec_type=audio|id=0x100|tag:language=deu

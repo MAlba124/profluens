@@ -1,0 +1,66 @@
+[package]
+name = "pf-subparse"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lib]
+name = "pf_subparse"
+
+[dependencies]
+# Only the element uses these, the parsers, IR and wire layout are std only.
+profluens-core = { path = "../../core" }
+pf-registry = { path = "../../lib/registry" }
+
+[dev-dependencies]
+pf-harness = { path = "../../lib/harness" }
+pf-sim = { path = "../../lib/sim", features = ["harness"] }
+
+[[bench]]
+name = "subrip"
+harness = false
+
+[[bench]]
+name = "microdvd"
+harness = false
+
+[[bench]]
+name = "mpl2"
+harness = false
+
+[[bench]]
+name = "subviewer"
+harness = false
+
+[[bench]]
+name = "sami"
+harness = false
+
+[[bench]]
+name = "tmplayer"
+harness = false
+
+[[bench]]
+name = "mpsub"
+harness = false
+
+[[bench]]
+name = "qttext"
+harness = false
+
+[[bench]]
+name = "lrc"
+harness = false
+
+[[bench]]
+name = "dks"
+harness = false
+
+[[bench]]
+name = "webvtt"
+harness = false
+
+[[bench]]
+name = "ssa"
+harness = false

@@ -1,0 +1,12 @@
+[package]
+name = "pf-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_harness"
+
+[dependencies]
+profluens-core = { path = "../../core" }

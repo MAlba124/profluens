@@ -1,0 +1,5 @@
+made by make.sh on 2026-10-12
+aomenc/aomdec: AOMedia Project AV1 Encoder 3.12.1 libaom 3.12.1
+ffmpeg: ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers
+tenbit_64x48, tenbit_odd_61x37 and tenbit444_64x48 remade on 2026-10-15 with the same aomenc/aomdec 3.12.1 and ffmpeg 8.1.2, the rest left as made
+i422_64x48 and tenbit422_64x48 added on 2026-10-25 with the same aomenc/aomdec 3.12.1 and ffmpeg 8.1.2, the rest left as made

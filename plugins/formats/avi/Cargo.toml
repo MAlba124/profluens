@@ -1,0 +1,22 @@
+[package]
+name = "pf-avi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_avi"
+
+[dependencies]
+profluens-core = { path = "../../../core" }
+pf-registry = { path = "../../../lib/registry" }
+# Codec pre-roll for index restarts.
+profluens-audio = { path = "../../../lib/audio" }
+
+[dev-dependencies]
+pf-reactor = { path = "../../../lib/reactor" }
+# Corruption rig for tests/corruption.rs.
+pf-sim = { path = "../../../lib/sim", features = ["harness"] }
+# End-to-end pipeline test.
+profluens-elements = { path = "../../../lib/elements" }

@@ -1,0 +1,4 @@
+cue 0: 0.000 +5.000
+  text: "A A  A   A\tA\t\tA"
+  line:
+    span "A A  A   A\tA\t\tA"

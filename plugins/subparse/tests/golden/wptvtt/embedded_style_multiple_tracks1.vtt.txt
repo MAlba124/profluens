@@ -1,0 +1,9 @@
+cue 0: 0.000 +5.000
+  text: "This is a test subtitle"
+  base: fg=#008000
+  line:
+    span "This "
+    span "is" [style=italic]
+    span " a "
+    span "test" [weight=700]
+    span " subtitle"

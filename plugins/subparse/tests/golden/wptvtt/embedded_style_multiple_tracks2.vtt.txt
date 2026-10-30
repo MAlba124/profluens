@@ -1,0 +1,8 @@
+cue 0: 0.000 +5.000
+  text: "Here is a second subtitle"
+  line:
+    span "Here "
+    span "is" [style=italic]
+    span " a "
+    span "second" [weight=700]
+    span " subtitle"

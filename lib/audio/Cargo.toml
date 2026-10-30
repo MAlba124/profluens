@@ -1,0 +1,19 @@
+[package]
+name = "profluens-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+profluens-core = { path = "../../core" }
+pf-registry = { path = "../registry" }
+
+[dev-dependencies]
+pf-reactor = { path = "../reactor" }
+pf-harness = { path = "../harness" }
+# wavparse test and the wav to flac example.
+profluens-elements = { path = "../elements" }
+pf-libflac = { path = "../../plugins/audio/libflac", features = ["encoder"] }
+# Corruption rig for tests/corruption.rs.
+pf-sim = { path = "../sim", features = ["harness"] }

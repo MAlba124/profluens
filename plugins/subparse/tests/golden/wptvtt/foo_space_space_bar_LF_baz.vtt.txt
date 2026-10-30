@@ -1,0 +1,6 @@
+cue 0: 0.000 +5.000
+  text: "foo  bar\nbaz"
+  line:
+    span "foo  bar"
+  line:
+    span "baz"

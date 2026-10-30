@@ -1,0 +1,38 @@
+[package]
+name = "pf-libflac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_libflac"
+
+[features]
+default = []
+# `flacenc` and `FlacEncoder`, used by tests, examples and the launch tool.
+encoder = ["libflac-sys/encoder"]
+
+[dependencies]
+profluens-core = { path = "../../../core" }
+pf-registry = { path = "../../../lib/registry" }
+profluens-audio = { path = "../../../lib/audio" }
+libflac-sys = { path = "../../../sys/libflac-sys" }
+# The RFC 9639 metadata-block reader (`flacmeta`).
+pf-tags = { path = "../../tags" }
+
+[dev-dependencies]
+pf-libflac = { path = ".", features = ["encoder"] }
+pf-reactor = { path = "../../../lib/reactor" }
+pf-harness = { path = "../../../lib/harness" }
+profluens-elements = { path = "../../../lib/elements" }
+pf-ogg = { path = "../../formats/ogg" }
+pf-sim = { path = "../../../lib/sim", features = ["harness"] }
+
+[[example]]
+name = "bench"
+required-features = ["encoder"]
+
+[[example]]
+name = "transcode_many"
+required-features = ["encoder"]

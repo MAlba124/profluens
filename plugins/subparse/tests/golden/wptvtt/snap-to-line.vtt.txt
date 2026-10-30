@@ -1,0 +1,5 @@
+cue 0: 0.000 +5.000
+  text: "foo"
+  layout: line=50% line-align=start position=50 position-align=line-left align=start
+  line:
+    span "foo"

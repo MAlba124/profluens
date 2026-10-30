@@ -1,0 +1,5 @@
+cue 0: 0.000 +0.100
+  text: "Test Text"
+  layout: size=40
+  line:
+    span "Test Text"

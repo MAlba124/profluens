@@ -1,0 +1,12 @@
+[package]
+name = "pf-hdr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_hdr"
+
+[dependencies]
+profluens-core = { path = "../../../core" }

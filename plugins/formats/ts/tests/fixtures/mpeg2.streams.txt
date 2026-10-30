@@ -1,0 +1,3 @@
+program|stream|index=0|codec_name=mpeg2video|codec_type=video|id=0x100|
+
+stream|index=0|codec_name=mpeg2video|codec_type=video|id=0x100|

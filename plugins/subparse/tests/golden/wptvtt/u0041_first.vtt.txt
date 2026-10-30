@@ -1,0 +1,4 @@
+cue 0: 0.000 +5.000
+  text: "Aab)"
+  line:
+    span "Aab)"

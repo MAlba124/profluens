@@ -1,0 +1,14 @@
+/target
+.claude/
+heaptrack.*
+perf.data*
+*.zst
+/output.*
+\#*\#
+.\#*
+*~
+/private/
+/tools
+review-wip/
+# Tests on local media, public once an open test corpus exists
+**/tests/local_*.rs

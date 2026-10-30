@@ -1,0 +1,1 @@
+stream|index=0|codec_name=pcm_dvd|codec_type=audio|sample_rate=48000|channels=2|id=0xa0

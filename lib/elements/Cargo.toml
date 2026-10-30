@@ -1,0 +1,17 @@
+[package]
+name = "profluens-elements"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+profluens-core = { path = "../../core" }
+pf-registry = { path = "../registry" }
+
+[dev-dependencies]
+# The OS reactor the tests and examples run the file elements on.
+pf-reactor = { path = "../reactor" }
+# The page residency check of the read hygiene test (`mincore(2)`).
+libc = "0.2"
+pf-harness = { path = "../harness" }

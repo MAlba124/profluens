@@ -1,0 +1,5 @@
+program|stream|index=0|codec_name=h264|codec_type=video|id=0x100
+stream|index=1|codec_name=aac|codec_type=audio|id=0x101
+
+stream|index=0|codec_name=h264|codec_type=video|id=0x100
+stream|index=1|codec_name=aac|codec_type=audio|id=0x101|tag:language=eng

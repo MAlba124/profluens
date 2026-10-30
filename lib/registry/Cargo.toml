@@ -1,0 +1,16 @@
+[package]
+name = "pf-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_registry"
+
+[dependencies]
+profluens-core = { path = "../../core" }
+
+[dev-dependencies]
+# Converters for the convert tests.
+profluens-audio = { path = "../audio" }

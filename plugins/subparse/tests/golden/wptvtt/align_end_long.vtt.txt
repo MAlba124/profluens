@@ -1,0 +1,5 @@
+cue 0: 0.000 +5.000
+  text: "This is a test subtitle that most likely will span over several rows since it is a pretty long cue with a lot of text."
+  layout: align=end
+  line:
+    span "This is a test subtitle that most likely will span over several rows since it is a pretty long cue with a lot of text."

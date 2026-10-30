@@ -1,0 +1,15 @@
+[package]
+name = "pf-mpegts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_mpegts"
+
+[dependencies]
+
+[[bench]]
+name = "demux_throughput"
+harness = false

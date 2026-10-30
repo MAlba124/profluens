@@ -1,0 +1,14 @@
+[package]
+name = "libopus-sys"
+version.workspace = true
+edition.workspace = true
+license = "MIT AND BSD-3-Clause"
+repository.workspace = true
+links = "opus"
+build = "build.rs"
+
+[lib]
+name = "libopus_sys"
+
+[build-dependencies]
+cc = "1"

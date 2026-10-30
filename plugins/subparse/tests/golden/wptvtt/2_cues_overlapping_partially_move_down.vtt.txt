@@ -1,0 +1,10 @@
+cue 0: 0.000 +5.000
+  text: "This is a test subtitle"
+  layout: line=50%
+  line:
+    span "This is a test subtitle"
+cue 1: 1.000 +4.000
+  text: "This is another test subtitle"
+  layout: line=52%
+  line:
+    span "This is another test subtitle"

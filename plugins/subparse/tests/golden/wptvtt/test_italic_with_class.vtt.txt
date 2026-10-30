@@ -1,0 +1,7 @@
+cue 0: 0.000 +5.000
+  text: "This is a test subtitle, test subtitle"
+  line:
+    span "This is a "
+    span "test subtitle" [style=italic]
+    span ", "
+    span "test subtitle" classes=foo [style=italic]

@@ -1,0 +1,9 @@
+cue 0: 0.000 +5.000
+  text: "平成20年4月16日に"
+  layout: vertical-lr
+  line:
+    span "平成"
+    span "20" classes=combine
+    span "年4月"
+    span "16" classes=combine
+    span "日に"

@@ -1,0 +1,5 @@
+cue 0: 0.000 +5.000
+  text: "A A  A   A\tA\t\tA\t\tA\tA   A  A A"
+  layout: size=40
+  line:
+    span "A A  A   A\tA\t\tA\t\tA\tA   A  A A"

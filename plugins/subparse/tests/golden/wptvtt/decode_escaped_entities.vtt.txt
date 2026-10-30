@@ -1,0 +1,4 @@
+cue 0: 0.000 +5.000
+  text: "Here are the escaped entities: &amp; &lt; &gt; &lrm; &rlm; &nbsp;"
+  line:
+    span "Here are the escaped entities: &amp; &lt; &gt; &lrm; &rlm; &nbsp;"

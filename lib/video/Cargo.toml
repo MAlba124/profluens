@@ -1,0 +1,20 @@
+[package]
+name = "profluens-video"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+profluens-core = { path = "../../core" }
+# Re-exported as `color`.
+pf-hdr = { path = "../../plugins/video/hdr" }
+pf-registry = { path = "../registry" }
+# The decoder shell's dmabuf mode.
+pf-memory = { path = "../memory" }
+libc = "0.2"
+
+[dev-dependencies]
+pf-reactor = { path = "../reactor" }
+pf-harness = { path = "../harness" }
+profluens-elements = { path = "../elements" }

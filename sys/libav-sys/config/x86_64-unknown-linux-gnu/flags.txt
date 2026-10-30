@@ -1,0 +1,5 @@
+cppflags -D_ISOC11_SOURCE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -D_POSIX_C_SOURCE=200112 -D_XOPEN_SOURCE=600 -DPIC 
+cflags -std=c17 -fomit-frame-pointer -fPIC -pthread -O3 -fno-math-errno -fno-signed-zeros -mstack-alignment=16 -Qunused-arguments 
+x86asmflags -f elf64 
+extralibs -pthread -lm -latomic
+configure --cc=clang --target-os=linux --arch=x86_64 --enable-pic --disable-everything --disable-autodetect --disable-programs --disable-doc --disable-avdevice --disable-avformat --disable-avfilter --disable-swscale --disable-swresample --disable-network --disable-iconv --disable-debug --disable-symver --disable-pixelutils --enable-decoder='h264,hevc,vp8,vp9,aac,ac3,eac3,mp3float,dca,truehd,mlp,mpeg2video,mpeg4,vorbis,alac,flv,vp6,vp6f,vp6a,vp7' --enable-parser='h264,hevc,vp8,vp9,aac,ac3,mpegaudio,dca,mlp,mpegvideo' --enable-encoder=aac

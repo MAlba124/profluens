@@ -6,6 +6,18 @@ pub fn at_key(keys: &[i64], tol: i64, pts: i64) -> bool {
     keys.get(i).is_some_and(|&k| k <= pts.saturating_add(tol))
 }
 
+/// [`at_key`], or the first frame past a key no frame came within `tol` of, the one before
+/// it at `prev` short of the key's tolerance. A variable rate source can step over a key by
+/// more than `tol`, its next frame keys instead.
+pub fn keyed(keys: &[i64], tol: i64, prev: Option<i64>, pts: i64) -> bool {
+    if at_key(keys, tol, pts) {
+        return true;
+    }
+    let i = keys.partition_point(|&k| k < pts);
+    let Some(&k) = i.checked_sub(1).and_then(|i| keys.get(i)) else { return false };
+    prev.is_some_and(|q| q < k.saturating_sub(tol))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -20,6 +32,25 @@ mod tests {
         assert!(!at_key(&keys, tol, 41_708_333));
         assert!(!at_key(&keys, tol, 4_024_000_001));
         assert!(!at_key(&[], tol, 0));
+    }
+
+    /// 60 fps into 20 fps, frames 50 ms apart step over the 6 s key by 17 ms on both sides.
+    #[test]
+    fn a_frame_rate_drop_keys_the_first_frame_past_a_key() {
+        let (keys, tol) = ([4_000_000_000i64, 6_000_000_000], 9_333_333);
+        assert!(!keyed(&keys, tol, Some(5_933_333_333), 5_983_333_333), "short of the key");
+        assert!(keyed(&keys, tol, Some(5_983_333_333), 6_033_333_333), "the first past it");
+        assert!(!keyed(&keys, tol, Some(6_033_333_333), 6_083_333_333), "only the first");
+        assert!(keyed(&keys, tol, Some(3_983_333_333), 4_000_000_000), "on the key as before");
+        assert!(
+            !keyed(&keys, tol, Some(3_995_000_000), 4_010_000_001),
+            "a frame within tol keyed already"
+        );
+        assert!(
+            !keyed(&keys, tol, None, 6_033_333_333),
+            "no frame before, the encoder keys a start itself"
+        );
+        assert!(!keyed(&keys, tol, Some(1), 3_000_000_000), "past no key");
     }
 
     #[test]

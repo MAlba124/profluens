@@ -19,7 +19,7 @@ use profluens_core::log::{Field, Level, Text};
 use profluens_core::time::Timestamp;
 use profluens_video::decoder::Color;
 use profluens_video::gpuframe::GpuFrameHeader;
-use profluens_video::keys::at_key;
+use profluens_video::keys::keyed;
 
 use crate::emit::VPL_OFFERS;
 use crate::error::{MfxError, VplErrorKind as K, check, failed};
@@ -504,6 +504,8 @@ pub struct VplEnc {
     force_idr: bool,
     /// Sorted stamps, ns, each frame within the tolerance of one opens an IDR.
     keys: Option<(std::sync::Arc<[i64]>, i64)>,
+    /// The stamp of the frame before, for [`keyed`], none after a flush.
+    key_prev: Option<i64>,
     popped: u64,
     emitted: u64,
     ended: bool,
@@ -585,6 +587,7 @@ impl VplEnc {
             rc_dirty: false,
             force_idr: false,
             keys: None,
+            key_prev: None,
             popped: 0,
             emitted: 0,
             ended: false,
@@ -1671,8 +1674,12 @@ impl VplEnc {
             self.previews.put(ts);
             self.force_idr = true;
         }
+        let prev = self.key_prev;
+        if let Some(p) = pts.nanos() {
+            self.key_prev = Some(i64::try_from(p).unwrap_or(i64::MAX));
+        }
         if let (Some((keys, tol)), Some(p)) = (&self.keys, pts.nanos())
-            && at_key(keys, *tol, i64::try_from(p).unwrap_or(i64::MAX))
+            && keyed(keys, *tol, prev, i64::try_from(p).unwrap_or(i64::MAX))
         {
             log!(&*ctx, Level::Debug, "forced_key", pts = pts, reason = "key_list");
             self.force_idr = true;
@@ -1899,6 +1906,7 @@ impl Element for VplEnc {
                 self.force_idr = true
             }
             Event::FlushStart => {
+                self.key_prev = None;
                 let t = ctx.steady();
                 self.flushed_at = t.max(1);
                 self.input.flush(ctx);

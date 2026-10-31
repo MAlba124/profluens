@@ -19,7 +19,7 @@ use profluens_core::id::{SinkPad, SrcPad};
 use profluens_core::log;
 use profluens_core::log::Level;
 use profluens_core::time::Timestamp;
-use profluens_video::keys::at_key;
+use profluens_video::keys::keyed;
 
 use crate::bitwriter::{BitWriter, annexb_nal};
 use crate::enc::{self, EncEngine, FrameBufs, InFormat, PadOut, RawPixFmt, Staged, Stamp};
@@ -166,6 +166,8 @@ pub struct VaapiH264Enc {
     rc_dirty: bool,
     warned_rc_mode: bool,
     keys: Option<(Arc<[i64]>, i64)>,
+    /// The stamp of the frame before, for [`keyed`], none after a flush.
+    key_prev: Option<i64>,
 
     in_fmt: Option<InFormat>,
     avcc: bool,
@@ -211,6 +213,7 @@ impl VaapiH264Enc {
             rc_dirty: false,
             warned_rc_mode: false,
             keys: None,
+            key_prev: None,
             in_fmt: None,
             avcc: false,
             bytes_out: false,
@@ -447,9 +450,13 @@ impl VaapiH264Enc {
                 s.gop_pos = 0;
                 s.idr_pic_id = s.idr_pic_id.wrapping_add(1) & 0xF;
             }
+            let prev = self.key_prev;
+            if let Some(p) = pts.nanos() {
+                self.key_prev = Some(p as i64);
+            }
             if let (Some((keys, tol)), Some(p)) = (&self.keys, pts.nanos())
                 && s.gop_pos != 0
-                && at_key(keys, *tol, p as i64)
+                && keyed(keys, *tol, prev, p as i64)
             {
                 log!(&*ctx, Level::Debug, "forced_key", pts = pts, reason = "key_list");
                 s.gop_pos = 0;
@@ -1094,6 +1101,7 @@ impl Element for VaapiH264Enc {
                 }
             }
             Event::FlushStart => {
+                self.key_prev = None;
                 log!(&*ctx, Level::Debug, "flush", pending = self.staged.len());
                 self.warned.summary(ctx, "flush");
                 if let Some(g) = &mut self.gpu {

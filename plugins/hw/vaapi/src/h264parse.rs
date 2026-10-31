@@ -541,7 +541,8 @@ fn skip_hrd_parameters(r: &mut BitReader) {
 
 /// Tables 7-3 and 7-4, in the coded (zigzag) order of 7.3.2.1.1.1.
 const DEFAULT_4X4_INTRA: [u8; 16] = [6, 13, 13, 20, 20, 20, 28, 28, 28, 28, 32, 32, 32, 37, 37, 42];
-const DEFAULT_4X4_INTER: [u8; 16] = [10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34];
+const DEFAULT_4X4_INTER: [u8; 16] =
+    [10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34];
 const DEFAULT_8X8_INTRA: [u8; 64] = [
     6, 10, 10, 13, 11, 13, 16, 16, 16, 16, 18, 18, 18, 18, 18, 23, 23, 23, 23, 23, 23, 25, 25, 25,
     25, 25, 25, 25, 27, 27, 27, 27, 27, 27, 27, 27, 29, 29, 29, 29, 29, 29, 29, 31, 31, 31, 31, 31,
@@ -569,8 +570,7 @@ pub struct ScalingLists {
 }
 
 impl ScalingLists {
-    pub const FLAT: ScalingLists =
-        ScalingLists { list4x4: [[16; 16]; 6], list8x8: [[16; 64]; 6] };
+    pub const FLAT: ScalingLists = ScalingLists { list4x4: [[16; 16]; 6], list8x8: [[16; 64]; 6] };
 
     fn default_4x4(i: usize) -> [u8; 16] {
         if i < 3 { DEFAULT_4X4_INTRA } else { DEFAULT_4X4_INTER }
@@ -1225,7 +1225,13 @@ impl PocState {
 
     /// POC (8.2.1) as (TopFieldOrderCnt, BottomFieldOrderCnt). Frames only. `ref_idc` is the
     /// NAL's nal_ref_idc, a non-reference picture leaves the prev state and counts apart.
-    pub fn compute(&mut self, sps: &Sps, sh: &SliceHeader, is_idr: bool, ref_idc: u8) -> (i32, i32) {
+    pub fn compute(
+        &mut self,
+        sps: &Sps,
+        sh: &SliceHeader,
+        is_idr: bool,
+        ref_idc: u8,
+    ) -> (i32, i32) {
         match sps.pic_order_cnt_type {
             0 => self.compute_type0(sps, sh, is_idr, ref_idc),
             2 => self.compute_type2(sps, sh, is_idr, ref_idc),
@@ -1233,7 +1239,13 @@ impl PocState {
         }
     }
 
-    fn compute_type0(&mut self, sps: &Sps, sh: &SliceHeader, is_idr: bool, ref_idc: u8) -> (i32, i32) {
+    fn compute_type0(
+        &mut self,
+        sps: &Sps,
+        sh: &SliceHeader,
+        is_idr: bool,
+        ref_idc: u8,
+    ) -> (i32, i32) {
         let max_poc_lsb = sps.max_poc_lsb() as i32;
         let (prev_msb, prev_lsb) =
             if is_idr { (0, 0) } else { (self.prev_poc_msb, self.prev_poc_lsb) };
@@ -1256,7 +1268,13 @@ impl PocState {
         (top, bottom)
     }
 
-    fn compute_type2(&mut self, sps: &Sps, sh: &SliceHeader, is_idr: bool, ref_idc: u8) -> (i32, i32) {
+    fn compute_type2(
+        &mut self,
+        sps: &Sps,
+        sh: &SliceHeader,
+        is_idr: bool,
+        ref_idc: u8,
+    ) -> (i32, i32) {
         let max_frame_num = sps.max_frame_num() as i32;
         let frame_num = sh.frame_num as i32;
         let frame_num_offset = if is_idr {
@@ -1268,13 +1286,25 @@ impl PocState {
         };
         // 8.2.1.3, a non-reference picture sits one below 2 * FrameNumOffset + frame_num.
         let tmp = frame_num_offset.wrapping_add(frame_num).wrapping_mul(2);
-        let poc = if is_idr { 0 } else if ref_idc == 0 { tmp.wrapping_sub(1) } else { tmp };
+        let poc = if is_idr {
+            0
+        } else if ref_idc == 0 {
+            tmp.wrapping_sub(1)
+        } else {
+            tmp
+        };
         self.prev_frame_num = frame_num;
         self.prev_frame_num_offset = frame_num_offset;
         (poc, poc)
     }
 
-    fn compute_type1(&mut self, sps: &Sps, sh: &SliceHeader, is_idr: bool, ref_idc: u8) -> (i32, i32) {
+    fn compute_type1(
+        &mut self,
+        sps: &Sps,
+        sh: &SliceHeader,
+        is_idr: bool,
+        ref_idc: u8,
+    ) -> (i32, i32) {
         let max_frame_num = sps.max_frame_num() as i32;
         let frame_num = sh.frame_num as i32;
         let frame_num_offset = if is_idr {

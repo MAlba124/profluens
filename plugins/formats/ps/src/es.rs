@@ -223,7 +223,14 @@ pub struct Spu {
 impl Spu {
     #[allow(clippy::disallowed_methods)] // once per stream
     pub fn new() -> Spu {
-        Spu { buf: Vec::with_capacity(0x1_0000), need: 0, stamp: None, offset: 0, broken: 0, lost: false }
+        Spu {
+            buf: Vec::with_capacity(0x1_0000),
+            need: 0,
+            stamp: None,
+            offset: 0,
+            broken: 0,
+            lost: false,
+        }
     }
 
     pub fn reset(&mut self) {

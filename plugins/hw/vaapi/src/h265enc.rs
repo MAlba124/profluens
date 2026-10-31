@@ -312,7 +312,8 @@ impl VaapiH265Enc {
             false => (ffi::VAProfileHEVCMain, "HEVCMain"),
         };
         // VDEnc-only parts offer EncSliceLP alone, and VDEnc codes 64x64 CTBs.
-        let row = probe::probe().and_then(|caps| caps.profiles.iter().find(|p| p.name == name).copied());
+        let row =
+            probe::probe().and_then(|caps| caps.profiles.iter().find(|p| p.name == name).copied());
         let (enc, lp) = row.map_or((true, false), |p| (p.enc, p.enc_lp));
         let entrypoint = match (enc, lp) {
             (false, true) => ffi::VAEntrypointEncSliceLP,
@@ -355,7 +356,8 @@ impl VaapiH265Enc {
         let vps_nal = write_vps(level_idc, ten);
         let sps_nal = write_sps(&engine, fmt, level_idc, ctb_log2);
         let pps_nal = write_pps(self.qp, brc);
-        let ctu_count = engine.coded_w.div_ceil(1 << ctb_log2) * engine.coded_h.div_ceil(1 << ctb_log2);
+        let ctu_count =
+            engine.coded_w.div_ceil(1 << ctb_log2) * engine.coded_h.div_ceil(1 << ctb_log2);
         let (w, h) = (fmt.width, fmt.height);
         log!(
             &*ctx,

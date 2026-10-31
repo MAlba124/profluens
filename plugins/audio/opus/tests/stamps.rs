@@ -57,7 +57,11 @@ fn packets_follow_the_input_stamps_across_ragged_chunks() {
 fn unstamped_input_counts_from_zero() {
     let mut h = mono();
     let got = encode(&mut h, &tone(FRAME * 3 + 100), 1000, None);
-    assert_eq!(got, [(0, 20), (20, 20), (40, 20), (60, 1)], "the tail is stamped with its 50 samples");
+    assert_eq!(
+        got,
+        [(0, 20), (20, 20), (40, 20), (60, 1)],
+        "the tail is stamped with its 50 samples"
+    );
 }
 
 #[test]

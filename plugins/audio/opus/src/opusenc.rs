@@ -243,12 +243,7 @@ impl OpusEnc {
     }
 
     /// `pad` is the zero tail bytes added at EOS, left out of the stamped duration.
-    fn encode_frame_bytes(
-        &mut self,
-        ctx: &mut Ctx,
-        frame: &[u8],
-        pad: usize,
-    ) -> Result<(), Error> {
+    fn encode_frame_bytes(&mut self, ctx: &mut Ctx, frame: &[u8], pad: usize) -> Result<(), Error> {
         let Some(enc) = self.enc.as_mut() else {
             return Err(Error::element_failed(ctx.element(), OpusError::InputFormatUnknown));
         };

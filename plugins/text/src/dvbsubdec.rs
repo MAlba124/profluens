@@ -1512,7 +1512,8 @@ mod tests {
     #[test]
     fn two_hundred_fifty_six_clut_ids_do_not_wrap_the_slot() {
         let mut r = Rig::new();
-        let mut segs = vec![page(5, 0, &[(1, 100, 200)]), region(1, 4, 2, 4, 255, 0, true, &[(7, 0, 0)])];
+        let mut segs =
+            vec![page(5, 0, &[(1, 100, 200)]), region(1, 4, 2, 4, 255, 0, true, &[(7, 0, 0)])];
         segs.extend((0..=255u8).map(|id| clut(id, &[(1, 235, 128, 128, 0)])));
         segs.push(object(7, &four_bit(&[(1, 4)]), &[]));
         segs.push(end());

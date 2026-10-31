@@ -741,8 +741,8 @@ impl LibavAudioDec {
         let sample = out_sample(own_sample(format), self.takes);
         let mask = frame.channel_mask();
         let layout = layout_or_default((mask != 0).then_some(mask), channels as u32);
-        let changed =
-            (rate, channels, sample, layout) != (self.rate, self.channels, self.sample, self.layout);
+        let changed = (rate, channels, sample, layout)
+            != (self.rate, self.channels, self.sample, self.layout);
         if changed && self.pending_pos < self.pending.len() {
             log!(
                 &*ctx,

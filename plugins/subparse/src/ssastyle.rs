@@ -1212,7 +1212,8 @@ mod tests {
         assert!(reg.lookup("S4095").is_some());
         assert!(reg.lookup("s4096").is_none());
         let text = format!("{{{}}}x", "\\rmissing\\rS4095".repeat(100_000));
-        let d = SsaEvent { raw_text: &text, style: "Default", margin_l: 0, margin_r: 0, margin_v: 0 };
+        let d =
+            SsaEvent { raw_text: &text, style: "Default", margin_l: 0, margin_r: 0, margin_v: 0 };
         let o = build(|b| dialogue_into(&d, &reg, 0, b));
         assert_eq!(o.plain_text(), "x");
     }

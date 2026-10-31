@@ -104,8 +104,9 @@ fn the_encoder_frame_headers_round_trip() {
         assert_eq!(groups.len(), 1);
         assert_eq!((groups[0].data_start, groups[0].data_end), (tile_at, tile_at + 100));
         assert_eq!(tiles, &[obu::Tile { offset: 0, size: 100, row: 0, col: 0 }]);
-        let refs =
-            ref_surfaces(&[Some(Slot { surface: 3, display: 3, width: 320, height: 240, showable: true }); 8]);
+        let refs = ref_surfaces(
+            &[Some(Slot { surface: 3, display: 3, width: 320, height: 240, showable: true }); 8],
+        );
         let p = params::pic_param(stream.seq.as_ref().unwrap(), h, refs, 9, 9);
         assert_eq!((p.frame_width_minus1, p.frame_height_minus1), (319, 239));
         assert_eq!(p.ref_frame_map, if key { [ffi::VA_INVALID_SURFACE; 8] } else { [3; 8] });

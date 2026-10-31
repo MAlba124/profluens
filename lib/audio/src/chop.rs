@@ -108,7 +108,8 @@ impl Element for AudioChop {
             while at < frames {
                 let n = piece.min(frames - at);
                 // the last slice carries any partial trailing frame, as the short path does
-                let len = if at + n == frames { buf.memory.len() - at * stride } else { n * stride };
+                let len =
+                    if at + n == frames { buf.memory.len() - at * stride } else { n * stride };
                 let Some(memory) = buf.memory.slice(at * stride, len) else {
                     log!(&*ctx, Level::Warn, "slice_failed", at = at, frames = frames);
                     break;

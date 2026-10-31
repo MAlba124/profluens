@@ -14,7 +14,8 @@ use profluens_core::pipeline::Pipeline;
 
 use common::{Codec, Collect, UnitSrc, hw_decodes};
 
-const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../fixtures/out/mkv_h265_aac.mkv");
+const FIXTURE: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../fixtures/out/mkv_h265_aac.mkv");
 const FRAMES: usize = 125;
 
 fn read_hevc_aus() -> Option<Vec<Vec<u8>>> {

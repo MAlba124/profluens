@@ -10,7 +10,8 @@ use pf_vpl::VplDec;
 use profluens_core::bus::BusMessage;
 use profluens_core::time::Timestamp;
 
-const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../fixtures/out/mkv_h265_aac.mkv");
+const FIXTURE: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../fixtures/out/mkv_h265_aac.mkv");
 const FRAMES: usize = 125;
 const FRAME_NS: u64 = 40_000_000;
 

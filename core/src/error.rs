@@ -24,10 +24,7 @@ pub enum Error {
     /// An OS resource could not be opened or used.
     Io { what: &'static str, kind: crate::io::IoError },
     /// A group thread panicked. `element` heads the group, `message` is the panic payload.
-    GroupPanicked {
-        element: ElementId,
-        message: String,
-    },
+    GroupPanicked { element: ElementId, message: String },
     /// The element does IO and the pipeline has no reactor factory.
     NoReactor { element: ElementId, element_name: &'static str },
     /// An element failed. `source` is the plugin crate's own error type.

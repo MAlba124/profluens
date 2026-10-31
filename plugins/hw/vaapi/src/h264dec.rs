@@ -583,7 +583,8 @@ impl VaapiH264Dec {
         // A stream joined mid-GOP decodes from its first IDR or all-intra picture, as the
         // references before it are not there.
         if self.awaiting_idr {
-            let intra = sc.headers.iter().all(|sh| matches!(sh.slice_type, SliceType::I | SliceType::Si));
+            let intra =
+                sc.headers.iter().all(|sh| matches!(sh.slice_type, SliceType::I | SliceType::Si));
             if !is_idr && !intra {
                 log!(&*ctx, Level::Trace, "await_idr", pts = pts);
                 return;
@@ -637,10 +638,8 @@ impl VaapiH264Dec {
             return;
         };
 
-        let Some((width, height, crop_x, crop_y, coded_w, coded_h)) = self
-            .va
-            .as_ref()
-            .map(|v| (v.width, v.height, v.crop_x, v.crop_y, v.coded_w, v.coded_h))
+        let Some((width, height, crop_x, crop_y, coded_w, coded_h)) =
+            self.va.as_ref().map(|v| (v.width, v.height, v.crop_x, v.crop_y, v.coded_w, v.coded_h))
         else {
             return;
         };
@@ -808,8 +807,7 @@ impl VaapiH264Dec {
         let rendered = (|| {
             context.render(&[pic_buf.id(), iq_buf.id()])?;
             for (sh, nal) in headers.iter().zip(slice_nals.iter()) {
-                let (list0, list1, n0, n1) =
-                    self.build_ref_lists(sps, sh, top_poc.min(bottom_poc));
+                let (list0, list1, n0, n1) = self.build_ref_lists(sps, sh, top_poc.min(bottom_poc));
                 let sp = self.build_slice_param(sh, nal.raw(au), &list0, &list1, n0, n1);
                 let sp_buf =
                     VaBuffer::new_struct(display, context, ffi::VASliceParameterBufferType, &sp)?;
@@ -935,7 +933,9 @@ impl VaapiH264Dec {
             }
             if long_term {
                 // 8.2.5.4.6, the frame that held LongTermFrameIdx is unmarked first.
-                self.remove_dpb_where(|e| e.long_term && e.long_term_frame_idx == long_term_frame_idx);
+                self.remove_dpb_where(|e| {
+                    e.long_term && e.long_term_frame_idx == long_term_frame_idx
+                });
             }
         } else {
             let num_short = self.dpb.iter().filter(|e| !e.long_term).count();
@@ -1091,9 +1091,12 @@ impl VaapiH264Dec {
             return Ok(true);
         };
 
-        let image =
-            match MappedImage::acquire(display, out.surface, width + out.crop_x, height + out.crop_y)
-            {
+        let image = match MappedImage::acquire(
+            display,
+            out.surface,
+            width + out.crop_x,
+            height + out.crop_y,
+        ) {
             Ok(im) => im,
             Err(e) => {
                 self.picture_failed(ctx, &e, K::Readback(e));

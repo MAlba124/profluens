@@ -150,7 +150,8 @@ fn ssa_dialogue_of_many_font_names_is_refused_in_linear_time() {
             text.push_str(&format!("\\fn{i}"));
         }
         text.push_str("}x");
-        let d = SsaEvent { raw_text: &text, style: "Default", margin_l: 0, margin_r: 0, margin_v: 0 };
+        let d =
+            SsaEvent { raw_text: &text, style: "Default", margin_l: 0, margin_r: 0, margin_v: 0 };
         let mut b = CueBuilder::new();
         dialogue_into(&d, &SsaStyles::default(), 0, &mut b);
         assert!(b.overflowed());
@@ -183,7 +184,9 @@ fn webvtt_style_rules_are_capped_and_the_cascade_stays_cheap() {
         body.push('\n');
         for i in 0..2_000u32 {
             let (h, m) = (i / 60, i % 60);
-            body.push_str(&format!("{h:02}:{m:02}:00.000 --> {h:02}:{m:02}:00.500\n<c.c1>x</c>\n\n"));
+            body.push_str(&format!(
+                "{h:02}:{m:02}:00.000 --> {h:02}:{m:02}:00.500\n<c.c1>x</c>\n\n"
+            ));
         }
         let mut parser = WebVtt::default();
         let cues = parser.parse(&body, &ParseContext::default()).unwrap();

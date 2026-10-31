@@ -1324,7 +1324,8 @@ impl Group {
                 let behind = self.ctxs[i + 1].input_len() >= cap;
                 self.ctxs[i].clear_full_pads();
                 if behind {
-                    self.ctxs[i].set_full_pad(SrcPad(0));
+                    let hop = self.ctxs[i].hop_pad();
+                    self.ctxs[i].set_full_pad(hop);
                 }
             }
         }
@@ -1575,7 +1576,8 @@ impl Group {
         progressed: &mut bool,
     ) -> Result<(), Error> {
         if let Some(up) = self.ctxs.get_mut(i + 1).and_then(|c| c.take_published(SinkPad(0))) {
-            self.tell(i, SrcPad(0), up)?;
+            let hop = self.ctxs[i].hop_pad();
+            self.tell(i, hop, up)?;
         }
         self.deliver_prop_changes(i)?;
         let trace_t0 = self.shared.tracing.load(Ordering::Relaxed).then(|| self.shared.trace_ns());
@@ -1678,7 +1680,8 @@ impl Group {
             self.counters[i + 1].record_in(nbuf, nbytes);
         }
         let (left, right) = self.ctxs.split_at_mut(i + 1);
-        right[0].input_append(left[i].output_mut());
+        let hop = left[i].hop_pad();
+        right[0].input_append(left[i].output_on(hop));
         if right[0].pulling.is_on() {
             right[0].pulling.tags.append(&mut left[i].serving.tags);
         }
@@ -5392,6 +5395,27 @@ mod tests {
         assert_eq!(r.group.pass().unwrap(), Outcome::Progressed);
         assert_eq!(settle(&mut r), ring(0));
         assert_eq!(r.group.counters[0].snapshot().buffers_out, 5);
+    }
+
+    /// A demuxer whose second pad alone is linked, its audio, hands that pad's buffers to the
+    /// member fused after it, not its first pad's. AVI's AC-3 went to its decoder as the video.
+    #[test]
+    fn an_inline_hop_takes_the_linked_pad_not_the_first() {
+        static DEMUX: ElementDesc = desc("demux", &ONE_SINK, &TWO_SRCS);
+        let demux = Probe { outs: &[1], ..probe(&DEMUX) };
+        let inline = Probe { outs: &[0], ..probe(&FILTER) };
+        let mut r = rig(vec![demux, inline], &[0], &[0]);
+        r.group.ctxs[0].set_linked_pads(vec![false, true]);
+        assert_eq!(r.group.ctxs[0].hop_pad(), SrcPad(1));
+        feed(&r, 0, timed(&r.pool, 0, 10));
+        for _ in 0..16 {
+            let _ = r.group.pass().unwrap();
+        }
+        assert_eq!(
+            n(&r.seen[1].buffers),
+            10,
+            "every buffer of the linked pad reached the next member"
+        );
     }
 
     #[test]

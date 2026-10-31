@@ -415,6 +415,12 @@ impl Ctx {
         self.linked_src_pads = linked;
     }
 
+    /// The src pad that feeds the next member of a group inline, the one linked pad of a member
+    /// that is not the group's tail, which may be any of an element's pads, a demuxer's audio.
+    pub(crate) fn hop_pad(&self) -> SrcPad {
+        SrcPad(self.linked_src_pads.iter().position(|on| *on).unwrap_or(0) as u32)
+    }
+
     pub(crate) fn set_pad_linked(&mut self, pad: SrcPad, on: bool) {
         let i = pad.0 as usize;
         if self.linked_src_pads.len() <= i {
@@ -1175,10 +1181,6 @@ impl Ctx {
         (std::mem::take(&mut self.added_srcs), std::mem::take(&mut self.added_sinks))
     }
 
-    pub(crate) fn output_mut(&mut self) -> &mut Batch {
-        self.out_slot(SrcPad(0))
-    }
-
     pub fn output_on(&mut self, pad: SrcPad) -> &mut Batch {
         self.out_slot(pad)
     }
@@ -1714,7 +1716,7 @@ mod tests {
         ctx.push_event(SrcPad(1), Event::Eos);
         assert_eq!((ctx.output_on(SrcPad(0)).len(), ctx.output_on(SrcPad(1)).len()), (1, 1));
         assert!(!ctx.output_on(SrcPad(0)).has_events() && ctx.output_on(SrcPad(1)).has_events());
-        assert_eq!(ctx.output_mut().len(), 1, "the hand-off moves the first src pad");
+        assert_eq!(ctx.output_on(SrcPad(0)).len(), 1, "the hand-off moves the first src pad");
         ctx.announce_format(SrcPad(1), "audio/raw", &[]);
         ctx.forward_format(SrcPad(0), FixedFormat::new(FormatId(0)));
         let pads: Vec<(SrcPad, u32)> =

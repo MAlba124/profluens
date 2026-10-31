@@ -34,8 +34,7 @@ use crate::publish::{Publisher, published};
 use crate::ring::{Consumer, Producer, spsc};
 use crate::sched::{
     DownLink, GROUP_PARK_BACKSTOP, GroupSetup, GroupShared, Stepped, Tag, UpLink, judge,
-    retire_group,
-    run_group,
+    retire_group, run_group,
 };
 use crate::slots::Slots;
 use crate::solve::{Fail, FailKind, List, NONE, Reason, Scope, Solver};
@@ -128,6 +127,8 @@ struct Tune {
     limit: Option<Limit>,
     marks: Option<(Limit, Limit)>,
     auto: bool,
+    /// In place of the element's own [`SchedHint`].
+    sched: Option<SchedHint>,
 }
 
 // A few per change, boxing the edge would allocate per edit.
@@ -855,6 +856,20 @@ impl Pipeline {
         if let Some(t) = self.tune_of(el) {
             t.alloc = Some((align, allocator));
         }
+    }
+
+    /// Runs `el` as `sched` in this pipeline in place of its own hint. A Passive element runs
+    /// inline on its upstream's thread, for one whose calls never block, an Active one gets a
+    /// thread of its own.
+    pub fn set_element_sched(&mut self, el: ElementId, sched: SchedHint) {
+        if let Some(t) = self.tune_of(el) {
+            t.sched = Some(sched);
+        }
+    }
+
+    /// The hint `el` runs by, the pipeline's over the element's own.
+    fn sched_at(&self, i: usize) -> SchedHint {
+        self.tune[i].sched.unwrap_or(self.rows[i].desc.sched)
     }
 
     pub fn set_queue_capacity(&mut self, el: ElementId, batches: usize) {
@@ -1941,7 +1956,8 @@ impl Pipeline {
         let control = Arc::clone(&self.control);
         control.topology.serve(true);
         // Unwinding out of here aborts the run and joins the groups, so no thread outlives it.
-        let mut guard = RunGuard { control: Arc::clone(&control), threads: Vec::new(), armed: true };
+        let mut guard =
+            RunGuard { control: Arc::clone(&control), threads: Vec::new(), armed: true };
         let mut first_err = None;
         loop {
             // Sampled first, so whatever is signaled from here on ends the park.
@@ -2488,11 +2504,10 @@ impl Pipeline {
         let mut groups: Vec<Vec<ElementId>> = Vec::new();
         for &id in order {
             let i = self.ix(id);
-            let sched = self.elements[i]
-                .as_ref()
-                .ok_or(Error::Graph(GraphError::ElementConsumed { element: id }))?
-                .desc()
-                .sched;
+            if self.elements[i].is_none() {
+                return Err(Error::Graph(GraphError::ElementConsumed { element: id }));
+            }
+            let sched = self.sched_at(i);
             let is_source = incoming[i].is_empty();
             if is_source || matches!(sched, SchedHint::Active) {
                 group_of[i] = Some(groups.len());
@@ -3053,7 +3068,7 @@ impl Pipeline {
             let el = left.remove(at);
             let into = |(_, e): &(usize, Edge)| (e.sink == el).then_some(e.src);
             let ups: Vec<ElementId> = fresh.iter().filter_map(into).collect();
-            let passive = self.rows[self.ix(el)].desc.sched == SchedHint::Passive;
+            let passive = self.sched_at(self.ix(el)) == SchedHint::Passive;
             if passive && ups.len() > 1 {
                 let inputs = ups.len();
                 return Err(Error::Graph(GraphError::PassiveMultipleInputs {
@@ -3570,10 +3585,7 @@ impl Drop for Exited<'_> {
 
 // One name per group thread, once per group.
 #[allow(clippy::disallowed_methods)]
-fn spawn_group(
-    gi: usize,
-    setup: GroupSetup,
-) -> std::io::Result<JoinHandle<Result<(), Error>>> {
+fn spawn_group(gi: usize, setup: GroupSetup) -> std::io::Result<JoinHandle<Result<(), Error>>> {
     let control = Arc::clone(&setup.shared.control);
     let tag = Tag::of(&setup);
     std::thread::Builder::new().name(format!("pf-group-{gi}")).spawn(move || {

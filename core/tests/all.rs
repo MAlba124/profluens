@@ -26,6 +26,11 @@ mod unlinked;
 
 // Test fixtures and assertions allocate freely.
 #[allow(clippy::disallowed_methods)]
+#[path = "sched_override.rs"]
+mod sched_override;
+
+// Test fixtures and assertions allocate freely.
+#[allow(clippy::disallowed_methods)]
 #[path = "seek_plan.rs"]
 mod seek_plan;
 

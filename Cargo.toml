@@ -38,9 +38,9 @@ members = [
 ]
 
 [workspace.dependencies]
-stein-arena = { git = "https://github.com/MAlba124/steinlibs.git", rev = "db5588ef245cd0b2b20acfea79d5fc3583494dcd" }
+stein-arena = { git = "https://github.com/MAlba124/steinlibs.git", rev = "603539b8b086dbb33a04f0fc83224910aa929bf1" }
 # No default driver feature.
-stein-io = { git = "https://github.com/MAlba124/steinlibs.git", rev = "db5588ef245cd0b2b20acfea79d5fc3583494dcd", default-features = false }
+stein-io = { git = "https://github.com/MAlba124/steinlibs.git", rev = "603539b8b086dbb33a04f0fc83224910aa929bf1", default-features = false }
 
 [workspace.package]
 version = "0.1.0"

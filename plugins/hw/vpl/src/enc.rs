@@ -15,7 +15,7 @@ use profluens_core::event::Event;
 use profluens_core::format::{Constraint, ConstraintDesc, FieldDesc, OfferDesc, Value};
 use profluens_core::id::{SinkPad, SrcPad};
 use profluens_core::log;
-use profluens_core::log::Level;
+use profluens_core::log::{Field, Level, Text};
 use profluens_core::time::Timestamp;
 use profluens_video::decoder::Color;
 use profluens_video::gpuframe::GpuFrameHeader;
@@ -300,6 +300,17 @@ impl Previews {
     }
 }
 
+/// Logs nothing, for the encoder's calls outside a pipeline.
+struct Quiet;
+
+impl Loggable for Quiet {
+    fn enabled(&self, _: Level) -> bool {
+        false
+    }
+
+    fn emit(&self, _: Level, _: &'static str, _: &[Field], _: Text) {}
+}
+
 fn candidates_eq(seen: &[(EncPlan, u32)], plan: EncPlan, bframes: u32) -> bool {
     seen.iter().any(|(p, b)| *p == plan && *b == bframes)
 }
@@ -355,6 +366,9 @@ pub struct Settings {
     pub quality: u16,
     pub qp: u8,
     pub hrd_ms: u32,
+    /// The HRD's parameters in the VUI too. Off, the parameter sets do not change with the
+    /// bitrate and a live rate change keeps them.
+    pub hrd_in_vui: bool,
     pub preset: u16,
     pub low_power: Option<bool>,
     /// Encodes in flight, 1 to [`RING`]. `None` takes `PF_VPL_ASYNC`, else 1.
@@ -373,6 +387,7 @@ impl Default for Settings {
             quality: 24,
             qp: 26,
             hrd_ms: 0,
+            hrd_in_vui: true,
             preset: ffi::MFX_TARGETUSAGE_BALANCED,
             low_power: None,
             async_depth: None,
@@ -389,6 +404,8 @@ impl Settings {
 }
 
 pub const RATE_MAX_KBPS: u32 = 500_000;
+/// How long a flush waits for a bitstream in flight before it closes the session instead.
+const FLUSH_SYNC_MS: u32 = 100;
 pub const HRD_MAX_MS: u32 = 10_000;
 
 /// Rate fields in 16 bit words with the runtime's multiplier, as ffmpeg's qsvenc does.
@@ -507,6 +524,14 @@ pub struct VplEnc {
     warned_rc: bool,
     warned_out: bool,
     pub frames: u64,
+    /// Steady ns of the last flush until its first packet goes out, 0 for none.
+    flushed_at: u64,
+    /// The rate coded, over the input's, for a source whose decoder names none.
+    fps: Option<(u32, u32)>,
+    /// The shape, rate and colour the first input will have, the session opens at start.
+    ahead: Option<(Geometry, (u32, u32), Color)>,
+    /// The colour the session was built for, an input in another reopens it.
+    built_color: Color,
 }
 
 // SAFETY: SchedHint::Active, one thread, the session its own.
@@ -576,6 +601,10 @@ impl VplEnc {
             warned_rc: false,
             warned_out: false,
             frames: 0,
+            flushed_at: 0,
+            fps: None,
+            ahead: None,
+            built_color: Color::default(),
         }
     }
 
@@ -611,6 +640,37 @@ impl VplEnc {
     pub fn with_keys(mut self, keys: std::sync::Arc<[i64]>, tol: i64) -> Self {
         self.keys = Some((keys, tol.max(0)));
         self
+    }
+
+    /// Codes at `num`/`den` fps whatever the input says, the VUI timing and the rate control's
+    /// bits a frame. For a source whose decoder announces no rate (the input then reads 30).
+    pub fn with_fps(mut self, num: u32, den: u32) -> Self {
+        self.fps = (num > 0 && den > 0).then_some((num, den));
+        self
+    }
+
+    /// Opens the session at start for a first input of `geom` at `fps` in `color`, beside
+    /// what runs upstream instead of after the first frame. An input of another shape or colour
+    /// reopens it as a shape change does.
+    pub fn with_ahead(mut self, geom: Geometry, fps: (u32, u32), color: Color) -> Self {
+        self.ahead = Some((geom, fps, color));
+        self
+    }
+
+    /// The two colours give the same stream, the VUI signal and, for HDR HEVC, the SEI.
+    fn codes_alike(&self, a: &Color, b: &Color) -> bool {
+        let signal = |c: &Color| {
+            let v = signal_of_color(ffi::MFX_EXTBUFF_VIDEO_SIGNAL_INFO, c);
+            (
+                v.VideoFullRange,
+                v.ColourDescriptionPresent,
+                v.ColourPrimaries,
+                v.TransferCharacteristics,
+                v.MatrixCoefficients,
+            )
+        };
+        let sei = |c: &Color| (self.codec == ffi::MFX_CODEC_HEVC && is_hdr(c)).then_some(c.hdr);
+        signal(a) == signal(b) && sei(a) == sei(b)
     }
 
     /// The chain's join group. Without one the session joins what `PF_VPL_JOIN` says.
@@ -657,6 +717,21 @@ impl VplEnc {
     }
 
     fn pick_plan(&mut self, ctx: &mut Ctx, rt: &Runtime) -> Option<EncPlan> {
+        let plan = self.plan_of(rt)?;
+        log!(
+            &*ctx,
+            Level::Info,
+            "encode_plan",
+            low_power = plan.low_power,
+            rc = probe::rc_name(plan.rc),
+            lookahead = plan.lookahead,
+            ext_brc = plan.ext_brc
+        );
+        Some(plan)
+    }
+
+    /// The plan the settings and the runtime's caps give, before any relaxation.
+    fn plan_of(&self, rt: &Runtime) -> Option<EncPlan> {
         let s = self.settings;
         let caps = &rt.caps;
         let plan = match s.rc {
@@ -678,16 +753,55 @@ impl VplEnc {
         if plan.lookahead > 0 && s.lookahead > 0 {
             plan.lookahead = plan.lookahead.min(s.lookahead.max(10));
         }
-        log!(
-            &*ctx,
-            Level::Info,
-            "encode_plan",
-            low_power = plan.low_power,
-            rc = probe::rc_name(plan.rc),
-            lookahead = plan.lookahead,
-            ext_brc = plan.ext_brc
-        );
         Some(plan)
+    }
+
+    /// Query is lenient and Init strict, so Init tries the plan, then relaxations in order.
+    fn candidates(&self, first: EncPlan) -> [(EncPlan, u32); 5] {
+        let vbr = ffi::MFX_RATECONTROL_VBR;
+        let plain = EncPlan { low_power: first.low_power, rc: vbr, lookahead: 0, ext_brc: false };
+        let other = EncPlan { low_power: !first.low_power, rc: vbr, lookahead: 0, ext_brc: false };
+        [
+            (first, self.settings.bframes),
+            (plain, self.settings.bframes),
+            (plain, 0),
+            (other, self.settings.bframes),
+            (other, 0),
+        ]
+    }
+
+    /// The parameter sets, Annex B, this encoder writes for a first input of `geom` at `fps`
+    /// in `color`, from a session of their own that closes again, the same plan, build and
+    /// Init as the encoder's. A packet out of a matching input starts with them. Cold, before
+    /// the pipeline runs, a few ms of Init.
+    #[allow(clippy::disallowed_methods)]
+    pub fn headers_for(
+        &mut self,
+        geom: Geometry,
+        fps: (u32, u32),
+        color: Color,
+    ) -> Result<Vec<u8>, MfxError> {
+        let fps = self.fps.unwrap_or(fps);
+        let rt = probe::runtime()
+            .ok_or(MfxError { status: ffi::MFX_ERR_NOT_INITIALIZED, call: "runtime" })?;
+        let first =
+            self.plan_of(rt).ok_or(MfxError { status: ffi::MFX_ERR_UNSUPPORTED, call: "plan" })?;
+        self.color = color;
+        let candidates = self.candidates(first);
+        let mut last =
+            MfxError { status: ffi::MFX_ERR_INVALID_VIDEO_PARAM, call: "MFXVideoENCODE_Init" };
+        for (i, (plan, bframes)) in candidates.into_iter().enumerate() {
+            if i > 0 && candidates_eq(&candidates[..i], plan, bframes) {
+                continue;
+            }
+            let session = rt.session()?;
+            self.build(geom, fps, plan, bframes);
+            match self.open_on(&session, &Quiet) {
+                Ok(()) => return Ok(self.read_headers(&session).0),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
     }
 
     fn build(&mut self, geom: Geometry, fps: (u32, u32), plan: EncPlan, bframes: u32) {
@@ -746,7 +860,12 @@ impl VplEnc {
             ..Default::default()
         };
         e.co.NalHrdConformance = if s.hrd_ms > 0 { on } else { ffi::MFX_CODINGOPTION_UNKNOWN };
-        e.co.VuiNalHrdParameters = if s.hrd_ms > 0 { on } else { ffi::MFX_CODINGOPTION_UNKNOWN };
+        e.co.VuiNalHrdParameters = match (s.hrd_ms > 0, s.hrd_in_vui) {
+            (true, true) => on,
+            // the runtime writes them by default while the conformance is on
+            (true, false) => off,
+            (false, _) => ffi::MFX_CODINGOPTION_UNKNOWN,
+        };
         e.co.PicTimingSEI = off;
         e.co.AUDelimiter = off;
         e.co2 = ffi::mfxExtCodingOption2 {
@@ -767,6 +886,7 @@ impl VplEnc {
         };
         e.co3.QVBRQuality =
             if plan.rc == ffi::MFX_RATECONTROL_QVBR { s.quality.clamp(1, 51) } else { 0 };
+        self.built_color = self.color;
         e.vsi = signal_of_color(ffi::MFX_EXTBUFF_VIDEO_SIGNAL_INFO, &self.color);
         e.with_signal = e.vsi.ColourDescriptionPresent != 0 || e.vsi.VideoFullRange != 0;
         let hdr = self.color.hdr;
@@ -807,6 +927,40 @@ impl VplEnc {
             return Err(MfxError { status: ffi::MFX_ERR_NOT_INITIALIZED, call: "init" });
         };
         let session = &owner.session;
+        self.open_on(session, &*ctx)?;
+        self.inited = true;
+        owner.set(Component::Encoder);
+        if ctx.enabled(Level::Trace) {
+            let mut q = self.param;
+            let mut req = ffi::mfxFrameAllocRequest::default();
+            // SAFETY: q valid, req a valid out struct.
+            let st = unsafe { ffi::MFXVideoENCODE_QueryIOSurf(session.raw(), &mut q, &mut req) };
+            let suggested = if st >= 0 { u32::from(req.NumFrameSuggested) } else { 0 };
+            // The encoder gets no hint, its inputs come from the producer or its own upload pool.
+            trace_pool(&*ctx, NAME, suggested, 0, &self.param.mfx().FrameInfo);
+        }
+        let (headers, packet_size) = self.read_headers(session);
+        self.headers = headers;
+        self.packet_size = packet_size;
+        if self.packet_size == 0 {
+            let f = self.param.mfx().FrameInfo;
+            self.packet_size = usize::from(f.Width) * usize::from(f.Height) * 3 / 2;
+        }
+        self.packet_size = self.packet_size.max(4096);
+        self.size_ring();
+        log!(
+            &*ctx,
+            Level::Info,
+            "encoder",
+            packet = self.packet_size,
+            headers = self.headers.len()
+        );
+        Ok(())
+    }
+
+    /// Query and Init of the built parameters on `session`, the runtime's corrections kept.
+    fn open_on(&mut self, session: &Session, log: &dyn Loggable) -> Result<(), MfxError> {
+        let ctx = log;
         let mut list = [std::ptr::null_mut::<ffi::mfxExtBuffer>(); 6];
         let n = self.ext.list(&mut list);
         let mut p = self.param;
@@ -817,7 +971,7 @@ impl VplEnc {
         if ctx.enabled(Level::Trace) {
             let (i, o) = (p.mfx().FrameInfo, out.mfx().FrameInfo);
             log!(
-                &*ctx,
+                ctx,
                 Level::Trace,
                 "query";
                 "st={} in {}x{} crop {}x{} fourcc={:#x} rc={} lp={} async={} -> {}x{} rc={} lp={} gop={} refdist={} la={} extbrc={} profile={} level={} async={}",
@@ -846,7 +1000,7 @@ impl VplEnc {
         check(st, "MFXVideoENCODE_Query")?;
         if st > 0 {
             log!(
-                &*ctx,
+                ctx,
                 Level::Info,
                 "encode_query",
                 status = st,
@@ -861,19 +1015,15 @@ impl VplEnc {
         attach(&mut self.param, &mut []);
         // SAFETY: as above.
         let st = unsafe { ffi::MFXVideoENCODE_Init(session.raw(), &mut p) };
-        log!(&*ctx, Level::Trace, "init"; "st={}", MfxError { status: st, call: "" }.name());
-        check(st, "MFXVideoENCODE_Init")?;
-        self.inited = true;
-        owner.set(Component::Encoder);
-        if ctx.enabled(Level::Trace) {
-            let mut q = self.param;
-            let mut req = ffi::mfxFrameAllocRequest::default();
-            // SAFETY: q valid, req a valid out struct.
-            let st = unsafe { ffi::MFXVideoENCODE_QueryIOSurf(session.raw(), &mut q, &mut req) };
-            let suggested = if st >= 0 { u32::from(req.NumFrameSuggested) } else { 0 };
-            // The encoder gets no hint, its inputs come from the producer or its own upload pool.
-            trace_pool(&*ctx, NAME, suggested, 0, &self.param.mfx().FrameInfo);
-        }
+        log!(ctx, Level::Trace, "init"; "st={}", MfxError { status: st, call: "" }.name());
+        check(st, "MFXVideoENCODE_Init")
+    }
+
+    /// The parameter sets the initialized encoder on `session` writes, Annex B, and the packet
+    /// size it names, 0 when it names none.
+    // Cold, once per session.
+    #[allow(clippy::disallowed_methods)]
+    fn read_headers(&self, session: &Session) -> (Vec<u8>, usize) {
         let mut sps = [0u8; 1024];
         let mut pps = [0u8; 256];
         let mut vps = [0u8; 256];
@@ -899,9 +1049,10 @@ impl VplEnc {
         attach(&mut got, &mut hl[..if self.codec == ffi::MFX_CODEC_HEVC { 2 } else { 1 }]);
         // SAFETY: got and the header buffers are live for the call.
         let st = unsafe { ffi::MFXVideoENCODE_GetVideoParam(session.raw(), &mut got) };
-        self.headers.clear();
+        let mut headers = Vec::new();
+        let mut packet_size = 0;
         if st >= 0 {
-            self.packet_size = usize::from(got.mfx().BufferSizeInKB)
+            packet_size = usize::from(got.mfx().BufferSizeInKB)
                 * usize::from(got.mfx().BRCParamMultiplier.max(1))
                 * 1000;
             for (buf, len) in [
@@ -914,25 +1065,12 @@ impl VplEnc {
                     continue;
                 }
                 if !nal.starts_with(&[0, 0, 1]) && !nal.starts_with(&[0, 0, 0, 1]) {
-                    self.headers.extend_from_slice(&[0, 0, 0, 1]);
+                    headers.extend_from_slice(&[0, 0, 0, 1]);
                 }
-                self.headers.extend_from_slice(nal);
+                headers.extend_from_slice(nal);
             }
         }
-        if self.packet_size == 0 {
-            let f = self.param.mfx().FrameInfo;
-            self.packet_size = usize::from(f.Width) * usize::from(f.Height) * 3 / 2;
-        }
-        self.packet_size = self.packet_size.max(4096);
-        self.size_ring();
-        log!(
-            &*ctx,
-            Level::Info,
-            "encoder",
-            packet = self.packet_size,
-            headers = self.headers.len()
-        );
-        Ok(())
+        (headers, packet_size)
     }
 
     /// Every slot holds a packet of the size the runtime names. Cold, once per session and on
@@ -975,17 +1113,7 @@ impl VplEnc {
             self.fail(ctx, K::Unsupported(probe::family_of(self.codec).unwrap_or("?")));
             return Open::Failed;
         };
-        // Query is lenient and Init strict, so try Init on the plan, then relaxations in order.
-        let vbr = ffi::MFX_RATECONTROL_VBR;
-        let plain = EncPlan { low_power: first.low_power, rc: vbr, lookahead: 0, ext_brc: false };
-        let other = EncPlan { low_power: !first.low_power, rc: vbr, lookahead: 0, ext_brc: false };
-        let candidates = [
-            (first, self.settings.bframes),
-            (plain, self.settings.bframes),
-            (plain, 0),
-            (other, self.settings.bframes),
-            (other, 0),
-        ];
+        let candidates = self.candidates(first);
         let mut last =
             MfxError { status: ffi::MFX_ERR_INVALID_VIDEO_PARAM, call: "MFXVideoENCODE_Init" };
         let resume = self.opening;
@@ -1019,7 +1147,9 @@ impl VplEnc {
             self.opening = 0;
             self.busy.clear();
             self.build(geom, fps, plan, bframes);
+            let t = ctx.steady();
             let r = self.init(ctx);
+            log!(&*ctx, Level::Debug, "init", us = (ctx.steady() - t) / 1000, ok = r.is_ok());
             log!(&*ctx, Level::Trace, "candidate";
                 "{i} rc={} lp={} bframes={} -> {}",
                 probe::rc_name(plan.rc),
@@ -1177,6 +1307,24 @@ impl VplEnc {
         }
     }
 
+    /// Waits out the bitstreams in flight and drops them, so a flush can Reset the session.
+    /// False when the device holds one past [`FLUSH_SYNC_MS`].
+    fn settle_in_flight(&mut self) -> bool {
+        let Some(owner) = self.owner.clone() else {
+            return false;
+        };
+        while let Some(at) = self.fifo.front() {
+            if !self.ring[at].done
+                && !matches!(owner.session.sync(self.ring[at].syncp, FLUSH_SYNC_MS), Ok(true))
+            {
+                return false;
+            }
+            self.ring[at].done = true;
+            self.fifo.pop();
+        }
+        true
+    }
+
     /// Polls the oldest bitstream and sends the done ones out in order. Waits ask for a wake.
     fn emit(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         while let Some(at) = self.fifo.front() {
@@ -1248,6 +1396,21 @@ impl VplEnc {
             buf.duration = stamp.duration;
             buf.flags = flags;
             ctx.out(OUT).push(buf);
+            if self.flushed_at != 0 {
+                let (now, submitted) = (ctx.steady(), self.ring[at].submitted);
+                let us = (now - self.flushed_at) / 1000;
+                let in_us = submitted.saturating_sub(self.flushed_at) / 1000;
+                let enc_us = now.saturating_sub(submitted) / 1000;
+                self.flushed_at = 0;
+                log!(
+                    &*ctx,
+                    Level::Debug,
+                    "flush_first_out",
+                    us = us,
+                    in_us = in_us,
+                    enc_us = enc_us
+                );
+            }
             self.fifo.pop();
             self.frames += 1;
         }
@@ -1401,7 +1564,7 @@ impl VplEnc {
                 }
             }
         };
-        Some((geom, f.rate()))
+        Some((geom, self.fps.unwrap_or_else(|| f.rate())))
     }
 
     /// The next input off the pad, its frame taken from the channel in token order.
@@ -1433,7 +1596,9 @@ impl VplEnc {
         let Some(key) = self.shape_of(&w) else {
             return Opened::Failed;
         };
-        if self.inited && self.key != Some(key) {
+        if self.inited
+            && (self.key != Some(key) || !self.codes_alike(&self.built_color, &self.color))
+        {
             self.waiting = Some(w);
             self.phase = Phase::Drain(Then::Reopen);
             return Opened::Drain;
@@ -1679,7 +1844,16 @@ impl Element for VplEnc {
         self.bytes_out = family == "bytes";
         let hold = self.settings.hold(self.depth());
         self.input.declare_hold(hold);
-        self.input.start(ctx, NAME, ctx.negotiated_sink(IN))
+        self.input.start(ctx, NAME, ctx.negotiated_sink(IN))?;
+        if let Some((geom, fps, color)) = self.ahead {
+            self.color = color;
+            let t = ctx.steady();
+            // A busy join opens on the first input instead, a refused open fails as it would there.
+            if let Open::Ready = self.ensure(ctx, geom, fps) {
+                log!(&*ctx, Level::Debug, "ahead", us = (ctx.steady() - t) / 1000);
+            }
+        }
+        Ok(())
     }
 
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
@@ -1725,6 +1899,8 @@ impl Element for VplEnc {
                 self.force_idr = true
             }
             Event::FlushStart => {
+                let t = ctx.steady();
+                self.flushed_at = t.max(1);
                 self.input.flush(ctx);
                 self.stamps.clear();
                 self.previews.clear();
@@ -1738,10 +1914,14 @@ impl Element for VplEnc {
                     self.phase = Phase::Run;
                     self.release();
                 }
-                if !self.fifo.is_empty() {
-                    // Bitstreams still in flight, closing the session stops the writes.
+                // A reopened session pays tens of ms before its first packet, a Reset keeps it.
+                // Bitstreams still in flight finish first, one the device holds past the
+                // limit closes the session so it writes no more.
+                if !self.fifo.is_empty() && !self.settle_in_flight() {
                     self.release();
-                } else if let (Some(raw), true) = (self.session().map(|s| s.raw()), self.inited) {
+                }
+                let action = if !self.inited { "close" } else { "reset" };
+                if let (Some(raw), true) = (self.session().map(|s| s.raw()), self.inited) {
                     let mut list = [std::ptr::null_mut::<ffi::mfxExtBuffer>(); 6];
                     let n = self.ext.list(&mut list);
                     let mut p = self.param;
@@ -1752,6 +1932,7 @@ impl Element for VplEnc {
                         self.release();
                     }
                 }
+                log!(&*ctx, Level::Debug, "flush", action = action, us = (ctx.steady() - t) / 1000);
             }
             // The tail comes out gated by room, the end waits for the ring.
             Event::Eos => {

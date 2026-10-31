@@ -205,6 +205,15 @@ pub struct VplDec {
     ended: bool,
     fused_warned: bool,
     pictures: u64,
+    /// Steady ns of the last flush until its first picture goes out, 0 for none.
+    flushed_at: u64,
+    /// An AV1 flush kept the session and its references, input waits for a keyframe.
+    await_key: bool,
+    /// The first input since the flush was logged.
+    first_in_logged: bool,
+    /// Pictures of before that flush may still come out, one whose stamp was not fed since
+    /// is dropped until the first that was.
+    stale_out: bool,
     /// Test hook, the next calls report the device busy.
     #[cfg(test)]
     inject_busy: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
@@ -270,6 +279,10 @@ impl VplDec {
             ended: false,
             fused_warned: false,
             pictures: 0,
+            flushed_at: 0,
+            await_key: false,
+            first_in_logged: false,
+            stale_out: false,
             #[cfg(test)]
             inject_busy: None,
         }
@@ -931,6 +944,7 @@ impl VplDec {
     ) -> Option<Wait> {
         let mut wait = None;
         let now = ctx.steady();
+        let single = single.filter(|s| !self.drop_stale(ctx, s));
         if let Some(s) = single {
             let stamp = self.stamp_of(&s, draining, &*ctx);
             let preview = Self::preview_of(ctx, stamp);
@@ -944,6 +958,9 @@ impl VplDec {
             let mut stamp = None;
             for i in 0..a.len() {
                 let Some(s) = a.take(i, owner) else { continue };
+                if self.drop_stale(ctx, &s) {
+                    continue;
+                }
                 let (st, preview) = match stamp {
                     Some(st) => st,
                     None => {
@@ -959,6 +976,21 @@ impl VplDec {
             self.pictures += 1;
         }
         wait
+    }
+
+    /// A picture of before a flush that kept the session, its stamp not fed since. The first
+    /// fed since ends the check.
+    fn drop_stale(&mut self, ctx: &mut Ctx, s: &Surface) -> bool {
+        if !self.stale_out {
+            return false;
+        }
+        if self.stamps.holds(s.timestamp()) {
+            self.stale_out = false;
+            return false;
+        }
+        ctx.count_drop();
+        log!(&*ctx, Level::Debug, "stale_out", ts = s.timestamp());
+        true
     }
 
     fn preview_of(ctx: &mut Ctx, stamp: Stamp) -> bool {
@@ -1009,6 +1041,11 @@ impl VplDec {
                 return Ok(false);
             }
             self.pending[pad].pop_front();
+            if self.flushed_at != 0 {
+                let us = (ctx.steady() - self.flushed_at) / 1000;
+                self.flushed_at = 0;
+                log!(&*ctx, Level::Debug, "flush_first_out", us = us);
+            }
         }
         Ok(true)
     }
@@ -1040,15 +1077,30 @@ impl VplDec {
 
     /// `Some` when the unit waits, held or behind a drain.
     fn feed(&mut self, ctx: &mut Ctx, buf: Buffer, offset: u32) -> Result<Option<Wait>, Error> {
+        if self.flushed_at != 0 && offset == 0 && !self.first_in_logged {
+            self.first_in_logged = true;
+            let us = (ctx.steady() - self.flushed_at) / 1000;
+            log!(&*ctx, Level::Debug, "flush_first_in", us = us, bytes = buf.memory.data().len());
+        }
+        if self.await_key {
+            if !buf.flags.contains(BufferFlags::KEYFRAME) {
+                ctx.count_drop();
+                log!(&*ctx, Level::Debug, "await_key", pts = buf.pts.0);
+                return Ok(None);
+            }
+            self.await_key = false;
+        }
         let data = buf.memory.data();
         let ts90 = to_ts90(buf.pts);
         if !self.inited {
             match self.read_header(ctx, data) {
                 Ok(true) => {
+                    let t = ctx.steady();
                     if let Err(e) = self.init(ctx) {
                         self.fail(ctx, K::Init(e));
                         return Ok(None);
                     }
+                    log!(&*ctx, Level::Debug, "init", us = (ctx.steady() - t) / 1000);
                 }
                 Ok(false) => return Ok(None),
                 Err(e) => {
@@ -1331,6 +1383,8 @@ impl Element for VplDec {
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
         match event {
             Event::FlushStart => {
+                self.flushed_at = ctx.steady().max(1);
+                self.first_in_logged = false;
                 self.clear_pending();
                 self.held = None;
                 self.phase = Phase::Feed;
@@ -1344,12 +1398,12 @@ impl Element for VplDec {
                     ch.out.flush();
                     ch.retry = None;
                 }
-                // The runtime's AV1 Reset forgets the surfaces the DPB still holds and stalls after
-                // a few seeks, so AV1 reopens on the next header.
+                // The runtime's AV1 Reset forgets the surfaces its DPB still holds and stalls after
+                // a few seeks, and a reopen costs the seek its Init and a fresh pool. The session
+                // stays as it is, a keyframe refreshes every reference.
                 if self.codec == Some(ffi::MFX_CODEC_AV1) {
-                    if self.inited {
-                        self.close_session();
-                    }
+                    self.await_key = self.inited;
+                    self.stale_out = self.inited;
                 } else if let (Some(raw), true) = (self.session().map(|s| s.raw()), self.inited) {
                     let mut p = self.param;
                     // SAFETY: initialized on this session, p the init parameters.

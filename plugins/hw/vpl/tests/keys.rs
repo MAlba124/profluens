@@ -84,6 +84,11 @@ fn keyed_stamps_open_an_idr_exactly_at_each_key() {
     );
     e.start().expect("start");
     let (dark, bright) = (i420(320, 240, 30), i420(320, 240, 200));
+    // what each packet says, its buffer goes back to the pool of 16
+    let packet = |p: &profluens_core::buffer::Buffer| {
+        let key = p.flags.contains(BufferFlags::KEYFRAME);
+        (p.pts.0, key, key && pf_vpl::nal::has_sps(p.memory.data(), false))
+    };
     let mut out = Vec::new();
     for (i, &t) in pts.iter().enumerate() {
         let mut b = e.alloc(if i < CUT { &dark } else { &bright });
@@ -91,10 +96,10 @@ fn keyed_stamps_open_an_idr_exactly_at_each_key() {
         b.duration = Timestamp::from_nanos(20 * MS);
         e.push(b).expect("push");
         while let Some(p) = e.pull(SrcPad(0)) {
-            out.push(p);
+            out.push(packet(&p));
         }
     }
-    out.extend(e.eos().expect("eos"));
+    out.extend(e.eos().expect("eos").iter().map(packet));
     let warnings: Vec<String> = e
         .bus_messages()
         .iter()
@@ -106,16 +111,11 @@ fn keyed_stamps_open_an_idr_exactly_at_each_key() {
         .collect();
     assert!(warnings.is_empty(), "{test}: warned {warnings:?}");
     assert_eq!(out.len(), FRAMES, "{test}: every frame");
-    let mut got: Vec<u64> =
-        out.iter().filter(|p| p.flags.contains(BufferFlags::KEYFRAME)).map(|p| p.pts.0).collect();
+    let mut got: Vec<u64> = out.iter().filter(|&&(_, key, _)| key).map(|&(pts, ..)| pts).collect();
     got.sort_unstable();
     let want: Vec<u64> = KEYED.iter().map(|&i| pts[i]).collect();
     assert_eq!(got, want, "{test}: keyframes exactly at the keyed frames");
-    for p in out.iter().filter(|p| p.flags.contains(BufferFlags::KEYFRAME)) {
-        assert!(
-            pf_vpl::nal::has_sps(p.memory.data(), true),
-            "{test}: the IDR at {} carries its parameter sets",
-            p.pts.0
-        );
+    for &(pts, _, sps) in out.iter().filter(|&&(_, key, _)| key) {
+        assert!(sps, "{test}: the IDR at {pts} carries its parameter sets");
     }
 }

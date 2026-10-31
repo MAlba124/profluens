@@ -38,10 +38,8 @@ pub struct PtsMap {
 impl PtsMap {
     pub const fn new() -> PtsMap {
         PtsMap {
-            slots: [(
-                None,
-                Stamp { pts: Timestamp::NONE, duration: Timestamp::NONE, only: false },
-            ); SLOTS],
+            slots: [(None, Stamp { pts: Timestamp::NONE, duration: Timestamp::NONE, only: false });
+                SLOTS],
             next: 0,
         }
     }
@@ -63,9 +61,8 @@ impl PtsMap {
     /// The earliest stamp owed after `last`, decoders output in presentation order.
     /// A frame fed twice leaves a stale entry, skipped when at or before `last`.
     pub fn take_next(&mut self, last: Option<Timestamp>) -> Option<Stamp> {
-        let owed = |i: &usize| {
-            self.slots[*i].0.is_some() && last.is_none_or(|l| self.slots[*i].1.pts > l)
-        };
+        let owed =
+            |i: &usize| self.slots[*i].0.is_some() && last.is_none_or(|l| self.slots[*i].1.pts > l);
         let i = (0..SLOTS).filter(owed).min_by_key(|&i| self.slots[i].1.pts)?;
         self.slots[i].0 = None;
         Some(self.slots[i].1)
@@ -77,6 +74,11 @@ impl PtsMap {
             return self.take(ts90);
         }
         self.take_next(last).unwrap_or_else(|| self.take(ts90))
+    }
+
+    /// A stamp fed at `ts90` is still owed.
+    pub fn holds(&self, ts90: u64) -> bool {
+        self.slots.iter().any(|(t, _)| *t == Some(ts90))
     }
 
     pub fn clear(&mut self) {

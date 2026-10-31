@@ -5,6 +5,8 @@
 //! [`config_unit`]. The decoder opens at the first unit, never in [`Codec::new`], which builds
 //! throwaway instances.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fmt;
 
 use profluens_core::element::{ElementDesc, PadDesc};
@@ -187,7 +189,20 @@ pub struct LavVideo<const KIND: u8> {
     /// Units refused and pictures lost since start, for the end of stream summary.
     failed: u64,
     lost: u64,
+    /// The stamps of units sent and not yet given to a picture, smallest first, see
+    /// [`decode_order`].
+    stamps: BinaryHeap<Reverse<i64>>,
 }
+
+/// Families whose units mostly come stamped in decode order, from AVI and FLV, which know no
+/// presentation time. Pictures leave a decoder in display order, so the k-th picture takes the
+/// k-th smallest stamp, right for decode order stamps and for presentation stamps alike.
+const fn decode_order(kind: u8) -> bool {
+    matches!(kind, MPEG4 | FLV1 | VP6 | VP6F | VP6A | VP7)
+}
+
+/// Stamps held past this many, a unit that made no picture, drop from the smallest.
+const STAMPS: usize = 32;
 
 impl<const KIND: u8> LavVideo<KIND> {
     /// Opens with the held configuration unit as extradata, else with `lead`.
@@ -274,7 +289,7 @@ impl<const KIND: u8> LavVideo<KIND> {
     }
 
     fn receive_all(&mut self, out: &mut Out<'_>) {
-        let LavVideo { held, decoder: Some(decoder), supply, lost, .. } = self else {
+        let LavVideo { held, decoder: Some(decoder), supply, lost, stamps, .. } = self else {
             return;
         };
         loop {
@@ -282,7 +297,11 @@ impl<const KIND: u8> LavVideo<KIND> {
             check_short(supply, out);
             match got {
                 Ok(Received::Frame(frame)) => {
-                    if !place(held, supply, frame, out) {
+                    let at = match decode_order(KIND) {
+                        true => stamps.pop().map_or(frame.pts(), |Reverse(s)| s),
+                        false => frame.pts(),
+                    };
+                    if !place(held, supply, frame, at, out) {
                         *lost += 1;
                         if *lost <= WARNINGS {
                             log!(
@@ -366,7 +385,14 @@ fn to_lav(t: Timestamp) -> i64 {
 }
 
 /// `false` when the picture is lost for want of a held handle.
-fn place(held: &mut [Option<Frame>], supply: &Supply, frame: Frame, out: &mut Out<'_>) -> bool {
+/// Puts `frame` out stamped `pts`, libav's units.
+fn place(
+    held: &mut [Option<Frame>],
+    supply: &Supply,
+    frame: Frame,
+    pts: i64,
+    out: &mut Out<'_>,
+) -> bool {
     let (width, height) = (frame.width(), frame.height());
     let (pixfmt, layout) = match frame.shape() {
         Shape::Named(p, l) => (p, l),
@@ -375,7 +401,7 @@ fn place(held: &mut [Option<Frame>], supply: &Supply, frame: Frame, out: &mut Ou
             return true;
         }
     };
-    let pts = from_lav(frame.pts());
+    let pts = from_lav(pts);
     let duration = from_lav(frame.duration());
     let placement = frame.placement();
     if let Some((memory, _, _)) = &placement {
@@ -446,6 +472,7 @@ impl<const KIND: u8> Codec for LavVideo<KIND> {
             sei_scratch: vec![0u8; 8192].into_boxed_slice(),
             failed: 0,
             lost: 0,
+            stamps: BinaryHeap::with_capacity(STAMPS + 1),
         }
     }
 
@@ -461,6 +488,7 @@ impl<const KIND: u8> Codec for LavVideo<KIND> {
             d.flush();
         }
         self.open_failed = false;
+        self.stamps.clear();
     }
 
     fn decode(&mut self, unit: &[u8], pts: Timestamp, duration: Timestamp, out: &mut Out<'_>) {
@@ -476,6 +504,12 @@ impl<const KIND: u8> Codec for LavVideo<KIND> {
         }
         let stamp = pts;
         let (pts, duration) = (to_lav(pts), to_lav(duration));
+        if decode_order(KIND) && pts != lav::NONE {
+            self.stamps.push(Reverse(pts));
+            if self.stamps.len() > STAMPS {
+                self.stamps.pop();
+            }
+        }
         // A full decoder gives its pictures and takes the unit on the second try.
         let mut taken = false;
         for _ in 0..2 {

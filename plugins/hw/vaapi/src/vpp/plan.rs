@@ -24,11 +24,42 @@ pub struct Plan {
     pub height: u32,
     pub out: Kind,
     pub place: Rect,
+    /// Degrees clockwise the picture is turned, 0, 90, 180 or 270. The sides above are the
+    /// turned picture's.
+    pub rotation: u16,
 }
 
 impl Plan {
     pub fn is_identity(&self, width: u32, height: u32, input: Kind) -> bool {
-        self.width == width && self.height == height && self.out == input && !self.bars()
+        self.width == width
+            && self.height == height
+            && self.out == input
+            && !self.bars()
+            && self.rotation == 0
+    }
+
+    /// The plan of a `width` x `height` input turned `rotation` degrees clockwise, the box fit
+    /// to the turned picture, `fixed` as [`plan_fixed`] else as [`plan`].
+    pub fn turned(
+        width: u32,
+        height: u32,
+        input: Kind,
+        t: Target,
+        rotation: u16,
+        fixed: bool,
+    ) -> Option<Plan> {
+        let rotation = match rotation {
+            90 | 180 | 270 => rotation,
+            _ => 0,
+        };
+        let (w, h) = if rotation % 180 == 90 { (height, width) } else { (width, height) };
+        let p = if fixed { plan_fixed(w, h, input, t) } else { plan(w, h, input, t) }?;
+        Some(Plan { rotation, ..p })
+    }
+
+    /// The `rotation_state` of the turn, `VA_ROTATION_*`.
+    pub fn va_rotation(&self) -> u32 {
+        u32::from(self.rotation / 90)
     }
 
     pub fn bars(&self) -> bool {
@@ -57,7 +88,13 @@ pub fn plan(width: u32, height: u32, input: Kind, t: Target) -> Option<Plan> {
     let bh = if t.max_height == 0 { h } else { u64::from(t.max_height).min(h) };
     let (ow, oh) = fit(w, h, bw, bh);
     let (ow, oh) = (even(ow), even(oh));
-    Some(Plan { width: ow, height: oh, out: out_kind(input, t), place: (0, 0, ow, oh) })
+    Some(Plan {
+        width: ow,
+        height: oh,
+        out: out_kind(input, t),
+        place: (0, 0, ow, oh),
+        rotation: 0,
+    })
 }
 
 pub fn plan_fixed(width: u32, height: u32, input: Kind, t: Target) -> Option<Plan> {
@@ -68,7 +105,7 @@ pub fn plan_fixed(width: u32, height: u32, input: Kind, t: Target) -> Option<Pla
     let (pw, ph) = fit(u64::from(width), u64::from(height), u64::from(ow), u64::from(oh));
     let (pw, ph) = (even(pw).min(ow), even(ph).min(oh));
     let place = (((ow - pw) / 2) & !1, ((oh - ph) / 2) & !1, pw, ph);
-    Some(Plan { width: ow, height: oh, out: out_kind(input, t), place })
+    Some(Plan { width: ow, height: oh, out: out_kind(input, t), place, rotation: 0 })
 }
 
 #[cfg(test)]
@@ -97,6 +134,22 @@ mod tests {
         assert_eq!(
             plan(3840, 2160, NV12, t(0, 720, 8)).map(|p| (p.width, p.height)),
             Some((1280, 720))
+        );
+    }
+
+    #[test]
+    fn a_turned_plan_fits_the_turned_picture() {
+        let p = Plan::turned(1440, 1920, NV12, t(1920, 1080, 8), 270, false).unwrap();
+        assert_eq!((p.width, p.height, p.rotation, p.va_rotation()), (1440, 1080, 270, 3));
+        assert!(!p.is_identity(1440, 1080, NV12));
+        let p = Plan::turned(640, 480, NV12, t(640, 480, 8), 90, true).unwrap();
+        assert_eq!(
+            (p.width, p.height, p.place, p.va_rotation()),
+            (640, 480, (140, 0, 360, 480), 1)
+        );
+        assert_eq!(
+            Plan::turned(64, 64, NV12, t(0, 0, 8), 30, false).map(|p| p.va_rotation()),
+            Some(0)
         );
     }
 

@@ -28,9 +28,16 @@ pub struct Caps {
     pub min_input: (u32, u32),
     pub max_output: (u32, u32),
     pub min_output: (u32, u32),
+    /// A bit for each `VA_ROTATION_*` the processor does.
+    pub rotations: u32,
 }
 
 impl Caps {
+    /// Whether the processor turns a picture `rotation` degrees clockwise, none always.
+    pub fn turns(&self, rotation: u16) -> bool {
+        rotation == 0 || self.rotations & (1 << (rotation / 90)) != 0
+    }
+
     /// iHD 26.1 leaves 444P, P016 and Y416 out of its lists and converts them.
     pub fn takes(&self, input: Kind, output: Kind) -> bool {
         self.inputs.contains(&input.fourcc) && self.outputs.contains(&output.fourcc)
@@ -119,6 +126,8 @@ pub struct Out {
     pub place: Rect,
     pub fill: bool,
     pub color: Color,
+    /// `VA_ROTATION_*`, `place` lies in the turned picture.
+    pub rotation: u32,
 }
 
 const BLACK: u32 = 0xff00_0000;
@@ -209,6 +218,7 @@ impl Proc {
             min_input: (c.min_input_width, c.min_input_height),
             max_output: (c.max_output_width, c.max_output_height),
             min_output: (c.min_output_width, c.min_output_height),
+            rotations: c.rotation_flags,
         })
     }
 
@@ -356,6 +366,7 @@ impl Proc {
             p.num_filters = 1;
         }
         p.filter_flags = ffi::VA_FILTER_SCALING_HQ;
+        p.rotation_state = out.rotation;
         let mut buf = ffi::VA_INVALID_ID;
         let size = std::mem::size_of::<VAProcPipelineParameterBuffer>() as u32;
         // SAFETY: context live, p a valid parameter buffer copied by the driver here.

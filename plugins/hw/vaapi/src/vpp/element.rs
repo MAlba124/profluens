@@ -33,7 +33,7 @@ use crate::gpuframe::{
 use crate::probe;
 use crate::va::{Display, ExportedSurface, ReadbackImage, SurfaceFormat, Surfaces, UploadImage};
 use crate::vpp::format::{self, Kind, NV12, P010};
-use crate::vpp::plan::{Plan, Target, plan, plan_fixed};
+use crate::vpp::plan::{Plan, Target};
 use crate::vpp::proc::{Color, Imported, Out, Proc, Src, dmabuf_key, import, surfaces};
 
 const NAME: &str = "vaapipostproc";
@@ -243,6 +243,8 @@ enum Sink {
 pub struct VaapiPostProc {
     target: Target,
     fixed: bool,
+    /// Degrees clockwise each picture is turned.
+    rotation: u16,
     // field order is drop order, what holds the display's handle goes first
     session: Option<Session>,
     gpu_in: Option<GpuIn>,
@@ -266,6 +268,7 @@ impl VaapiPostProc {
         VaapiPostProc {
             target,
             fixed: false,
+            rotation: 0,
             session: None,
             gpu_in: None,
             gpu_out: None,
@@ -314,6 +317,12 @@ impl VaapiPostProc {
         self
     }
 
+    /// Turns every picture `degrees` clockwise, 90, 180 or 270, the box fit to the turned one.
+    pub fn with_rotation(mut self, degrees: u16) -> Self {
+        self.rotation = degrees;
+        self
+    }
+
     pub fn with_fixed_size(mut self) -> Self {
         self.fixed = true;
         self
@@ -351,11 +360,7 @@ impl VaapiPostProc {
     }
 
     fn plan_of(&self, f: InFormat) -> Option<Plan> {
-        if self.fixed {
-            plan_fixed(f.width, f.height, f.kind(), self.target)
-        } else {
-            plan(f.width, f.height, f.kind(), self.target)
-        }
+        Plan::turned(f.width, f.height, f.kind(), self.target, self.rotation, self.fixed)
     }
 
     fn session(&mut self, ctx: &Ctx, f: InFormat, p: Plan) -> Result<(), K> {
@@ -384,6 +389,13 @@ impl VaapiPostProc {
         let (upload, gpu_out) = (self.gpu_in.is_none(), self.gpu_out.as_ref().map(|g| g.align));
         let d = self.display()?;
         let proc = Proc::new(d).map_err(K::SessionSetup)?;
+        if !proc.caps.turns(p.rotation) {
+            return Err(K::DriverLacks(match p.rotation {
+                90 => "a turn of 90 degrees",
+                180 => "a turn of 180 degrees",
+                _ => "a turn of 270 degrees",
+            }));
+        }
         if !proc.caps.takes(input, p.out) {
             return Err(K::NoConversion { input: input.name, output: p.out.name });
         }
@@ -552,7 +564,13 @@ impl VaapiPostProc {
                 s.proc
                     .run(
                         Src { surface: src, at: src_at, size: (f.width, f.height), color },
-                        Out { surface: dst, place: p.place, fill: p.bars(), color },
+                        Out {
+                            surface: dst,
+                            place: p.place,
+                            fill: p.bars(),
+                            color,
+                            rotation: p.va_rotation(),
+                        },
                         None,
                     )
                     .map_err(K::Process)?;
@@ -583,7 +601,13 @@ impl VaapiPostProc {
                     .proc
                     .run(
                         Src { surface: src, at: src_at, size: (f.width, f.height), color },
-                        Out { surface: dst, place: p.place, fill: p.bars(), color },
+                        Out {
+                            surface: dst,
+                            place: p.place,
+                            fill: p.bars(),
+                            color,
+                            rotation: p.va_rotation(),
+                        },
                         None,
                     )
                     .map_err(K::Process);

@@ -91,6 +91,7 @@ fn pq_bands_tone_map_into_sdr_range() {
                     place: (0, 0, ow, oh),
                     fill: false,
                     color: Color::SDR,
+                    rotation: 0,
                 },
                 Some(&tm),
             );

@@ -58,8 +58,13 @@ fn every_layout_converts_while_scaling() {
         };
         for out in format::OUTPUTS {
             let dst = surfaces(&d, out, 1920, 1080, 1).expect("an output surface");
-            let whole =
-                Out { surface: dst.ids()[0], place: (0, 0, 1920, 1080), fill: false, color: BT709 };
+            let whole = Out {
+                surface: dst.ids()[0],
+                place: (0, 0, 1920, 1080),
+                fill: false,
+                color: BT709,
+                rotation: 0,
+            };
             p.run(
                 Src { surface: src.ids()[0], at: (0, 0), size: (3840, 2160), color: BT709 },
                 whole,
@@ -152,7 +157,13 @@ fn known_colours_come_back_through_scale_chroma_and_depth() {
             let dst = surfaces(&d, out, ow, oh, 1).expect("an output surface");
             p.run(
                 Src { surface: src.ids()[0], at: (0, 0), size: (w, h), color: BT709 },
-                Out { surface: dst.ids()[0], place: (0, 0, ow, oh), fill: false, color: BT709 },
+                Out {
+                    surface: dst.ids()[0],
+                    place: (0, 0, ow, oh),
+                    fill: false,
+                    color: BT709,
+                    rotation: 0,
+                },
                 None,
             )
             .expect("processed");
@@ -192,7 +203,13 @@ fn a_placed_picture_sits_in_black_bars() {
         let dst = surfaces(&d, out, plan.width, plan.height, 1).expect("an output surface");
         p.run(
             Src { surface: src.ids()[0], at: (0, 0), size: (w, h), color: BT709 },
-            Out { surface: dst.ids()[0], place: plan.place, fill: plan.bars(), color: BT709 },
+            Out {
+                surface: dst.ids()[0],
+                place: plan.place,
+                fill: plan.bars(),
+                color: BT709,
+                rotation: 0,
+            },
             None,
         )
         .expect("processed");

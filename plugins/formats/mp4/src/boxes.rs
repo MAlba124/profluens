@@ -192,6 +192,19 @@ pub struct Tkhd {
     pub height: u32,
     pub enabled: bool,
     pub alternate_group: i16,
+    /// Degrees clockwise the matrix turns the picture, 0 for none or one that also mirrors.
+    pub rotation: u16,
+}
+
+/// The quarter turn clockwise of a matrix's `a b c d`, 16.16 (8.3.2), a point (p, q) shown
+/// at (a p + c q, b p + d q). 0 for the identity and for any matrix that is no pure turn.
+pub fn rotation_of(a: i32, b: i32, c: i32, d: i32) -> u16 {
+    match (a.signum(), b.signum(), c.signum(), d.signum()) {
+        (0, 1, -1, 0) => 90,
+        (-1, 0, 0, -1) => 180,
+        (0, -1, 1, 0) => 270,
+        _ => 0,
+    }
 }
 
 pub fn parse_tkhd(body: &[u8]) -> Result<Tkhd, BoxError> {
@@ -217,10 +230,15 @@ pub fn parse_tkhd(body: &[u8]) -> Result<Tkhd, BoxError> {
     // reserved[2] u32, layer, alternate_group, volume, reserved u16, matrix i32[9] (8.3.2).
     r.skip(10, "tkhd reserved and layer")?;
     let alternate_group = r.u16("tkhd alternate_group")? as i16;
-    r.skip(40, "tkhd volume and matrix")?;
+    r.skip(4, "tkhd volume and reserved")?;
+    let mut m = [0i32; 9];
+    for v in &mut m {
+        *v = r.u32("tkhd matrix")? as i32;
+    }
+    let rotation = rotation_of(m[0], m[1], m[3], m[4]);
     let width = r.u32("tkhd width")? >> 16; // 16.16 fixed-point to integer pixels
     let height = r.u32("tkhd height")? >> 16;
-    Ok(Tkhd { track_id, width, height, enabled: head.flags & 1 != 0, alternate_group })
+    Ok(Tkhd { track_id, width, height, enabled: head.flags & 1 != 0, alternate_group, rotation })
 }
 
 pub fn parse_kind(body: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -560,7 +578,14 @@ mod tests {
         let t = parse_tkhd(&tkhd).unwrap();
         assert_eq!(
             t,
-            Tkhd { track_id: 7, width: 640, height: 360, enabled: true, alternate_group: 2 }
+            Tkhd {
+                track_id: 7,
+                width: 640,
+                height: 360,
+                enabled: true,
+                alternate_group: 2,
+                rotation: 0
+            }
         );
         tkhd[3] = 2;
         assert!(!parse_tkhd(&tkhd).unwrap().enabled, "in the movie, not enabled");
@@ -570,6 +595,30 @@ mod tests {
         assert_eq!(parse_kind(b"\0\0\0\0no terminator"), None);
         assert_eq!(parse_elng(b"\0\0\0\0fr-CA\0"), Some("fr-CA"));
         assert_eq!(parse_elng(b"\0\0\0\0\0"), None);
+    }
+
+    /// The matrices ffprobe reads as rotation -90, 90 and 180 from phone and test files.
+    #[test]
+    fn a_track_header_matrix_is_a_quarter_turn_or_none() {
+        const ONE: i32 = 1 << 16;
+        assert_eq!(rotation_of(0, ONE, -ONE, 0), 90);
+        assert_eq!(rotation_of(0, -ONE, ONE, 0), 270);
+        assert_eq!(rotation_of(-ONE, 0, 0, -ONE), 180);
+        assert_eq!(rotation_of(ONE, 0, 0, ONE), 0);
+        assert_eq!(rotation_of(-ONE, 0, 0, ONE), 0, "a mirror is no turn");
+        let mut tkhd = vec![0, 0, 0, 3];
+        tkhd.extend_from_slice(&[0; 8]);
+        tkhd.extend_from_slice(&7u32.to_be_bytes());
+        tkhd.extend_from_slice(&[0; 8]);
+        tkhd.extend_from_slice(&[0; 12]);
+        tkhd.extend_from_slice(&[0; 4]);
+        for v in [0, -ONE, 0, ONE, 0, 0, 0, 0, 1 << 30] {
+            tkhd.extend_from_slice(&v.to_be_bytes());
+        }
+        tkhd.extend_from_slice(&(1440u32 << 16).to_be_bytes());
+        tkhd.extend_from_slice(&(1920u32 << 16).to_be_bytes());
+        let t = parse_tkhd(&tkhd).unwrap();
+        assert_eq!((t.width, t.height, t.rotation), (1440, 1920, 270));
     }
 
     #[test]

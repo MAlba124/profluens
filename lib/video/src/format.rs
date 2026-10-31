@@ -10,6 +10,8 @@ pub const FIELD_HEIGHT: &str = "height";
 pub const FIELD_PIXFMT: &str = "pixfmt";
 /// Frame rate as an exact rational, e.g. `30000/1001`.
 pub const FIELD_FPS: &str = "fps";
+/// Degrees clockwise the coded picture turns to stand upright, 90, 180 or 270, absent for none.
+pub const FIELD_ROTATION: &str = "rotation";
 
 /// A raster pixel format. See [`crate::geometry`] for plane layouts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

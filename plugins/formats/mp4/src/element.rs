@@ -136,6 +136,7 @@ enum Announce {
         height: u32,
         duration_ns: u64,
         colour: StreamColor,
+        rotation: u16,
     },
     Audio {
         rate: u32,
@@ -460,6 +461,7 @@ impl Mp4Demux {
                 height: track.height,
                 duration_ns,
                 colour: track.entry.colour,
+                rotation: track.rotation,
             }
         } else if audio {
             Announce::Audio {
@@ -877,7 +879,9 @@ impl Mp4Demux {
     #[allow(clippy::disallowed_methods)]
     fn announce(ctx: &mut Ctx, pad: SrcPad, family: &'static str, announce: Announce) {
         match announce {
-            Announce::Video { width, height, duration_ns, colour } if width != 0 && height != 0 => {
+            Announce::Video { width, height, duration_ns, colour, rotation }
+                if width != 0 && height != 0 =>
+            {
                 let mut fields = vec![
                     ("width", ValueDesc::Int(width as i64)),
                     ("height", ValueDesc::Int(height as i64)),
@@ -890,6 +894,12 @@ impl Mp4Demux {
                     [("", ValueDesc::Int(0)); profluens_video::color::FIELDS.len()];
                 let n = colour.write_fields(&mut colour_fields);
                 fields.extend_from_slice(&colour_fields[..n]);
+                // only where an element declares it, an un-interned name drops the whole
+                // announcement
+                let turn = profluens_video::format::FIELD_ROTATION;
+                if rotation != 0 && ctx.field_id(turn).is_some() {
+                    fields.push((turn, ValueDesc::Int(i64::from(rotation))));
+                }
                 ctx.announce_format(pad, family, &fields);
             }
             Announce::Audio { rate, channels, duration_ns, delay_ns, sample }

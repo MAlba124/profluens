@@ -146,6 +146,8 @@ pub struct Track {
     pub entry: SampleEntry,
     pub width: u32,
     pub height: u32,
+    /// Degrees clockwise the picture is turned to show, from the track header's matrix.
+    pub rotation: u16,
     pub language: [u8; 3],
     /// The `udta` name, else the `hdlr` name unless it is a muxer's generic handler word.
     pub title: String,
@@ -1755,6 +1757,7 @@ fn resolve_track(
         entry,
         width,
         height,
+        rotation: tkhd.map_or(0, |t| t.rotation),
         language: mdhd.language,
         title,
         language_tag,

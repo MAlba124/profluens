@@ -215,6 +215,20 @@ fn ac3_stereo_and_5_1_match_ffmpeg() {
     }
 }
 
+/// 20 stereo 96 kbit/s syncframes as an AVI carries them, one whole frame a unit, from
+/// fixtures avi_mpeg4_ac3.avi. Each frame is 1536 samples, decoded without ffmpeg around.
+#[test]
+fn whole_ac3_frames_a_unit_decode() {
+    let bytes = include_bytes!("fixtures/st96k_20.ac3");
+    let mut h = Harness::with_slot_size(LibavAudioDec::ac3(), SLOT);
+    let (got, _) = decode(&mut h, &chunks(bytes, 384));
+    assert_eq!(announced(&h, "channels"), Some(2));
+    assert_eq!(announced(&h, "rate"), Some(48_000));
+    let sample = if announced_sample(&h) == "f32" { 4 } else { 2 };
+    let frames = got.len() / (2 * sample);
+    assert!(frames >= 19 * 1536, "{frames} sample frames of 20 syncframes");
+}
+
 #[test]
 fn eac3_5_1_decodes_in_the_ac3_element() {
     let Some(bytes) = stream("51.eac3", 6, &["-c:a", "eac3", "-b:a", "256k", "-f", "eac3"]) else {

@@ -132,6 +132,7 @@ int main(void) {
     OFF(mfxExtCodingOption3, AdaptiveLTR, "ADAPTIVE_LTR"); OFF(mfxExtCodingOption3, AdaptiveCQM, "ADAPTIVE_CQM"); OFF(mfxExtCodingOption3, AdaptiveRef, "ADAPTIVE_REF"); OFF(mfxExtCodingOption3, reserved, "RESERVED");
 
     SIZE(mfxExtVPPScaling); OFF(mfxExtVPPScaling, ScalingMode, "SCALING_MODE"); OFF(mfxExtVPPScaling, InterpolationMethod, "INTERPOLATION_METHOD");
+    SIZE(mfxExtVPPRotation); OFF(mfxExtVPPRotation, Angle, "ANGLE");
     SIZE(mfxExtVPPDoNotUse); OFF(mfxExtVPPDoNotUse, NumAlg, "NUM_ALG"); OFF(mfxExtVPPDoNotUse, AlgList, "ALG_LIST");
     SIZE(mfxExtVPPDoUse); OFF(mfxExtVPPDoUse, NumAlg, "NUM_ALG"); OFF(mfxExtVPPDoUse, AlgList, "ALG_LIST");
     SIZE(mfxExtVideoSignalInfo);

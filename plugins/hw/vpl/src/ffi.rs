@@ -156,6 +156,7 @@ pub const MFX_EXTBUFF_CODING_OPTION_VPS: u32 = fourcc(b"COVP");
 pub const MFX_EXTBUFF_VPP_DONOTUSE: u32 = fourcc(b"NUSE");
 pub const MFX_EXTBUFF_VPP_DOUSE: u32 = fourcc(b"DUSE");
 pub const MFX_EXTBUFF_VPP_SCALING: u32 = fourcc(b"VSCL");
+pub const MFX_EXTBUFF_VPP_ROTATION: u32 = fourcc(b"ROT ");
 pub const MFX_EXTBUFF_VIDEO_SIGNAL_INFO: u32 = fourcc(b"VSIN");
 pub const MFX_EXTBUFF_VIDEO_SIGNAL_INFO_IN: u32 = fourcc(b"VSII");
 pub const MFX_EXTBUFF_VIDEO_SIGNAL_INFO_OUT: u32 = fourcc(b"VSIO");
@@ -771,6 +772,15 @@ pub struct mfxExtVPPScaling {
     pub ScalingMode: u16,
     pub InterpolationMethod: u16,
     pub reserved: [u16; 10],
+}
+
+/// `Angle` is one of 0, 90, 180, 270.
+#[repr(C, packed(4))]
+#[derive(Clone, Copy, Default)]
+pub struct mfxExtVPPRotation {
+    pub Header: mfxExtBuffer,
+    pub Angle: u16,
+    pub reserved: [u16; 11],
 }
 
 #[repr(C)]
@@ -1623,6 +1633,8 @@ mod layout_tests {
     #[test]
     fn vpp_and_signal_buffers() {
         assert_eq!(size_of::<mfxExtVPPScaling>(), l::mfxExtVPPScaling_SIZE);
+        assert_eq!(size_of::<mfxExtVPPRotation>(), l::mfxExtVPPRotation_SIZE);
+        assert_eq!(std::mem::offset_of!(mfxExtVPPRotation, Angle), l::mfxExtVPPRotation_ANGLE);
         assert_eq!(offset_of!(mfxExtVPPScaling, ScalingMode), l::mfxExtVPPScaling_SCALING_MODE);
         assert_eq!(
             offset_of!(mfxExtVPPScaling, InterpolationMethod),

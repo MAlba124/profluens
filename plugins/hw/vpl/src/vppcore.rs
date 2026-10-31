@@ -37,11 +37,37 @@ pub struct Plan {
     pub height: u32,
     pub out: Layout,
     pub place: Rect,
+    /// Degrees clockwise the picture is turned, 0, 90, 180 or 270. The sides above are the
+    /// turned picture's.
+    pub rotation: u16,
 }
 
 impl Plan {
     pub fn is_identity(&self, width: u32, height: u32, input: Layout) -> bool {
-        self.width == width && self.height == height && self.out == input && !self.bars()
+        self.width == width
+            && self.height == height
+            && self.out == input
+            && !self.bars()
+            && self.rotation == 0
+    }
+
+    /// The plan of a `width` x `height` input turned `rotation` degrees clockwise, the box fit
+    /// to the turned picture, `fixed` as [`plan_fixed`] else as [`plan`].
+    pub fn turned(
+        width: u32,
+        height: u32,
+        input: Layout,
+        t: Target,
+        rotation: u16,
+        fixed: bool,
+    ) -> Option<Plan> {
+        let rotation = match rotation {
+            90 | 180 | 270 => rotation,
+            _ => 0,
+        };
+        let (w, h) = if rotation % 180 == 90 { (height, width) } else { (width, height) };
+        let p = if fixed { plan_fixed(w, h, input, t) } else { plan(w, h, input, t) }?;
+        Some(Plan { rotation, ..p })
     }
 
     pub fn bars(&self) -> bool {
@@ -72,7 +98,13 @@ pub fn plan(width: u32, height: u32, input: Layout, t: Target) -> Option<Plan> {
     let bh = if t.max_height == 0 { h } else { u64::from(t.max_height).min(h) };
     let (ow, oh) = fit(w, h, bw, bh);
     let (ow, oh) = (even(ow), even(oh));
-    Some(Plan { width: ow, height: oh, out: out_layout(input, t), place: (0, 0, ow, oh) })
+    Some(Plan {
+        width: ow,
+        height: oh,
+        out: out_layout(input, t),
+        place: (0, 0, ow, oh),
+        rotation: 0,
+    })
 }
 
 /// Exactly `t`'s box, the source scaled to fit and centred, the rest bars.
@@ -84,7 +116,7 @@ pub fn plan_fixed(width: u32, height: u32, input: Layout, t: Target) -> Option<P
     let (pw, ph) = fit(u64::from(width), u64::from(height), u64::from(ow), u64::from(oh));
     let (pw, ph) = (even(pw).min(ow), even(ph).min(oh));
     let place = (((ow - pw) / 2) & !1, ((oh - ph) / 2) & !1, pw, ph);
-    Some(Plan { width: ow, height: oh, out: out_layout(input, t), place })
+    Some(Plan { width: ow, height: oh, out: out_layout(input, t), place, rotation: 0 })
 }
 
 /// Coded size aligned to 16. The runtime fills outside the crop black.
@@ -293,12 +325,22 @@ impl VppCore {
             ..Default::default()
         };
         let mut tone = tone.copied();
+        let mut turn = ffi::mfxExtVPPRotation {
+            Header: header::<ffi::mfxExtVPPRotation>(ffi::MFX_EXTBUFF_VPP_ROTATION),
+            Angle: self.plan.rotation,
+            ..Default::default()
+        };
         let raw = self.owner.session.raw();
         // Each ladder step leaves one hint out until the runtime takes the query.
         let mut last = MfxError { status: ffi::MFX_ERR_UNSUPPORTED, call: "MFXVideoVPP_Query" };
         for step in 0..4 {
-            let mut list: [*mut ffi::mfxExtBuffer; 7] = [std::ptr::null_mut(); 7];
+            let mut list: [*mut ffi::mfxExtBuffer; 8] = [std::ptr::null_mut(); 8];
             let mut n = 0;
+            // the turn is the picture's, never left out
+            if self.plan.rotation != 0 {
+                list[n] = (&raw mut turn).cast();
+                n += 1;
+            }
             if step < 1 {
                 list[n] = (&raw mut scaling).cast();
                 n += 1;
@@ -327,7 +369,7 @@ impl VppCore {
             // SAFETY: p and its buffers live for the calls, out shares the buffers.
             let st = unsafe { ffi::MFXVideoVPP_Query(raw, &mut p, &mut out) };
             log!(log, Level::Trace, "query";
-                "step={step} st={} in={}x{} crop={}x{} fourcc={:#x} out={}x{} fourcc={:#x} async={} -> {}",
+                "step={step} st={} in={}x{} crop={}x{} fourcc={:#x} out={}x{} fourcc={:#x} turn={} async={} -> {}",
                 MfxError { status: st, call: "" }.name(),
                 self.in_info.Width,
                 self.in_info.Height,
@@ -337,6 +379,7 @@ impl VppCore {
                 self.out.Width,
                 self.out.Height,
                 self.out.FourCC,
+                self.plan.rotation,
                 p.AsyncDepth,
                 out.AsyncDepth
             );
@@ -541,6 +584,31 @@ mod tests {
         assert_eq!(surface_bytes(&nv12), 1920 * 1088 * 3 / 2);
         let p010 = frame_info(ffi::MFX_FOURCC_P010, 3840, 2160);
         assert_eq!(surface_bytes(&p010), 3840 * 2160 * 3);
+    }
+
+    #[test]
+    fn a_turned_plan_fits_the_turned_picture() {
+        let size = |p: Plan| (p.width, p.height, p.place, p.rotation);
+        let p = Plan::turned(1440, 1920, Layout::Nv12, t(1920, 1080, 8), 270, false).unwrap();
+        assert_eq!(
+            size(p),
+            (1440, 1080, (0, 0, 1440, 1080), 270),
+            "a portrait coded phone video shown landscape"
+        );
+        assert!(!p.is_identity(1440, 1080, Layout::Nv12));
+        let p = Plan::turned(640, 480, Layout::Nv12, t(640, 480, 8), 90, true).unwrap();
+        assert_eq!(
+            size(p),
+            (640, 480, (140, 0, 360, 480), 90),
+            "a fixed box, the turned picture centred"
+        );
+        let p = Plan::turned(640, 480, Layout::Nv12, t(640, 480, 8), 180, false).unwrap();
+        assert_eq!(size(p), (640, 480, (0, 0, 640, 480), 180));
+        assert!(!p.is_identity(640, 480, Layout::Nv12), "a half turn still runs the VPP");
+        assert_eq!(
+            Plan::turned(640, 480, Layout::Nv12, t(640, 480, 8), 45, false).map(|p| p.rotation),
+            Some(0)
+        );
     }
 
     #[test]

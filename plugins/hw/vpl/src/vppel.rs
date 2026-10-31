@@ -32,7 +32,7 @@ use crate::probe;
 use crate::pts::{PtsMap, Stamp, to_ts90};
 use crate::session::{Owner, Surface};
 use crate::stats::Meter;
-use crate::vppcore::{Plan, Processed, Setup, Target, VppCore, out_pool, plan, plan_fixed};
+use crate::vppcore::{Plan, Processed, Setup, Target, VppCore, out_pool};
 use profluens_core::buffer::BufferFlags;
 use profluens_core::log::Loggable;
 use profluens_core::time::Timestamp;
@@ -125,6 +125,8 @@ enum Push {
 pub struct VplVpp {
     target: Target,
     fixed: bool,
+    /// Degrees clockwise each picture is turned.
+    rotation: u16,
     input: Input,
     out: Output,
     group: Option<Arc<VplGroup>>,
@@ -181,6 +183,7 @@ impl VplVpp {
         VplVpp {
             target,
             fixed: false,
+            rotation: 0,
             input: Input::raw(),
             out: Output::new(Mode::Raw, OUT, IN),
             group: None,
@@ -230,6 +233,12 @@ impl VplVpp {
         self
     }
 
+    /// Turns every picture `degrees` clockwise, 90, 180 or 270, the box fit to the turned one.
+    pub fn with_rotation(mut self, degrees: u16) -> Self {
+        self.rotation = degrees;
+        self
+    }
+
     /// The chain's join group. Without one the session joins what `PF_VPL_JOIN` says.
     pub fn with_group(mut self, group: Arc<VplGroup>) -> Self {
         self.group = Some(group);
@@ -251,11 +260,7 @@ impl VplVpp {
     }
 
     fn plan_of(&self, w: u32, h: u32, input: Layout) -> Option<Plan> {
-        if self.fixed {
-            plan_fixed(w, h, input, self.target)
-        } else {
-            plan(w, h, input, self.target)
-        }
+        Plan::turned(w, h, input, self.target, self.rotation, self.fixed)
     }
 
     fn warn(ctx: &mut Ctx, kind: K) {

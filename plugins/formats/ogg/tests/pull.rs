@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use pf_ogg::{
-    GRANULE_NONE, GranuleClock, Mapping, OGG_TAIL_FIRST, OGG_TAIL_LEN, OggDemux, PageHeader,
-    demux_all, granule_clock,
+    GRANULE_NONE, GranuleClock, Mapping, OGG_TAIL_FIRST, OGG_TAIL_LEN, OggDemux, Packet,
+    PageHeader, demux_all, flac_frame_samples, granule_clock, opus_packet_samples,
 };
 use pf_sim::driver::reactor::{Faults, World};
 use pf_sim::time::MS;
@@ -549,6 +549,7 @@ fn landed(data: &[u8], serial: Option<u32>, target: u64) -> Vec<Ev> {
     let clock = granule_clock(&packets[0].data).expect("a clock");
     let preroll = if matches!(clock, GranuleClock::Opus { .. }) { 80_000_000 } else { 0 };
     let ns = |g: u64| clock.ns(g).unwrap();
+    let stamp = |g: u64| clock.stamp(g).unwrap();
     let page = packets
         .iter()
         .filter(|p| {
@@ -560,14 +561,19 @@ fn landed(data: &[u8], serial: Option<u32>, target: u64) -> Vec<Ev> {
         .max()
         .expect("a page ends by the target");
     let serial = serial.unwrap_or(key);
-    let mut evs: Vec<Ev> = packets
+    let from: Vec<&Packet> = packets
         .iter()
         .filter(|p| p.serial == serial && (p.serial != key || p.granule > page))
-        .map(|p| Ev::Buf { pts: None, flags: 0, bytes: p.data.clone() })
         .collect();
-    if let Some(Ev::Buf { pts, .. }) = evs.first_mut() {
-        *pts = Some(ns(page));
-    }
+    let stamps = match serial == key {
+        true => stamps(&from, &packets[0].data, page, stamp(page)),
+        false => (0..from.len()).map(|i| (i == 0).then_some(stamp(page))).collect(),
+    };
+    let mut evs: Vec<Ev> = from
+        .iter()
+        .zip(stamps)
+        .map(|(p, pts)| Ev::Buf { pts, flags: 0, bytes: p.data.clone() })
+        .collect();
     let vorbis = Mapping::identify(&packets[0].data) == Mapping::Vorbis;
     if let Some(lead) =
         last_on_page(data, key, page).filter(|_| vorbis && serial == key && !evs.is_empty())
@@ -575,6 +581,31 @@ fn landed(data: &[u8], serial: Option<u32>, target: u64) -> Vec<Ev> {
         evs.insert(0, Ev::Buf { pts: None, flags: 0, bytes: lead });
     }
     evs
+}
+
+/// The stamps of a stream's packets from a landing on the page ending at `page` stamped `at`, the
+/// first at `at`, each after it later by the samples between, a page's granule ending its packets.
+/// Only the first stamped for a mapping whose packet lengths the demuxer does not read.
+fn stamps(packets: &[&Packet], ident: &[u8], page: u64, at: u64) -> Vec<Option<u64>> {
+    let (rate, flac) = match (Mapping::identify(ident), granule_clock(ident)) {
+        (Mapping::Opus, _) => (48_000u128, false),
+        (Mapping::Flac, Some(GranuleClock::Rate(rate))) => (u128::from(rate), true),
+        _ => return (0..packets.len()).map(|i| (i == 0).then_some(at)).collect(),
+    };
+    let mut start = page;
+    let mut out = Vec::with_capacity(packets.len());
+    for p in packets {
+        out.push(Some(at + (u128::from(start - page) * 1_000_000_000 / rate) as u64));
+        let len = match flac {
+            true => flac_frame_samples(&p.data),
+            false => opus_packet_samples(&p.data),
+        };
+        start += u64::from(len.expect("a packet length"));
+        if p.last && p.granule != GRANULE_NONE {
+            start = p.granule;
+        }
+    }
+    out
 }
 
 #[test]
@@ -851,5 +882,54 @@ fn told_the_rate_a_window_holds_a_quarter_second_of_it() {
             !steady.is_empty() && steady.iter().all(|w| *w >= paced / 2 && *w <= paced * 2),
             "{what}: {steady:?} for {paced}"
         );
+    }
+}
+
+/// From the start nothing upstream stamps, the first media packet takes the time of where its
+/// page's granule puts it and every packet after is stamped, pushed or pulled. Headers go out
+/// unstamped.
+#[test]
+fn from_the_start_every_media_packet_is_stamped_from_the_granules() {
+    for path in fixtures() {
+        let what = path.display();
+        let data = std::fs::read(path).unwrap();
+        let packets = demux_all(&data);
+        let ident = &packets[0].data;
+        let clock = granule_clock(ident).expect("a clock");
+        let mapping = Mapping::identify(ident);
+        if !matches!(mapping, Mapping::Opus | Mapping::Flac) {
+            continue;
+        }
+        let media: Vec<&Packet> =
+            packets.iter().skip(mapping.header_packets(ident) as usize).collect();
+        let to_end = media.iter().position(|p| p.last).expect("a page end");
+        let samples: u64 = media[..=to_end]
+            .iter()
+            .map(|p| {
+                let n = match mapping {
+                    Mapping::Opus => opus_packet_samples(&p.data),
+                    _ => flac_frame_samples(&p.data),
+                };
+                u64::from(n.expect("a packet length"))
+            })
+            .sum();
+        let start = media[to_end].granule - samples;
+        let want = stamps(&media, ident, start, clock.stamp(start).unwrap());
+        for opts in [PUSH, PULL] {
+            let out = demux(path, opts);
+            let got: Vec<Option<u64>> = out
+                .evs
+                .iter()
+                .filter_map(|e| match e {
+                    Ev::Buf { pts, flags, .. } if flags & BufferFlags::HEADER.0 == 0 => Some(*pts),
+                    Ev::Buf { pts, .. } => {
+                        assert_eq!(*pts, None, "{what}: a header unstamped");
+                        None
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(got, want, "{what} pulled {}", opts.pull);
+        }
     }
 }

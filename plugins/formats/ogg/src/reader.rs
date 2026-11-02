@@ -16,6 +16,8 @@ pub struct Packet {
     pub bos: bool,
     /// True if this packet finished on the eos page of its bitstream (section 6, flag 0x04).
     pub eos: bool,
+    /// True for the last packet finishing on its page, the one `granule` ends.
+    pub last: bool,
     /// The packet payload (concatenated segment bytes).
     pub data: Vec<u8>,
 }
@@ -168,6 +170,12 @@ impl OggReader {
         self.pages_parsed
     }
 
+    /// The packets assembled and not handed out yet, in order. A page's packets are queued
+    /// together, so the ones after a packet handed out are here up to its page's end.
+    pub fn queued(&self) -> impl Iterator<Item = &Packet> {
+        self.ready.iter()
+    }
+
     /// Bytes pushed and not handed out, parsed or not.
     pub fn held(&self) -> usize {
         self.buf.len() - self.pos + self.ready.iter().map(|p| p.data.len()).sum::<usize>()
@@ -299,6 +307,8 @@ fn handle_page(
     let mut off = 0usize;
     let mut run_start = 0usize;
     let last_idx = table.len().wrapping_sub(1);
+    // the granule is the end of the last packet finishing here, a packet may run on past it
+    let last_end = table.iter().rposition(|&l| l != 255);
 
     for (i, &lacing) in table.iter().enumerate() {
         off += lacing as usize;
@@ -330,6 +340,7 @@ fn handle_page(
             // Only the packet completing on the eos page's last segment is the stream's final
             // packet.
             eos: eos && is_last_on_page,
+            last: last_end == Some(i),
             data,
         };
         state.pending_bos = false;

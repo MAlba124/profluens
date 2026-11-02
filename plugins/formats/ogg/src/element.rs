@@ -19,10 +19,12 @@ use profluens_core::pull::{Fed, Feed, RangeError};
 use profluens_core::rate;
 use profluens_core::time::Timestamp;
 
-use crate::duration::{GranuleClock, OGG_TAIL_FIRST, OGG_TAIL_LEN, granule_clock, last_granule};
-use crate::ident::Mapping;
+use crate::duration::{
+    GranuleClock, OGG_TAIL_FIRST, OGG_TAIL_LEN, OPUS_GRANULE_RATE, granule_clock, last_granule,
+};
+use crate::ident::{Mapping, flac_frame_samples, opus_packet_samples};
 use crate::page::GRANULE_NONE;
-use crate::reader::OggReader;
+use crate::reader::{OggReader, Packet};
 use crate::seek::{Bisect, Landing, Step};
 use crate::streams::scan_head;
 use crate::writer::OggWriter;
@@ -99,6 +101,7 @@ struct Carry {
     data: Vec<u8>,
     track: usize,
     head: bool,
+    pts: Timestamp,
 }
 
 struct Track {
@@ -107,6 +110,104 @@ struct Track {
     pad: Option<SrcPad>,
     stamp: Timestamp,
     heads: u32,
+    run: Run,
+}
+
+/// The clock of a track whose packet lengths the demuxer reads, Opus and FLAC. A stamp anchors
+/// it, the packets after go out at the anchor plus the samples between. Each page's granule
+/// keeps it on time, a packet lost to a bad page costs no drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Run {
+    /// Samples a second, 0 for a mapping whose packet lengths are not read here.
+    rate: u32,
+    flac: bool,
+    anchor: Timestamp,
+    /// Samples since the anchor.
+    samples: u64,
+    /// The granule at the anchor, learnt on the first page ending after it.
+    base: Option<u64>,
+}
+
+impl Default for Run {
+    fn default() -> Self {
+        Run { rate: 0, flac: false, anchor: Timestamp::NONE, samples: 0, base: None }
+    }
+}
+
+impl Run {
+    fn identify(&mut self, ident: &[u8]) {
+        (self.rate, self.flac) = match (Mapping::identify(ident), granule_clock(ident)) {
+            (Mapping::Opus, _) => (OPUS_GRANULE_RATE, false),
+            (Mapping::Flac, Some(GranuleClock::Rate(rate))) => (rate, true),
+            _ => (0, false),
+        };
+        self.stop();
+    }
+
+    /// Until the next stamp the packets go out unstamped.
+    fn stop(&mut self) {
+        (self.anchor, self.samples, self.base) = (Timestamp::NONE, 0, None);
+    }
+
+    fn length(&self, data: &[u8]) -> Option<u32> {
+        match (self.rate, self.flac) {
+            (0, _) => None,
+            (_, true) => flac_frame_samples(data),
+            (_, false) => opus_packet_samples(data),
+        }
+    }
+
+    fn anchored(&self) -> bool {
+        self.rate == 0 || self.anchor.is_some()
+    }
+
+    /// The granule where `packet` starts, the end of its page less the samples from it on
+    /// there, `after` the packets queued behind it.
+    fn start<'a>(&self, packet: &Packet, mut after: impl Iterator<Item = &'a Packet>) -> Option<u64> {
+        let mut samples = u64::from(self.length(&packet.data)?);
+        let mut end = packet;
+        while !end.last {
+            end = after.find(|p| p.serial == packet.serial)?;
+            samples += u64::from(self.length(&end.data)?);
+        }
+        (end.granule != GRANULE_NONE).then_some(end.granule)?.checked_sub(samples)
+    }
+
+    /// Anchors the clock at the sample of `granule`, its container stamp, ahead of the stream
+    /// time by an Opus pre-skip as a demuxer stamps.
+    fn anchor_at(&mut self, granule: u64) {
+        let ns = u128::from(granule) * 1_000_000_000 / u128::from(self.rate);
+        self.anchor = Timestamp(u64::try_from(ns).unwrap_or(u64::MAX));
+        (self.samples, self.base) = (0, Some(granule));
+    }
+
+    /// The stamp of a media packet the demuxer had `stamp` for.
+    fn stamp(&mut self, stamp: Timestamp, data: &[u8], granule: u64, last: bool) -> Timestamp {
+        if self.rate == 0 {
+            return stamp;
+        }
+        if stamp.is_some() {
+            self.stop();
+            self.anchor = stamp;
+        }
+        let Some(anchor) = self.anchor.nanos() else {
+            return stamp;
+        };
+        let ns = u128::from(self.samples) * 1_000_000_000 / u128::from(self.rate);
+        let pts = Timestamp(anchor.saturating_add(u64::try_from(ns).unwrap_or(u64::MAX)));
+        let Some(n) = self.length(data) else {
+            self.stop();
+            return pts;
+        };
+        self.samples += u64::from(n);
+        if last && granule != GRANULE_NONE {
+            match self.base {
+                None => self.base = granule.checked_sub(self.samples),
+                Some(base) => self.samples = granule.checked_sub(base).unwrap_or(self.samples),
+            }
+        }
+        pts
+    }
 }
 
 /// What a head that names no stream fails with.
@@ -170,6 +271,7 @@ impl Default for OggDemux {
                 pad: Some(Self::OUT),
                 stamp: Timestamp::NONE,
                 heads: 0,
+                run: Run::default(),
             }],
             head: None,
             streams: false,
@@ -311,6 +413,7 @@ impl OggDemux {
                 pad: None,
                 stamp: Timestamp::NONE,
                 heads: 0,
+                run: Run::default(),
             });
         }
         log!(&*ctx, Level::Info, "opened", streams = self.tracks.len());
@@ -367,7 +470,7 @@ impl OggDemux {
         ctx: &mut Ctx,
         pad: SrcPad,
         data: &[u8],
-        stamp: &mut Timestamp,
+        pts: Timestamp,
         head: bool,
     ) -> bool {
         let buf = match ctx.try_alloc_sized(data.len()) {
@@ -379,32 +482,43 @@ impl OggDemux {
                 return true;
             }
         };
-        Self::put(ctx, pad, buf, data, stamp, head);
+        Self::put(ctx, pad, buf, data, pts, head);
         true
     }
 
-    fn emit_exact(ctx: &mut Ctx, pad: SrcPad, data: &[u8], stamp: &mut Timestamp, head: bool) {
+    fn emit_exact(ctx: &mut Ctx, pad: SrcPad, data: &[u8], pts: Timestamp, head: bool) {
         let Some(buf) = ctx.alloc_exact(data.len()) else {
             let (element, error) = (ctx.element(), ctx.exact_refused(data.len()));
             ctx.post(BusMessage::Warning { element, error });
             return;
         };
-        Self::put(ctx, pad, buf, data, stamp, head);
+        Self::put(ctx, pad, buf, data, pts, head);
     }
 
-    fn put(
-        ctx: &mut Ctx,
-        pad: SrcPad,
-        mut buf: Buffer,
-        data: &[u8],
-        stamp: &mut Timestamp,
-        head: bool,
-    ) {
+    fn put(ctx: &mut Ctx, pad: SrcPad, mut buf: Buffer, data: &[u8], pts: Timestamp, head: bool) {
         buf.memory.as_mut_full()[..data.len()].copy_from_slice(data);
         buf.memory.set_len(data.len());
-        buf.pts = std::mem::replace(stamp, Timestamp::NONE);
+        buf.pts = pts;
         buf.flags = if head { BufferFlags::HEADER } else { BufferFlags::empty() };
         ctx.out(pad).push(buf);
+    }
+
+    /// The stamp of `packet` on track `at`. A header goes out unstamped and leaves the track's
+    /// stamp to the first media packet.
+    fn pts(&mut self, at: usize, packet: &Packet, head: bool) -> Timestamp {
+        if head {
+            return Timestamp::NONE;
+        }
+        let t = &mut self.tracks[at];
+        let stamp = std::mem::replace(&mut t.stamp, Timestamp::NONE);
+        // no stamp from upstream, the page granule anchors it
+        if stamp.is_none()
+            && !t.run.anchored()
+            && let Some(g) = t.run.start(packet, self.reader.queued())
+        {
+            t.run.anchor_at(g);
+        }
+        t.run.stamp(stamp, &packet.data, packet.granule, packet.last)
     }
 
     fn head(&mut self, at: usize, data: &[u8]) -> bool {
@@ -412,6 +526,7 @@ impl OggDemux {
         let mapping = Mapping::identify(data);
         if mapping != Mapping::Unknown {
             track.heads = mapping.header_packets(data);
+            track.run.identify(data);
         }
         let head = track.heads > 0;
         track.heads = track.heads.saturating_sub(1);
@@ -463,9 +578,8 @@ impl OggDemux {
         self.note_reader(ctx);
         // A parked packet precedes everything queued behind it.
         if let Some(c) = self.pending.take() {
-            let track = &mut self.tracks[c.track];
-            let pad = track.pad.unwrap_or(Self::OUT);
-            if !Self::emit_packet(ctx, pad, &c.data, &mut track.stamp, c.head) {
+            let pad = self.tracks[c.track].pad.unwrap_or(Self::OUT);
+            if !Self::emit_packet(ctx, pad, &c.data, c.pts, c.head) {
                 self.pending = Some(c);
                 return false; // budget still spent
             }
@@ -483,8 +597,9 @@ impl OggDemux {
             };
             self.lead_out(ctx, packet.serial, pad);
             let head = self.head(at, &packet.data);
-            if !Self::emit_packet(ctx, pad, &packet.data, &mut self.tracks[at].stamp, head) {
-                self.pending = Some(Carry { data: packet.data, track: at, head });
+            let pts = self.pts(at, &packet, head);
+            if !Self::emit_packet(ctx, pad, &packet.data, pts, head) {
+                self.pending = Some(Carry { data: packet.data, track: at, head, pts });
                 return false;
             }
             self.reader.recycle(packet.data);
@@ -529,14 +644,8 @@ impl OggDemux {
 
     fn flush(&mut self, ctx: &mut Ctx) {
         if let Some(c) = self.pending.take() {
-            let track = &mut self.tracks[c.track];
-            Self::emit_exact(
-                ctx,
-                track.pad.unwrap_or(Self::OUT),
-                &c.data,
-                &mut track.stamp,
-                c.head,
-            );
+            let pad = self.tracks[c.track].pad.unwrap_or(Self::OUT);
+            Self::emit_exact(ctx, pad, &c.data, c.pts, c.head);
             self.reader.recycle(c.data);
         }
         while let Some(packet) = self.reader.next_packet() {
@@ -546,7 +655,8 @@ impl OggDemux {
                 Some((at, pad)) => {
                     self.lead_out(ctx, packet.serial, pad);
                     let head = self.head(at, &packet.data);
-                    Self::emit_exact(ctx, pad, &packet.data, &mut self.tracks[at].stamp, head);
+                    let pts = self.pts(at, &packet, head);
+                    Self::emit_exact(ctx, pad, &packet.data, pts, head);
                     self.reader.recycle(packet.data);
                 }
                 None => self.keep(skipped, packet.data),
@@ -585,8 +695,7 @@ impl OggDemux {
             return;
         }
         if let Some(lead) = self.lead.take() {
-            let mut unstamped = Timestamp::NONE;
-            Self::emit_exact(ctx, pad, &lead, &mut unstamped, false);
+            Self::emit_exact(ctx, pad, &lead, Timestamp::NONE, false);
             self.reader.recycle(lead);
         }
     }
@@ -649,7 +758,8 @@ impl OggDemux {
             Some(l) => {
                 self.feed.restart(l.at);
                 self.skip = Some(l.granule);
-                self.stamp_all(Timestamp(l.ns));
+                let stamp = self.learnt.and_then(|(_, clock)| clock.stamp(l.granule));
+                self.stamp_all(Timestamp(stamp.unwrap_or(l.ns)));
             }
             None => {
                 self.feed.restart(from.to_byte);
@@ -807,6 +917,7 @@ impl Element for OggDemux {
         self.unlock();
         for t in &mut self.tracks {
             (t.stamp, t.heads) = (Timestamp::NONE, 0);
+            t.run.stop();
             if self.streams {
                 t.pad = ctx.stream_pad(t.stream).filter(|pad| ctx.pad_linked(*pad));
             }
@@ -834,6 +945,7 @@ impl Element for OggDemux {
                 self.reader.reset();
                 self.pending = None;
                 self.stamp_all(Timestamp::NONE);
+                self.tracks.iter_mut().for_each(|t| t.run.stop());
                 self.unland();
                 (self.at, self.measured) = (Timestamp::NONE, rate::ByteRate::default());
                 self.teller.restart();
@@ -999,5 +1111,59 @@ impl Element for OggMux {
     fn stop(&mut self, ctx: &mut Ctx) {
         self.finish_stream(ctx);
         self.scratch = Vec::new();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 20 ms CELT packet, config 31, one frame.
+    const PACKET: [u8; 2] = [31 << 3, 0];
+    const MS20: u64 = 20_000_000;
+
+    fn opus() -> Run {
+        let mut r = Run::default();
+        r.identify(b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00");
+        r
+    }
+
+    #[test]
+    fn packets_after_a_stamp_are_timed_by_their_samples() {
+        let mut r = opus();
+        let mut stamp = |s: Timestamp, granule: u64, last: bool| r.stamp(s, &PACKET, granule, last);
+        assert_eq!(stamp(Timestamp(5), 960, false), Timestamp(5));
+        assert_eq!(stamp(Timestamp::NONE, 1920, true), Timestamp(5 + MS20));
+        assert_eq!(stamp(Timestamp::NONE, 2880, true), Timestamp(5 + 2 * MS20));
+        assert_eq!(stamp(Timestamp(1_000), 0, false), Timestamp(1_000), "a new stamp anchors");
+    }
+
+    #[test]
+    fn a_page_granule_puts_the_clock_back_on_time_after_a_lost_packet() {
+        let mut r = opus();
+        // the first page learns the granule at the anchor
+        r.stamp(Timestamp::ZERO, &PACKET, 1920, false);
+        r.stamp(Timestamp::NONE, &PACKET, 1920, true);
+        // the page ending at 4800 lost its first packet, two of three came
+        r.stamp(Timestamp::NONE, &PACKET, 4800, false);
+        r.stamp(Timestamp::NONE, &PACKET, 4800, true);
+        assert_eq!(r.stamp(Timestamp::NONE, &PACKET, 5760, true), Timestamp(5 * MS20));
+    }
+
+    #[test]
+    fn a_packet_running_past_its_page_waits_for_the_page_it_ends_on() {
+        let mut r = opus();
+        r.stamp(Timestamp::ZERO, &PACKET, 960, true);
+        // ends on a page whose granule is a later packet's end
+        r.stamp(Timestamp::NONE, &PACKET, GRANULE_NONE, false);
+        assert_eq!(r.stamp(Timestamp::NONE, &PACKET, 2880, true), Timestamp(2 * MS20));
+    }
+
+    #[test]
+    fn a_mapping_of_unread_lengths_stamps_only_what_it_was_given() {
+        let mut r = Run::default();
+        r.identify(b"\x01vorbis");
+        assert_eq!(r.stamp(Timestamp(7), b"x", 100, true), Timestamp(7));
+        assert_eq!(r.stamp(Timestamp::NONE, b"x", 200, true), Timestamp::NONE);
     }
 }

@@ -126,7 +126,7 @@ impl Element for Rec {
 }
 
 fn file() -> Option<Arc<Vec<u8>>> {
-    let path = std::env::temp_dir().join(format!("pf_ogg_bitrate_{}.opus", std::process::id()));
+    let path = std::env::temp_dir().join(format!("pf_ogg_bitrate_{}_{:?}.opus", std::process::id(), std::thread::current().id()));
     let made = Command::new("ffmpeg")
         .env_remove("LD_LIBRARY_PATH")
         .args([

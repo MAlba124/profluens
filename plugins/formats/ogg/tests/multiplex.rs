@@ -57,6 +57,7 @@ fn expected(serial: u32, packets: &[(Vec<u8>, u64)]) -> Vec<Packet> {
             granule: *gran,
             bos: i == 0,
             eos: i == packets.len() - 1,
+            last: true,
             data: data.clone(),
         })
         .collect()

@@ -92,6 +92,15 @@ impl GranuleClock {
             GranuleClock::Rate(rate) => vorbis_duration_ns(granule, rate),
         }
     }
+
+    /// The container stamp of the sample at `granule`, ahead of its stream time by an Opus
+    /// pre-skip as a decoder takes it (RFC 7845 section 4.3).
+    pub fn stamp(self, granule: u64) -> Option<u64> {
+        match self {
+            GranuleClock::Opus { .. } => Some(opus_duration_ns(granule, 0)),
+            GranuleClock::Rate(rate) => vorbis_duration_ns(granule, rate),
+        }
+    }
 }
 
 /// The clock of the stream whose identification packet is `bos`, `None` for another mapping.

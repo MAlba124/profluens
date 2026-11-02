@@ -135,3 +135,81 @@ fn truncations_never_panic() {
         }
     }
 }
+
+fn au(nals: &[&[u8]]) -> Vec<u8> {
+    nals.iter().flat_map(|n| [&[0u8, 0, 0, 1][..], n].concat()).collect()
+}
+
+#[test]
+fn h264_unreferenced_by_nal_ref_idc() {
+    let h = NalCodec::H264;
+    let aud: &[u8] = &[0x09, 0xf0];
+    assert!(unreferenced(h, &[], &au(&[aud, &[0x01, 0x9e, 0x11]])), "a non-reference slice");
+    assert!(!unreferenced(h, &[], &au(&[aud, &[0x41, 0x9a, 0x22]])), "a reference P slice");
+    assert!(!unreferenced(h, &[], &au(&[&[0x67, 1], &[0x68, 2], &[0x65, 0x88]])), "an IDR");
+    assert!(!unreferenced(h, &[], &au(&[&[0x01, 1], &[0x21, 2]])), "one slice is referenced");
+    assert!(!unreferenced(h, &[], &au(&[aud])), "no picture");
+    assert!(!unreferenced(h, &[], &[0x01, 0x9e]), "not Annex B");
+}
+
+#[test]
+fn hevc_unreferenced_by_type_and_the_top_sub_layer() {
+    let h = NalCodec::H265;
+    // VPS, SPS with sps_max_sub_layers_minus1 0, then 1
+    let head0 = au(&[&[0x40, 0x01, 0x0c], &[0x42, 0x01, 0x01, 0x01]]);
+    let head1 = au(&[&[0x42, 0x01, 0x03, 0x01]]);
+    assert_eq!((hevc_top_layer(&head0), hevc_top_layer(&head1)), (Some(0), Some(1)));
+    let trail_n: &[u8] = &[0x00, 0x01, 0xaf];
+    let trail_r: &[u8] = &[0x02, 0x01, 0xaf];
+    let sei: &[u8] = &[0x4e, 0x01, 0x05];
+    assert!(unreferenced(h, &head0, &au(&[sei, trail_n])));
+    assert!(!unreferenced(h, &head0, &au(&[trail_r])));
+    assert!(!unreferenced(h, &head0, &au(&[&[0x26, 0x01, 0xaf]])), "an IDR");
+    assert!(!unreferenced(h, &head1, &au(&[trail_n])), "a higher sub-layer may refer to it");
+    assert!(unreferenced(h, &head1, &au(&[&[0x00, 0x02, 0xaf]])), "on the top sub-layer");
+    assert!(!unreferenced(h, &[], &au(&[trail_n])), "no SPS to tell");
+    assert!(!unreferenced(h, &head0, &au(&[&[0x00]])), "a header cut short");
+}
+
+#[test]
+fn param_sets_of_an_h264_idr_unit() {
+    let au = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 1, 0x65, 4, 5];
+    let mut out = Vec::new();
+    annexb_param_sets(NalCodec::H264, &au, &mut out);
+    assert_eq!(out, [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3]);
+    out.clear();
+    annexb_param_sets(NalCodec::H264, &au[12..], &mut out);
+    assert!(out.is_empty(), "a slice alone");
+}
+
+/// A PPS followed by a four byte start code keeps the zero byte as its own, an encoder's sets
+/// read back alone have none, both give the same head.
+#[test]
+fn trailing_zeros_are_left_off_a_param_set() {
+    let au = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3, 0, 0, 0, 0, 1, 0x65, 4, 5];
+    let alone = [0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3];
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    annexb_param_sets(NalCodec::H264, &au, &mut a);
+    annexb_param_sets(NalCodec::H264, &alone, &mut b);
+    assert_eq!(a, [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3]);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn an_idr_unit_without_its_param_sets() {
+    let au = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 1, 0x65, 4, 5];
+    let mut out = Vec::new();
+    assert!(strip_param_sets(NalCodec::H264, &au, &mut out));
+    assert_eq!(out, [0, 0, 0, 1, 0x65, 4, 5]);
+    out.clear();
+    assert!(!strip_param_sets(NalCodec::H264, &au[12..], &mut out), "a slice alone stays");
+    assert!(out.is_empty());
+}
+
+#[test]
+fn param_sets_of_an_hevc_idr_unit() {
+    let au = [0, 0, 1, 0x40, 1, 9, 0, 0, 1, 0x42, 1, 1, 0, 0, 1, 0x44, 1, 0, 0, 1, 0x26, 1, 8];
+    let mut out = Vec::new();
+    annexb_param_sets(NalCodec::H265, &au, &mut out);
+    assert_eq!(out, [0, 0, 0, 1, 0x40, 1, 9, 0, 0, 0, 1, 0x42, 1, 1, 0, 0, 0, 1, 0x44, 1]);
+}

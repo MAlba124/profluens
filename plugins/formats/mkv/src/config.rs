@@ -182,6 +182,79 @@ pub fn length_prefixed_sample(ctx: &mut Ctx, codec: NalCodec, mut mem: Memory) -
     Some(out.memory)
 }
 
+fn is_param_set(codec: NalCodec, b0: u8) -> bool {
+    matches!(codec.kind(b0), NalKind::Vps | NalKind::Sps | NalKind::Pps)
+}
+
+/// The parameter sets of an Annex B access unit onto `out`, each behind a four byte start code,
+/// the head a decoder opens with. Trailing zero bytes are left off, so the same sets give the
+/// same head whatever start code followed them.
+pub fn annexb_param_sets(codec: NalCodec, au: &[u8], out: &mut Vec<u8>) {
+    for (a, b) in nals(au) {
+        if is_param_set(codec, au[a]) {
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(&au[a..b]);
+        }
+    }
+}
+
+/// An Annex B access unit onto `out` without its parameter sets, each unit behind a four byte
+/// start code. False with `out` untouched when it carries none.
+pub fn strip_param_sets(codec: NalCodec, au: &[u8], out: &mut Vec<u8>) -> bool {
+    if !nals(au).any(|(a, _)| is_param_set(codec, au[a])) {
+        return false;
+    }
+    out.reserve(au.len());
+    for (a, b) in nals(au) {
+        if !is_param_set(codec, au[a]) {
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(&au[a..b]);
+        }
+    }
+    true
+}
+
+/// The highest TemporalId of an HEVC stream, sps_max_sub_layers_minus1 of the first SPS in the
+/// Annex B `head` (7.3.2.2.1). The field sits ahead of any emulation prevention byte.
+pub fn hevc_top_layer(head: &[u8]) -> Option<u8> {
+    let (a, b) = nals(head).find(|&(a, _)| NalCodec::H265.kind(head[a]) == NalKind::Sps)?;
+    head[a..b].get(2).map(|v| (v >> 1) & 7)
+}
+
+/// Whether every picture of an Annex B access unit is one nothing refers to, H.264 slices with
+/// nal_ref_idc 0 and HEVC sub-layer non-reference pictures of the highest sub-layer. A decoder
+/// seeking past such a picture may drop it undecoded. `head` holds the stream's parameter sets,
+/// an HEVC unit is never judged so without an SPS there.
+pub fn unreferenced(codec: NalCodec, head: &[u8], au: &[u8]) -> bool {
+    let top = match codec {
+        NalCodec::H264 => 0,
+        NalCodec::H265 => match hevc_top_layer(head) {
+            Some(t) => t,
+            None => return false,
+        },
+    };
+    let mut vcl = false;
+    for (a, b) in nals(au) {
+        let n = &au[a..b];
+        if codec.kind(n[0]) != NalKind::Vcl {
+            continue;
+        }
+        let free = match codec {
+            NalCodec::H264 => n[0] & 0x60 == 0,
+            // The _N types are the even ones up to RSV_VCL_N14 (7.4.2.2).
+            NalCodec::H265 => {
+                let t = (n[0] >> 1) & 0x3F;
+                n.get(1).is_some_and(|h| t <= 14 && t & 1 == 0 && (h & 7).saturating_sub(1) == top)
+            }
+        };
+        if !free {
+            return false;
+        }
+        vcl = true;
+    }
+    vcl
+}
+
 pub fn av1_sample(mem: Memory) -> Option<Memory> {
     let td = leading_temporal_delimiter(mem.data());
     match td {

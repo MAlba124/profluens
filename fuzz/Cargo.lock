@@ -138,6 +138,7 @@ version = "0.1.0"
 dependencies = [
  "pf-mp3",
  "pf-registry",
+ "profluens-audio",
  "profluens-core",
 ]
 

@@ -4,7 +4,7 @@
 
 pub mod av1dec;
 pub mod av1enc;
-pub mod bitwriter;
+pub use profluens_video::bits as bitwriter;
 pub mod colour;
 pub mod decproc;
 mod enc;
@@ -15,10 +15,10 @@ pub mod gpuframe;
 mod gpuin;
 pub mod h264dec;
 pub mod h264enc;
-pub mod h264parse;
+pub use profluens_video::h264parse;
 pub mod h265dec;
 pub mod h265enc;
-pub mod h265parse;
+pub use profluens_video::h265parse;
 pub mod probe;
 pub mod va;
 pub mod vp8enc;

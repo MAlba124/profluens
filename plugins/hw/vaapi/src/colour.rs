@@ -1,45 +1,13 @@
 //! The colour an H.264 or H.265 bitstream states: the VUI signal type (H.264 E.1.1, H.265 E.2.1)
 //! and the HDR SEI, mastering display (137) and content light level (144), H.265 D.2.28 and D.2.35.
 
+pub use profluens_video::color::vui_signal;
 use profluens_video::color::{
-    ChromaSite, ContentLight, HdrStatic, Mastering, Matrix, Primaries, Range, StreamColor,
-    TransferFn,
+    ContentLight, HdrStatic, Mastering, Matrix, Primaries, Range, StreamColor, TransferFn,
 };
-use profluens_video::decoder::Color;
-
-use crate::h264parse::BitReader;
 
 const SEI_MASTERING_DISPLAY: u32 = 137;
 const SEI_CONTENT_LIGHT: u32 = 144;
-
-/// The part of the VUI H.264 E.1.1 and H.265 E.2.1 share. An absent signal type states nothing.
-/// The reader is left at `timing_info_present_flag` (H.264) or `neutral_chroma_indication_flag`
-/// (H.265).
-pub fn vui_signal(r: &mut BitReader) -> Color {
-    let mut c = Color::default();
-    if r.flag() && r.u(8) == 255 {
-        r.u(16);
-        r.u(16);
-    }
-    if r.flag() {
-        r.flag(); // overscan_appropriate_flag
-    }
-    if r.flag() {
-        r.u(3); // video_format
-        c.range = Some(if r.flag() { Range::Full } else { Range::Limited });
-        if r.flag() {
-            let cp = |v: u32| v as u8;
-            c.primaries = Primaries::from_h273(cp(r.u(8)));
-            c.transfer = TransferFn::from_h273(cp(r.u(8)));
-            c.matrix = Matrix::from_h273(cp(r.u(8)));
-        }
-    }
-    if r.flag() {
-        c.chroma = ChromaSite::from_h26x(r.ue()); // chroma_sample_loc_type_top_field
-        r.ue(); // chroma_sample_loc_type_bottom_field
-    }
-    c
-}
 
 /// What an encoder's VUI states of `c`, the full range flag and the primaries, transfer and
 /// matrix as H.273, 2 where unstated. None when `c` states none of the three.
@@ -292,37 +260,5 @@ mod tests {
         let cut = &hdr10_sei()[..20];
         assert!(!sei_hdr(cut, &mut hdr));
         assert!(hdr.is_empty());
-    }
-
-    #[test]
-    fn the_vui_signal_type_states_range_and_code_points() {
-        // aspect 1 + 255 + 16 + 16, overscan 0, signal 1 + format 5 + full 0 + desc 1 +
-        // 9, 16, 9, chroma loc 1 + ue 0 + ue 0.
-        let mut bits = String::new();
-        bits += "1";
-        bits += &format!("{:08b}{:016b}{:016b}", 255, 1, 1);
-        bits += "0";
-        bits += "1";
-        bits += "101";
-        bits += "0";
-        bits += "1";
-        bits += &format!("{:08b}{:08b}{:08b}", 9, 16, 9);
-        bits += "1";
-        bits += "1";
-        bits += "1";
-        while !bits.len().is_multiple_of(8) {
-            bits.push('0');
-        }
-        let bytes: Vec<u8> = bits
-            .as_bytes()
-            .chunks(8)
-            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap())
-            .collect();
-        let c = vui_signal(&mut BitReader::new(&bytes));
-        assert_eq!(c.range, Some(Range::Limited));
-        assert_eq!(c.primaries, Some(Primaries::Bt2020));
-        assert_eq!(c.transfer, Some(TransferFn::Pq));
-        assert_eq!(c.matrix, Some(Matrix::Bt2020));
-        assert_eq!(vui_signal(&mut BitReader::new(&[0x00])), Color::default());
     }
 }

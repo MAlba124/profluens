@@ -1,9 +1,7 @@
-//! H.264 Annex-B parsing for VA-API slice-level decode. SPS, PPS, slice headers and POC
-//! (H.264 7.3, 8.2.1). 8-bit 4:2:0 progressive only.
-
 #![allow(clippy::needless_range_loop)]
 
-use profluens_video::fixed::FixedList;
+pub use crate::bits::{BitReader, de_emulate};
+use crate::fixed::FixedList;
 
 /// A parsed NAL (7.4.1) as offsets into the access unit, header and emulation bytes included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,7 +96,7 @@ fn push_nal(au: &[u8], start: usize, end: usize, f: &mut impl FnMut(Nal)) {
     });
 }
 
-/// De-emulate an RBSP (7.4.1). The raw NAL still goes to VA.
+/// De-emulate an RBSP (7.4.1).
 // Parameter sets and the cold slice header fallback, once per stream or never.
 #[allow(clippy::disallowed_methods)]
 fn rbsp_of(nal: &[u8]) -> Vec<u8> {
@@ -107,105 +105,6 @@ fn rbsp_of(nal: &[u8]) -> Vec<u8> {
     let n = de_emulate(body, &mut out);
     out.truncate(n);
     out
-}
-
-pub(crate) fn de_emulate(body: &[u8], out: &mut [u8]) -> usize {
-    let mut n = 0;
-    let mut zeros = 0;
-    let mut idx = 0;
-    while idx < body.len() && n < out.len() {
-        let b = body[idx];
-        if zeros >= 2 && b == 0x03 && idx + 1 < body.len() && body[idx + 1] <= 0x03 {
-            zeros = 0;
-            idx += 1;
-            continue;
-        }
-        out[n] = b;
-        n += 1;
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-        idx += 1;
-    }
-    n
-}
-
-/// Big-endian bit reader with Exp-Golomb helpers (9.1).
-pub struct BitReader<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> BitReader<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        BitReader { data, pos: 0 }
-    }
-
-    pub fn bit_pos(&self) -> usize {
-        self.pos
-    }
-
-    fn bit(&mut self) -> u32 {
-        let byte = self.pos >> 3;
-        if byte >= self.data.len() {
-            self.pos += 1;
-            return 0;
-        }
-        let shift = 7 - (self.pos & 7);
-        self.pos += 1;
-        ((self.data[byte] >> shift) & 1) as u32
-    }
-
-    pub fn u(&mut self, n: u32) -> u32 {
-        let mut v = 0u32;
-        for _ in 0..n {
-            v = (v << 1) | self.bit();
-        }
-        v
-    }
-
-    pub fn flag(&mut self) -> bool {
-        self.bit() != 0
-    }
-
-    /// Unsigned Exp-Golomb `ue(v)` (9.1).
-    pub fn ue(&mut self) -> u32 {
-        let mut zeros = 0u32;
-        while self.bit() == 0 {
-            zeros += 1;
-            if zeros > 31 {
-                return 0; // malformed guard
-            }
-        }
-        if zeros == 0 {
-            return 0;
-        }
-        let suffix = self.u(zeros);
-        (1u32 << zeros) - 1 + suffix
-    }
-
-    /// Signed Exp-Golomb `se(v)` (9.1.1).
-    pub fn se(&mut self) -> i32 {
-        let k = self.ue();
-        let mag = ((k + 1) >> 1) as i32;
-        if k & 1 == 1 { mag } else { -mag }
-    }
-
-    /// `more_rbsp_data` (7.2).
-    pub fn more_rbsp_data(&self) -> bool {
-        let total_bits = self.data.len() * 8;
-        let mut last_one = None;
-        for i in (0..total_bits).rev() {
-            let byte = i >> 3;
-            let shift = 7 - (i & 7);
-            if (self.data[byte] >> shift) & 1 == 1 {
-                last_one = Some(i);
-                break;
-            }
-        }
-        match last_one {
-            Some(stop) => self.pos < stop,
-            None => false,
-        }
-    }
 }
 
 /// Parsed SPS (7.3.2.1).
@@ -240,7 +139,7 @@ pub struct Sps {
     /// VUI `bitstream_restriction` (E.2.1), in frames.
     pub max_num_reorder_frames: Option<u32>,
     pub max_dec_frame_buffering: Option<u32>,
-    pub colour: profluens_video::decoder::Color,
+    pub colour: crate::decoder::Color,
     /// `seq_scaling_matrix_present_flag` lists, fall-back rule A applied. None is Flat_16.
     pub scaling: Option<ScalingLists>,
 }
@@ -488,9 +387,9 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
 fn parse_vui_restriction(
     r: &mut BitReader,
     bits: usize,
-    colour: &mut profluens_video::decoder::Color,
+    colour: &mut crate::decoder::Color,
 ) -> Option<(u32, u32)> {
-    let signal = crate::colour::vui_signal(r);
+    let signal = crate::color::vui_signal(r);
     if r.bit_pos() <= bits {
         *colour = signal;
     }
@@ -1410,7 +1309,7 @@ mod tests {
         mmcos: usize,
         mmco_arg: u32,
     ) -> Vec<u8> {
-        let mut w = crate::bitwriter::BitWriter::new();
+        let mut w = crate::bits::BitWriter::new();
         w.ue(0); // first_mb_in_slice
         w.ue(5); // slice_type P
         w.ue(pps.pic_parameter_set_id);
@@ -1543,7 +1442,7 @@ mod tests {
         assert_eq!(read_scaling_list(&mut BitReader::new(&bits), &mut list), None);
     }
 
-    fn write_list(w: &mut crate::bitwriter::BitWriter, values: &[u8]) {
+    fn write_list(w: &mut crate::bits::BitWriter, values: &[u8]) {
         let mut last = 8i32;
         for &v in values {
             let delta = (i32::from(v) - last + 128).rem_euclid(256) - 128;
@@ -1553,8 +1452,8 @@ mod tests {
     }
 
     /// A High profile SPS of 320x240, scaling lists written by `lists` when given.
-    fn high_sps(lists: Option<&dyn Fn(&mut crate::bitwriter::BitWriter)>) -> Vec<u8> {
-        let mut w = crate::bitwriter::BitWriter::new();
+    fn high_sps(lists: Option<&dyn Fn(&mut crate::bits::BitWriter)>) -> Vec<u8> {
+        let mut w = crate::bits::BitWriter::new();
         w.u(100, 8); // profile_idc
         w.u(0, 8); // constraint flags
         w.u(40, 8); // level_idc
@@ -1584,8 +1483,8 @@ mod tests {
     }
 
     /// A CABAC PPS with the 8x8 transform, scaling lists written by `lists` when given.
-    fn pps_8x8(lists: Option<&dyn Fn(&mut crate::bitwriter::BitWriter)>) -> Vec<u8> {
-        let mut w = crate::bitwriter::BitWriter::new();
+    fn pps_8x8(lists: Option<&dyn Fn(&mut crate::bits::BitWriter)>) -> Vec<u8> {
+        let mut w = crate::bits::BitWriter::new();
         w.ue(0); // pic_parameter_set_id
         w.ue(0); // seq_parameter_set_id
         w.flag(true); // entropy_coding_mode_flag

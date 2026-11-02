@@ -1,6 +1,105 @@
-//! MSB-first bitstream writer for the H.264/H.265 packed headers VA-API encode takes from the
-//! application.
+/// Copies `body` into `out` without its emulation prevention bytes (H.264 7.4.1), the length
+/// written.
+pub fn de_emulate(body: &[u8], out: &mut [u8]) -> usize {
+    let mut n = 0;
+    let mut zeros = 0;
+    let mut idx = 0;
+    while idx < body.len() && n < out.len() {
+        let b = body[idx];
+        if zeros >= 2 && b == 0x03 && idx + 1 < body.len() && body[idx + 1] <= 0x03 {
+            zeros = 0;
+            idx += 1;
+            continue;
+        }
+        out[n] = b;
+        n += 1;
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        idx += 1;
+    }
+    n
+}
 
+/// Big-endian bit reader with Exp-Golomb helpers (H.264 9.1).
+pub struct BitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        BitReader { data, pos: 0 }
+    }
+
+    pub fn bit_pos(&self) -> usize {
+        self.pos
+    }
+
+    fn bit(&mut self) -> u32 {
+        let byte = self.pos >> 3;
+        if byte >= self.data.len() {
+            self.pos += 1;
+            return 0;
+        }
+        let shift = 7 - (self.pos & 7);
+        self.pos += 1;
+        ((self.data[byte] >> shift) & 1) as u32
+    }
+
+    pub fn u(&mut self, n: u32) -> u32 {
+        let mut v = 0u32;
+        for _ in 0..n {
+            v = (v << 1) | self.bit();
+        }
+        v
+    }
+
+    pub fn flag(&mut self) -> bool {
+        self.bit() != 0
+    }
+
+    /// Unsigned Exp-Golomb `ue(v)` (9.1).
+    pub fn ue(&mut self) -> u32 {
+        let mut zeros = 0u32;
+        while self.bit() == 0 {
+            zeros += 1;
+            if zeros > 31 {
+                return 0; // malformed guard
+            }
+        }
+        if zeros == 0 {
+            return 0;
+        }
+        let suffix = self.u(zeros);
+        (1u32 << zeros) - 1 + suffix
+    }
+
+    /// Signed Exp-Golomb `se(v)` (9.1.1).
+    pub fn se(&mut self) -> i32 {
+        let k = self.ue();
+        let mag = ((k + 1) >> 1) as i32;
+        if k & 1 == 1 { mag } else { -mag }
+    }
+
+    /// `more_rbsp_data` (7.2).
+    pub fn more_rbsp_data(&self) -> bool {
+        let total_bits = self.data.len() * 8;
+        let mut last_one = None;
+        for i in (0..total_bits).rev() {
+            let byte = i >> 3;
+            let shift = 7 - (i & 7);
+            if (self.data[byte] >> shift) & 1 == 1 {
+                last_one = Some(i);
+                break;
+            }
+        }
+        match last_one {
+            Some(stop) => self.pos < stop,
+            None => false,
+        }
+    }
+}
+
+/// MSB-first writer for H.264 and H.265 headers.
 pub struct BitWriter {
     bytes: Vec<u8>,
     free: u32,

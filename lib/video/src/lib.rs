@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub mod annexb;
+pub mod bits;
 pub mod color;
 pub mod decoder;
 pub mod fixed;
@@ -12,6 +13,8 @@ pub mod format;
 pub mod frame;
 pub mod geometry;
 pub mod gpuframe;
+pub mod h264parse;
+pub mod h265parse;
 pub mod keys;
 pub mod parse;
 pub mod props;

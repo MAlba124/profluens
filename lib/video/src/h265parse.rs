@@ -1,11 +1,7 @@
-//! H.265 Annex-B parsing for VA-API slice-level decode. VPS/SPS/PPS, RPS, slice segment headers
-//! and POC (H.265 7.3, 8.3.1). Main and Main 10 4:2:0 progressive only.
-
 #![allow(clippy::needless_range_loop)]
 
-use profluens_video::fixed::FixedList;
-
-use crate::h264parse::BitReader;
+use crate::bits::BitReader;
+use crate::fixed::FixedList;
 
 // NAL unit types (Table 7-1). The header is 2 bytes.
 pub const NAL_TRAIL_N: u8 = 0;
@@ -134,7 +130,7 @@ fn push_nal(au: &[u8], start: usize, end: usize, out: &mut Vec<Nal>) {
 fn rbsp_of(nal: &[u8]) -> (Vec<u8>, u16) {
     let body = &nal[2.min(nal.len())..];
     let mut out = vec![0; body.len()];
-    let n = crate::h264parse::de_emulate(body, &mut out);
+    let n = crate::bits::de_emulate(body, &mut out);
     out.truncate(n);
     (out, emulation_bytes(body))
 }
@@ -248,7 +244,7 @@ pub struct Sps {
     pub range_ext: u32,
     /// A format range extensions profile (A.3.5), decoded as VA's Main 12.
     pub rext: bool,
-    pub colour: profluens_video::decoder::Color,
+    pub colour: crate::decoder::Color,
 }
 
 /// `range_ext` bits iHD decodes none of, extended_precision_processing_flag and
@@ -616,7 +612,7 @@ fn skip_profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> (bo
     )
 }
 
-/// The VUI past the chroma location, where [`crate::colour::vui_signal`] leaves the reader, to
+/// The VUI past the chroma location, where [`crate::color::vui_signal`] leaves the reader, to
 /// the end (E.2.1).
 fn skip_vui_rest(r: &mut BitReader, max_sub_layers_minus1: u32) {
     r.flag(); // neutral_chroma_indication_flag
@@ -1196,7 +1192,7 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
     let strong_intra_smoothing_enabled_flag = r.flag();
     let vui_parameters_present_flag = r.flag();
     let colour = match vui_parameters_present_flag {
-        true => crate::colour::vui_signal(&mut r),
+        true => crate::color::vui_signal(&mut r),
         false => Default::default(),
     };
     // Main and Main 10 refuse no extension as before. A range extensions profile is taken only
@@ -1497,7 +1493,7 @@ pub fn parse_slice_header_after(
         return None;
     }
     let mut prefix = [0u8; HEADER_PREFIX];
-    let n = crate::h264parse::de_emulate(&nal[2..], &mut prefix);
+    let n = crate::bits::de_emulate(&nal[2..], &mut prefix);
     let mut sh = parse_slice_header_rbsp(&prefix[..n], nal_type, sps, pps, prev);
     if n == HEADER_PREFIX && sh.as_ref().is_none_or(|sh| sh.slice_data_byte_offset as usize > n + 2)
     {
@@ -2075,7 +2071,7 @@ mod tests {
         let prev = parse_slice_header(&first, NAL_IDR_W_RADL, &sps, &pps).expect("parses");
         let pic_size = sps.pic_width_in_ctbs() * sps.pic_height_in_ctbs();
         let address = pic_size / 2;
-        let mut w = crate::bitwriter::BitWriter::new();
+        let mut w = crate::bits::BitWriter::new();
         w.flag(false); // first_slice_segment_in_pic_flag
         w.ue(pps.pps_id);
         w.flag(true); // dependent_slice_segment_flag
@@ -2273,7 +2269,7 @@ mod tests {
         }
     }
 
-    use crate::bitwriter::BitWriter;
+    use crate::bits::BitWriter;
 
     fn pred(w: &mut BitWriter, delta: u32) {
         w.flag(false);

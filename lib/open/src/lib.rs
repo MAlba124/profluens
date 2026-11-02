@@ -244,6 +244,11 @@ pub struct Opened {
 }
 
 impl Opened {
+    /// [`Brand::of`] its head.
+    pub fn brand(&self) -> Brand {
+        Brand::of(self.kind, &self.head)
+    }
+
     pub fn bytes(&self, s: Span) -> &[u8] {
         self.arena.get(s.range()).unwrap_or_default()
     }
@@ -281,6 +286,37 @@ impl Opened {
             .map(|c| (c.time_ns, c.byte))
             .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
         Some(at.map_or(*first_cluster, |c| c.1))
+    }
+}
+
+/// The flavour a container states of itself, by the Matroska DocType or the MP4 `ftyp` brands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Brand {
+    /// A container without flavours.
+    #[default]
+    None,
+    Matroska,
+    WebM,
+    /// ISO base media, `isom`, `mp41`, `mp42` and the rest.
+    Mp4,
+    /// Apple QuickTime, `qt  `.
+    QuickTime,
+    /// MPEG-4 audio, `M4A `, `M4B ` or `M4P `.
+    M4a,
+}
+
+impl Brand {
+    /// The flavour of a file of `kind` whose first bytes are `head`. A Matroska DocType other
+    /// than `webm` is Matroska, an MP4 whose brands name no class is Mp4.
+    pub fn of(kind: Kind, head: &[u8]) -> Brand {
+        match kind {
+            Kind::Mkv => match mkv::doc_type(head) {
+                Some(b"webm") => Brand::WebM,
+                _ => Brand::Matroska,
+            },
+            Kind::Mp4 => mp4::brand(head),
+            _ => Brand::None,
+        }
     }
 }
 
@@ -428,6 +464,51 @@ mod tests {
         0x05, 0xa8, 0x48, 0x80, 0x48, 0x20, 0x00, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00, 0x03, 0x03,
         0x21, 0x00, 0x00, 0x00, 0x01, 0x44, 0x01, 0xc0, 0x73, 0xc1, 0x89,
     ];
+
+    fn ftyp(major: &[u8; 4], compatible: &[&[u8; 4]]) -> Vec<u8> {
+        let mut b = ((16 + 4 * compatible.len()) as u32).to_be_bytes().to_vec();
+        b.extend_from_slice(b"ftyp");
+        b.extend_from_slice(major);
+        b.extend_from_slice(&[0, 0, 2, 0]);
+        compatible.iter().for_each(|c| b.extend_from_slice(*c));
+        b.extend_from_slice(b"\0\0\0\x08qt  ");
+        b
+    }
+
+    fn ebml(doc_type: Option<&[u8]>) -> Vec<u8> {
+        let mut body = vec![0x42, 0x86, 0x81, 0x01];
+        if let Some(d) = doc_type {
+            body.extend_from_slice(&[0x42, 0x82, 0x80 | d.len() as u8]);
+            body.extend_from_slice(d);
+        }
+        body.extend_from_slice(&[0x42, 0x87, 0x81, 0x04]);
+        let mut b = vec![0x1A, 0x45, 0xDF, 0xA3, 0x80 | body.len() as u8];
+        b.extend_from_slice(&body);
+        b.extend_from_slice(&[0x18, 0x53, 0x80, 0x67]);
+        b
+    }
+
+    #[test]
+    fn the_brand_is_the_doctype_or_the_ftyp_class() {
+        assert_eq!(Brand::of(Kind::Mkv, &ebml(Some(b"webm"))), Brand::WebM);
+        assert_eq!(Brand::of(Kind::Mkv, &ebml(Some(b"webm\0\0"))), Brand::WebM, "NUL padded");
+        assert_eq!(Brand::of(Kind::Mkv, &ebml(Some(b"matroska"))), Brand::Matroska);
+        assert_eq!(Brand::of(Kind::Mkv, &ebml(None)), Brand::Matroska, "none stated");
+        assert_eq!(Brand::of(Kind::Mkv, &ebml(Some(b"webm"))[..12]), Brand::Matroska, "cut");
+        assert_eq!(Brand::of(Kind::Mp4, &ftyp(b"qt  ", &[b"qt  "])), Brand::QuickTime);
+        assert_eq!(Brand::of(Kind::Mp4, &ftyp(b"M4A ", &[b"M4A ", b"mp42", b"isom"])), Brand::M4a);
+        assert_eq!(Brand::of(Kind::Mp4, &ftyp(b"isom", &[b"isom", b"iso2", b"avc1"])), Brand::Mp4);
+        assert_eq!(
+            Brand::of(Kind::Mp4, &ftyp(b"CAEP", &[b"CAEP", b"qt  "])),
+            Brand::QuickTime,
+            "a compatible one"
+        );
+        assert_eq!(Brand::of(Kind::Mp4, &ftyp(b"qt  ", &[])[..10]), Brand::Mp4, "cut");
+        // the box that follows is no compatible brand
+        assert_eq!(Brand::of(Kind::Mp4, &ftyp(b"XYZW", &[])), Brand::Mp4);
+        assert_eq!(Brand::of(Kind::Ogg, b"OggS"), Brand::None);
+        assert_eq!(Brand::of(Kind::Mp4, b""), Brand::Mp4);
+    }
 
     /// A track that leaves its colour to the bitstream is PQ by its SPS. A VP9 track keeps the
     /// container's.

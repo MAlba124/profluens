@@ -4,7 +4,7 @@ mod common;
 
 use common::*;
 use pf_avi::Idx1At;
-use pf_open::{Caps, Index, Kind, Meta, TrackKind, Want};
+use pf_open::{Brand, Caps, Index, Kind, Meta, TrackKind, Want};
 use pf_probe::head::{AviHeadAt, Mp4HeadAt};
 use profluens_core::fetch::{Need, Window};
 
@@ -155,4 +155,19 @@ fn what_is_not_opened_here_says_so() {
     let ts = fixture("plugins/formats/ts/tests/fixtures/h264_aac.ts");
     let (o, _) = open_with(&ts, Want::ALL, Caps::default());
     assert_eq!(o.err(), Some(pf_open::OpenError::Unsupported(Kind::Ts)));
+}
+
+#[test]
+fn an_open_states_its_brand() {
+    assert_eq!(open(&own("tone.webm")).brand(), Brand::WebM);
+    assert_eq!(open(&own("tagged.mkv")).brand(), Brand::Matroska);
+    assert_eq!(open(&own("tone.m4a")).brand(), Brand::M4a);
+    let mut b = fixture("plugins/formats/mp4/tests/fixtures/tiny_av.mp4");
+    assert_eq!(open(&b).brand(), Brand::Mp4);
+    // the same movie stated QuickTime, the major and every compatible brand
+    for at in (8..32).step_by(4).filter(|&at| at != 12) {
+        b[at..at + 4].copy_from_slice(b"qt  ");
+    }
+    let o = open(&b);
+    assert_eq!((o.kind, o.brand(), o.tracks.len()), (Kind::Mp4, Brand::QuickTime, 2));
 }

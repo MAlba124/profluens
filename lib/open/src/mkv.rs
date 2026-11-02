@@ -39,6 +39,25 @@ pub(crate) fn head_in(window: &[u8], max: u64) -> Option<usize> {
     None
 }
 
+/// The DocType of the EBML header leading `head`, None where it states none or is cut.
+pub(crate) fn doc_type(head: &[u8]) -> Option<&[u8]> {
+    let ebml = read_element_header(head, 0).ok()?;
+    if ebml.id != id::EBML {
+        return None;
+    }
+    let end = ebml.data_end().ok()??.min(head.len());
+    let mut at = ebml.data_start;
+    while at < end {
+        let h = read_element_header(head, at).ok()?;
+        let next = h.data_end().ok()??;
+        if h.id == id::DOC_TYPE {
+            return head.get(h.data_start..next).map(pf_mkv::ebml::read_string);
+        }
+        at = next;
+    }
+    None
+}
+
 /// Where the Cues and the Tags of `head` lie, absolute, by its SeekHead and its own elements.
 pub(crate) fn places(head: &[u8]) -> (Option<u64>, Option<u64>, Option<u64>) {
     let cues = pf_mkv::parse_seek_head(head)

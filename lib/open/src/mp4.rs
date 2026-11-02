@@ -1,6 +1,6 @@
 use pf_mp4::{Mp4Reader, Reframer, TrackKind as Mp4Kind};
 
-use crate::{Desc, OpenError, TrackDesc, TrackKind};
+use crate::{Brand, Desc, OpenError, TrackDesc, TrackKind};
 
 /// RFC 7845 section 4.6 asks Opus for 80 ms of decoding ahead of a seek target, the Opus in
 /// ISOBMFF mapping states the same roll.
@@ -63,6 +63,33 @@ pub(crate) fn describe(head: &[u8], d: &mut Desc) -> Result<u64, OpenError> {
         return Err(OpenError::NoStreams);
     }
     Ok(duration)
+}
+
+/// The class a single `ftyp` brand names, ISO/IEC 14496-12 section 4.3 and the MP4 registration
+/// authority's list.
+fn class(b: &[u8]) -> Option<Brand> {
+    match b {
+        b"qt  " => Some(Brand::QuickTime),
+        b"M4A " | b"M4B " | b"M4P " => Some(Brand::M4a),
+        b"mp41" | b"mp42" | b"mp71" | b"avc1" | b"dash" | b"M4V " | b"M4VH" | b"M4VP" => {
+            Some(Brand::Mp4)
+        }
+        b if b.starts_with(b"iso") => Some(Brand::Mp4),
+        _ => None,
+    }
+}
+
+/// The class of the `ftyp` leading `head`, the major brand's, else the first compatible brand
+/// that names one, else Mp4.
+pub(crate) fn brand(head: &[u8]) -> Brand {
+    let Some(hdr) = head.get(..8).filter(|h| &h[4..8] == b"ftyp") else { return Brand::Mp4 };
+    let size = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+    let Some(body) = head.get(8..size.max(8).min(head.len())) else { return Brand::Mp4 };
+    let major = body.get(..4).and_then(class);
+    // the minor version sits between the major brand and the compatible ones
+    let compatible =
+        body.get(8..).unwrap_or_default().as_chunks::<4>().0.iter().find_map(|b| class(b));
+    major.or(compatible).unwrap_or(Brand::Mp4)
 }
 
 /// Top level boxes walked for the `moov` and the `mdat`, as the head machine walks them.

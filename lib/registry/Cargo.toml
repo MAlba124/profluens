@@ -14,3 +14,20 @@ profluens-core = { path = "../../core" }
 [dev-dependencies]
 # Converters for the convert tests.
 profluens-audio = { path = "../audio" }
+# The catalog test, every plugin set a player links.
+profluens-video = { path = "../video" }
+pf-opus = { path = "../../plugins/audio/opus" }
+pf-libflac = { path = "../../plugins/audio/libflac", features = ["encoder"] }
+pf-libav = { path = "../../plugins/libav" }
+pf-vaapi = { path = "../../plugins/hw/vaapi" }
+pf-av1 = { path = "../../plugins/video/av1" }
+pf-text = { path = "../../plugins/text" }
+pf-subparse = { path = "../../plugins/subparse" }
+pf-mkv = { path = "../../plugins/formats/mkv" }
+pf-mp4 = { path = "../../plugins/formats/mp4" }
+pf-avi = { path = "../../plugins/formats/avi" }
+pf-flv = { path = "../../plugins/formats/flv" }
+pf-ogg = { path = "../../plugins/formats/ogg" }
+pf-ps = { path = "../../plugins/formats/ps" }
+pf-tsdemux = { path = "../../plugins/formats/tsdemux" }
+pf-bare = { path = "../../plugins/formats/bare" }

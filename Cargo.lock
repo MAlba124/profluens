@@ -420,8 +420,24 @@ dependencies = [
 name = "pf-registry"
 version = "0.1.0"
 dependencies = [
+ "pf-av1",
+ "pf-avi",
+ "pf-bare",
+ "pf-flv",
+ "pf-libav",
+ "pf-libflac",
+ "pf-mkv",
+ "pf-mp4",
+ "pf-ogg",
+ "pf-opus",
+ "pf-ps",
+ "pf-subparse",
+ "pf-text",
+ "pf-tsdemux",
+ "pf-vaapi",
  "profluens-audio",
  "profluens-core",
+ "profluens-video",
 ]
 
 [[package]]

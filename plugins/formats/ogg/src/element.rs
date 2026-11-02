@@ -238,6 +238,8 @@ pub struct OggDemux {
     tail: Vec<u8>,
     tail_at: Tail,
     tail_want: u32,
+    /// The duration the caller knows, published without a tail read.
+    known: Option<u64>,
     ident: Option<Vec<u8>>,
     published: bool,
     feed: Feed,
@@ -282,6 +284,7 @@ impl Default for OggDemux {
             tail: Vec::new(),
             tail_at: Tail::Absent,
             tail_want: OGG_TAIL_FIRST as u32,
+            known: None,
             ident: None,
             published: false,
             feed: Feed::new(WINDOW_FIRST, WINDOW_DEPTH),
@@ -324,6 +327,12 @@ impl OggDemux {
         let mut d = Self { len, tail, tail_at: Tail::In, ..Self::default() };
         d.feed.set_end(len);
         d
+    }
+
+    /// Publishes `ns` as the duration and asks no tail, for a file an earlier run timed.
+    pub fn with_duration(mut self, ns: u64) -> Self {
+        (self.known, self.tail_at) = (Some(ns), Tail::In);
+        self
     }
 
     /// The demuxer of the file whose first bytes are `head`, enough of them to hold every bos page
@@ -446,7 +455,7 @@ impl OggDemux {
         if std::mem::replace(&mut self.published, true) {
             return;
         }
-        let duration = crate::stream_duration_ns(bos, &self.tail, serial);
+        let duration = self.known.or_else(|| crate::stream_duration_ns(bos, &self.tail, serial));
         let tail = self.tail.len();
         self.tail = Vec::new();
         match duration {

@@ -712,6 +712,43 @@ fn the_windows_do_not_wait_on_the_tail() {
     }
 }
 
+#[test]
+fn a_known_duration_asks_no_tail() {
+    for path in fixtures() {
+        let what = path.display();
+        let data = Arc::new(std::fs::read(path).unwrap());
+        let len = data.len() as u64;
+        let push = demux(path, PUSH);
+        let known = push.index.as_deref().and_then(|i| i.duration.nanos()).expect("timed");
+        let log = Arc::new(Mutex::new(TailLog::default()));
+        let clock = MockClock::new();
+        let shared: Arc<dyn Clock> = Arc::new(clock.clone());
+        let mut p = Pipeline::with(DebugSpec::default(), false, Arc::clone(&shared));
+        p.set_pool(4096, 16);
+        let src = p.add(TailLast {
+            data: Arc::clone(&data),
+            tails: tails(len),
+            held: Vec::new(),
+            tail_held: None,
+            log: Arc::clone(&log),
+        });
+        let oggdemux = p.add(OggDemux::with_len(Some(len)).with_duration(known));
+        p.set_element_pool_bytes(oggdemux, 4096, 8, 128 << 10);
+        let evs = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let rec = p.add(Rec { evs: Arc::clone(&evs), seen: Arc::clone(&seen) });
+        p.link(src.src(SrcPad(0)), oggdemux.sink(OggDemux::IN)).expect("src ! oggdemux");
+        p.link(oggdemux.src(OggDemux::OUT), rec.sink(SinkPad(0))).expect("oggdemux ! rec");
+        let taps = p.tap_handle();
+        let run = p.step(Arc::clone(&shared)).expect("step");
+        step(run, &clock, None, &seen, 1);
+        let log = log.lock().unwrap();
+        assert!(!log.taken.is_empty() && !log.taken.contains(&true), "{what}: {:?}", log.taken);
+        assert_same(&push.evs, &evs.lock().unwrap(), &format!("{what}"));
+        assert_eq!(taps.index(oggdemux), push.index, "{what}: the index");
+    }
+}
+
 fn by_serial(data: &[u8]) -> Vec<(u32, Vec<Vec<u8>>)> {
     let mut out: Vec<(u32, Vec<Vec<u8>>)> = Vec::new();
     for p in demux_all(data) {

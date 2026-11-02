@@ -194,23 +194,8 @@ impl Layout {
         Some(layout)
     }
 
-    /// Frames to decode ahead so a frame comes out whole, reaching back over the bit reservoir
-    /// (ISO/IEC 11172-3 2.4.2.7 `main_data_begin`) at the smallest frame.
     fn preroll_frames(&self) -> u64 {
-        let reservoir: u64 = match (self.stream.layer, self.stream.lsf) {
-            (3, false) => 511,
-            (3, true) => 255,
-            _ => 0,
-        };
-        let smallest = match self.cbr {
-            Some((num, den)) => num / den,
-            None => {
-                u64::from(if self.stream.lsf { 8u32 } else { 32 })
-                    * if self.stream.lsf { 72_000 } else { 144_000 }
-                    / u64::from(self.rate.max(1))
-            }
-        };
-        (2 + reservoir.div_ceil(smallest.max(1))).min(PREROLL_MAX)
+        preroll_frames(&self.stream, self.cbr)
     }
 
     pub fn coded(&self, k: u64) -> u64 {
@@ -285,6 +270,26 @@ impl Layout {
         }
         Some(entries)
     }
+}
+
+/// Frames to decode ahead so a frame comes out whole, reaching back over the bit reservoir
+/// (ISO/IEC 11172-3 2.4.2.7 `main_data_begin`) at the smallest frame of `stream`, a CBR one's
+/// `cbr` bytes per frame.
+pub fn preroll_frames(stream: &Header, cbr: Option<(u64, u64)>) -> u64 {
+    let reservoir: u64 = match (stream.layer, stream.lsf) {
+        (3, false) => 511,
+        (3, true) => 255,
+        _ => 0,
+    };
+    let smallest = match cbr {
+        Some((num, den)) => num / den.max(1),
+        None => {
+            u64::from(if stream.lsf { 8u32 } else { 32 })
+                * if stream.lsf { 72_000 } else { 144_000 }
+                / u64::from(stream.sample_rate_hz.max(1))
+        }
+    };
+    (2 + reservoir.div_ceil(smallest.max(1))).min(PREROLL_MAX)
 }
 
 /// The frame size when every frame is of one bitrate, by the window's frames and the VBR header.

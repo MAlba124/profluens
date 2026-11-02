@@ -30,6 +30,7 @@ mod gate;
 #[path = "../tests/inputs/mod.rs"]
 mod inputs;
 
+pub use item::of;
 pub use parallel::{scan_parallel, scan_parallel_with};
 pub use scanner::{ReactorKind, Scanner};
 pub use sniff::Format;

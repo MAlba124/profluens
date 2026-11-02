@@ -28,6 +28,8 @@ pf-mkv = { path = "../formats/mkv" }
 pf-mp3 = { path = "../audio/mp3" }
 pf-mp4 = { path = "../formats/mp4" }
 pf-ogg = { path = "../formats/ogg" }
+# The tag bytes an open read, pf-open depends on no tags crate.
+pf-open = { path = "../../lib/open" }
 
 [features]
 default = []

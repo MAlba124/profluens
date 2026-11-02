@@ -336,6 +336,40 @@ pub fn mkv(meta: pf_mkv::walk::Meta) -> ItemTags {
     c.finish()
 }
 
+/// The tags and pictures of a file as its open read them, none when they were not wanted. A
+/// Matroska file's pictures are copied, [`taken`] moves them.
+pub fn of(o: &pf_open::Opened) -> ItemTags {
+    match &o.meta {
+        pf_open::Meta::Mkv(m) => mkv(m.clone()),
+        meta => read(o, meta),
+    }
+}
+
+/// [`of`] with the tag bytes moved out of the open.
+pub fn taken(o: &mut pf_open::Opened) -> ItemTags {
+    match std::mem::take(&mut o.meta) {
+        pf_open::Meta::Mkv(m) => mkv(m),
+        meta => read(o, &meta),
+    }
+}
+
+fn read(o: &pf_open::Opened, meta: &pf_open::Meta) -> ItemTags {
+    use pf_open::Meta;
+    let scratch = Arena::default();
+    match meta {
+        Meta::None | Meta::Mkv(_) => ItemTags::default(),
+        Meta::Bare { raw, flac: true } => {
+            let span = |r| raw.span(r);
+            flac(raw.comments.iter().map(span), raw.pictures.iter().map(span))
+        }
+        Meta::Bare { raw, flac: false } => id3(raw.id3v2(), &raw.ape, &raw.v1, &scratch),
+        Meta::Moov(r) => {
+            o.head.get(r.clone()).map_or_else(ItemTags::default, |m| moov(m, &scratch))
+        }
+        Meta::Ogg(s) => ogg(o.bytes(*s), &scratch),
+    }
+}
+
 /// What a [`crate::Scanner`] found in a file, its pictures untyped.
 // Owned result, once per item.
 #[allow(clippy::disallowed_methods)]

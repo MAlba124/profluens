@@ -447,6 +447,7 @@ dependencies = [
  "pf-mp3",
  "pf-mp4",
  "pf-ogg",
+ "pf-open",
  "pf-reactor",
  "pf-sim",
  "profluens-core",

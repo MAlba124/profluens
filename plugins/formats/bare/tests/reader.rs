@@ -3,11 +3,17 @@
 //! Matroska track's.
 
 // A test's own fixtures and timing, not an element.
-#![allow(clippy::disallowed_methods, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 
-use pf_bare::fixture::{flac_file, flac_frame_header, reader};
-use pf_bare::{BareError, BareHead, BareKind, Codec, RawTags, Reader, Unit, open};
-use std::cell::Cell;
+use pf_bare::fixture::{flac_file, flac_frame_header};
+use pf_bare::{BareError, BareHead, BareKind, Codec, OpenAt, RawTags, Reader, Unit};
+use profluens_core::fetch::{Fetch, Step, drive_file, drive_slice, drive_slice_log};
 
 const MS: i64 = 1_000_000;
 
@@ -15,8 +21,12 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
 }
 
+fn open(bytes: &[u8], kind: BareKind) -> Result<(BareHead, RawTags), BareError> {
+    drive_slice(&mut OpenAt::new(bytes.len() as u64, kind), bytes)
+}
+
 fn opened(bytes: &[u8], kind: BareKind) -> (BareHead, RawTags) {
-    open(&mut reader(bytes), bytes.len() as u64, kind).unwrap()
+    open(bytes, kind).unwrap()
 }
 
 fn head(bytes: &[u8], kind: BareKind) -> BareHead {
@@ -24,14 +34,21 @@ fn head(bytes: &[u8], kind: BareKind) -> BareHead {
 }
 
 /// Every unit from where `rd` is, with its bytes.
+fn next(h: &BareHead, bytes: &[u8], rd: &mut Reader) -> Result<Option<Unit>, BareError> {
+    drive_slice(&mut rd.next(h), bytes)
+}
+
 fn drain(h: &BareHead, rd: &mut Reader, bytes: &[u8]) -> Vec<(Unit, Vec<u8>)> {
-    let mut r = reader(bytes);
     let mut out = Vec::new();
-    while let Some(u) = rd.next(h, &mut r).unwrap() {
+    while let Some(u) = next(h, bytes, rd).unwrap() {
         out.push((u, rd.bytes(&u).to_vec()));
     }
-    assert!(rd.next(h, &mut r).unwrap().is_none(), "the end stays the end");
+    assert!(next(h, bytes, rd).unwrap().is_none(), "the end stays the end");
     out
+}
+
+fn seek(h: &BareHead, bytes: &[u8], rd: &mut Reader, ns: i64) -> Result<(), BareError> {
+    drive_slice(&mut rd.seek(h, ns), bytes)
 }
 
 /// The CodecPrivate and the frames of the one track of a Matroska file.
@@ -46,8 +63,8 @@ fn mkv(bytes: &[u8]) -> (Vec<u8>, Vec<(i64, Vec<u8>)>) {
 }
 
 fn seek_to(h: &BareHead, bytes: &[u8], rd: &mut Reader, ns: i64) -> Unit {
-    rd.seek(h, &mut reader(bytes), ns).unwrap();
-    rd.next(h, &mut reader(bytes)).unwrap().unwrap()
+    seek(h, bytes, rd, ns).unwrap();
+    next(h, bytes, rd).unwrap().unwrap()
 }
 
 #[test]
@@ -80,7 +97,7 @@ fn flac_is_the_matroska_track_frame_for_frame() {
     assert_eq!((u.pts_ns, rd.bytes(&u)), (1_152 * MS, &frames[12].1[..]));
     let u = seek_to(&h, &b, &mut rd, 60_000 * MS);
     assert_eq!(rd.bytes(&u), &frames[20].1[..], "past the end, the last frame");
-    assert!(rd.next(&h, &mut reader(&b)).unwrap().is_none());
+    assert!(next(&h, &b, &mut rd).unwrap().is_none());
 }
 
 #[test]
@@ -163,17 +180,11 @@ fn the_tag_bytes_come_back_raw() {
     assert_eq!((t.v1, h.end), (v1, len));
 }
 
-/// A reader over `bytes` that counts what it hands out.
-fn counting<'a>(
-    bytes: &'a [u8],
-    n: &'a Cell<u64>,
-) -> impl FnMut(u64, &mut [u8]) -> std::io::Result<usize> + 'a {
-    let mut r = reader(bytes);
-    move |off, buf| {
-        let k = r(off, buf)?;
-        n.set(n.get() + k as u64);
-        Ok(k)
-    }
+/// `m` over `bytes`, and the bytes it read.
+fn counted<F: Fetch>(m: &mut F, bytes: &[u8]) -> (Result<F::Out, F::Err>, u64) {
+    let mut log = Vec::new();
+    let out = drive_slice_log(m, bytes, &mut log);
+    (out, log.iter().map(|n| (n.len as u64).min((bytes.len() as u64).saturating_sub(n.at))).sum())
 }
 
 #[test]
@@ -182,27 +193,27 @@ fn flac_opens_and_seeks_without_reading_the_file() {
         // about 5 MB, 2000 frames of 4096 samples
         let f = flac_file(2000, 777, &[], table);
         let len = f.bytes.len() as u64;
-        let n = Cell::new(0);
-        let (h, _) = open(&mut counting(&f.bytes, &n), len, BareKind::Flac).unwrap();
-        assert!(n.get() <= (128 << 10) + 160, "the head and the tail, {} bytes", n.get());
+        let (opened, n) = counted(&mut OpenAt::new(len, BareKind::Flac), &f.bytes);
+        let (h, _) = opened.unwrap();
+        assert!(n <= (128 << 10) + 160, "the head and the tail, {n} bytes");
         assert_eq!(h.points.len(), if table { 200 } else { 0 });
         assert_eq!(h.duration_ns, h.ns(1999 * 4096 + 777));
         let mut rd = Reader::new(&h);
         for target_frame in [0usize, 1, 7, 500, 1234, 1998, 1999] {
             let at = h.ns(f.frames[target_frame].2 + 1000);
-            n.set(0);
-            rd.seek(&h, &mut counting(&f.bytes, &n), at).unwrap();
-            let u = rd.next(&h, &mut reader(&f.bytes)).unwrap().unwrap();
+            let (sought, n) = counted(&mut rd.seek(&h, at), &f.bytes);
+            sought.unwrap();
+            let u = next(&h, &f.bytes, &mut rd).unwrap().unwrap();
             let (off, flen, sample) = f.frames[target_frame];
             assert_eq!(
                 (u.off, u.len, u.pts_ns),
                 (off, flen, h.ns(sample)),
                 "table={table} frame {target_frame}"
             );
-            assert!(n.get() < 2 << 20, "table={table} frame {target_frame} read {} bytes", n.get());
+            assert!(n < 2 << 20, "table={table} frame {target_frame} read {n} bytes");
         }
         // the rest plays on from a seek, to the short last frame
-        rd.seek(&h, &mut reader(&f.bytes), h.ns(1990 * 4096)).unwrap();
+        seek(&h, &f.bytes, &mut rd, h.ns(1990 * 4096)).unwrap();
         let rest = drain(&h, &mut rd, &f.bytes);
         assert_eq!(rest.len(), 10);
         assert_eq!(
@@ -298,14 +309,11 @@ fn vbr_mp3_seeks_by_its_table_then_counts() {
 fn broken_files_are_refused() {
     let junk = b"nothing like audio at all".repeat(100);
     for kind in [BareKind::Flac, BareKind::Mp3, BareKind::Adts] {
-        assert!(open(&mut reader(&junk), junk.len() as u64, kind).is_err(), "{kind:?}");
+        assert!(open(&junk, kind).is_err(), "{kind:?}");
     }
     let mut f = flac_file(3, 100, &[], false).bytes;
     f.truncate(30);
-    assert!(matches!(
-        open(&mut reader(&f), f.len() as u64, BareKind::Flac),
-        Err(BareError::Malformed(_))
-    ));
+    assert!(matches!(open(&f, BareKind::Flac), Err(BareError::Malformed(_))));
     let flac = flac_file(3, 100, &[], false);
     let h = head(&flac.bytes, BareKind::Flac);
     assert!(matches!(h.codec, Codec::Flac { variable: false, .. }));
@@ -339,16 +347,16 @@ fn damage_never_hangs_or_panics() {
             if round % 4 == 0 {
                 b.truncate((rnd() % b.len() as u64) as usize);
             }
-            let Ok((h, _)) = open(&mut reader(&b), b.len() as u64, *kind) else { continue };
+            let Ok((h, _)) = open(&b, *kind) else { continue };
             let mut rd = Reader::new(&h);
             let mut n = 0;
-            while let Ok(Some(_)) = rd.next(&h, &mut reader(&b)) {
+            while let Ok(Some(_)) = next(&h, &b, &mut rd) {
                 n += 1;
                 assert!(n < 100_000, "{kind:?} round {round} never ends");
             }
             for at in [0, 700 * MS, 1_500 * MS, 90_000 * MS] {
-                let _ = rd.seek(&h, &mut reader(&b), at);
-                let _ = rd.next(&h, &mut reader(&b));
+                let _ = seek(&h, &b, &mut rd, at);
+                let _ = next(&h, &b, &mut rd);
             }
         }
     }
@@ -380,10 +388,7 @@ fn a_seek_point_past_u64_is_dropped() {
 fn endless_metadata_is_refused() {
     let pad: Vec<(u8, Vec<u8>)> = (0..2000).map(|_| (1, Vec::new())).collect();
     let f = flac_file(3, 100, &pad, false);
-    assert!(matches!(
-        open(&mut reader(&f.bytes), f.bytes.len() as u64, BareKind::Flac),
-        Err(BareError::Malformed(_))
-    ));
+    assert!(matches!(open(&f.bytes, BareKind::Flac), Err(BareError::Malformed(_))));
 }
 
 /// A FLAC whose first frame is followed by megabytes of headers that pass their CRC but
@@ -408,12 +413,12 @@ fn headers_that_never_chain_end_in_bounded_time() {
     let t = std::time::Instant::now();
     let mut rd = Reader::new(&h);
     let mut n = 0;
-    while let Ok(Some(_)) = rd.next(&h, &mut reader(&b)) {
+    while let Ok(Some(_)) = next(&h, &b, &mut rd) {
         n += 1;
         assert!(n < 1000);
     }
-    let _ = rd.seek(&h, &mut reader(&b), 30_000 * MS);
-    let _ = rd.next(&h, &mut reader(&b));
+    let _ = seek(&h, &b, &mut rd, 30_000 * MS);
+    let _ = next(&h, &b, &mut rd);
     assert!(t.elapsed() < std::time::Duration::from_secs(20), "took {:?}", t.elapsed());
 }
 
@@ -433,7 +438,7 @@ fn a_long_frame_at_a_low_rate_saturates_its_duration() {
     }
     let h = head(&b, BareKind::Flac);
     let mut rd = Reader::new(&h);
-    let u = rd.next(&h, &mut reader(&b)).unwrap().unwrap();
+    let u = next(&h, &b, &mut rd).unwrap().unwrap();
     assert_eq!((u.pts_ns, u.dur_ns), (0, u32::MAX));
 }
 
@@ -442,7 +447,7 @@ fn a_xing_frame_past_the_end_leaves_no_audio() {
     let (b, offs) = vbr(20);
     for cut in 40..offs[0] as usize + 8 {
         let b = &b[..cut];
-        if let Ok((h, _)) = open(&mut reader(b), b.len() as u64, BareKind::Mp3) {
+        if let Ok((h, _)) = open(b, BareKind::Mp3) {
             assert!(
                 h.first <= h.end && h.end <= b.len() as u64,
                 "cut {cut}, first {} end {}",
@@ -462,10 +467,59 @@ fn seeks_to_the_ends_of_time_stay_in_the_file() {
         let h = head(&b, kind);
         let mut rd = Reader::new(&h);
         for at in [i64::MIN, -1, i64::MAX] {
-            rd.seek(&h, &mut reader(&b), at).unwrap();
-            if let Some(u) = rd.next(&h, &mut reader(&b)).unwrap() {
+            seek(&h, &b, &mut rd, at).unwrap();
+            if let Some(u) = next(&h, &b, &mut rd).unwrap() {
                 assert!(u.off + u64::from(u.len) <= h.end, "{name} at {at}");
             }
         }
     }
+}
+
+/// The file driver reads what the slice driver does, a read error is the caller's.
+#[test]
+fn a_file_on_disk_reads_alike_and_its_errors_are_io() {
+    let b = fixture("tone.flac");
+    let path = std::env::temp_dir().join(format!("pf-bare-disk-{}.flac", std::process::id()));
+    std::fs::write(&path, &b).unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    let (h, tags) = drive_file(&mut OpenAt::new(b.len() as u64, BareKind::Flac), &file).unwrap();
+    assert_eq!((&h, &tags), (&opened(&b, BareKind::Flac).0, &opened(&b, BareKind::Flac).1));
+    let mut rd = Reader::new(&h);
+    let mut from_disk = Vec::new();
+    while let Some(u) = drive_file(&mut rd.next(&h), &file).map_err(BareError::from).unwrap() {
+        from_disk.push((u, rd.bytes(&u).to_vec()));
+    }
+    assert_eq!(from_disk, drain(&h, &mut Reader::new(&h), &b));
+    drive_file(&mut rd.seek(&h, 1_234 * MS), &file).unwrap();
+    let u = drive_file(&mut rd.next(&h), &file).unwrap().unwrap();
+    assert_eq!(u, seek_to(&h, &b, &mut Reader::new(&h), 1_234 * MS));
+    // a file open for writing alone refuses reads
+    let write_only = std::fs::File::options().append(true).open(&path).unwrap();
+    let e = drive_file(&mut Reader::new(&h).next(&h), &write_only).unwrap_err();
+    let _ = std::fs::remove_file(&path);
+    assert!(matches!(BareError::from(e), BareError::Io(_)), "{e:?}");
+}
+
+/// A read the caller never answered leaves the reader as it was before it.
+#[test]
+fn a_machine_dropped_half_way_leaves_the_reader_whole() {
+    // about 900 KB, the window holds a seventh of it
+    let f = flac_file(400, 1000, &[], false);
+    let h = opened(&f.bytes, BareKind::Flac).0;
+    let mut rd = Reader::new(&h);
+    {
+        let mut m = rd.next(&h);
+        assert!(matches!(m.poll(), Ok(Step::Need(_))), "a read first");
+    }
+    let first = next(&h, &f.bytes, &mut rd).unwrap().unwrap();
+    assert_eq!((first.off, first.len), (f.frames[0].0, f.frames[0].1), "the fill read again");
+    {
+        let mut m = rd.seek(&h, h.ns(300 * 4096));
+        assert!(matches!(m.poll(), Ok(Step::Need(_))), "a probe past the window");
+    }
+    seek(&h, &f.bytes, &mut rd, 0).unwrap();
+    assert_eq!(next(&h, &f.bytes, &mut rd).unwrap(), Some(first));
+    let rest = drain(&h, &mut rd, &f.bytes);
+    assert_eq!(rest.len(), 399);
+    assert!(rest.iter().all(|(u, b)| b[..] == f.bytes[u.off as usize..][..u.len as usize]));
 }

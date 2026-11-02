@@ -1,14 +1,15 @@
-//! What a bare file is, read once at open from its head and its tail through the caller's
-//! callback. A FLAC file's metadata blocks, an MPEG audio file's Xing frame, an ADTS file's
+//! What a bare file is, read once at open from its head and its tail, [`OpenAt`] asks the caller
+//! for the bytes. A FLAC file's metadata blocks, an MPEG audio file's Xing frame, an ADTS file's
 //! first frames, and the trailing ID3v1 and APEv2 tags that the audio ends before.
 
 // Cold, the opener runs once per file.
 #![allow(clippy::disallowed_methods)]
 
+use crate::BareError;
 use crate::flac::{self, MAX_HEADER, STREAMINFO_LEN, StreamInfo};
 use crate::reader::header;
-use crate::{BareError, ReadAt};
 use pf_mp3::frame::Header as MpaHeader;
+use profluens_core::fetch::{Fetch, Need, Step};
 use std::ops::Range;
 
 /// The head read at open, the metadata or the ID3v2 tag and the first frames.
@@ -157,173 +158,314 @@ pub(crate) fn adts(b: &[u8]) -> Option<(u8, u8, u8, u64, u64, u32)> {
     (sfi < 13 && len > skip).then_some((profile, sfi, ch, len, skip, blocks * 1024))
 }
 
-/// Appends up to `n` bytes of the file from `off` to `buf`, fewer at its end.
-fn append(read: &mut ReadAt<'_>, off: u64, buf: &mut Vec<u8>, n: usize) -> Result<(), BareError> {
-    let start = buf.len();
-    buf.resize(start + n, 0);
-    let mut got = 0;
-    while got < n {
-        let Some(at) = off.checked_add(got as u64) else { break };
-        let k = read(at, &mut buf[start + got..]).map_err(|e| BareError::Io(e.kind()))?;
-        if k == 0 {
-            break;
-        }
-        got += k.min(n - got);
-    }
-    buf.truncate(start + got);
-    Ok(())
+/// The read in flight of [`OpenAt`], or the step it runs next when it needs none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenState {
+    Start,
+    /// The file's first [`HEAD`] bytes.
+    Head,
+    /// FLAC, the bytes through the `fLaC` magic.
+    Magic,
+    /// FLAC, the header of the `n`th metadata block at `p`.
+    Block {
+        p: u64,
+        n: usize,
+    },
+    /// FLAC, the body of the block at `p` and the header behind it.
+    Body {
+        p: u64,
+        n: usize,
+    },
+    /// MPEG audio and ADTS, the ID3v2 tag and a window of audio behind it.
+    Window,
+    /// The tail, the audio from `from` on.
+    Tail {
+        from: u64,
+    },
+    /// An APEv2 tag that ends `cut` bytes before the end, before an ID3v1 tag of `v1`.
+    Ape {
+        cut: u64,
+        v1: usize,
+    },
+    /// FLAC, the first frame's header, the audio ending at `end`.
+    Frame {
+        end: u64,
+    },
 }
 
-/// Grows `head`, the file from byte 0, to `to` bytes in one read.
-fn extend(read: &mut ReadAt<'_>, head: &mut Vec<u8>, to: u64, len: u64) -> Result<(), BareError> {
-    let to = to.min(len);
-    if to as usize <= head.len() {
-        return Ok(());
-    }
-    if to > MAX_META {
-        return Err(BareError::TooLarge);
-    }
-    append(read, head.len() as u64, head, to as usize - head.len())
-}
-
-/// Reads the trailing ID3v1 and APEv2 tags into `tags`, where the audio ends.
-fn trailers(
-    read: &mut ReadAt<'_>,
-    len: u64,
-    from: u64,
-    tags: &mut RawTags,
-) -> Result<u64, BareError> {
-    let from = from.min(len);
-    let at = len.saturating_sub(TAIL).max(from);
-    let mut tail = Vec::new();
-    append(read, at, &mut tail, (len - at) as usize)?;
-    let v1 =
-        if tail.len() >= 128 && tail[tail.len() - 128..].starts_with(b"TAG") { 128 } else { 0 };
-    let before = &tail[..tail.len() - v1];
-    let ape = pf_mp3::id3::ape_tail_len(before)
-        .map_or(0, |n| n as u64)
-        .min(len - from - (v1 as u64).min(len - from));
-    let cut = v1 as u64 + ape;
-    if ape > 0 && ape <= MAX_APE {
-        append(read, len - cut, &mut tags.ape, ape as usize)?;
-    }
-    tail.drain(..tail.len() - v1);
-    tags.v1 = tail;
-    Ok(len - cut)
-}
-
-/// Opens a bare FLAC, MP3 or ADTS file of `len` bytes through `read`, the head, the trailing
-/// tags, and the tag bytes the file holds.
-pub fn open(
-    read: &mut ReadAt<'_>,
+/// Opens a bare FLAC, MP3 or ADTS file of `len` bytes, the head, the trailing tags, and the tag
+/// bytes the file holds. The head grows a read at a time, the tail is read once.
+#[derive(Debug)]
+pub struct OpenAt {
     len: u64,
     kind: BareKind,
-) -> Result<(BareHead, RawTags), BareError> {
-    let mut tags = RawTags::default();
-    extend(read, &mut tags.head, HEAD, len)?;
-    let tag = pf_mp3::id3::v2_total_len(&tags.head).map_or(0, |n| n as u64);
-    let h = match kind {
-        BareKind::Flac => open_flac(read, len, tag, &mut tags)?,
-        BareKind::Mp3 | BareKind::Adts => open_frames(read, len, tag, kind, &mut tags)?,
-    };
-    Ok((h, tags))
+    state: OpenState,
+    tags: RawTags,
+    /// The tail read, the ID3v1 tag once the audio's end is known.
+    tail: Vec<u8>,
+    /// Where the read in flight starts in its buffer.
+    from: usize,
+    /// The ID3v2 tag's length.
+    tag: u64,
+    si: Option<StreamInfo>,
+    si_bytes: [u8; STREAMINFO_LEN],
+    seek: Vec<(u64, u64)>,
+    first: u64,
 }
 
-fn open_flac(
-    read: &mut ReadAt<'_>,
-    len: u64,
-    tag: u64,
-    tags: &mut RawTags,
-) -> Result<BareHead, BareError> {
-    extend(read, &mut tags.head, tag + 8, len)?;
-    if tags.head.get(tag as usize..tag as usize + 4) != Some(b"fLaC") {
-        return Err(BareError::NoStreams);
+impl OpenAt {
+    pub fn new(len: u64, kind: BareKind) -> Self {
+        OpenAt {
+            len,
+            kind,
+            state: OpenState::Start,
+            tags: RawTags::default(),
+            tail: Vec::new(),
+            from: 0,
+            tag: 0,
+            si: None,
+            si_bytes: [0; STREAMINFO_LEN],
+            seek: Vec::new(),
+            first: 0,
+        }
     }
-    tags.id3v2 = tag as usize;
-    let (mut si, mut si_bytes, mut seek) = (None, [0u8; STREAMINFO_LEN], Vec::new());
-    let mut p = tag + 4;
-    for blocks in 0.. {
-        if blocks == MAX_BLOCKS {
+
+    /// Grows the head, the file from byte 0, to `to` bytes in one read, then runs `state`. The
+    /// read, None when the head holds them.
+    fn extend(&mut self, state: OpenState, to: u64) -> Result<Option<Need>, BareError> {
+        self.state = state;
+        let (to, have) = (to.min(self.len), self.tags.head.len());
+        if to as usize <= have {
+            return Ok(None);
+        }
+        if to > MAX_META {
+            return Err(BareError::TooLarge);
+        }
+        self.tags.head.resize(to as usize, 0);
+        self.from = have;
+        Ok(Some(Need { at: have as u64, len: to as usize - have }))
+    }
+
+    /// The metadata block at `p`, the `n`th.
+    fn block(&mut self, p: u64, n: usize) -> Result<Option<Need>, BareError> {
+        if n == MAX_BLOCKS {
             return Err(BareError::Malformed(p));
         }
-        extend(read, &mut tags.head, p + 4, len)?;
-        let Some(b) = tags.head.get(p as usize..p as usize + 4) else {
+        self.extend(OpenState::Block { p, n }, p + 4)
+    }
+
+    /// The block at `p` read, the next one or the audio behind the last.
+    fn after_block(&mut self, p: u64, n: usize) -> Result<Option<Need>, BareError> {
+        let (last, _, size) = self.block_head(p)?;
+        let p = p + 4 + size;
+        if !(last || p >= self.len) {
+            return self.block(p, n + 1);
+        }
+        if self.si.is_none() {
+            return Err(BareError::BadHead("flac"));
+        }
+        self.first = p;
+        Ok(self.tail(p))
+    }
+
+    /// Whether the block at `p` is the last, its type and its size.
+    fn block_head(&self, p: u64) -> Result<(bool, u8, u64), BareError> {
+        let Some(b) = self.tags.head.get(p as usize..p as usize + 4) else {
             return Err(BareError::Malformed(p));
         };
-        let (last, kind) = (b[0] & 0x80 != 0, b[0] & 0x7F);
-        let size = u64::from(u32::from_be_bytes([0, b[1], b[2], b[3]]));
-        let body = p + 4;
-        // padding, application blocks and an oversized picture are not read, the rest are
-        if matches!(kind, 0 | 3 | 4 | 6) && size <= MAX_PICTURE_BLOCK {
-            extend(read, &mut tags.head, body + size + 4, len)?;
-            let span = body as usize..(body + size) as usize;
-            let Some(d) = tags.head.get(span.clone()) else {
-                return Err(BareError::Malformed(body));
-            };
-            match kind {
-                0 if d.len() >= STREAMINFO_LEN => {
-                    si_bytes.copy_from_slice(&d[..STREAMINFO_LEN]);
-                    si = flac::stream_info(d);
+        Ok((b[0] & 0x80 != 0, b[0] & 0x7F, u64::from(u32::from_be_bytes([0, b[1], b[2], b[3]]))))
+    }
+
+    /// The trailing ID3v1 and APEv2 tags of the audio from `from` on, in the tail read.
+    fn tail(&mut self, from: u64) -> Option<Need> {
+        let from = from.min(self.len);
+        let at = self.len.saturating_sub(TAIL).max(from);
+        self.state = OpenState::Tail { from };
+        self.tail.clear();
+        self.tail.resize((self.len - at) as usize, 0);
+        self.from = 0;
+        (at < self.len).then_some(Need { at, len: (self.len - at) as usize })
+    }
+
+    /// The trailing tags read, the audio ends `cut` bytes before the file does.
+    fn after_tail(&mut self, cut: u64, v1: usize) -> Result<Step<(BareHead, RawTags)>, BareError> {
+        let (len, tag) = (self.len, self.tag);
+        self.tail.drain(..self.tail.len() - v1);
+        self.tags.v1 = std::mem::take(&mut self.tail);
+        let end = len - cut;
+        let h = match self.kind {
+            BareKind::Flac => {
+                if let Some(need) =
+                    self.extend(OpenState::Frame { end }, self.first + MAX_HEADER as u64)?
+                {
+                    return Ok(Step::Need(need));
                 }
-                3 => seek = flac::seek_points(d),
-                4 => tags.comments.push(span),
-                6 => tags.pictures.push(span),
-                _ => {}
+                return self.flac(end);
+            }
+            BareKind::Adts => {
+                open_adts(self.tags.head.get(tag as usize..).unwrap_or(&[]), tag, end)?
+            }
+            BareKind::Mp3 => open_mp3(self.tags.head.get(tag as usize..).unwrap_or(&[]), tag, end)?,
+        };
+        self.state = OpenState::Start;
+        Ok(Step::Done((h, std::mem::take(&mut self.tags))))
+    }
+
+    /// The FLAC head once the first frame's header is read.
+    fn flac(&mut self, end: u64) -> Result<Step<(BareHead, RawTags)>, BareError> {
+        let (first, si) = (self.first, self.si.unwrap_or_default());
+        let f = self
+            .tags
+            .head
+            .get(first as usize..)
+            .and_then(|b| flac::frame(b, &si))
+            .ok_or(BareError::Malformed(first))?;
+        let h = BareHead {
+            codec: Codec::Flac { si, variable: f.variable },
+            family: "flac",
+            head: flac::codec_head(&self.si_bytes),
+            first,
+            end,
+            rate: si.rate,
+            spf: 0,
+            samples: si.total,
+            duration_ns: 0,
+            points: self
+                .seek
+                .iter()
+                .filter_map(|&(s, o)| Some((s, first.checked_add(o)?)))
+                .filter(|p| p.1 < end)
+                .collect(),
+            cbr: None,
+            gapless: (0, 0),
+        };
+        let duration_ns = h.ns(si.total);
+        self.state = OpenState::Start;
+        Ok(Step::Done((BareHead { duration_ns, ..h }, std::mem::take(&mut self.tags))))
+    }
+
+    fn step(&mut self) -> Result<Step<(BareHead, RawTags)>, BareError> {
+        loop {
+            let need = match self.state {
+                OpenState::Start => {
+                    (self.tags, self.si, self.seek) = (RawTags::default(), None, Vec::new());
+                    self.extend(OpenState::Head, HEAD)?
+                }
+                OpenState::Head => {
+                    self.tag = pf_mp3::id3::v2_total_len(&self.tags.head).map_or(0, |n| n as u64);
+                    match self.kind {
+                        BareKind::Flac => self.extend(OpenState::Magic, self.tag + 8)?,
+                        // the whole ID3v2 tag for its text and pictures, and 8 KiB of audio
+                        // behind it
+                        _ => {
+                            self.extend(OpenState::Window, self.tag + pf_mp3::index::WINDOW as u64)?
+                        }
+                    }
+                }
+                OpenState::Magic => {
+                    let tag = self.tag as usize;
+                    if self.tags.head.get(tag..tag + 4) != Some(b"fLaC") {
+                        return Err(BareError::NoStreams);
+                    }
+                    self.tags.id3v2 = tag;
+                    self.block(self.tag + 4, 0)?
+                }
+                OpenState::Block { p, n } => {
+                    let (_, kind, size) = self.block_head(p)?;
+                    let body = p + 4;
+                    // padding, application blocks and an oversized picture are not read, the
+                    // rest are
+                    match matches!(kind, 0 | 3 | 4 | 6) && size <= MAX_PICTURE_BLOCK {
+                        true => self.extend(OpenState::Body { p, n }, body + size + 4)?,
+                        false => self.after_block(p, n)?,
+                    }
+                }
+                OpenState::Body { p, n } => {
+                    let (_, kind, size) = self.block_head(p)?;
+                    let body = p + 4;
+                    let span = body as usize..(body + size) as usize;
+                    let Some(d) = self.tags.head.get(span.clone()) else {
+                        return Err(BareError::Malformed(body));
+                    };
+                    match kind {
+                        0 if d.len() >= STREAMINFO_LEN => {
+                            self.si_bytes.copy_from_slice(&d[..STREAMINFO_LEN]);
+                            self.si = flac::stream_info(d);
+                        }
+                        3 => self.seek = flac::seek_points(d),
+                        4 => self.tags.comments.push(span),
+                        6 => self.tags.pictures.push(span),
+                        _ => {}
+                    }
+                    self.after_block(p, n)?
+                }
+                OpenState::Window => {
+                    // a tag that claims more than the file holds ends with it
+                    self.tag = self.tag.min(self.tags.head.len() as u64);
+                    self.tags.id3v2 = self.tag as usize;
+                    self.tail(self.tag)
+                }
+                OpenState::Tail { from } => {
+                    let (len, tail) = (self.len, &self.tail);
+                    let v1 = if tail.len() >= 128 && tail[tail.len() - 128..].starts_with(b"TAG") {
+                        128
+                    } else {
+                        0
+                    };
+                    let before = &tail[..tail.len() - v1];
+                    let ape = pf_mp3::id3::ape_tail_len(before)
+                        .map_or(0, |n| n as u64)
+                        .min(len - from - (v1 as u64).min(len - from));
+                    let cut = v1 as u64 + ape;
+                    if ape == 0 || ape > MAX_APE {
+                        return self.after_tail(cut, v1);
+                    }
+                    self.state = OpenState::Ape { cut, v1 };
+                    self.tags.ape.clear();
+                    self.tags.ape.resize(ape as usize, 0);
+                    self.from = 0;
+                    Some(Need { at: len - cut, len: ape as usize })
+                }
+                OpenState::Ape { cut, v1 } => return self.after_tail(cut, v1),
+                OpenState::Frame { end } => return self.flac(end),
+            };
+            if let Some(need) = need {
+                return Ok(Step::Need(need));
             }
         }
-        p = body + size;
-        if last || p >= len {
-            break;
-        }
     }
-    let si = si.ok_or(BareError::BadHead("flac"))?;
-    let first = p;
-    let end = trailers(read, len, first, tags)?;
-    extend(read, &mut tags.head, first + MAX_HEADER as u64, len)?;
-    let f = tags
-        .head
-        .get(first as usize..)
-        .and_then(|b| flac::frame(b, &si))
-        .ok_or(BareError::Malformed(first))?;
-    let h = BareHead {
-        codec: Codec::Flac { si, variable: f.variable },
-        family: "flac",
-        head: flac::codec_head(&si_bytes),
-        first,
-        end,
-        rate: si.rate,
-        spf: 0,
-        samples: si.total,
-        duration_ns: 0,
-        points: seek
-            .iter()
-            .filter_map(|&(s, o)| Some((s, first.checked_add(o)?)))
-            .filter(|p| p.1 < end)
-            .collect(),
-        cbr: None,
-        gapless: (0, 0),
-    };
-    let duration_ns = h.ns(si.total);
-    Ok(BareHead { duration_ns, ..h })
 }
 
-fn open_frames(
-    read: &mut ReadAt<'_>,
-    len: u64,
-    tag: u64,
-    kind: BareKind,
-    tags: &mut RawTags,
-) -> Result<BareHead, BareError> {
-    // the whole ID3v2 tag for its text and pictures, and 8 KiB of audio behind it
-    extend(read, &mut tags.head, tag + pf_mp3::index::WINDOW as u64, len)?;
-    // a tag that claims more than the file holds ends with it
-    let tag = tag.min(tags.head.len() as u64);
-    tags.id3v2 = tag as usize;
-    let end = trailers(read, len, tag, tags)?;
-    let audio = tags.head.get(tag as usize..).unwrap_or(&[]);
-    match kind {
-        BareKind::Adts => open_adts(audio, tag, end),
-        _ => open_mp3(audio, tag, end),
+impl Fetch for OpenAt {
+    type Out = (BareHead, RawTags);
+    type Err = BareError;
+
+    fn poll(&mut self) -> Result<Step<(BareHead, RawTags)>, BareError> {
+        let step = self.step();
+        if step.is_err() {
+            self.state = OpenState::Start;
+        }
+        step
+    }
+
+    fn buf(&mut self) -> &mut [u8] {
+        let b = match self.state {
+            OpenState::Tail { .. } => &mut self.tail,
+            OpenState::Ape { .. } => &mut self.tags.ape,
+            _ => &mut self.tags.head,
+        };
+        let from = self.from.min(b.len());
+        &mut b[from..]
+    }
+
+    fn filled(&mut self, n: usize) {
+        let b = match self.state {
+            OpenState::Tail { .. } => &mut self.tail,
+            OpenState::Ape { .. } => &mut self.tags.ape,
+            _ => &mut self.tags.head,
+        };
+        let from = self.from.min(b.len());
+        b.truncate(from + n.min(b.len() - from));
     }
 }
 

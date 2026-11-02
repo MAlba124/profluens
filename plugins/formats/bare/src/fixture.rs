@@ -1,18 +1,8 @@
-//! Synthetic native FLAC files and an in-memory read callback, for tests here and in crates
-//! that build on this one. The frames carry valid headers and filler, no decoder can play
-//! them, the opener and the reader only time them.
+//! Synthetic native FLAC files, for tests here and in crates that build on this one. The frames
+//! carry valid headers and filler, no decoder can play them, the opener and the reader only time
+//! them. `profluens_core::fetch::drive_slice` reads them from memory.
 
 #![allow(clippy::disallowed_methods)] // test builders, they allocate freely
-
-/// A read callback over bytes in memory.
-pub fn reader(file: &[u8]) -> impl FnMut(u64, &mut [u8]) -> std::io::Result<usize> + '_ {
-    move |off, buf| {
-        let s = (off as usize).min(file.len());
-        let n = buf.len().min(file.len() - s);
-        buf[..n].copy_from_slice(&file[s..s + n]);
-        Ok(n)
-    }
-}
 
 /// A FLAC frame header, fixed blocking, frame number `num`, `block` samples, CRC-8 set.
 pub fn flac_frame_header(si: &crate::flac::StreamInfo, num: u64, block: u32) -> Vec<u8> {

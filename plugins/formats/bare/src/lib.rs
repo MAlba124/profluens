@@ -1,7 +1,8 @@
 //! pf-bare, audio files with no container, native FLAC, MPEG audio and ADTS AAC. Opening reads
 //! the head and the tail, a [`Reader`] finds the frames as a session reads forward and seeks
 //! on them, `baresrc` puts them out a frame per buffer. Tags are left to the caller, the opener
-//! hands back the tag bytes it read on the way.
+//! hands back the tag bytes it read on the way. The opener and the reader are fetch machines,
+//! the caller does the reads.
 
 #![deny(unsafe_code)]
 
@@ -12,14 +13,12 @@ pub mod head;
 pub mod reader;
 
 pub use element::{BareSrc, BareSrcError};
-pub use head::{BareHead, BareKind, Codec, RawTags, open};
-pub use reader::{Reader, Unit};
+pub use head::{BareHead, BareKind, Codec, OpenAt, RawTags};
+pub use reader::{NextAt, Reader, SeekAt, Unit};
 
 use pf_registry::Registry;
+use profluens_core::fetch::FileError;
 use std::fmt;
-
-/// Reads into the buffer at a file offset, returns the bytes read, 0 at the end.
-pub type ReadAt<'a> = dyn FnMut(u64, &mut [u8]) -> std::io::Result<usize> + 'a;
 
 /// Everything an opener or a reader refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +35,15 @@ pub enum BareError {
     Malformed(u64),
     /// The caller's read failed.
     Io(std::io::ErrorKind),
+}
+
+impl From<FileError<BareError>> for BareError {
+    fn from(e: FileError<BareError>) -> Self {
+        match e {
+            FileError::Fetch(e) => e,
+            FileError::Io { kind, .. } => BareError::Io(kind),
+        }
+    }
 }
 
 impl fmt::Display for BareError {

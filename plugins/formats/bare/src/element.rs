@@ -1,5 +1,5 @@
-//! `baresrc`, the source of a bare FLAC, MP3 or ADTS file. It reads the file itself with
-//! positioned reads through a [`Reader`], a frame per buffer, and takes a seek's target time
+//! `baresrc`, the source of a bare FLAC, MP3 or ADTS file. It drives a [`Reader`]'s machines
+//! over the file itself with positioned reads, a frame per buffer, and takes a seek's target time
 //! from the flush, the reader finds the frame. A run opens with the codec head flagged HEADER
 //! as the Matroska demuxer does it. The index it publishes has no entries, so the pipeline
 //! plans by time and a snap seek lands on its target, every frame is a key.
@@ -7,7 +7,6 @@
 // The caller's open file, read in place with positioned reads, see `BareSrc::new`.
 #[allow(clippy::disallowed_types)]
 use std::fs::File;
-use std::os::unix::fs::FileExt as _;
 
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::BufferFlags;
@@ -17,6 +16,7 @@ use profluens_core::element::{
 };
 use profluens_core::error::Error;
 use profluens_core::event::Event;
+use profluens_core::fetch::drive_file;
 use profluens_core::format::{OfferDesc, ValueDesc};
 use profluens_core::id::SrcPad;
 use profluens_core::pipeline::{Index, Serves};
@@ -130,11 +130,9 @@ impl BareSrc {
         if !self.started {
             return Err(Self::fail(ctx, BareSrcError::NotStarted));
         }
-        let f = &self.file;
         // A blocking pread of at most a window chunk, the reader holds what it read.
-        #[allow(clippy::disallowed_methods)]
-        let mut read = |off: u64, buf: &mut [u8]| f.read_at(buf, off);
-        self.rd.next(&self.head, &mut read).map_err(|e| Self::fail(ctx, BareSrcError::Read(e)))
+        drive_file(&mut self.rd.next(&self.head), &self.file)
+            .map_err(|e| Self::fail(ctx, BareSrcError::Read(e.into())))
     }
 }
 
@@ -216,13 +214,10 @@ impl Element for BareSrc {
             return Ok(());
         }
         let at = ctx.seek_target().and_then(|t| t.at.nanos()).unwrap_or(0);
-        let f = &self.file;
         // A seek probes a few frames at most per bisection step, blocking preads as in `frame`.
-        #[allow(clippy::disallowed_methods)]
-        let mut read = |off: u64, buf: &mut [u8]| f.read_at(buf, off);
-        self.rd
-            .seek(&self.head, &mut read, at.min(i64::MAX as u64) as i64)
-            .map_err(|e| Self::fail(ctx, BareSrcError::Read(e)))?;
+        let mut seek = self.rd.seek(&self.head, at.min(i64::MAX as u64) as i64);
+        drive_file(&mut seek, &self.file)
+            .map_err(|e| Self::fail(ctx, BareSrcError::Read(e.into())))?;
         (self.phase, self.held) = (Phase::Head, None);
         Ok(())
     }

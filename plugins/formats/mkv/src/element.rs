@@ -830,7 +830,9 @@ enum CuesRead {
 
 const CUES_FIRST: u32 = 64 << 10;
 
-const MAX_CUES: u64 = 4 << 20;
+/// Cues past this are not read. A file of many subtitle tracks cues every block of each, 9 MB
+/// for half an hour of 36 tracks.
+const MAX_CUES: u64 = 32 << 20;
 
 const SIDE_FIRST: u32 = 64 << 10;
 
@@ -915,7 +917,29 @@ pub struct MkvDemux {
     walk_from: u64,
     /// Frames that failed to reframe at the end, past the bus.
     lost: u64,
+    /// The largest keyframe of a linked video track read on its own lately, decaying.
+    key_bytes: u32,
+    hold: Hold,
 }
+
+/// A pulled start that a seek follows reads nothing until that seek, the bytes at the head of
+/// the file would only be thrown away and hold the disk from the seek's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Hold {
+    Off,
+    /// The first pull restart from the start holds.
+    Armed,
+    Holding,
+}
+
+/// A seek's first read holds the Cluster's head and its keyframe, so the kernel reads them as
+/// one random read instead of ramping its readahead behind a small window. The keyframes seen
+/// size it, or the stream's rate over [`LEAD_NS`] before any was.
+const LEAD_MIN: u32 = 512 << 10;
+const LEAD_MAX: u32 = 4 << 20;
+const LEAD_NS: u64 = 150_000_000;
+/// Room past a seen keyframe for the Cluster's head and blocks before it.
+const LEAD_SLACK: u32 = 64 << 10;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Read {
@@ -1017,6 +1041,8 @@ impl MkvDemux {
             cued_from: 0,
             walk_from: 0,
             lost: 0,
+            key_bytes: 0,
+            hold: Hold::Off,
         }
     }
 
@@ -1122,8 +1148,18 @@ impl MkvDemux {
         }
     }
 
-    pub fn with_cues(mut self, cues: Vec<Cue>) -> Self {
+    /// The Cues read already, every track's, so the demuxer reads none. `at` is where they lie in
+    /// the file, the end of the Clusters the pool is sized for, as when it reads them itself.
+    /// A pulled run asks nothing from the start until its first seek, for a run started only
+    /// to seek. One whose first restart is already a seek's goes as any.
+    pub fn with_held_start(mut self) -> Self {
+        self.hold = Hold::Armed;
+        self
+    }
+
+    pub fn with_cues(mut self, cues: Vec<Cue>, at: Option<u64>) -> Self {
         self.seek.whole = !cues.is_empty();
+        self.seek.reserve = at.filter(|_| self.seek.whole);
         self.seek.cues = cues;
         self
     }
@@ -1905,13 +1941,36 @@ impl MkvDemux {
         }
         self.walk_from = from.to_byte;
         let resync = self.mid_segment(from.to_byte);
+        let lead = self.lead(from.at);
         let pull = &mut self.pull;
         pull.plan.reset();
         (pull.win, pull.stash) = (None, None);
         pull.walk.restart(from.to_byte, resync);
+        pull.walk.lead = lead;
         if let Some(video_from) = self.video_from.take() {
             self.hold_video(video_from, from.at);
         }
+    }
+
+    /// The lead of a seek to `at`, none without a linked video track.
+    fn lead(&self, at: Timestamp) -> u32 {
+        if !self.pad_tracks.iter().any(|pt| pt.linked && pt.kind == Kind::Video) {
+            return 0;
+        }
+        if self.key_bytes > 0 {
+            return self
+                .key_bytes
+                .saturating_add(self.key_bytes / 4)
+                .saturating_add(LEAD_SLACK)
+                .min(LEAD_MAX);
+        }
+        let bits = self
+            .rated
+            .as_ref()
+            .and_then(|i| rate::of_index(i, at))
+            .map_or(0, |b| b.bits_per_second);
+        let bytes = u128::from(bits) * u128::from(LEAD_NS) / 8_000_000_000;
+        (bytes.min(u128::from(LEAD_MAX)) as u32).max(LEAD_MIN)
     }
 
     fn pull(&mut self, ctx: &mut Ctx, inputs: &mut Inputs<'_>) -> Result<Flow, Error> {
@@ -2137,6 +2196,15 @@ impl MkvDemux {
                     return Ok(());
                 }
                 Step::Window { .. } if pull.plan.window.is_some() => return Ok(()),
+                Step::Frame { track, pts_ns, keyframe, to, .. }
+                    if !self.pad_tracks.iter().any(|pt| pt.linked && pt.track_number == track) =>
+                {
+                    // a frame no pad takes is walked past unread, its stamp still grows the index
+                    pull.win = None;
+                    pull.plan.leave_window();
+                    seek.due |= grow && seek.grown.block(track, pts_ns, keyframe);
+                    pull.walk.pos = to;
+                }
                 Step::Frame { offset, len, .. } | Step::Window { offset, len, .. } => {
                     pull.win = None;
                     pull.plan.leave_window();
@@ -2180,6 +2248,12 @@ impl MkvDemux {
                         pull.plan.window = Some((tag, len, offset));
                         return Ok(());
                     };
+                    let video = |pt: &PadTrack| {
+                        pt.linked && pt.track_number == track && pt.kind == Kind::Video
+                    };
+                    if keyframe && self.pad_tracks.iter().any(video) {
+                        self.key_bytes = len.max(self.key_bytes - self.key_bytes / 8);
+                    }
                     let state = State::Waiting { offset, want: len };
                     let duration_ns = seek
                         .tracks
@@ -2402,11 +2476,27 @@ impl Element for MkvDemux {
 impl MkvDemux {
     fn demux(&mut self, ctx: &mut Ctx, inputs: &mut Inputs<'_>) -> Result<Flow, Error> {
         if let Some(from) = ctx.pull_reset(Self::IN) {
+            let start = from.to_byte == 0 && from.at == Timestamp::ZERO;
+            self.hold = match self.hold {
+                Hold::Armed if start => Hold::Holding,
+                _ => Hold::Off,
+            };
             self.cued_from =
                 ctx.presentation_point().or(Some(from.at)).and_then(|t| t.nanos()).unwrap_or(0);
             let (at, scan) = (from.to_byte, self.mid_segment(from.to_byte));
-            log!(&*ctx, Level::Debug, "pull_restart", target = from.at, at = at, scan = scan);
+            log!(
+                &*ctx,
+                Level::Debug,
+                "pull_restart",
+                target = from.at,
+                at = at,
+                scan = scan,
+                held = self.hold == Hold::Holding
+            );
             self.restart_pull(from);
+        }
+        if self.hold == Hold::Holding && ctx.pulls(Self::IN) {
+            return Ok(Flow::Ok);
         }
         if ctx.pulls(Self::IN) {
             return self.pull(ctx, inputs);

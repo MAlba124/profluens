@@ -13,6 +13,12 @@ use crate::reader::{Cue, Track};
 /// measured.
 pub const CAPTION_REACH: u64 = 20_000_000_000;
 
+/// The longest pre-roll an audio track may go without beside linked video, its restart then the
+/// video keyframe's own Cluster: AC3, E-AC3, AAC, DTS and FLAC under it, MP3, Vorbis and Opus
+/// over. Audio may then start up to a packet after the picture, the read saved is the whole group
+/// before (megabytes, a cold disk seek). An audio only run keeps every lead.
+pub const SHORT_PRE_ROLL: u64 = 25_000_000;
+
 /// The first video track the Cues name (RFC 9559 section 22.1), else the first audio track.
 pub fn key_track(cues: &[Cue], tracks: &[Track]) -> Option<u64> {
     let cued = |t: &&Track| cues.iter().any(|c| c.track == t.track_number);
@@ -42,10 +48,12 @@ pub fn cue_entries(
         .collect();
     keys.dedup_by_key(|k| k.0);
     let on = |t: &&Track| linked(t.track_number);
+    let video = tracks.iter().filter(on).any(|t| is_video_family(family_for(&t.codec_id)));
     let audio: Vec<(Vec<(u64, u64)>, u64)> = tracks
         .iter()
         .filter(on)
         .filter(|t| is_audio_family(family_for(&t.codec_id)))
+        .filter(|t| !video || lead_of(t).pre_roll > SHORT_PRE_ROLL)
         .map(|t| {
             let own: Vec<(u64, u64)> = cues
                 .iter()
@@ -240,6 +248,26 @@ mod tests {
             silent.iter().all(|e| (e.restart, e.restart_ns) == (e.byte, e.time_ns)),
             "{silent:?}"
         );
+    }
+
+    /// Beside linked video an audio track with a short pre-roll restarts at the keyframe, one
+    /// with a long one and an audio only run go back for their lead.
+    #[test]
+    fn short_pre_roll_audio_beside_video_restarts_at_the_keyframe() {
+        let (cues, mut tracks) = film(false);
+        let keys: Vec<(u64, u64)> = (0..8u64).map(|n| (1_000 + n * 1_000, n * 20)).collect();
+        for codec in ["A_AC3", "A_EAC3", "A_AAC", "A_DTS", "A_FLAC"] {
+            tracks[1] = track(2, codec);
+            let entries = cue_entries(&cues, &tracks, &|_| true, 1_000_000);
+            assert_eq!(restarts(&entries), keys, "{codec} beside video");
+            let alone = cue_entries(&cues, &tracks, &|n| n == 2, 1_000_000);
+            assert_ne!(restarts(&alone), keys, "{codec} alone keeps its lead");
+        }
+        for codec in ["A_OPUS", "A_MPEG/L3", "A_VORBIS"] {
+            tracks[1] = track(2, codec);
+            let entries = cue_entries(&cues, &tracks, &|_| true, 1_000_000);
+            assert_ne!(restarts(&entries), keys, "{codec} keeps its pre-roll");
+        }
     }
 
     #[test]

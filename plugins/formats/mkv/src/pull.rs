@@ -71,6 +71,8 @@ pub(crate) struct Walk {
     pub(crate) damage: Option<ReadError>,
     /// Where that damage was.
     pub(crate) damage_at: u64,
+    /// The least the next ask reads, once. A seek's first read holds the keyframe with it.
+    pub(crate) lead: u32,
 }
 
 impl Walk {
@@ -92,6 +94,7 @@ impl Walk {
             end: None,
             damage: None,
             damage_at: 0,
+            lead: 0,
         }
     }
 
@@ -128,7 +131,8 @@ impl Walk {
     }
 
     fn ask(&mut self, offset: u64, whole: Option<u64>, need: u64) -> Step {
-        let len = need.max(self.window.min(self.most) as u64).min(u32::MAX as u64) as u32;
+        let lead = std::mem::take(&mut self.lead).min(self.cap) as u64;
+        let len = need.max(self.window.min(self.most) as u64).max(lead).min(u32::MAX as u64) as u32;
         Step::Window { offset, len, whole }
     }
 

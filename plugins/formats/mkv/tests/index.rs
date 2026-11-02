@@ -3,7 +3,7 @@
 // A test's own fixtures and threads, not an element.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -172,20 +172,34 @@ struct MemSrc {
     pull: Option<Pulled>,
 }
 
+/// The offset and length of each ask served.
+type Asks = Arc<Mutex<Vec<(u64, u32)>>>;
+
 struct Pulled {
     held_at: u64,
     held: Vec<Ask>,
     release: Arc<AtomicBool>,
     end: Arc<AtomicBool>,
+    /// Bytes served, when counted.
+    served: Option<Arc<AtomicU64>>,
+    /// Each ask's offset and length, when kept.
+    asks: Option<Asks>,
 }
 
 impl MemSrc {
     const OUT: SrcPad = SrcPad(0);
 
-    fn serve(&self, ctx: &mut Ctx, ask: Ask) {
+    fn serve(&self, ctx: &mut Ctx, ask: Ask, pull: &Pulled) {
         let Ask { offset, len, tag, mut buf } = ask;
+        let served = pull.served.as_deref();
+        if let Some(asks) = &pull.asks {
+            asks.lock().unwrap().push((offset, len));
+        }
         let from = (offset as usize).min(self.data.len());
         let to = (from + len as usize).min(self.data.len());
+        if let Some(s) = served {
+            s.fetch_add((to - from) as u64, Ordering::Relaxed);
+        }
         buf.memory.as_mut_full()[..to - from].copy_from_slice(&self.data[from..to]);
         buf.memory.set_len(to - from);
         ctx.serve(Self::OUT, tag, buf);
@@ -210,12 +224,12 @@ impl Element for MemSrc {
             while let Some(ask) = ctx.next_ask(Self::OUT) {
                 match ask.offset == pull.held_at && !released {
                     true => pull.held.push(ask),
-                    false => self.serve(ctx, ask),
+                    false => self.serve(ctx, ask, &pull),
                 }
             }
             if released {
                 for ask in std::mem::take(&mut pull.held) {
-                    self.serve(ctx, ask);
+                    self.serve(ctx, ask, &pull);
                 }
             }
             let over = pull.held.is_empty()
@@ -288,21 +302,34 @@ fn the_published_index_is_the_cued_keyframes_and_where_each_restarts() {
     let at = clusters(&file);
     let times: Vec<u64> = at.iter().map(|c| c.1).collect();
     assert_eq!(times, [0, 400 * MS, 800 * MS, 1_200 * MS], "a Cluster a keyframe");
+    // AAC's short pre-roll beside the video restarts at the keyframe, alone it goes back
+    let keys: Vec<IndexEntry> =
+        at.iter().map(|&(byte, time)| IndexEntry::key(time, byte)).collect();
     let index = pulled("cued_av.mkv", &file, &|_| true);
-    let want: Vec<IndexEntry> = (0..4)
+    assert_eq!(index.entries, keys);
+    assert!(index.complete, "every keyframe is cued");
+    assert_eq!((index.file_len, index.duration), (Some(file.len() as u64), Timestamp(1_600 * MS)));
+    let index = pulled("cued_a.mkv", &file, &|n| n == 1);
+    let back: Vec<IndexEntry> = (0..4)
         .map(|n| {
             let (byte, time_ns) = at[n];
             let (restart, restart_ns) = at[n.saturating_sub(1)];
             IndexEntry { time_ns, byte, restart, restart_ns }
         })
         .collect();
-    assert_eq!(index.entries, want);
-    assert!(index.complete, "every keyframe is cued");
-    assert_eq!((index.file_len, index.duration), (Some(file.len() as u64), Timestamp(1_600 * MS)));
+    assert_eq!(index.entries, back);
     let index = pulled("cued_v.mkv", &file, &|n| n == 0);
-    let keys: Vec<IndexEntry> =
-        at.iter().map(|&(byte, time)| IndexEntry::key(time, byte)).collect();
     assert_eq!(index.entries, keys);
+}
+
+/// Cues of more than 4 MB, as a file of many subtitle tracks cues every block of each, are read.
+#[test]
+fn large_cues_are_read_whole() {
+    let file = film(9_000_000, 40, false, true);
+    assert!(file.len() as u64 - cues_at(&file) > 4 << 20, "Cues over 4 MB");
+    let index = pulled("large_cues.mkv", &file, &|_| true);
+    assert!(index.complete, "the Cues were read");
+    assert_eq!(index.entries.len(), 225_000);
 }
 
 #[test]
@@ -355,7 +382,12 @@ fn cues_handed_over_are_published_at_preroll() {
     );
     let mut p = Pipeline::new();
     let src = p.add(MemSrc { data: file.clone(), chunk: 4096, pos: 0, pull: None });
-    let (demux, _) = build(&mut p, src, MkvDemux::new(header(&file)).with_cues(cues), &|_| true);
+    let (demux, _) = build(
+        &mut p,
+        src,
+        MkvDemux::new(header(&file)).with_cues(cues, Some(cues_at(&file))),
+        &|_| true,
+    );
     let index = p.index(demux).expect("published at preroll");
     let keys: Vec<IndexEntry> =
         clusters(&file).iter().map(|&(byte, time)| IndexEntry::key(time, byte)).collect();
@@ -382,6 +414,8 @@ fn a_seek_before_the_cues_are_in_lands_on_the_estimate_and_the_next_exactly() {
         held: Vec::new(),
         release: Arc::clone(&release),
         end: Arc::clone(&end),
+        served: None,
+        asks: None,
     };
     let mut p = pf_reactor::pipeline();
     let src = p.add(MemSrc { data: file.clone(), chunk: 0, pos: 0, pull: Some(held) });
@@ -426,4 +460,162 @@ fn a_seek_before_the_cues_are_in_lands_on_the_estimate_and_the_next_exactly() {
     assert_eq!(first(&seen[0], 1), Some(2_000 * MS), "the keyframe at two seconds");
     end.store(true, Ordering::Release);
     run.join().expect("the run thread").expect("the run ends");
+}
+
+/// The frames past the read window of a track no pad takes are walked past unread. PCM's
+/// 64 KB blocks beside a small video, with the video alone only the 16 KB window that finds
+/// each block's head is read of it, every picture still out, past the start's lead of 512 KB.
+/// With the PCM linked it is all read.
+#[test]
+fn an_unlinked_tracks_large_frames_are_not_read() {
+    let tracks = vec![
+        TrackConfig::vp8(1, 320, 240),
+        TrackConfig::audio(2, "A_PCM/INT/LIT", Vec::new(), 48_000.0, 2, 16),
+    ];
+    let mut w = MatroskaWriter::new(tracks);
+    w.enable_cues();
+    w.set_duration_ns(2_000 * MS);
+    let mut out = Vec::new();
+    w.write_header(&mut out).unwrap();
+    let pcm = vec![7u8; 64 << 10];
+    for t in (0..2_000).step_by(20) {
+        if t % 40 == 0 {
+            w.write_frame(&mut out, 1, t * MS, &[1, (t / 40) as u8], t % 1_000 == 0).unwrap();
+        }
+        w.write_frame(&mut out, 2, t * MS, &pcm, true).unwrap();
+    }
+    w.finalize(&mut out);
+    let file = sized(out);
+    let run = |link: &dyn Fn(usize) -> bool| {
+        let served = Arc::new(AtomicU64::new(0));
+        let end = Arc::new(AtomicBool::new(true));
+        let pulled = Pulled {
+            held_at: u64::MAX,
+            held: Vec::new(),
+            release: Arc::new(AtomicBool::new(true)),
+            end: Arc::clone(&end),
+            served: Some(Arc::clone(&served)),
+            asks: None,
+        };
+        let mut p = pf_reactor::pipeline();
+        let src = p.add(MemSrc { data: file.clone(), chunk: 0, pos: 0, pull: Some(pulled) });
+        let (_, seen) = build(&mut p, src, MkvDemux::new(header(&file)), link);
+        p.run().expect("run");
+        let pictures = seen[0].lock().unwrap().rows.iter().filter(|r| r.is_some()).count();
+        (served.load(Ordering::Relaxed), pictures)
+    };
+    let (video_only, pictures) = run(&|n| n == 0);
+    assert_eq!(pictures, 50, "every picture");
+    let lead = 512 << 10;
+    assert!(
+        video_only < file.len() as u64 * 3 / 10 + lead,
+        "{video_only} of {} bytes read",
+        file.len()
+    );
+    let (both, _) = run(&|_| true);
+    assert!(both >= file.len() as u64 * 9 / 10, "{both} of {} bytes read", file.len());
+}
+
+/// A seek's first read holds its Cluster's head and the keyframe, one ask the size of the
+/// keyframes seen, so the file is read once there instead of a small window and the block apart.
+#[test]
+fn a_seeks_first_read_holds_the_keyframe_of_its_cluster() {
+    const KEY: usize = 300 << 10;
+    let mut w = MatroskaWriter::new(vec![TrackConfig::vp8(1, 320, 240)]);
+    w.enable_cues();
+    w.set_duration_ns(8_000 * MS);
+    let mut out = Vec::new();
+    w.write_header(&mut out).unwrap();
+    let key = vec![9u8; KEY];
+    for t in (0..8_000).step_by(40) {
+        let first = t % 1_000 == 0;
+        let frame: &[u8] = if first { &key } else { &[1, 2] };
+        w.write_frame(&mut out, 1, t * MS, frame, first).unwrap();
+    }
+    w.finalize(&mut out);
+    let file = sized(out);
+    let at = clusters(&file);
+    assert_eq!(at.len(), 8, "a Cluster a keyframe");
+    let asks = Arc::new(Mutex::new(Vec::new()));
+    let pulled = Pulled {
+        held_at: u64::MAX,
+        held: Vec::new(),
+        release: Arc::new(AtomicBool::new(true)),
+        end: Arc::new(AtomicBool::new(false)),
+        served: None,
+        asks: Some(Arc::clone(&asks)),
+    };
+    let mut p = pf_reactor::pipeline();
+    let src = p.add(MemSrc { data: file.clone(), chunk: 0, pos: 0, pull: Some(pulled) });
+    let (demux, seen) = build(&mut p, src, MkvDemux::new(header(&file)), &|_| true);
+    let (control, tap) = (p.control(), p.tap_handle());
+    let run = std::thread::spawn(move || p.run());
+    let rows = |seen: &Arc<Mutex<Seen>>| seen.lock().unwrap().rows.clone();
+    until("the pictures", || rows(&seen[0]).len() >= 200);
+    until("the Cues", || tap.index(demux).is_some_and(|index| index.complete));
+    asks.lock().unwrap().clear();
+    let flushes = |rows: &[Option<u64>]| rows.iter().filter(|r| r.is_none()).count();
+    let before = flushes(&rows(&seen[0]));
+    let index = tap.index(demux).expect("published");
+    let plan =
+        index.plan(Timestamp(5_000 * MS), SeekMode::Keyframe, Timestamp::NONE, None, Reach::Group);
+    let SeekPlan::Seek { to_byte, key, to_time } = plan else { panic!("{plan:?}") };
+    assert_eq!(to_byte, at[5].0, "the Cluster at five seconds");
+    let _ = control.seek_bytes(to_time, &[(profluens_core::command::ALL, to_byte, key)]);
+    until("the keyframe", || {
+        let rows = rows(&seen[0]);
+        flushes(&rows) > before && rows.last().is_some_and(Option::is_some)
+    });
+    let asked = asks.lock().unwrap().clone();
+    let (offset, len) = asked.first().copied().expect("an ask");
+    assert_eq!(offset, at[5].0, "from the Cluster, {asked:?}");
+    assert!(len as usize > KEY && offset + u64::from(len) < at[6].0 + (512 << 10), "{asked:?}");
+    let inside = |&&(o, _): &&(u64, u32)| o > offset && o < offset + KEY as u64;
+    assert!(!asked.iter().skip(1).any(|a| inside(&a)), "the keyframe read once, {asked:?}");
+    control.stop();
+    run.join().expect("the run thread").expect("the run ends");
+}
+
+/// A held start asks nothing until its seek, which then reads from its own Cluster, and a seek
+/// to the start releases it from the first Cluster.
+#[test]
+fn a_held_start_reads_nothing_until_its_seek() {
+    let file = film(4_000, 1_000, true, true);
+    for target in [2_000 * MS, 0] {
+        let asks = Arc::new(Mutex::new(Vec::new()));
+        let pulled = Pulled {
+            held_at: u64::MAX,
+            held: Vec::new(),
+            release: Arc::new(AtomicBool::new(true)),
+            end: Arc::new(AtomicBool::new(false)),
+            served: None,
+            asks: Some(Arc::clone(&asks)),
+        };
+        let mut p = pf_reactor::pipeline();
+        let src = p.add(MemSrc { data: file.clone(), chunk: 0, pos: 0, pull: Some(pulled) });
+        let demux = MkvDemux::new(header(&file)).with_cues(cues_of(&file), Some(cues_at(&file)));
+        let (demux, seen) = build(&mut p, src, demux.with_held_start(), &|_| true);
+        let (control, tap) = (p.control(), p.tap_handle());
+        let run = std::thread::spawn(move || p.run());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(asks.lock().unwrap().is_empty(), "nothing read before the seek");
+        assert!(seen[0].lock().unwrap().rows.iter().all(Option::is_none), "nor put out");
+        let index = tap.index(demux).expect("published at preroll");
+        let plan =
+            index.plan(Timestamp(target), SeekMode::Keyframe, Timestamp::NONE, None, Reach::Group);
+        let SeekPlan::Seek { to_byte, key, to_time } = plan else { panic!("{plan:?}") };
+        let _ = control.seek_bytes(to_time, &[(profluens_core::command::ALL, to_byte, key)]);
+        until("a picture", || seen[0].lock().unwrap().rows.iter().any(Option::is_some));
+        let first = asks.lock().unwrap().first().copied().expect("an ask");
+        assert_eq!(first.0, to_byte, "read from the seek's Cluster");
+        let rows = seen[0].lock().unwrap().rows.clone();
+        assert_eq!(rows.iter().flatten().next(), Some(&target), "the seek's keyframe first");
+        control.stop();
+        run.join().expect("the run thread").expect("the run ends");
+    }
+}
+
+fn cues_of(file: &[u8]) -> Vec<pf_mkv::Cue> {
+    let info = parse_seek_head(&header(file)).expect("a Segment");
+    parse_cue_tracks(&file[cues_at(file) as usize..], info.segment_data_start, info.timestamp_scale)
 }

@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::fmt;
 use std::io;
 
@@ -73,6 +74,54 @@ pub fn drive_slice_log<F: Fetch>(
     }
 }
 
+/// `len` bytes from `at` in one read, fewer at the end of the file. [`Window::with_buf`] reads
+/// into a buffer handed back from an earlier window, its allocation kept.
+#[derive(Debug, Default)]
+pub struct Window {
+    at: u64,
+    len: usize,
+    buf: Vec<u8>,
+    asked: bool,
+}
+
+impl Window {
+    // Empty until the read, app-side setup, the buffer goes out with the bytes.
+    #[allow(clippy::disallowed_methods)]
+    pub fn new(at: u64, len: usize) -> Self {
+        Window::with_buf(at, len, Vec::new())
+    }
+
+    pub fn with_buf(at: u64, len: usize, buf: Vec<u8>) -> Self {
+        Window { at, len, buf, asked: false }
+    }
+}
+
+impl Fetch for Window {
+    type Out = Vec<u8>;
+    type Err = Infallible;
+
+    fn poll(&mut self) -> Result<Step<Vec<u8>>, Infallible> {
+        if !self.asked {
+            self.buf.clear();
+            self.buf.resize(self.len, 0);
+        }
+        if self.asked || self.len == 0 {
+            self.asked = false;
+            return Ok(Step::Done(std::mem::take(&mut self.buf)));
+        }
+        self.asked = true;
+        Ok(Step::Need(Need { at: self.at, len: self.len }))
+    }
+
+    fn buf(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
+    fn filled(&mut self, n: usize) {
+        self.buf.truncate(n);
+    }
+}
+
 /// What [`drive_file`] refuses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FileError<E> {
@@ -108,10 +157,34 @@ impl<E: std::error::Error + 'static> std::error::Error for FileError<E> {
 // The caller's open file, read in place.
 #[allow(clippy::disallowed_types)]
 pub fn drive_file<F: Fetch>(m: &mut F, file: &std::fs::File) -> Result<F::Out, FileError<F::Err>> {
+    file_run(m, file, None)
+}
+
+/// [`drive_file`] with every Need appended to `log`, for tests that check what is read.
+#[cfg(unix)]
+#[allow(clippy::disallowed_types)]
+pub fn drive_file_log<F: Fetch>(
+    m: &mut F,
+    file: &std::fs::File,
+    log: &mut Vec<Need>,
+) -> Result<F::Out, FileError<F::Err>> {
+    file_run(m, file, Some(log))
+}
+
+#[cfg(unix)]
+#[allow(clippy::disallowed_types)]
+fn file_run<F: Fetch>(
+    m: &mut F,
+    file: &std::fs::File,
+    mut log: Option<&mut Vec<Need>>,
+) -> Result<F::Out, FileError<F::Err>> {
     loop {
         match m.poll().map_err(FileError::Fetch)? {
             Step::Done(out) => return Ok(out),
             Step::Need(need) => {
+                if let Some(log) = log.as_deref_mut() {
+                    log.push(need);
+                }
                 let buf = m.buf();
                 debug_assert_eq!(buf.len(), need.len, "a buffer other than the Need");
                 let n =
@@ -261,6 +334,51 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(matches!(e, FileError::Io { need: Need { at: 1, len: 2 }, .. }), "{e:?}");
         assert!(e.to_string().starts_with("2 bytes at byte 1 cannot be read"), "{e}");
+    }
+
+    #[test]
+    fn a_window_is_one_read_into_the_buffer_it_was_given() {
+        let file = [1u8, 2, 3, 4, 5];
+        let mut log = Vec::new();
+        assert_eq!(drive_slice_log(&mut Window::new(1, 3), &file, &mut log), Ok(vec![2, 3, 4]));
+        assert_eq!(log, [Need { at: 1, len: 3 }]);
+        let mut spare = Vec::with_capacity(64);
+        spare.extend_from_slice(&[9; 40]);
+        let ptr = spare.as_ptr();
+        let got = drive_slice(&mut Window::with_buf(3, 8, spare), &file).unwrap();
+        assert_eq!(got, [4, 5], "short at the end, the old bytes gone");
+        assert_eq!(got.as_ptr(), ptr, "the allocation is kept");
+        log.clear();
+        assert_eq!(drive_slice_log(&mut Window::new(0, 0), &file, &mut log), Ok(vec![]));
+        assert!(log.is_empty(), "nothing asked reads nothing");
+        let mut w = Window::new(0, 2);
+        assert_eq!(drive_slice(&mut w, &file), Ok(vec![1, 2]));
+        assert_eq!(drive_slice(&mut w, &file), Ok(vec![1, 2]), "a window that is done starts over");
+        assert_eq!(w.poll(), Ok(Step::Need(Need { at: 0, len: 2 })));
+        w.filled(99);
+        assert_eq!(w.poll(), Ok(Step::Done(vec![0, 0])), "a fill past the Need is the Need");
+    }
+
+    #[test]
+    fn the_file_driver_logs_what_it_reads() {
+        let file: Vec<u8> = (0..10).collect();
+        let path = std::env::temp_dir().join(format!("pf-core-fetch-log-{}", std::process::id()));
+        std::fs::write(&path, &file).unwrap();
+        let opened = std::fs::File::open(&path).unwrap();
+        let mut log = Vec::new();
+        assert_eq!(drive_file_log(&mut sum(4, 4), &opened, &mut log), Ok(39));
+        let mut want = Vec::new();
+        assert_eq!(drive_slice_log(&mut sum(4, 4), &file, &mut want), Ok(39));
+        assert_eq!(log, want);
+        log.clear();
+        assert_eq!(drive_file_log(&mut Window::new(8, 4), &opened, &mut log), Ok(vec![8, 9]));
+        assert_eq!(log, [Need { at: 8, len: 4 }]);
+        let write_only = std::fs::File::create(&path).unwrap();
+        log.clear();
+        let e = drive_file_log(&mut sum(1, 2), &write_only, &mut log).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(e, FileError::Io { need: Need { at: 1, len: 2 }, .. }), "{e:?}");
+        assert_eq!(log, [Need { at: 1, len: 2 }], "the failed read is logged");
     }
 
     #[test]

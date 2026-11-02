@@ -80,7 +80,7 @@ static PROPS: [PropDesc; 3] = [
 
 // One-time construction.
 #[allow(clippy::disallowed_methods)]
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "libavaacenc",
     sinks: &SINKS,
     srcs: &SRCS,

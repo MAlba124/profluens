@@ -34,7 +34,7 @@ static PROPS: [PropDesc; 2] = [
 
 // One-time. `make_default` boxes an instance at pipeline construction.
 #[allow(clippy::disallowed_methods)]
-static DESC: ElementDesc =
+pub(crate) static DESC: ElementDesc =
     decoder::picking(decoder::desc_with_props("av1dec", &SINKS, &SRCS, &PROPS, || {
         Box::new(Av1Dec::new())
     }));

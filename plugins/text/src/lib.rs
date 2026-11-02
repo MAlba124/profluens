@@ -24,13 +24,12 @@ pub use vobsubdec::{VOBSUB_FAMILY, VobSubDec};
 /// The bitmap-subtitle family the PGS, DVB and VobSub decoders emit, see [`bitmap`].
 pub const BITMAP_FAMILY: &str = "subtitle/bitmap";
 
-use pf_registry::Registry;
-use profluens_core::element::Element;
+use pf_registry::{Elements, Registry};
+
+pub static ELEMENTS: Elements =
+    &[&pgsdec::DESC, &dvbsubdec::DESC, &vobsubdec::DESC, &overlay::DESC];
 
 /// Register this crate's elements for name-based construction.
 pub fn register(registry: &mut Registry) {
-    registry.register(PgsDec::new().desc());
-    registry.register(DvbSubDec::new().desc());
-    registry.register(VobSubDec::new().desc());
-    registry.register(SubtitleOverlay::new().desc());
+    registry.register_all(ELEMENTS);
 }

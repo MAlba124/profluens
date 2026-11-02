@@ -94,7 +94,7 @@ static PROPS: [PropDesc; 4] = [
 ];
 
 #[allow(clippy::disallowed_methods)] // make_default boxes once at parse time
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "opusenc",
     sinks: &SINKS,
     srcs: &SRCS,

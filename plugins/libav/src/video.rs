@@ -59,37 +59,37 @@ static VP7_SINKS: [PadDesc; 1] = decoder::sink_pad(&VP7_SINK);
 
 // One-time construction.
 #[allow(clippy::disallowed_methods)]
-static H264_DESC: ElementDesc =
+pub(crate) static H264_DESC: ElementDesc =
     decoder::desc("libavh264dec", &H264_SINKS, &SRCS, || Box::new(LibavH264Dec::new()));
 #[allow(clippy::disallowed_methods)]
-static H265_DESC: ElementDesc =
+pub(crate) static H265_DESC: ElementDesc =
     decoder::desc("libavh265dec", &H265_SINKS, &SRCS, || Box::new(LibavH265Dec::new()));
 #[allow(clippy::disallowed_methods)]
-static VP8_DESC: ElementDesc =
+pub(crate) static VP8_DESC: ElementDesc =
     decoder::desc("libavvp8dec", &VP8_SINKS, &SRCS, || Box::new(LibavVp8Dec::new()));
 #[allow(clippy::disallowed_methods)]
-static VP9_DESC: ElementDesc =
+pub(crate) static VP9_DESC: ElementDesc =
     decoder::desc("libavvp9dec", &VP9_SINKS, &SRCS, || Box::new(LibavVp9Dec::new()));
 #[allow(clippy::disallowed_methods)]
-static MPEG2_DESC: ElementDesc =
+pub(crate) static MPEG2_DESC: ElementDesc =
     decoder::desc("libavmpeg2dec", &MPEG2_SINKS, &SRCS, || Box::new(LibavMpeg2Dec::new()));
 #[allow(clippy::disallowed_methods)]
-static MPEG4_DESC: ElementDesc =
+pub(crate) static MPEG4_DESC: ElementDesc =
     decoder::desc("libavmpeg4dec", &MPEG4_SINKS, &SRCS, || Box::new(LibavMpeg4Dec::new()));
 #[allow(clippy::disallowed_methods)]
-static FLV1_DESC: ElementDesc =
+pub(crate) static FLV1_DESC: ElementDesc =
     decoder::desc("libavflv1dec", &FLV1_SINKS, &SRCS, || Box::new(LibavFlv1Dec::new()));
 #[allow(clippy::disallowed_methods)]
-static VP6_DESC: ElementDesc =
+pub(crate) static VP6_DESC: ElementDesc =
     decoder::desc("libavvp6dec", &VP6_SINKS, &SRCS, || Box::new(LibavVp6Dec::new()));
 #[allow(clippy::disallowed_methods)]
-static VP6F_DESC: ElementDesc =
+pub(crate) static VP6F_DESC: ElementDesc =
     decoder::desc("libavvp6fdec", &VP6F_SINKS, &SRCS, || Box::new(LibavVp6fDec::new()));
 #[allow(clippy::disallowed_methods)]
-static VP6A_DESC: ElementDesc =
+pub(crate) static VP6A_DESC: ElementDesc =
     decoder::desc("libavvp6adec", &VP6A_SINKS, &SRCS, || Box::new(LibavVp6aDec::new()));
 #[allow(clippy::disallowed_methods)]
-static VP7_DESC: ElementDesc =
+pub(crate) static VP7_DESC: ElementDesc =
     decoder::desc("libavvp7dec", &VP7_SINKS, &SRCS, || Box::new(LibavVp7Dec::new()));
 
 pub const H264: u8 = 0;

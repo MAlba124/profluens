@@ -25,10 +25,11 @@ pub use encoding::{Charset, Decoder};
 pub use format::{Format, LineScanner, Parsed, SubtitleFormat, parse_with};
 pub use ir::{CUE_IR_FAMILY, CueBuilder, CueIr};
 
-use pf_registry::Registry;
-use profluens_core::element::Element;
+use pf_registry::{Elements, Registry};
+
+pub static ELEMENTS: Elements = &[&element::DESC];
 
 /// Register this crate's element for name-based construction.
 pub fn register(registry: &mut Registry) {
-    registry.register(SubParse::new().desc());
+    registry.register_all(ELEMENTS);
 }

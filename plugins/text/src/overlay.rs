@@ -59,7 +59,7 @@ static SRCS: [PadDesc; 1] = [PadDesc {
     offers: &VIDEO_OFFERS, // same format as the video sink, announced/forwarded at runtime
 }];
 
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "suboverlay",
     sinks: &SINKS,
     srcs: &SRCS,

@@ -59,7 +59,7 @@ static PRESETS: [[(&str, ValueDesc); 1]; 6] = [
     [("charset", ValueDesc::Id(Charset::Windows1252.label()))],
 ];
 
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "subparse",
     sinks: &SINKS,
     srcs: &SRCS,

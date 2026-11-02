@@ -24,14 +24,15 @@ pub use flacenc::FlacEnc;
 pub use oggflac::OggFlacDeframe;
 pub use pf_tags::flacmeta::FlacTags;
 
-use pf_registry::Registry;
-use profluens_core::element::Element;
+use pf_registry::{Elements, Registry};
+
+#[cfg(feature = "encoder")]
+pub static ELEMENTS: Elements = &[&flacenc::DESC, &flacdec::DESC, &oggflac::DESC];
+#[cfg(not(feature = "encoder"))]
+pub static ELEMENTS: Elements = &[&flacdec::DESC, &oggflac::DESC];
 
 pub fn register(registry: &mut Registry) {
-    #[cfg(feature = "encoder")]
-    registry.register(FlacEnc::new(44_100, 2, SampleFormat::S16).desc());
-    registry.register(FlacDec::new().desc());
-    registry.register(OggFlacDeframe::new().desc());
+    registry.register_all(ELEMENTS);
 }
 
 /// Where a two-pass caller writes the STREAMINFO body from [`FlacEncoder::finish`].

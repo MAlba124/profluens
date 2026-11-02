@@ -27,7 +27,7 @@ static SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: &OFFERS }];
 
 // Boxed once at registry or parse time.
 #[allow(clippy::disallowed_methods)]
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "oggflacdeframe",
     sinks: &SINKS,
     srcs: &SRCS,

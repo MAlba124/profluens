@@ -107,28 +107,28 @@ const fn desc(
 
 // One-time construction.
 #[allow(clippy::disallowed_methods)]
-static AAC_DESC: ElementDesc =
+pub(crate) static AAC_DESC: ElementDesc =
     desc("libavaacdec", &AAC_SINKS, SchedHint::Active, || Box::new(LibavAudioDec::aac()));
 #[allow(clippy::disallowed_methods)]
-static AC3_DESC: ElementDesc =
+pub(crate) static AC3_DESC: ElementDesc =
     desc("libavac3dec", &AC3_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::ac3()));
 #[allow(clippy::disallowed_methods)]
-static MP3_DESC: ElementDesc =
+pub(crate) static MP3_DESC: ElementDesc =
     desc("libavmp3dec", &MP3_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::mp3()));
 #[allow(clippy::disallowed_methods)]
-static DTS_DESC: ElementDesc =
+pub(crate) static DTS_DESC: ElementDesc =
     desc("libavdtsdec", &DTS_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::dts()));
 #[allow(clippy::disallowed_methods)]
-static TRUEHD_DESC: ElementDesc =
+pub(crate) static TRUEHD_DESC: ElementDesc =
     desc("libavtruehddec", &TRUEHD_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::truehd()));
 #[allow(clippy::disallowed_methods)]
-static MLP_DESC: ElementDesc =
+pub(crate) static MLP_DESC: ElementDesc =
     desc("libavmlpdec", &MLP_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::mlp()));
 #[allow(clippy::disallowed_methods)]
-static VORBIS_DESC: ElementDesc =
+pub(crate) static VORBIS_DESC: ElementDesc =
     desc("libavvorbisdec", &VORBIS_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::vorbis()));
 #[allow(clippy::disallowed_methods)]
-static ALAC_DESC: ElementDesc =
+pub(crate) static ALAC_DESC: ElementDesc =
     desc("libavalacdec", &ALAC_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::alac()));
 
 const FRAMES_PER_BATCH: u32 = 2;

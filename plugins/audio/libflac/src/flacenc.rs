@@ -49,7 +49,7 @@ static PROPS: [PropDesc; 3] = [
 
 // Boxed once at registry or parse time.
 #[allow(clippy::disallowed_methods)]
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "flacenc",
     sinks: &SINKS,
     srcs: &SRCS,

@@ -13,28 +13,31 @@ pub use video::{
     LibavVp6Dec, LibavVp6aDec, LibavVp6fDec, LibavVp7Dec, LibavVp8Dec, LibavVp9Dec,
 };
 
-use pf_registry::Registry;
-use profluens_core::element::Element;
+use pf_registry::{Elements, Registry};
+
+pub static ELEMENTS: Elements = &[
+    &video::H264_DESC,
+    &video::H265_DESC,
+    &video::VP8_DESC,
+    &video::VP9_DESC,
+    &video::MPEG2_DESC,
+    &video::MPEG4_DESC,
+    &video::FLV1_DESC,
+    &video::VP6_DESC,
+    &video::VP6F_DESC,
+    &video::VP6A_DESC,
+    &video::VP7_DESC,
+    &audio::AAC_DESC,
+    &audio::AC3_DESC,
+    &audio::MP3_DESC,
+    &audio::DTS_DESC,
+    &audio::TRUEHD_DESC,
+    &audio::MLP_DESC,
+    &audio::VORBIS_DESC,
+    &audio::ALAC_DESC,
+    &aacenc::DESC,
+];
 
 pub fn register(registry: &mut Registry) {
-    registry.register(LibavH264Dec::new().desc());
-    registry.register(LibavH265Dec::new().desc());
-    registry.register(LibavVp8Dec::new().desc());
-    registry.register(LibavVp9Dec::new().desc());
-    registry.register(LibavMpeg2Dec::new().desc());
-    registry.register(LibavMpeg4Dec::new().desc());
-    registry.register(LibavFlv1Dec::new().desc());
-    registry.register(LibavVp6Dec::new().desc());
-    registry.register(LibavVp6fDec::new().desc());
-    registry.register(LibavVp6aDec::new().desc());
-    registry.register(LibavVp7Dec::new().desc());
-    registry.register(LibavAudioDec::aac().desc());
-    registry.register(LibavAudioDec::ac3().desc());
-    registry.register(LibavAudioDec::mp3().desc());
-    registry.register(LibavAudioDec::dts().desc());
-    registry.register(LibavAudioDec::truehd().desc());
-    registry.register(LibavAudioDec::mlp().desc());
-    registry.register(LibavAudioDec::vorbis().desc());
-    registry.register(LibavAudioDec::alac().desc());
-    registry.register(LibavAacEnc::new().desc());
+    registry.register_all(ELEMENTS);
 }

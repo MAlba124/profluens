@@ -5,10 +5,11 @@ pub mod dav1d;
 
 pub use av1dec::{Av1Dec, Av1DecError};
 
-use pf_registry::Registry;
-use profluens_core::element::Element;
+use pf_registry::{Elements, Registry};
+
+pub static ELEMENTS: Elements = &[&av1dec::DESC];
 
 /// Register this crate's elements for name-based construction.
 pub fn register(registry: &mut Registry) {
-    registry.register(Av1Dec::new().desc());
+    registry.register_all(ELEMENTS);
 }

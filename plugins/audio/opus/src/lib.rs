@@ -15,10 +15,10 @@ pub use head::{OpusHead, OpusHeadError, apply_output_gain, apply_output_gain_f32
 pub use opusdec::OpusDec;
 pub use opusenc::OpusEnc;
 
-use pf_registry::Registry;
-use profluens_core::element::Element;
+use pf_registry::{Elements, Registry};
+
+pub static ELEMENTS: Elements = &[&opusdec::DESC, &opusenc::DESC];
 
 pub fn register(registry: &mut Registry) {
-    registry.register(OpusDec::new().desc());
-    registry.register(OpusEnc::new().desc());
+    registry.register_all(ELEMENTS);
 }

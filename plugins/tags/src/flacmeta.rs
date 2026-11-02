@@ -2,6 +2,7 @@
 //! Best-effort, malformed metadata stops the walk. One leading ID3v2 tag is skipped.
 
 use profluens_core::event::TagSink;
+use std::borrow::Cow;
 
 /// Tags parsed from a FLAC stream's metadata blocks.
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -160,6 +161,15 @@ fn walk_blocks<'a>(bytes: &'a [u8], mut visit: impl FnMut(u8, &'a [u8]) -> bool)
 
 /// The comments of one VORBIS_COMMENT block body (section 8.6), keys uppercased.
 pub fn vorbis_comment_into(block: &[u8], sink: &mut impl TagSink) {
+    comments_into(block, false, sink);
+}
+
+/// [`vorbis_comment_into`] keeping a comment that is no UTF-8, each invalid run as U+FFFD.
+pub fn vorbis_comment_lossy_into(block: &[u8], sink: &mut impl TagSink) {
+    comments_into(block, true, sink);
+}
+
+fn comments_into(block: &[u8], keep_invalid: bool, sink: &mut impl TagSink) {
     let le = |b: &[u8], p: usize| {
         b.get(p..p + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
     };
@@ -178,11 +188,15 @@ pub fn vorbis_comment_into(block: &[u8], sink: &mut impl TagSink) {
             break;
         };
         p += clen;
-        if let Ok(s) = std::str::from_utf8(s) {
-            // Only the first '=' separates, so a value may itself contain '=' (section 8.6).
-            if let Some((key, value)) = s.split_once('=') {
-                sink.text(upper_key(key, &mut key_buf), value);
-            }
+        // Only an entry that is no UTF-8 copies.
+        let s = match std::str::from_utf8(s) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) if keep_invalid => String::from_utf8_lossy(s),
+            Err(_) => continue,
+        };
+        // Only the first '=' separates, so a value may itself contain '=' (section 8.6).
+        if let Some((key, value)) = s.split_once('=') {
+            sink.text(upper_key(key, &mut key_buf), value);
         }
     }
 }
@@ -202,27 +216,40 @@ fn upper_key<'k>(key: &'k str, buf: &'k mut [u8; KEY_STACK_MAX]) -> &'k str {
 
 /// The picture of one PICTURE block body (section 8.8) with its type, past 255 as 255.
 pub fn picture_into(block: &[u8], sink: &mut impl TagSink) {
-    let be = |b: &[u8], p: usize| {
-        b.get(p..p + 4).map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize)
-    };
-    let Some(kind) = be(block, 0) else { return };
-    let kind = u8::try_from(kind).unwrap_or(u8::MAX);
+    if let Some(f) = picture_fields(block) {
+        sink.picture_typed(f.kind, f.mime, f.data);
+    }
+}
+
+/// The width and height a PICTURE block body states, None for one [`picture_into`] passes over.
+pub fn picture_size(block: &[u8]) -> Option<(u32, u32)> {
+    picture_fields(block).map(|f| (f.width, f.height))
+}
+
+struct PictureFields<'a> {
+    kind: u8,
+    mime: &'a str,
+    width: u32,
+    height: u32,
+    data: &'a [u8],
+}
+
+fn picture_fields(block: &[u8]) -> Option<PictureFields<'_>> {
+    let be = |p: usize| block.get(p..p + 4).map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]));
+    let kind = u8::try_from(be(0)?).unwrap_or(u8::MAX);
     let mut p = 4;
-    let Some(mime_len) = be(block, p) else { return };
+    let mime_len = be(p)? as usize;
     p += 4;
-    let Some(mime) = block.get(p..p + mime_len).and_then(|s| std::str::from_utf8(s).ok()) else {
-        return;
-    };
+    let mime = block.get(p..p + mime_len).and_then(|s| std::str::from_utf8(s).ok())?;
     p += mime_len;
-    let Some(desc_len) = be(block, p) else { return };
+    let desc_len = be(p)? as usize;
     p += 4 + desc_len; // skip description
+    let (width, height) = (be(p)?, be(p + 4)?);
     p += 16; // width, height, colour depth, indexed-colour count, 4 bytes each
-    let Some(data_len) = be(block, p) else { return };
+    let data_len = be(p)? as usize;
     p += 4;
-    let Some(data) = block.get(p..p + data_len) else {
-        return;
-    };
-    sink.picture_typed(kind, mime, data);
+    let data = block.get(p..p + data_len)?;
+    Some(PictureFields { kind, mime, width, height, data })
 }
 
 fn parse_streaminfo(block: &[u8]) -> Option<StreamInfo> {
@@ -367,6 +394,35 @@ mod tests {
         picture_into(&body[..3], &mut k);
         let png = "image/png".to_string();
         assert_eq!(k.0, [(3, png.clone()), (4, png.clone()), (255, png)], "past 255 as 255");
+    }
+
+    #[test]
+    fn a_picture_block_states_its_size() {
+        let mut body = picture_block_body("image/png", b"\x89PNG");
+        assert_eq!(picture_size(&body), Some((0, 0)));
+        body[24..28].copy_from_slice(&600u32.to_be_bytes());
+        body[28..32].copy_from_slice(&500u32.to_be_bytes());
+        assert_eq!(picture_size(&body), Some((600, 500)));
+        assert_eq!(picture_size(&body[..body.len() - 1]), None, "cut short");
+    }
+
+    #[test]
+    fn the_lossy_read_keeps_a_comment_that_is_no_utf8() {
+        let mut block = 0u32.to_le_bytes().to_vec();
+        block.extend_from_slice(&2u32.to_le_bytes());
+        for e in [&b"title=Caf\xE9"[..], b"ARTIST=Me"] {
+            block.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            block.extend_from_slice(e);
+        }
+        let mut strict = FlacTags::default();
+        vorbis_comment_into(&block, &mut OwningSink(&mut strict));
+        assert_eq!(strict.comments, vec![("ARTIST".into(), "Me".into())]);
+        let mut lossy = FlacTags::default();
+        vorbis_comment_lossy_into(&block, &mut OwningSink(&mut lossy));
+        assert_eq!(
+            lossy.comments,
+            vec![("TITLE".into(), "Caf\u{FFFD}".into()), ("ARTIST".into(), "Me".into())]
+        );
     }
 
     fn flac_with_comment_and_picture() -> Vec<u8> {

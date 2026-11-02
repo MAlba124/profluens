@@ -9,7 +9,7 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay }:
-    # x86_64 Linux only: intel-media-driver and vpl-gpu-rt exist nowhere else, and libav-sys has
+    # x86_64 Linux only: intel-media-driver exists nowhere else, and libav-sys has
     # a committed FFmpeg config for that target alone.
     flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
@@ -35,14 +35,13 @@
             pkgs.ninja
           ];
 
-          buildInputs = [ pkgs.libva pkgs.libvpl ];
+          buildInputs = [ pkgs.libva ];
 
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "cc";
           RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
-          # The test binaries load libva and libvpl at run time and carry no rpath to the store.
-          LD_LIBRARY_PATH = "${pkgs.libva.out}/lib:${pkgs.libvpl}/lib";
-          ONEVPL_SEARCH_PATH = "${pkgs.vpl-gpu-rt}/lib";
+          # The test binaries load libva at run time and carry no rpath to the store.
+          LD_LIBRARY_PATH = "${pkgs.libva.out}/lib";
           LIBVA_DRIVERS_PATH = "${pkgs.intel-media-driver}/lib/dri:${pkgs.mesa}/lib/dri";
         };
 

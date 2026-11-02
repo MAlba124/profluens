@@ -46,6 +46,6 @@ The profluens code is MIT, see [LICENSE](LICENSE). Some crates build or carry th
 | `libopus-sys` | libopus 1.6.1, `sys/libopus-sys/opus` | BSD-3-Clause | `opus/COPYING` |
 | `pf-text` | glyph atlas made from JetBrains Mono | OFL-1.1 | `plugins/text/src/FONT_LICENSE.txt` |
 
-FFmpeg is configured LGPL only: no `--enable-gpl`, `--enable-version3` or `--enable-nonfree`, and every external library off. It is linked statically, so a program that ships `pf-libav` must let its users relink against a modified FFmpeg (LGPL 2.1 section 6). Programs that ship the BSD libraries must carry their copyright notices. `pf-vaapi` and `pf-vpl` link libva and libvpl (both MIT) dynamically.
+FFmpeg is configured LGPL only: no `--enable-gpl`, `--enable-version3` or `--enable-nonfree`, and every external library off. It is linked statically, so a program that ships `pf-libav` must let its users relink against a modified FFmpeg (LGPL 2.1 section 6). Programs that ship the BSD libraries must carry their copyright notices. `pf-vaapi` links libva (MIT) dynamically.
 
 Reference material under `spec/` and `specs/` directories, and the WebVTT corpus in `plugins/subparse/tests/corpus`, keep their own licenses next to the files: BSD-3-Clause for the Monkey's Audio, WavPack, libmpc, Speex and web-platform-tests files, and the IETF Trust terms for the RFC texts.

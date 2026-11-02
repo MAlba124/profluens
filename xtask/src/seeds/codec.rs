@@ -209,7 +209,7 @@ mod lav {
     pub const AGAIN: u8 = 0x40;
 }
 
-pub const TARGETS: [&str; 8] = [
+pub const TARGETS: [&str; 7] = [
     "vaapi_h264",
     "vaapi_h265",
     "vaapi_av1",
@@ -217,7 +217,6 @@ pub const TARGETS: [&str; 8] = [
     "libav_dec",
     "opus_dec",
     "probe",
-    "vpl_nal",
 ];
 
 /// opus_dec knobs: s16 at 48 kHz, f32, s16 at 16 kHz with a sink delay, f32 at 24 kHz in batches
@@ -409,9 +408,6 @@ fn h264(w: &mut Writer<'_>, name: &str, b: &[u8]) -> Result<(), Error> {
     }
     let starts = |n: &[u8]| matches!(n[0] & 0x1F, 1 | 5).then(|| n[1] & 0x80 != 0);
     let units = access_units(&all, 1, starts);
-    for (i, u) in units.iter().take(2).enumerate() {
-        w.put("vpl_nal", &format!("{name}.{i}"), 0, u)?;
-    }
     w.lav(name, lav::H264, &units)
 }
 
@@ -433,9 +429,6 @@ fn hevc(w: &mut Writer<'_>, name: &str, b: &[u8]) -> Result<(), Error> {
     }
     let starts = |n: &[u8]| (ty(n) < 32).then(|| n[2] & 0x80 != 0);
     let units = access_units(&all, 2, starts);
-    for (i, u) in units.iter().take(2).enumerate() {
-        w.put("vpl_nal", &format!("{name}.{i}"), 1, u)?;
-    }
     w.lav(name, lav::H265, &units)
 }
 

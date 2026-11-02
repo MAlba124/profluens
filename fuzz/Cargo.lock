@@ -165,7 +165,6 @@ dependencies = [
  "pf-text",
  "pf-tsdemux",
  "pf-vaapi",
- "pf-vpl",
  "profluens-audio",
  "profluens-core",
  "profluens-video",
@@ -348,16 +347,6 @@ dependencies = [
 
 [[package]]
 name = "pf-vaapi"
-version = "0.1.0"
-dependencies = [
- "pf-hdr",
- "pf-registry",
- "profluens-core",
- "profluens-video",
-]
-
-[[package]]
-name = "pf-vpl"
 version = "0.1.0"
 dependencies = [
  "pf-hdr",

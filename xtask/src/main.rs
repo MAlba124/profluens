@@ -33,7 +33,7 @@ commands:
                             (nix and ffmpeg)
   seeds <out>               demuxer fuzz seed corpora into <out>/<format>_demux
                             (ffmpeg on PATH, else only the committed fixtures)
-  layout <vaapi-av1|vaapi-dav1d|vpl>
+  layout <vaapi-av1|vaapi-dav1d>
                             regenerate a struct layout .rs file from its C generator
   libav-config <target>     sys/libav-sys/config/<target> from the FFmpeg submodule
   help                      this text
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(parse(&args(&["fixtures-ts", "/t"])).ok(), Some(Cmd::FixturesTs("/t".into())));
         assert_eq!(parse(&args(&["fixtures-ps", "/p"])).ok(), Some(Cmd::FixturesPs("/p".into())));
         assert_eq!(parse(&args(&["fixtures-flv", "/f"])).ok(), Some(Cmd::FixturesFlv("/f".into())));
-        assert_eq!(parse(&args(&["layout", "vpl"])).ok(), Some(Cmd::Layout(Layout::Vpl)));
+        assert_eq!(parse(&args(&["layout", "vaapi-av1"])).ok(), Some(Cmd::Layout(Layout::VaapiAv1)));
         assert_eq!(
             parse(&args(&["libav-config", "x86_64-unknown-linux-gnu"])).ok(),
             Some(Cmd::LibavConfig("x86_64-unknown-linux-gnu".into()))

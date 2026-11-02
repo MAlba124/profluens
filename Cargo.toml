@@ -23,7 +23,6 @@ members = [
     "plugins/formats/ts",
     "plugins/formats/tsdemux",
     "plugins/hw/vaapi",
-    "plugins/hw/vpl",
     "plugins/libav",
     "plugins/subparse",
     "plugins/tags",

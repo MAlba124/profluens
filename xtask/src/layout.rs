@@ -10,7 +10,6 @@ use crate::util;
 pub enum Layout {
     VaapiAv1,
     VaapiDav1d,
-    Vpl,
 }
 
 impl Layout {
@@ -18,7 +17,6 @@ impl Layout {
         match name {
             "vaapi-av1" => Some(Layout::VaapiAv1),
             "vaapi-dav1d" => Some(Layout::VaapiDav1d),
-            "vpl" => Some(Layout::Vpl),
             _ => None,
         }
     }
@@ -49,10 +47,6 @@ pub fn generate(root: &Path, which: Layout) -> Result<(), Error> {
             cc.arg(format!("-I{}", inc.display()));
             ("plugins/hw/vaapi/gen/dav1d_layout.c", "plugins/hw/vaapi/tests/common/dav1d_layout.rs")
         }
-        Layout::Vpl => {
-            cc.args(["-O1", "-Wno-deprecated-declarations"]).args(cflags("vpl")?);
-            ("plugins/hw/vpl/gen/layout.c", "plugins/hw/vpl/src/layout.rs")
-        }
     };
     util::run("cc", cc.arg(root.join(src)).arg("-o").arg(&bin))?;
     // Written only once the generator succeeded, a failure leaves the old file.
@@ -68,7 +62,7 @@ mod tests {
     fn layout_names() {
         assert_eq!(Layout::parse("vaapi-av1"), Some(Layout::VaapiAv1));
         assert_eq!(Layout::parse("vaapi-dav1d"), Some(Layout::VaapiDav1d));
-        assert_eq!(Layout::parse("vpl"), Some(Layout::Vpl));
+        assert_eq!(Layout::parse("vpl"), None);
         assert_eq!(Layout::parse("vaapi"), None);
     }
 }

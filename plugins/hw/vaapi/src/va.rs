@@ -152,6 +152,11 @@ impl SurfaceFormat {
         fourcc: ffi::VA_FOURCC_P010,
         bits_per_pixel: 24,
     };
+    pub const P012: SurfaceFormat = SurfaceFormat {
+        rt_format: ffi::VA_RT_FORMAT_YUV420_12,
+        fourcc: ffi::VA_FOURCC_P012,
+        bits_per_pixel: 24,
+    };
 }
 
 pub struct Config {
@@ -184,6 +189,35 @@ impl Config {
             )
         };
         check(st, "vaCreateConfig")?;
+        Ok(Config { dpy: display.raw(), id })
+    }
+
+    /// A decode config whose pictures are also scaled in the call, see [`crate::decproc`].
+    pub fn new_decode_processing(
+        display: &Display,
+        profile: ffi::VAProfile,
+        format: SurfaceFormat,
+    ) -> VaResult<Config> {
+        let mut attribs = [
+            ffi::VAConfigAttrib { type_: ffi::VAConfigAttribRTFormat, value: format.rt_format },
+            ffi::VAConfigAttrib {
+                type_: ffi::VAConfigAttribDecProcessing,
+                value: ffi::VA_DEC_PROCESSING,
+            },
+        ];
+        let mut id: ffi::VAConfigID = ffi::VA_INVALID_ID;
+        // SAFETY: display live, attribs a valid two-element array, id out ptr valid.
+        let st = unsafe {
+            ffi::vaCreateConfig(
+                display.raw(),
+                profile,
+                ffi::VAEntrypointVLD,
+                attribs.as_mut_ptr(),
+                attribs.len() as i32,
+                &mut id,
+            )
+        };
+        check(st, "vaCreateConfig(dec processing)")?;
         Ok(Config { dpy: display.raw(), id })
     }
 
@@ -251,6 +285,26 @@ impl Config {
         self.id
     }
 }
+
+/// Waits for the GPU to be done with `surface` in 1 ms steps (vaSyncSurface2), false when `stop`
+/// says so first. A driver without it, or a failure, is left to the sync after.
+// `dpy` outlives the call, the element owns it on its single thread.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn wait_surface(dpy: ffi::VADisplay, surface: ffi::VASurfaceID, stop: impl Fn() -> bool) -> bool {
+    loop {
+        // SAFETY: surface is a live surface on this display.
+        let status = unsafe { ffi::vaSyncSurface2(dpy, surface, WAIT_STEP_NS) };
+        if status != ffi::VA_STATUS_ERROR_TIMEDOUT {
+            return true;
+        }
+        if stop() {
+            return false;
+        }
+    }
+}
+
+/// How long [`wait_surface`] waits before it looks at `stop` again.
+const WAIT_STEP_NS: u64 = 1_000_000;
 
 pub fn sync_surface(display: &Display, surface: ffi::VASurfaceID) -> VaResult<()> {
     // SAFETY: the display is live, and the caller's surface is one of its own.
@@ -538,6 +592,17 @@ impl Buffer {
     }
 
     /// The target surface must be synced first, some drivers block in the map otherwise.
+    /// Whether the GPU is done with the buffer, without waiting (vaSyncBuffer at a zero
+    /// timeout). A driver without it says done, the map then waits.
+    pub fn idle(&self) -> VaResult<bool> {
+        // SAFETY: self.id is a live buffer on this display.
+        match unsafe { ffi::vaSyncBuffer(self.dpy, self.id, 0) } {
+            ffi::VA_STATUS_SUCCESS | ffi::VA_STATUS_ERROR_UNIMPLEMENTED => Ok(true),
+            ffi::VA_STATUS_ERROR_TIMEDOUT => Ok(false),
+            status => Err(VaError { status, ctx: "vaSyncBuffer" }),
+        }
+    }
+
     pub fn read_coded(&self, out: &mut Vec<u8>) -> VaResult<()> {
         let mut base: *mut std::ffi::c_void = ptr::null_mut();
         // SAFETY: self.id is a live coded buffer on this display.

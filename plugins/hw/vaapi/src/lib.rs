@@ -6,6 +6,7 @@ pub mod av1dec;
 pub mod av1enc;
 pub mod bitwriter;
 pub mod colour;
+pub mod decproc;
 mod enc;
 pub mod encshell;
 pub mod error;
@@ -98,6 +99,29 @@ pub fn video_decoder_for(family: &str) -> Option<Box<dyn Element>> {
         "h265/annexb" if caps.supports("h265/annexb") => Some(Box::new(VaapiH265Dec::new())),
         "vp9" if caps.supports("vp9") => Some(Box::new(VaapiVp9Dec::new())),
         "av1" if caps.supports("av1") => Some(Box::new(VaapiAv1Dec::new())),
+        _ => None,
+    }
+}
+
+/// A zero-copy decoder of `family` whose pictures leave scaled into `target`'s box by the decode
+/// call, bars around them when `fixed`. None where the driver does no decode processing for
+/// every profile of the family or the decoder has none.
+// Cold: one boxing per element construction, not per-frame.
+#[allow(clippy::disallowed_methods)]
+pub fn shrinking_decoder_for(
+    family: &str,
+    channel: std::sync::Arc<gpuframe::GpuFrameChannel>,
+    target: vpp::Target,
+    fixed: bool,
+) -> Option<Box<dyn Element>> {
+    let caps = probe::probe()?;
+    if !caps.shrinks(family) {
+        return None;
+    }
+    match family {
+        "h264/annexb" => Some(Box::new(VaapiH264Dec::new_zerocopy(channel).with_shrink(target, fixed))),
+        "h265/annexb" => Some(Box::new(VaapiH265Dec::new_zerocopy(channel).with_shrink(target, fixed))),
+        "vp9" => Some(Box::new(VaapiVp9Dec::new_zerocopy(channel).with_shrink(target, fixed))),
         _ => None,
     }
 }

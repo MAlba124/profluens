@@ -235,7 +235,7 @@ pub struct VaapiAv1Dec {
 }
 
 // SAFETY: `SchedHint::Active`, the element runs on one scheduler thread and never
-// shares its `Display`. The preroll probe opens and closes a display of its own.
+// shares its `Display`. The display preroll opens moves to that thread with the element.
 unsafe impl Send for VaapiAv1Dec {}
 
 impl Default for VaapiAv1Dec {
@@ -710,6 +710,7 @@ impl VaapiAv1Dec {
         let color = Color { hdr: self.hdr, dovi: self.side.dovi, ..stated_color(&seq.color) };
         self.output_queue.push_back(PendingOut {
             surface,
+            export: surface,
             pts,
             duration,
             width,
@@ -820,6 +821,11 @@ impl VaapiAv1Dec {
         let Some(dpy) = self.display.as_ref().map(Display::raw) else {
             return Ok(true);
         };
+        // a pending command, a seek's flush, cuts the wait short, the decoder runs again after it
+        if !crate::va::wait_surface(dpy, out.surface, || ctx.command_pending()) {
+            ctx.wake_within(crate::enc::POLL_WAKE);
+            return Ok(false);
+        }
         let mut exported = match ExportedSurface::export(dpy, out.surface) {
             Ok(e) => e,
             Err(e) => {
@@ -1005,7 +1011,9 @@ impl Element for VaapiAv1Dec {
         if self.zerocopy.is_none() {
             return Ok(());
         }
-        let display = if self.ensure_display(ctx) { self.display.take() } else { None };
+        // kept for the session, a display opened again on the element's thread is 2 to 5 ms
+        // ahead of its first picture
+        let display = if self.ensure_display(ctx) { self.display.as_ref() } else { None };
         let formats = match display.map(gpuframe::exported_formats) {
             Some(Ok(formats)) => formats,
             Some(Err(e)) => {
@@ -1026,6 +1034,7 @@ impl Element for VaapiAv1Dec {
     }
 
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        let emitted = self.emitted;
         if self.failed {
             while inputs.pop().is_some() {
                 ctx.count_drop();
@@ -1045,7 +1054,8 @@ impl Element for VaapiAv1Dec {
             if !self.emit_queued(ctx, keep)? {
                 return Ok(Flow::Ok);
             }
-            if ctx.command_pending() {
+            // a picture put out goes downstream now, the next decode would hold it back
+            if ctx.command_pending() || self.emitted != emitted {
                 return Ok(Flow::Ok);
             }
             let Some(front) = inputs.front() else { break };

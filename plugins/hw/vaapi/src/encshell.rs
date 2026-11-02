@@ -319,6 +319,7 @@ impl<C: Codec> VaEnc<C> {
             fmt.height,
             C::ALIGN,
             C::PACKED,
+            1,
         )
         .map_err(K::SessionSetup)?;
         let codec = C::begin(display, profile, entrypoint, &engine, &self.cfg, fmt)?;
@@ -619,6 +620,17 @@ pub(crate) trait MiscParam: Copy {}
 impl MiscParam for ffi::VAEncMiscParameterRateControl {}
 impl MiscParam for ffi::VAEncMiscParameterFrameRate {}
 impl MiscParam for ffi::VAEncMiscParameterHRD {}
+impl MiscParam for ffi::VAEncMiscParameterBufferQualityLevel {}
+
+/// The quality level VPL's balanced target usage is, iHD defaults to 7 without one. VDEnc
+/// codes the same at any level, the shader encoders do not.
+pub(crate) const QUALITY_BALANCED: u32 = 4;
+
+/// The quality level misc buffer, 1 best to 7 fastest.
+pub(crate) fn quality_buffer(display: &Display, engine: &EncEngine, level: u32) -> VaResult<VaBuffer> {
+    let q = ffi::VAEncMiscParameterBufferQualityLevel { quality_level: level, va_reserved: [0; ffi::VA_PADDING_LOW] };
+    misc_buffer(display, engine, ffi::VAEncMiscParameterTypeQualityLevel, &q)
+}
 
 pub(crate) fn misc_buffer<T: MiscParam>(
     display: &Display,

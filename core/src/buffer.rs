@@ -33,6 +33,9 @@ impl BufferFlags {
     pub const HEADER: Self = Self(1 << 6);
     /// The first picture decoded behind a preview seek, shown until the one at the point comes.
     pub const PREVIEW: Self = Self(1 << 7);
+    /// A decoded picture its source coded without reference to another, most often a scene
+    /// change, where an encoder after the decoder does well to start a GOP.
+    pub const INTRA: Self = Self(1 << 8);
 
     pub const fn empty() -> Self {
         Self(0)

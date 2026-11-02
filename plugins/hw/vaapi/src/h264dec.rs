@@ -21,7 +21,9 @@ use profluens_core::time::Timestamp;
 
 use std::sync::Arc;
 
+use crate::decproc::{self, Twins};
 use crate::error::{Transient, VaapiErrorKind as K, Verdict, Warned, failed, log_fatal};
+use crate::vpp::Target;
 use crate::ffi;
 use crate::gpuframe::{
     self, F_LAYOUT, F_MODIFIER, FAMILY_VIDEO_GPU, FrameToken, FrameTx, GPU_FRAME_HEADER_LEN,
@@ -32,7 +34,8 @@ use crate::h264parse::{
 };
 use crate::probe;
 use crate::va::{
-    Buffer as VaBuffer, Config, Context, Display, ExportFn, ExportedSurface, MappedImage, Surfaces,
+    Buffer as VaBuffer, Config, Context, Display, ExportFn, ExportedSurface, MappedImage, SurfaceFormat,
+    Surfaces,
 };
 use profluens_video::color::{self as colour, HdrStatic};
 use profluens_video::decoder::{Color, color_fields};
@@ -119,6 +122,8 @@ struct DpbEntry {
 
 struct PendingOut {
     surface: ffi::VASurfaceID,
+    /// What is exported, the surface or its twin, the geometry below is its.
+    export: ffi::VASurfaceID,
     pts: Timestamp,
     duration: Timestamp,
     width: u32,
@@ -129,11 +134,15 @@ struct PendingOut {
     coded_h: u32,
     color: Color,
     preview: bool,
+    /// Every slice of it is I or SI, the source's scene change most often.
+    intra: bool,
 }
 
 struct VaState {
     // Field order is drop order, the context goes before its surfaces and its config.
     context: Context,
+    /// The scaled twins of the surfaces when the decoder shrinks.
+    twins: Option<Twins>,
     surfaces: Surfaces,
     _config: Config,
     free: VecDeque<ffi::VASurfaceID>,
@@ -189,9 +198,12 @@ pub struct VaapiH264Dec {
     export: ExportFn,
     modifier: Option<u64>,
     only: bool,
+    /// Pictures leave scaled into this box by the decode call, bars around them when fixed.
+    shrink: Option<(Target, bool)>,
 }
 
-// SAFETY: an Active element runs on one dedicated thread, the raw VADisplay never crosses threads.
+// SAFETY: an Active element runs on one dedicated thread after preroll, its display moves there
+// with it and is never used from two threads at once.
 unsafe impl Send for VaapiH264Dec {}
 
 impl Default for VaapiH264Dec {
@@ -211,6 +223,14 @@ impl VaapiH264Dec {
     /// Zero-copy mode. Decoded surfaces leave as DMA-BUF [`GpuFrame`]s on `channel`.
     pub fn new_zerocopy(channel: Arc<GpuFrameChannel>) -> Self {
         Self::with_zerocopy(Some(channel))
+    }
+
+    /// Zero-copy pictures leave scaled into `target` by the decode call itself, placed in its box
+    /// with bars when `fixed`, see [`crate::decproc`]. The driver must do decode processing for
+    /// the stream's profile.
+    pub fn with_shrink(mut self, target: Target, fixed: bool) -> Self {
+        self.shrink = Some((target, fixed));
+        self
     }
 
     #[cfg(test)]
@@ -257,6 +277,7 @@ impl VaapiH264Dec {
             export: ExportedSurface::export,
             modifier: None,
             scratch: AuScratch::default(),
+            shrink: None,
         }
     }
 
@@ -343,8 +364,22 @@ impl VaapiH264Dec {
         let count = crate::va::decode_surface_count(refs, reorder, extra);
         // A new SPS takes effect only at an IDR (7.4.1.2.1), so an undersized session is rebuilt
         // there.
+        let shrink = match self.shrink.filter(|_| self.zerocopy.is_some()) {
+            Some((t, fixed)) => match decproc::plan(width, height, 8, t, fixed) {
+                Some(p) => Some(p),
+                None => {
+                    self.fail(ctx, K::ProcSize { width, height });
+                    return false;
+                }
+            },
+            None => None,
+        };
         if let Some(va) = &self.va {
-            if va.width == width && va.height == height && (va.count >= count || !idr) {
+            if va.width == width
+                && va.height == height
+                && va.twins.as_ref().map(|t| t.plan) == shrink
+                && (va.count >= count || !idr)
+            {
                 return true;
             }
             log!(
@@ -373,7 +408,11 @@ impl VaapiH264Dec {
         );
 
         let profile = ffi::VAProfileH264High; // High covers Main and CB for VLD on Intel.
-        let config = match Config::new_decode(display, profile) {
+        let config = match shrink {
+            Some(_) => Config::new_decode_processing(display, profile, SurfaceFormat::NV12),
+            None => Config::new_decode(display, profile),
+        };
+        let config = match config {
             Ok(c) => c,
             Err(e) => {
                 self.fail(ctx, K::SessionSetup(e));
@@ -395,9 +434,23 @@ impl VaapiH264Dec {
                     return false;
                 }
             };
+        // the decoded picture is whole macroblocks, frame cropping the crop
+        let crop = (crop_x, crop_y, width, height);
+        let twins = match shrink.map(|p| Twins::new(display, p, count, crop, (coded_w, coded_h))).transpose() {
+            Ok(t) => t,
+            Err(e) => {
+                self.fail(ctx, e);
+                return false;
+            }
+        };
+        if let Some(t) = &twins {
+            let (w, h) = (t.plan.width, t.plan.height);
+            log!(&*ctx, Level::Info, "shrink", width = w, height = h, layout = t.kind().name);
+        }
         let free = VecDeque::from(surfaces.ids().to_vec());
         self.va = Some(VaState {
             context,
+            twins,
             surfaces,
             _config: config,
             free,
@@ -638,8 +691,14 @@ impl VaapiH264Dec {
             return;
         };
 
-        let Some((width, height, crop_x, crop_y, coded_w, coded_h)) =
-            self.va.as_ref().map(|v| (v.width, v.height, v.crop_x, v.crop_y, v.coded_w, v.coded_h))
+        let Some((export, width, height, crop_x, crop_y, coded_w, coded_h)) =
+            self.va.as_ref().map(|v| match &v.twins {
+                Some(t) => {
+                    let twin = t.of(&v.surfaces, target).unwrap_or(target);
+                    (twin, t.plan.width, t.plan.height, 0, 0, t.coded.0, t.coded.1)
+                }
+                None => (target, v.width, v.height, v.crop_x, v.crop_y, v.coded_w, v.coded_h),
+            })
         else {
             return;
         };
@@ -683,6 +742,7 @@ impl VaapiH264Dec {
 
         self.output_queue.push_back(PendingOut {
             surface: target,
+            export,
             pts,
             duration,
             width,
@@ -693,6 +753,7 @@ impl VaapiH264Dec {
             coded_h,
             color: Color { hdr: self.hdr, dovi: self.side.dovi, ..sps.colour },
             preview,
+            intra: sc.headers.iter().all(|h| matches!(h.slice_type, SliceType::I | SliceType::Si)),
         });
         if mmco5 {
             // 8.2.1, the picture restarts the order count. Earlier pictures sort first.
@@ -802,10 +863,23 @@ impl VaapiH264Dec {
         };
         let iq_buf = VaBuffer::new_struct(display, context, ffi::VAIQMatrixBufferType, &iq)?;
 
+        // every picture names its twin, iHD would write the last one's again
+        let mut regions = va.twins.as_ref().map(|t| {
+            let twin = t.of(&va.surfaces, target).unwrap_or(ffi::VA_INVALID_SURFACE);
+            decproc::Regions::new(t, twin)
+        });
+        let proc_buf = match regions.as_mut() {
+            Some(r) => Some(decproc::pipeline(display, context, target, r)?),
+            None => None,
+        };
+
         keep.clear();
         context.begin(target)?;
         let rendered = (|| {
             context.render(&[pic_buf.id(), iq_buf.id()])?;
+            if let Some(p) = &proc_buf {
+                context.render(&[p.id()])?;
+            }
             for (sh, nal) in headers.iter().zip(slice_nals.iter()) {
                 let (list0, list1, n0, n1) = self.build_ref_lists(sps, sh, top_poc.min(bottom_poc));
                 let sp = self.build_slice_param(sh, nal.raw(au), &list0, &list1, n0, n1);
@@ -1155,6 +1229,9 @@ impl VaapiH264Dec {
         if out.preview {
             buf.flags |= BufferFlags::PREVIEW;
         }
+        if out.intra {
+            buf.flags |= BufferFlags::INTRA;
+        }
         drop(image);
         log!(&*ctx, Level::Trace, "frame", pts = buf.pts);
         self.side.attach(buf.pts.0, &mut buf.memory);
@@ -1182,7 +1259,13 @@ impl VaapiH264Dec {
             None => return Ok(true),
         };
 
-        let mut exported = match (self.export)(dpy, out.surface) {
+        // a pending command, a seek's flush, cuts the wait short, the decoder runs again after it
+        if !crate::va::wait_surface(dpy, out.export, || ctx.command_pending()) {
+            self.pending = Some(out);
+            ctx.wake_within(crate::enc::POLL_WAKE);
+            return Ok(false);
+        }
+        let mut exported = match (self.export)(dpy, out.export) {
             Ok(e) => e,
             Err(e) => {
                 // The driver fails this sync now and then under rapid seeks.
@@ -1259,6 +1342,9 @@ impl VaapiH264Dec {
         buf.duration = out.duration;
         if out.preview {
             buf.flags |= BufferFlags::PREVIEW;
+        }
+        if out.intra {
+            buf.flags |= BufferFlags::INTRA;
         }
 
         let frame = GpuFrame {
@@ -1344,7 +1430,9 @@ impl Element for VaapiH264Dec {
         if self.zerocopy.is_none() {
             return Ok(());
         }
-        let display = if self.ensure_display(ctx) { self.display.take() } else { None };
+        // kept for the session, a display opened again on the element's thread is 2 to 5 ms
+        // ahead of its first picture
+        let display = if self.ensure_display(ctx) { self.display.as_ref() } else { None };
         let formats = match display.map(gpuframe::exported_formats) {
             Some(Ok(formats)) => formats,
             Some(Err(e)) => {
@@ -1366,6 +1454,7 @@ impl Element for VaapiH264Dec {
     }
 
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        let emitted = self.emitted;
         if self.failed {
             while inputs.pop().is_some() {
                 ctx.count_drop();
@@ -1403,7 +1492,8 @@ impl Element for VaapiH264Dec {
                     return Ok(Flow::Ok); // pool dry, re-cranked on slot return
                 }
             }
-            if ctx.command_pending() {
+            // a picture put out goes downstream now, the next decode would hold it back
+            if ctx.command_pending() || self.emitted != emitted {
                 return Ok(Flow::Ok);
             }
             let Some(inbuf) = inputs.pop() else { break };
@@ -1874,6 +1964,7 @@ mod tests {
         let push = |dec: &mut VaapiH264Dec, surface: u32, poc: i32| {
             dec.output_queue.push_back(PendingOut {
                 surface,
+                export: surface,
                 pts: Timestamp::ZERO,
                 duration: Timestamp::ZERO,
                 width: 16,
@@ -1884,6 +1975,7 @@ mod tests {
                 coded_h: 16,
                 color: Color::default(),
                 preview: false,
+                intra: false,
             });
             dec.reorder_output(surface, poc);
         };

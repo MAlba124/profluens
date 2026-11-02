@@ -1,5 +1,6 @@
 //! `vaapih265enc`, VA-API H.265 encode. NV12/I420 in, Annex-B or HVCC out.
-//! IDR + P only, one SPS short-term RPS, headers authored here and sent packed.
+//! IDR + P only, up to [`REFS`] references a P picture, an SPS short-term RPS for each count of
+//! them, headers authored here and sent packed.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +22,8 @@ use profluens_core::log::Level;
 use profluens_core::time::Timestamp;
 
 use crate::bitwriter::{BitWriter, annexb_nal};
+use crate::colour;
+use profluens_video::color::StreamColor;
 use crate::enc::{self, EncEngine, FrameBufs, InFormat, PadOut, RawPixFmt, Staged, Stamp};
 use crate::encshell;
 use crate::error::{VaapiErrorKind as K, Warned, failed};
@@ -39,6 +42,7 @@ const NAL_TRAIL_R: u8 = 1;
 const NAL_IDR_W_RADL: u8 = 19;
 const NAL_VPS: u8 = 32;
 const NAL_SPS: u8 = 33;
+const NAL_PREFIX_SEI: u8 = 39;
 const NAL_PPS: u8 = 34;
 
 static PIXFMT_VALUES: [ValueDesc; 3] =
@@ -123,6 +127,60 @@ fn pick_level(coded_w: u32, coded_h: u32, fps: (u32, u32)) -> u8 {
     156 // 5.2
 }
 
+/// References a P picture takes at most, VDEnc's low delay B takes three (iHD 26).
+pub const REFS: u32 = 3;
+
+/// The quantizer a session starts at, its PPS's init_qp.
+pub const DEFAULT_QP: u8 = 26;
+
+/// The entrypoints a session tries in order, VDEnc first when asked or alone, the shader
+/// encoder after it. VDEnc-only parts offer EncSliceLP alone.
+fn entrypoints(enc: bool, lp: bool, low_power: bool) -> [Option<ffi::VAEntrypoint>; 2] {
+    match (enc, lp && (low_power || !enc)) {
+        (true, true) => [Some(ffi::VAEntrypointEncSliceLP), Some(ffi::VAEntrypointEncSlice)],
+        (false, true) => [Some(ffi::VAEntrypointEncSliceLP), None],
+        (true, false) => [Some(ffi::VAEntrypointEncSlice), None],
+        (false, false) => [None, None],
+    }
+}
+
+/// References a session keeps, [`REFS`] within the driver's L0, and its L1 too where inter
+/// pictures are low delay B (both lists the previous pictures).
+fn session_refs(r: probe::EncRefs) -> u32 {
+    REFS.min(r.l0).min(if r.gpb { r.l1 } else { r.l0 }).max(1)
+}
+
+/// The VPS, SPS and PPS (Annex B) a session for `width` x `height` pictures writes, known
+/// before one opens, from the probe. `qp`, `brc`, `low_power` as the session has them, `color`
+/// the one [`VaapiH265Enc::with_colour`] pins. A session the driver refuses on its first
+/// entrypoint writes the next one's. None without a probe or an encoder of the profile.
+#[allow(clippy::too_many_arguments)]
+pub fn parameter_sets(
+    width: u32,
+    height: u32,
+    fps: (u32, u32),
+    ten: bool,
+    qp: u8,
+    brc: bool,
+    low_power: bool,
+    color: &StreamColor,
+) -> Option<Vec<u8>> {
+    let name = if ten { "HEVCMain10" } else { "HEVCMain" };
+    let row = probe::probe()?.profiles.iter().find(|p| p.name == name).copied()?;
+    let entrypoint = entrypoints(row.enc, row.enc_lp, low_power)[0]?;
+    let lp = entrypoint == ffi::VAEntrypointEncSliceLP;
+    let refs = session_refs(row.enc_refs[usize::from(lp)]);
+    let ctb_log2 = if lp { 6 } else { 5 };
+    let (width, height) = (width.max(2), height.max(2));
+    let coded = (enc::align_up(width, 16), enc::align_up(height, 16));
+    let pixfmt = if ten { RawPixFmt::P010 } else { RawPixFmt::Nv12 };
+    let fmt = InFormat { width, height, pixfmt, fps };
+    let level_idc = pick_level(coded.0, coded.1, fps);
+    let vps = write_vps(level_idc, ten, refs);
+    let sps = write_sps(coded, fmt, level_idc, ctb_log2, refs, colour::vui_colour(color));
+    Some(concat_nals(&vps, &sps, &write_pps(qp, brc, ctb_log2, refs)))
+}
+
 struct Session {
     engine: EncEngine,
     vps_nal: Vec<u8>,
@@ -139,12 +197,19 @@ struct Session {
     ctb_log2: u32,
     level_idc: u8,
     ten: bool,
+    /// The colour the SPS states.
+    color: StreamColor,
+    /// The HDR SEI NAL each IDR carries after its parameter sets.
+    sei: Option<Vec<u8>>,
+    /// Inter pictures are coded as B slices with both lists the previous pictures.
+    gpb: bool,
 }
 
 /// VA-API H.265 encoder element.
 pub struct VaapiH265Enc {
     device: Option<PathBuf>,
     // Field order is drop order, what holds the display's handle goes before it.
+    inflight: Option<enc::InFlight>,
     gpu: Option<GpuIn>,
     session: Option<Session>,
     display: Option<Display>,
@@ -156,14 +221,22 @@ pub struct VaapiH265Enc {
     rc_dirty: bool,
     warned_rc_mode: bool,
 
+    low_power: bool,
     in_fmt: Option<InFormat>,
+    /// The input's colour, stated in the VUI, its HDR metadata as SEI.
+    color: StreamColor,
     hvcc: bool,
     bytes_out: bool,
     bufs: FrameBufs,
     staged: Staged,
+    cadence: enc::IntraCadence,
     disabled: bool,
     warned: Warned,
     frames: u64,
+    /// The picture size a zero-copy session opens at in `start`.
+    ahead: Option<(u32, u32)>,
+    /// The colour the VUI states in place of the input's, its HDR metadata still the input's.
+    pinned: Option<StreamColor>,
 }
 
 // SAFETY: an Active element runs on one dedicated thread, the raw VADisplay never crosses threads.
@@ -189,23 +262,29 @@ impl VaapiH265Enc {
     pub fn new() -> Self {
         VaapiH265Enc {
             device: None,
+            inflight: None,
             gpu: None,
             display: None,
             session: None,
-            qp: 26,
+            qp: DEFAULT_QP,
             bitrate_kbps: 0,
             gop_len: 60,
             hrd_ms: 0,
             rc_dirty: false,
             warned_rc_mode: false,
+            low_power: true,
             in_fmt: None,
+            color: StreamColor::default(),
             hvcc: false,
             bytes_out: false,
             bufs: FrameBufs::new(),
             staged: Staged::new(),
+            cadence: enc::IntraCadence::default(),
             disabled: false,
             warned: Warned::default(),
             frames: 0,
+            ahead: None,
+            pinned: None,
         }
     }
 
@@ -241,8 +320,31 @@ impl VaapiH265Enc {
     }
 
     /// HRD buffer depth in ms at the target bitrate (0 = off). The `hrd` prop overrides.
+    /// Opens the session for `width` x `height` pictures in `start`, beside the demuxer and the
+    /// decoder, instead of on the first picture, at the depth the link names. A first picture of
+    /// another size, depth or colour reopens it.
+    /// The colour the VUI states whatever the input announces, so a head written before the
+    /// session (see [`parameter_sets`]) is the SPS it writes. The SEI keeps the input's HDR
+    /// metadata.
+    pub fn with_colour(mut self, color: StreamColor) -> Self {
+        self.pinned = Some(color);
+        self
+    }
+
+    pub fn with_ahead(mut self, width: u32, height: u32) -> Self {
+        self.ahead = Some((width, height));
+        self
+    }
+
     pub fn with_hrd_ms(mut self, ms: u32) -> Self {
         self.hrd_ms = ms.min(10_000);
+        self
+    }
+
+    /// Encodes on VDEnc (EncSliceLP) where the driver has it, on by default. The shader
+    /// encoder (EncSlice) loads the render engine past what a 1080p60 stream leaves free.
+    pub fn with_low_power(mut self, on: bool) -> Self {
+        self.low_power = on;
         self
     }
 
@@ -283,7 +385,10 @@ impl VaapiH265Enc {
 
     fn ensure_session(&mut self, ctx: &mut Ctx, fmt: InFormat) -> bool {
         if let Some(s) = &self.session {
-            if s.engine.width == fmt.width && s.engine.height == fmt.height && s.ten == ten_bit(fmt)
+            if s.engine.width == fmt.width
+                && s.engine.height == fmt.height
+                && s.ten == ten_bit(fmt)
+                && s.color == self.color
             {
                 return true;
             }
@@ -311,51 +416,68 @@ impl VaapiH265Enc {
             true => (ffi::VAProfileHEVCMain10, "HEVCMain10"),
             false => (ffi::VAProfileHEVCMain, "HEVCMain"),
         };
-        // VDEnc-only parts offer EncSliceLP alone, and VDEnc codes 64x64 CTBs.
         let row =
             probe::probe().and_then(|caps| caps.profiles.iter().find(|p| p.name == name).copied());
         let (enc, lp) = row.map_or((true, false), |p| (p.enc, p.enc_lp));
-        let entrypoint = match (enc, lp) {
-            (false, true) => ffi::VAEntrypointEncSliceLP,
-            (true, _) => ffi::VAEntrypointEncSlice,
-            _ => {
-                self.warn(ctx, K::NoEncodeEntrypoint { profile: name });
-                return false;
-            }
-        };
-        let ctb_log2 = if entrypoint == ffi::VAEntrypointEncSliceLP { 6 } else { 5 };
+        // the shader encoder after VDEnc, VDEnc refuses a small picture
+        let order = entrypoints(enc, lp, self.low_power);
+        if order[0].is_none() {
+            self.warn(ctx, K::NoEncodeEntrypoint { profile: name });
+            return false;
+        }
         let rc_mode = if self.bitrate_kbps > 0 { ffi::VA_RC_VBR } else { ffi::VA_RC_CQP };
-        let packed_mask =
-            va::config_attribute(display, profile, entrypoint, ffi::VAConfigAttribEncPackedHeaders)
-                .ok()
-                .flatten()
-                .unwrap_or(0);
-        log!(&*ctx, Level::Debug, "packed_headers", mask = packed_mask);
-
-        // Aligned to 16, a multiple of MinCbSizeY (7.4.3.2.1). Partial edge CTBs are legal.
-        let engine = match EncEngine::new_packed(
-            display,
-            profile,
-            entrypoint,
-            rc_mode,
-            fmt.pixfmt.surface(),
-            fmt.width,
-            fmt.height,
-            16,
-            packed_mask,
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                self.warn(ctx, K::SessionSetup(e));
-                return false;
+        let (mut opened, mut refused) = (None, None);
+        for entrypoint in order.into_iter().flatten() {
+            let packed_mask =
+                va::config_attribute(display, profile, entrypoint, ffi::VAConfigAttribEncPackedHeaders)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+            // a driver that takes no P slice wants low delay B, both lists the previous pictures
+            // (as ffmpeg's p_to_gpb)
+            let r = probe::EncRefs::query(display, profile, entrypoint);
+            let (gpb, refs) = (r.gpb, session_refs(r));
+            // Aligned to 16, a multiple of MinCbSizeY (7.4.3.2.1). Partial edge CTBs are legal.
+            let engine = EncEngine::new_packed(
+                display,
+                profile,
+                entrypoint,
+                rc_mode,
+                fmt.pixfmt.surface(),
+                fmt.width,
+                fmt.height,
+                16,
+                packed_mask,
+                refs as usize,
+            );
+            match engine {
+                Ok(e) => {
+                    opened = Some((e, entrypoint, packed_mask, gpb));
+                    break;
+                }
+                Err(e) => refused = Some(e),
             }
+        }
+        let Some((engine, entrypoint, packed_mask, gpb)) = opened else {
+            if let Some(e) = refused {
+                self.warn(ctx, K::SessionSetup(e));
+            }
+            return false;
         };
+        if let Some(e) = refused {
+            log!(&*ctx, Level::Info, "low_power_refused", status = e.status);
+        }
+        log!(&*ctx, Level::Debug, "packed_headers", mask = packed_mask);
+        let refs = engine.refs() as u32;
+        let ctb_log2 = if entrypoint == ffi::VAEntrypointEncSliceLP { 6 } else { 5 };
 
         let level_idc = pick_level(engine.coded_w, engine.coded_h, fmt.fps);
         let brc = self.bitrate_kbps > 0;
-        let vps_nal = write_vps(level_idc, ten);
-        let sps_nal = write_sps(&engine, fmt, level_idc, ctb_log2);
-        let pps_nal = write_pps(self.qp, brc);
+        let vps_nal = write_vps(level_idc, ten, refs);
+        let colour = colour::vui_colour(self.pinned.as_ref().unwrap_or(&self.color));
+        let sps_nal = write_sps(engine.coded(), fmt, level_idc, ctb_log2, refs, colour);
+        let sei = colour::hdr_sei_rbsp(&self.color.hdr).map(|r| annexb_nal(&nal_header(NAL_PREFIX_SEI), &r));
+        let pps_nal = write_pps(self.qp, brc, ctb_log2, refs);
         let ctu_count =
             engine.coded_w.div_ceil(1 << ctb_log2) * engine.coded_h.div_ceil(1 << ctb_log2);
         let (w, h) = (fmt.width, fmt.height);
@@ -368,6 +490,8 @@ impl VaapiH265Enc {
             level = level_idc,
             ten_bit = ten
         );
+        let lp = entrypoint == ffi::VAEntrypointEncSliceLP;
+        log!(&*ctx, Level::Info, "entrypoint", low_power = lp, gpb = gpb, refs = refs);
         let (kbps, qp, gop) = (self.bitrate_kbps, self.qp, self.gop_len);
         log!(
             &*ctx,
@@ -392,6 +516,9 @@ impl VaapiH265Enc {
             ctb_log2,
             level_idc,
             ten,
+            color: self.color,
+            sei,
+            gpb,
         });
         if self.bytes_out {
             ctx.announce_format(Self::OUT, "bytes", &[]);
@@ -427,13 +554,62 @@ impl VaapiH265Enc {
         self.staged.drain(&mut Self::pad(ctx))
     }
 
+    /// Reads the picture in flight once the GPU is done with it and sends it, waiting for it
+    /// when `wait`. False while it is still being coded, a wake asked for.
+    fn finish(&mut self, ctx: &mut Ctx, wait: bool) -> Result<bool, Error> {
+        let Some(f) = &self.inflight else {
+            return Ok(true);
+        };
+        if !wait {
+            match f.coded.idle() {
+                Ok(true) => {}
+                Ok(false) => {
+                    ctx.wake_within(enc::POLL_WAKE);
+                    return Ok(false);
+                }
+                // read by the map below, iHD fails every picture after a coded buffer destroyed unread
+                Err(e) => self.warn(ctx, K::Encode(e)),
+            }
+        }
+        let Some(f) = self.inflight.take() else {
+            return Ok(true);
+        };
+        let b = &mut self.bufs;
+        b.coded.clear();
+        if let (true, Some(s)) = (f.head, &self.session) {
+            b.coded.extend_from_slice(&s.seq_nals);
+        }
+        // the map waits for the GPU
+        if let Err(e) = f.coded.read_coded(&mut b.coded) {
+            self.warn(ctx, K::Encode(e));
+            return Ok(true);
+        }
+        if let (true, Some(sei)) = (f.stamp.key, self.session.as_ref().and_then(|s| s.sei.as_ref())) {
+            insert_before_slices(&mut b.coded, sei);
+        }
+        log!(&*ctx, Level::Trace, "encoded", bytes = b.coded.len(), key = f.stamp.key);
+        self.frames += 1;
+        if self.hvcc {
+            b.conv.clear();
+            annexb_to_hvcc(&b.coded, &mut b.conv);
+            std::mem::swap(&mut b.coded, &mut b.conv);
+        }
+        self.staged.send_or_stage(&mut Self::pad(ctx), &mut self.bufs.coded, f.stamp)?;
+        Ok(true)
+    }
+
+    /// Hands the picture to the GPU, it goes out on [`Self::finish`]. `frame` is the producer's
+    /// picture the GPU reads, held until then.
+    #[allow(clippy::too_many_arguments)]
     fn encode_frame(
         &mut self,
         ctx: &mut Ctx,
         input: Input<'_>,
+        frame: Option<crate::gpuframe::GpuFrame>,
         pts: Timestamp,
         duration: Timestamp,
         preview: bool,
+        intra: bool,
     ) -> Result<(), Error> {
         let Some(fmt) = self.in_fmt else {
             return Ok(());
@@ -446,14 +622,20 @@ impl VaapiH265Enc {
                 log!(&*ctx, Level::Debug, "forced_key", pts = pts, reason = "preview");
                 s.gop_pos = 0;
             }
+            // a source intra picture off its keyframe grid is a scene change, a P there smears
+            // for frames, a quarter GOP from the last IDR at least
+            let cut = self.cadence.note(intra);
+            if cut && s.gop_pos >= (self.gop_len / 4).max(1) {
+                log!(&*ctx, Level::Debug, "forced_key", pts = pts, reason = "intra");
+                s.gop_pos = 0;
+            }
             let is_idr = s.gop_pos == 0;
             let rc = RcUpdate { dirty: self.rc_dirty, hrd_ms: self.hrd_ms };
-            self.bufs.coded.clear();
             let (qp, kbps, gop) = (self.qp, self.bitrate_kbps, self.gop_len);
             encode_one(display, s, fmt, qp, kbps, gop, is_idr, rc, input, &mut self.bufs)
-                .map(|()| is_idr)
+                .map(|q| (is_idr, q))
         };
-        let is_idr = match result {
+        let (is_idr, (coded, head)) = match result {
             Ok(v) => v,
             Err(e) => {
                 self.warn(ctx, K::Encode(e));
@@ -461,15 +643,6 @@ impl VaapiH265Enc {
             }
         };
         self.rc_dirty = false; // the RC/HRD update rode this frame's submission
-        log!(&*ctx, Level::Trace, "encoded", bytes = self.bufs.coded.len(), key = is_idr);
-        self.frames += 1;
-
-        if self.hvcc {
-            let b = &mut self.bufs;
-            b.conv.clear();
-            annexb_to_hvcc(&b.coded, &mut b.conv);
-            std::mem::swap(&mut b.coded, &mut b.conv);
-        }
 
         let gop_len = self.gop_len.clamp(1, 256);
         let Some(s) = self.session.as_mut() else {
@@ -481,7 +654,8 @@ impl VaapiH265Enc {
             s.gop_pos = 0;
         }
         let stamp = Stamp { pts, duration, key: is_idr, preview };
-        self.staged.send_or_stage(&mut Self::pad(ctx), &mut self.bufs.coded, stamp)
+        self.inflight = Some(enc::InFlight { coded, head, stamp, _frame: frame });
+        Ok(())
     }
 }
 
@@ -491,7 +665,7 @@ struct RcUpdate {
     hrd_ms: u32,
 }
 
-/// Encodes one picture and appends its Annex B bytes to `bufs.coded`.
+/// Hands one picture to the GPU, its coded buffer and whether the parameter sets go in front.
 #[allow(clippy::too_many_arguments)]
 fn encode_one(
     display: &Display,
@@ -504,7 +678,7 @@ fn encode_one(
     rc: RcUpdate,
     input: Input<'_>,
     bufs: &mut FrameBufs,
-) -> va::VaResult<()> {
+) -> va::VaResult<(VaBuffer, bool)> {
     let surface = match input {
         Input::Raw(data) => {
             s.engine.upload(display, data, fmt.pixfmt)?;
@@ -523,6 +697,8 @@ fn encode_one(
         if is_idr {
             let seq = seq_param(engine, fmt, gop_len, bitrate_kbps, s.level_idc, s.ctb_log2);
             bufs.param(display, engine, ffi::VAEncSequenceParameterBufferType, &seq)?;
+            // iHD encodes at its fastest target usage (7) without one, VPL's balanced 4 is ours
+            bufs.hold.push(encshell::quality_buffer(display, engine, encshell::QUALITY_BALANCED)?);
         }
         if brc && (is_idr || rc.dirty) {
             encshell::rc_buffers(display, engine, bitrate_kbps, 51, fmt.fps, &mut bufs.hold)?;
@@ -535,26 +711,41 @@ fn encode_one(
             let (ty, nals) = (ffi::VAEncPackedHeaderSequence, &s.seq_nals);
             bufs.packed(display, engine, ty, nals, nals.len() as u32 * 8, true)?;
         }
-        let pic = pic_param(engine, poc, is_idr, qp, brc, coded.id());
+        let pic = pic_param(engine, poc, is_idr, qp, brc, s.ctb_log2, coded.id());
         bufs.param(display, engine, ffi::VAEncPictureParameterBufferType, &pic)?;
         if s.packed_mask & ffi::VA_ENC_PACKED_HEADER_SLICE != 0 {
             let w = &mut s.slice_header;
             w.clear();
-            write_slice_header(w, is_idr, poc);
+            let refs = engine.refs() as u32;
+            write_slice_header(w, is_idr, poc, s.gpb, refs_now(engine, poc), refs);
             let ty = ffi::VAEncPackedHeaderSlice;
             bufs.packed(display, engine, ty, w.as_bytes(), w.bit_len(), false)?;
         }
-        let slice = slice_param(engine, s.ctu_count, poc, is_idr);
+        let slice = slice_param(engine, s.ctu_count, poc, is_idr, s.gpb);
         bufs.param(display, engine, ffi::VAEncSliceParameterBufferType, &slice)
     })();
-    let submitted = built.and_then(|()| bufs.submit(display, &s.engine, surface));
+    let queued = built.and_then(|()| bufs.queue(&s.engine, surface));
     bufs.hold.clear();
-    submitted?;
+    queued?;
+    Ok((coded, is_idr && s.packed_mask & ffi::VA_ENC_PACKED_HEADER_SEQUENCE == 0))
+}
 
-    if is_idr && s.packed_mask & ffi::VA_ENC_PACKED_HEADER_SEQUENCE == 0 {
-        bufs.coded.extend_from_slice(&s.seq_nals);
+/// `nal` put in Annex B `au` before its first VCL NAL, after the parameter sets.
+fn insert_before_slices(au: &mut Vec<u8>, nal: &[u8]) {
+    let mut i = 0;
+    while i + 3 < au.len() {
+        if au[i..i + 3] == [0, 0, 1] {
+            if (au[i + 3] >> 1) & 0x3F < 32 {
+                let at = if i > 0 && au[i - 1] == 0 { i - 1 } else { i };
+                au.splice(at..at, nal.iter().copied());
+                return;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
     }
-    coded.read_coded(&mut bufs.coded)
+    au.extend_from_slice(nal);
 }
 
 // Cold, once per session.
@@ -580,6 +771,7 @@ fn seq_param(
     let seq_fields: u32 = 1 // chroma_format_idc = 1 (4:2:0)
         | depth_minus8 << 3 // bit_depth_luma_minus8
         | depth_minus8 << 6 // bit_depth_chroma_minus8
+        | 1 << 11 // amp_enabled_flag, VDEnc codes asymmetric partitions whatever it is told
         | 1 << 16; // low_delay_seq (decode order == display order)
     ffi::VAEncSequenceParameterBufferHEVC {
         general_profile_idc: if ten { 2 } else { 1 }, // Main 10 or Main
@@ -626,18 +818,41 @@ fn hevc_pic(surface: ffi::VASurfaceID, poc: i32, flags: u32) -> ffi::VAPictureHE
     }
 }
 
+/// diff_cu_qp_delta_depth of 8x8 quantization groups, where the rate control's QP deltas fall.
+/// VDEnc's HuC codes them per 8x8 whatever the CTB, a coarser group in the PPS dequantizes its
+/// pictures with the wrong QP, worse the more bits (iHD 26.1, VPL writes the same).
+fn qg_depth(ctb_log2: u32) -> u8 {
+    ctb_log2.saturating_sub(3) as u8
+}
+
+/// References the P picture `poc` takes, the pictures since its IDR up to what the engine keeps.
+/// 0 for an IDR, whose POC is 0.
+fn refs_now(engine: &EncEngine, poc: i32) -> u32 {
+    (poc.max(0) as u32).min(engine.refs() as u32)
+}
+
+/// The `n` pictures before `poc`, the last coded first, RefPicSetStCurrBefore and the list it
+/// makes without modifications (8.3.4).
+fn ref_list(engine: &EncEngine, poc: i32, n: u32) -> [ffi::VAPictureHEVC; 15] {
+    let mut l = [ffi::VAPictureHEVC::invalid(); 15];
+    let flags = ffi::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
+    for (i, r) in l.iter_mut().enumerate().take(n as usize) {
+        *r = hevc_pic(engine.recon_back(i), poc - 1 - i as i32, flags);
+    }
+    l
+}
+
 fn pic_param(
     engine: &EncEngine,
     poc: i32,
     is_idr: bool,
     qp: u8,
     brc: bool,
+    ctb_log2: u32,
     coded_buf: ffi::VABufferID,
 ) -> ffi::VAEncPictureParameterBufferHEVC {
-    let mut refs = [ffi::VAPictureHEVC::invalid(); 15];
-    if !is_idr {
-        refs[0] = hevc_pic(engine.recon_ref(), poc - 1, ffi::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE);
-    }
+    let refs = ref_list(engine, poc, if is_idr { 0 } else { refs_now(engine, poc) });
+    let default_minus1 = engine.refs().saturating_sub(1) as u8;
     let coding_type: u32 = if is_idr { 1 } else { 2 }; // 1 = I, 2 = P
     let pic_fields: u32 = (is_idr as u32)
         | coding_type << 1
@@ -650,7 +865,7 @@ fn pic_param(
         collocated_ref_pic_index: 0xFF, // no TMVP
         last_picture: 0,
         pic_init_qp: qp,
-        diff_cu_qp_delta_depth: if brc { 2 } else { 0 },
+        diff_cu_qp_delta_depth: if brc { qg_depth(ctb_log2) } else { 0 },
         pps_cb_qp_offset: 0,
         pps_cr_qp_offset: 0,
         num_tile_columns_minus1: 0,
@@ -659,8 +874,8 @@ fn pic_param(
         row_height_minus1: [0; 21],
         log2_parallel_merge_level_minus2: 0,
         ctu_max_bitsize_allowed: 0,
-        num_ref_idx_l0_default_active_minus1: 0,
-        num_ref_idx_l1_default_active_minus1: 0,
+        num_ref_idx_l0_default_active_minus1: default_minus1,
+        num_ref_idx_l1_default_active_minus1: default_minus1,
         slice_pic_parameter_set_id: 0,
         nal_unit_type: if is_idr { NAL_IDR_W_RADL } else { NAL_TRAIL_R },
         pic_fields,
@@ -676,21 +891,22 @@ fn slice_param(
     ctu_count: u32,
     poc: i32,
     is_idr: bool,
+    gpb: bool,
 ) -> ffi::VAEncSliceParameterBufferHEVC {
-    let mut l0 = [ffi::VAPictureHEVC::invalid(); 15];
-    if !is_idr {
-        l0[0] = hevc_pic(engine.recon_ref(), poc - 1, ffi::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE);
-    }
+    let n = if is_idr { 0 } else { refs_now(engine, poc) };
+    let l0 = ref_list(engine, poc, n);
+    let l1 = if gpb { l0 } else { [ffi::VAPictureHEVC::invalid(); 15] };
+    let minus1 = n.saturating_sub(1) as u8;
     let slice_fields: u32 = 1; // last_slice_of_pic (single slice per picture)
     ffi::VAEncSliceParameterBufferHEVC {
         slice_segment_address: 0,
         num_ctu_in_slice: ctu_count,
-        slice_type: if is_idr { 2 } else { 1 }, // 2 = I, 1 = P (7.4.7.1)
+        slice_type: slice_type(is_idr, gpb),
         slice_pic_parameter_set_id: 0,
-        num_ref_idx_l0_active_minus1: 0,
-        num_ref_idx_l1_active_minus1: 0,
+        num_ref_idx_l0_active_minus1: minus1,
+        num_ref_idx_l1_active_minus1: if gpb { minus1 } else { 0 },
         ref_pic_list0: l0,
-        ref_pic_list1: [ffi::VAPictureHEVC::invalid(); 15],
+        ref_pic_list1: l1,
         luma_log2_weight_denom: 0,
         delta_chroma_log2_weight_denom: 0,
         delta_luma_weight_l0: [0; 15],
@@ -734,7 +950,7 @@ fn write_ptl(w: &mut BitWriter, level_idc: u8, ten: bool) {
     w.u(level_idc as u32, 8); // general_level_idc
 }
 
-fn write_vps(level_idc: u8, ten: bool) -> Vec<u8> {
+fn write_vps(level_idc: u8, ten: bool, refs: u32) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.u(0, 4); // vps_video_parameter_set_id
     w.flag(true); // vps_base_layer_internal_flag
@@ -745,7 +961,7 @@ fn write_vps(level_idc: u8, ten: bool) -> Vec<u8> {
     w.u(0xFFFF, 16); // vps_reserved_0xffff_16bits
     write_ptl(&mut w, level_idc, ten);
     w.flag(false); // vps_sub_layer_ordering_info_present_flag
-    w.ue(1); // vps_max_dec_pic_buffering_minus1[0]
+    w.ue(refs); // vps_max_dec_pic_buffering_minus1[0], the references and the current picture
     w.ue(0); // vps_max_num_reorder_pics[0]
     w.ue(0); // vps_max_latency_increase_plus1[0]
     w.u(0, 6); // vps_max_layer_id
@@ -756,9 +972,19 @@ fn write_vps(level_idc: u8, ten: bool) -> Vec<u8> {
     annexb_nal(&nal_header(NAL_VPS), &w.into_bytes())
 }
 
-fn write_sps(engine: &EncEngine, fmt: InFormat, level_idc: u8, ctb_log2: u32) -> Vec<u8> {
-    let crop_r = (engine.coded_w - engine.width) / 2;
-    let crop_b = (engine.coded_h - engine.height) / 2;
+/// `colour` is the VUI's full range flag, primaries, transfer and matrix, see
+/// [`colour::vui_colour`].
+/// `coded` is the coded width and height, `fmt` the picture's.
+fn write_sps(
+    coded: (u32, u32),
+    fmt: InFormat,
+    level_idc: u8,
+    ctb_log2: u32,
+    refs: u32,
+    colour: Option<(bool, u8, u8, u8)>,
+) -> Vec<u8> {
+    let crop_r = (coded.0 - fmt.width) / 2;
+    let crop_b = (coded.1 - fmt.height) / 2;
     let mut w = BitWriter::new();
     w.u(0, 4); // sps_video_parameter_set_id
     w.u(0, 3); // sps_max_sub_layers_minus1
@@ -766,8 +992,8 @@ fn write_sps(engine: &EncEngine, fmt: InFormat, level_idc: u8, ctb_log2: u32) ->
     write_ptl(&mut w, level_idc, ten_bit(fmt));
     w.ue(0); // sps_seq_parameter_set_id
     w.ue(1); // chroma_format_idc (4:2:0)
-    w.ue(engine.coded_w); // pic_width_in_luma_samples
-    w.ue(engine.coded_h); // pic_height_in_luma_samples
+    w.ue(coded.0); // pic_width_in_luma_samples
+    w.ue(coded.1); // pic_height_in_luma_samples
     let cropping = crop_r > 0 || crop_b > 0;
     w.flag(cropping); // conformance_window_flag
     if cropping {
@@ -781,7 +1007,8 @@ fn write_sps(engine: &EncEngine, fmt: InFormat, level_idc: u8, ctb_log2: u32) ->
     w.ue(depth_minus8); // bit_depth_chroma_minus8
     w.ue(4); // log2_max_pic_order_cnt_lsb_minus4 -> MaxPicOrderCntLsb 256
     w.flag(false); // sps_sub_layer_ordering_info_present_flag
-    w.ue(1); // sps_max_dec_pic_buffering_minus1
+    // the references and the current picture, at most 5 of level 4's MaxDpbSize 6 at 1080p (A.4.2)
+    w.ue(refs); // sps_max_dec_pic_buffering_minus1
     w.ue(0); // sps_max_num_reorder_pics
     w.ue(0); // sps_max_latency_increase_plus1
     w.ue(0); // log2_min_luma_coding_block_size_minus3 (MinCb 8)
@@ -791,33 +1018,51 @@ fn write_sps(engine: &EncEngine, fmt: InFormat, level_idc: u8, ctb_log2: u32) ->
     w.ue(2); // max_transform_hierarchy_depth_inter
     w.ue(2); // max_transform_hierarchy_depth_intra
     w.flag(false); // scaling_list_enabled_flag
-    w.flag(false); // amp_enabled_flag
+    w.flag(true); // amp_enabled_flag, as the sequence parameters say
     w.flag(false); // sample_adaptive_offset_enabled_flag
     w.flag(false); // pcm_enabled_flag
-    w.ue(1); // num_short_term_ref_pic_sets
-    w.ue(1); // num_negative_pics
-    w.ue(0); // num_positive_pics
-    w.ue(0); // delta_poc_s0_minus1[0] -> delta POC 1
-    w.flag(true); // used_by_curr_pic_s0_flag[0]
+    // set i holds the i + 1 pictures before, what a P picture i + 1 or more after its IDR takes
+    w.ue(refs); // num_short_term_ref_pic_sets
+    for i in 0..refs {
+        if i != 0 {
+            w.flag(false); // inter_ref_pic_set_prediction_flag
+        }
+        w.ue(i + 1); // num_negative_pics
+        w.ue(0); // num_positive_pics
+        for _ in 0..=i {
+            w.ue(0); // delta_poc_s0_minus1, each one before the last
+            w.flag(true); // used_by_curr_pic_s0_flag
+        }
+    }
     w.flag(false); // long_term_ref_pics_present_flag
     w.flag(false); // sps_temporal_mvp_enabled_flag
     w.flag(false); // strong_intra_smoothing_enabled_flag
     let have_fps = fmt.fps.0 > 0;
-    w.flag(have_fps); // vui_parameters_present_flag
-    if have_fps {
+    w.flag(have_fps || colour.is_some()); // vui_parameters_present_flag
+    if have_fps || colour.is_some() {
         w.flag(false); // aspect_ratio_info_present_flag
         w.flag(false); // overscan_info_present_flag
-        w.flag(false); // video_signal_type_present_flag
+        w.flag(colour.is_some()); // video_signal_type_present_flag
+        if let Some((full, primaries, transfer, matrix)) = colour {
+            w.u(5, 3); // video_format, unspecified
+            w.flag(full); // video_full_range_flag
+            w.flag(true); // colour_description_present_flag
+            w.u(u32::from(primaries), 8); // colour_primaries
+            w.u(u32::from(transfer), 8); // transfer_characteristics
+            w.u(u32::from(matrix), 8); // matrix_coeffs
+        }
         w.flag(false); // chroma_loc_info_present_flag
         w.flag(false); // neutral_chroma_indication_flag
         w.flag(false); // field_seq_flag
         w.flag(false); // frame_field_info_present_flag
         w.flag(false); // default_display_window_flag
-        w.flag(true); // vui_timing_info_present_flag
-        w.u(fmt.fps.1, 32); // vui_num_units_in_tick
-        w.u(fmt.fps.0, 32); // vui_time_scale
-        w.flag(false); // vui_poc_proportional_to_timing_flag
-        w.flag(false); // vui_hrd_parameters_present_flag
+        w.flag(have_fps); // vui_timing_info_present_flag
+        if have_fps {
+            w.u(fmt.fps.1, 32); // vui_num_units_in_tick
+            w.u(fmt.fps.0, 32); // vui_time_scale
+            w.flag(false); // vui_poc_proportional_to_timing_flag
+            w.flag(false); // vui_hrd_parameters_present_flag
+        }
         w.flag(false); // bitstream_restriction_flag
     }
     w.flag(false); // sps_extension_present_flag
@@ -825,7 +1070,7 @@ fn write_sps(engine: &EncEngine, fmt: InFormat, level_idc: u8, ctb_log2: u32) ->
     annexb_nal(&nal_header(NAL_SPS), &w.into_bytes())
 }
 
-fn write_pps(qp: u8, brc: bool) -> Vec<u8> {
+fn write_pps(qp: u8, brc: bool, ctb_log2: u32, refs: u32) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id
@@ -834,14 +1079,14 @@ fn write_pps(qp: u8, brc: bool) -> Vec<u8> {
     w.u(0, 3); // num_extra_slice_header_bits
     w.flag(false); // sign_data_hiding_enabled_flag
     w.flag(false); // cabac_init_present_flag
-    w.ue(0); // num_ref_idx_l0_default_active_minus1
-    w.ue(0); // num_ref_idx_l1_default_active_minus1
+    w.ue(refs - 1); // num_ref_idx_l0_default_active_minus1
+    w.ue(refs - 1); // num_ref_idx_l1_default_active_minus1
     w.se(qp as i32 - 26); // init_qp_minus26
     w.flag(false); // constrained_intra_pred_flag
     w.flag(false); // transform_skip_enabled_flag
     w.flag(brc); // cu_qp_delta_enabled_flag (driver BRC patches CU QPs)
     if brc {
-        w.ue(2); // diff_cu_qp_delta_depth
+        w.ue(u32::from(qg_depth(ctb_log2))); // diff_cu_qp_delta_depth
     }
     w.se(0); // pps_cb_qp_offset
     w.se(0); // pps_cr_qp_offset
@@ -862,8 +1107,18 @@ fn write_pps(qp: u8, brc: bool) -> Vec<u8> {
     annexb_nal(&nal_header(NAL_PPS), &w.into_bytes())
 }
 
+/// 7.4.7.1, 2 I, 1 P, 0 B for a low delay B picture.
+fn slice_type(is_idr: bool, gpb: bool) -> u8 {
+    match (is_idr, gpb) {
+        (true, _) => 2,
+        (false, false) => 1,
+        (false, true) => 0,
+    }
+}
+
 /// Slice segment header (7.3.6.1). It ends with byte_alignment(), so bit_length is byte-aligned.
-fn write_slice_header(w: &mut BitWriter, is_idr: bool, poc: i32) {
+/// A P slice takes `n` references of the `refs` the SPS has an RPS for and the PPS defaults to.
+fn write_slice_header(w: &mut BitWriter, is_idr: bool, poc: i32, gpb: bool, n: u32, refs: u32) {
     let nal_type = if is_idr { NAL_IDR_W_RADL } else { NAL_TRAIL_R };
     for b in [0u8, 0, 0, 1, nal_type << 1, 1] {
         w.u(b as u32, 8);
@@ -873,11 +1128,25 @@ fn write_slice_header(w: &mut BitWriter, is_idr: bool, poc: i32) {
         w.flag(false); // no_output_of_prior_pics_flag (IRAP NAL types 16..23)
     }
     w.ue(0); // slice_pic_parameter_set_id
-    w.ue(if is_idr { 2 } else { 1 }); // slice_type (I / P)
+    w.ue(u32::from(slice_type(is_idr, gpb))); // slice_type
     if !is_idr {
         w.u((poc & 0xFF) as u32, 8); // slice_pic_order_cnt_lsb (log2 max = 8)
-        w.flag(true); // short_term_ref_pic_set_sps_flag (the SPS's single RPS)
-        w.flag(false); // num_ref_idx_active_override_flag
+        w.flag(true); // short_term_ref_pic_set_sps_flag
+        if refs > 1 {
+            // u(v) of Ceil(Log2(num_short_term_ref_pic_sets)) bits (7.4.7.1)
+            w.u(n - 1, u32::BITS - (refs - 1).leading_zeros()); // short_term_ref_pic_set_idx
+        }
+        w.flag(n != refs); // num_ref_idx_active_override_flag
+        if n != refs {
+            w.ue(n - 1); // num_ref_idx_l0_active_minus1
+            if gpb {
+                w.ue(n - 1); // num_ref_idx_l1_active_minus1
+            }
+        }
+        if gpb {
+            // list 1 is RefPicSetStCurrBefore too (8.3.4), the previous pictures
+            w.flag(false); // mvd_l1_zero_flag
+        }
         w.ue(0); // five_minus_max_num_merge_cand (MaxNumMergeCand = 5)
     }
     w.se(0); // slice_qp_delta
@@ -942,7 +1211,8 @@ impl VaapiH265Enc {
     fn process_gpu(&mut self, ctx: &mut Ctx, inputs: &mut Inputs<'_>) -> Result<(), Error> {
         loop {
             self.drain_pending(ctx)?;
-            if self.staged.full() {
+            // a seek's flush waits behind no picture it would discard
+            if self.staged.full() || ctx.command_pending() {
                 return Ok(());
             }
             let Some(inbuf) = inputs.pop() else { break };
@@ -962,6 +1232,8 @@ impl VaapiH265Enc {
                 self.warn(ctx, K::NoGpuFrame { token: h.token });
                 continue;
             };
+            // the picture before out first, a session rebuilt waits for it
+            self.finish(ctx, true)?;
             if !self.ensure_session(ctx, fmt) {
                 continue; // warned inside
             }
@@ -982,11 +1254,14 @@ impl VaapiH265Enc {
             self.encode_frame(
                 ctx,
                 Input::Surface(surface),
+                Some(frame),
                 inbuf.pts,
                 inbuf.duration,
                 inbuf.flags.contains(BufferFlags::PREVIEW),
+                inbuf.flags.contains(BufferFlags::INTRA),
             )?;
-            drop(frame);
+            // the GPU codes it while the caller goes on, the next decode queued behind it
+            break;
         }
         self.drain_pending(ctx)?;
         Ok(())
@@ -1030,8 +1305,18 @@ impl Element for VaapiH265Enc {
             .unwrap_or(FAM_ANNEXB);
         self.hvcc = family == FAM_HVCC;
         self.bytes_out = family == "bytes";
+        if let Some(f) = ctx.negotiated_sink(Self::IN) {
+            self.color = StreamColor::read(ctx, f);
+        }
         if let Some(g) = &mut self.gpu {
             g.start(ctx, ctx.negotiated_sink(Self::IN)).map_err(|e| failed(ctx, DESC.name, e))?;
+        }
+        let ahead = self.ahead.zip(self.gpu.as_ref().and_then(|g| Some((g.link?.0, g.fps))));
+        if let Some(((width, height), (kind, fps))) = ahead {
+            let pixfmt = if kind == crate::vpp::format::P010 { RawPixFmt::P010 } else { RawPixFmt::Nv12 };
+            if self.ensure_display(ctx) {
+                self.ensure_session(ctx, InFormat { width, height, pixfmt, fps });
+            }
         }
         Ok(())
     }
@@ -1040,12 +1325,14 @@ impl Element for VaapiH265Enc {
         if !self.staged.resume(&mut Self::pad(ctx))? {
             return Ok(Flow::Ok);
         }
+        self.finish(ctx, false)?;
         if !self.ensure_display(ctx) {
             while inputs.pop().is_some() {}
             return Ok(Flow::Ok);
         }
         if self.gpu.is_some() {
             self.process_gpu(ctx, &mut inputs)?;
+            self.finish(ctx, false)?;
             return Ok(Flow::Ok);
         }
         if self.in_fmt.is_none()
@@ -1056,7 +1343,8 @@ impl Element for VaapiH265Enc {
         loop {
             // A dry output pool must not stop input consumption, see vaapih264enc.
             self.drain_pending(ctx)?;
-            if self.staged.full() {
+            // a seek's flush waits behind no picture it would discard
+            if self.staged.full() || ctx.command_pending() {
                 return Ok(Flow::Ok);
             }
             let Some(inbuf) = inputs.pop() else { break };
@@ -1071,24 +1359,32 @@ impl Element for VaapiH265Enc {
                 );
                 continue;
             }
+            // the picture before out first, a session rebuilt or an upload waits for it
+            self.finish(ctx, true)?;
             if !self.ensure_session(ctx, fmt) {
                 continue;
             }
             self.encode_frame(
                 ctx,
                 Input::Raw(inbuf.memory.data()),
+                None,
                 inbuf.pts,
                 inbuf.duration,
                 inbuf.flags.contains(BufferFlags::PREVIEW),
+                inbuf.flags.contains(BufferFlags::INTRA),
             )?;
+            // the GPU codes it while the caller goes on, it leaves on the next pass
+            break;
         }
         self.drain_pending(ctx)?;
+        self.finish(ctx, false)?;
         Ok(Flow::Ok)
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
         match event {
             Event::FormatChange(f) => {
+                self.color = StreamColor::read(ctx, f);
                 if let Some(fmt) = enc::read_in_format(ctx, f) {
                     log!(
                         &*ctx,
@@ -1136,6 +1432,12 @@ impl Element for VaapiH265Enc {
                 }
             }
             Event::FlushStart => {
+                // read and dropped, iHD fails every picture after a coded buffer destroyed unread
+                if let Some(f) = self.inflight.take() {
+                    let _ = f.coded.read_coded(&mut self.bufs.coded);
+                    self.bufs.coded.clear();
+                }
+                self.cadence.reset();
                 log!(&*ctx, Level::Debug, "flush", pending = self.staged.len());
                 self.warned.summary(ctx, "flush");
                 if let Some(g) = &mut self.gpu {
@@ -1147,6 +1449,7 @@ impl Element for VaapiH265Enc {
                 }
             }
             Event::Eos => {
+                self.finish(ctx, true)?;
                 let drained = self.staged.finish(&mut Self::pad(ctx))?;
                 let pending = self.staged.len();
                 log!(
@@ -1165,6 +1468,7 @@ impl Element for VaapiH265Enc {
     }
 
     fn stop(&mut self, _ctx: &mut Ctx) {
+        self.inflight = None;
         self.staged.discard();
         if let Some(g) = &mut self.gpu {
             g.stop();
@@ -1180,6 +1484,7 @@ impl Element for VaapiH265Enc {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::h265parse;
 
     #[test]
     fn level_ladder_picks_sane_levels() {
@@ -1187,6 +1492,81 @@ mod tests {
         assert_eq!(pick_level(1920, 1088, (60, 1)), 123, "1080p60 → L4.1");
         assert_eq!(pick_level(1280, 720, (30, 1)), 93, "720p30 → L3.1");
         assert_eq!(pick_level(320, 240, (30, 1)), 60, "tiny → L2");
+    }
+
+    fn parsed_sets(refs: u32) -> (h265parse::Sps, h265parse::Pps) {
+        let fmt = InFormat { width: 1920, height: 1080, pixfmt: RawPixFmt::Nv12, fps: (25, 1) };
+        let sps = write_sps((1920, 1088), fmt, 120, 6, refs, None);
+        let pps = write_pps(26, true, 6, refs);
+        let sps = h265parse::parse_sps(&sps[4..]).expect("own SPS parses");
+        let pps = h265parse::parse_pps(&pps[4..]).expect("own PPS parses");
+        (sps, pps)
+    }
+
+    #[test]
+    fn the_sps_has_a_reference_set_for_each_count() {
+        for refs in 1..=REFS {
+            let (sps, pps) = parsed_sets(refs);
+            let dpb = sps.sps_max_dec_pic_buffering_minus1;
+            assert_eq!(dpb, refs, "the references and the picture");
+            assert_eq!(sps.sps_max_num_reorder_pics, 0);
+            assert_eq!(sps.num_short_term_ref_pic_sets, refs);
+            for (i, rps) in sps.st_rps.iter().enumerate() {
+                let want: Vec<i32> = (1..=i as i32 + 1).map(|d| -d).collect();
+                assert_eq!(&rps.delta_poc_s0[..], &want[..], "set {i} of {refs}");
+                assert!(rps.used_s0.iter().all(|u| *u) && rps.delta_poc_s1.is_empty());
+            }
+            assert_eq!(pps.num_ref_idx_l0_default_active_minus1, refs - 1);
+            assert_eq!(pps.num_ref_idx_l1_default_active_minus1, refs - 1);
+            let vps = write_vps(120, false, refs);
+            // the VPS's dec_pic_buffering ue sits after the 12 byte PTL, read it back
+            let mut rbsp = Vec::new();
+            for &b in &vps[6..] {
+                if !(b == 3 && rbsp.ends_with(&[0, 0])) {
+                    rbsp.push(b);
+                }
+            }
+            let mut r = h264parse::BitReader::new(&rbsp);
+            r.u(32);
+            for _ in 0..12 {
+                r.u(8);
+            }
+            r.flag(); // vps_sub_layer_ordering_info_present_flag
+            assert_eq!(r.ue(), refs, "vps_max_dec_pic_buffering_minus1");
+        }
+    }
+
+    #[test]
+    fn slice_headers_take_the_set_of_the_pictures_since_the_idr() {
+        let mut w = BitWriter::new();
+        for refs in 1..=REFS {
+            let (sps, pps) = parsed_sets(refs);
+            for gpb in [false, true] {
+                for poc in 0..6i32 {
+                    let idr = poc == 0;
+                    let n = (poc as u32).min(refs);
+                    w.clear();
+                    write_slice_header(&mut w, idr, poc, gpb, n, refs);
+                    let ty = if idr { NAL_IDR_W_RADL } else { NAL_TRAIL_R };
+                    let nal = &w.as_bytes()[4..];
+                    let sh = h265parse::parse_slice_header(nal, ty, &sps, &pps).expect("parses");
+                    let at = format!("refs {refs} gpb {gpb} poc {poc}");
+                    assert_eq!(sh.slice_data_byte_offset, w.bit_len() / 8 - 4, "{at}");
+                    if idr {
+                        continue;
+                    }
+                    let want = if gpb { h265parse::SliceType::B } else { h265parse::SliceType::P };
+                    assert!(sh.slice_type == want, "{at}");
+                    assert_eq!(sh.pic_order_cnt_lsb, poc as u32, "{at}");
+                    let want: Vec<i32> = (1..=n as i32).map(|d| -d).collect();
+                    assert_eq!(&sh.st_rps.delta_poc_s0[..], &want[..], "{at}");
+                    assert_eq!(sh.num_ref_idx_l0_active_minus1 + 1, n, "{at}");
+                    if gpb {
+                        assert_eq!(sh.num_ref_idx_l1_active_minus1 + 1, n, "{at}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1245,7 +1625,8 @@ mod tests {
             }
             hx.push(b).expect("pushed");
         }
-        let out: Vec<_> = std::iter::from_fn(|| hx.pull(VaapiH265Enc::OUT)).collect();
+        // the last picture leaves with the end, the GPU had it in flight
+        let out = hx.eos().expect("the end");
         assert_eq!(out.len(), 6, "every picture coded");
         let key = |i: usize| out[i].flags.contains(BufferFlags::KEYFRAME);
         let preview = |i: usize| out[i].flags.contains(BufferFlags::PREVIEW);
@@ -1257,5 +1638,55 @@ mod tests {
             h264parse::split_nals(au).iter().any(|n| matches!(h265_nal_type(n.raw(au)), 19 | 20))
         };
         assert!(idr(0) && idr(1) && !idr(2), "the flags match the slices");
+    }
+
+    /// A flush while a picture is on the GPU, the pictures after it code clean and open on a
+    /// key. iHD 26.1 fails every picture after a coded buffer destroyed unread.
+    #[test]
+    fn the_pictures_after_a_flush_with_one_in_flight_code_clean() {
+        let test = "the_pictures_after_a_flush_with_one_in_flight_code_clean";
+        let Some(caps) = crate::probe() else {
+            return eprintln!("skip {test}: no VA-API device");
+        };
+        if !caps.supports_encode("h265/annexb") {
+            return eprintln!("skip {test}: no encode entrypoint");
+        }
+        let (w, h) = (128u32, 64u32);
+        let mut hx = pf_harness::Harness::with_pool(VaapiH265Enc::new().with_bitrate(500), 256 * 1024, 16);
+        hx.fix_sink_format(
+            VaapiH265Enc::IN,
+            "video/raw",
+            &[
+                ("width", ValueDesc::Int(w.into())),
+                ("height", ValueDesc::Int(h.into())),
+                ("pixfmt", ValueDesc::Id("nv12")),
+                ("fps", ValueDesc::Rat(25, 1)),
+            ],
+        );
+        let frame = |i: u64| -> Vec<u8> { (0..(w * h * 3 / 2) as usize).map(|p| ((p as u64 + i * 7) % 220 + 16) as u8).collect() };
+        for i in 0..4u64 {
+            let mut b = hx.alloc(&frame(i));
+            b.pts = Timestamp::from_nanos(i * 40_000_000);
+            hx.push(b).expect("pushed");
+        }
+        while hx.pull(VaapiH265Enc::OUT).is_some() {}
+        hx.seek(0, Timestamp::from_nanos(10 * 40_000_000)).expect("the flush");
+        for i in 10..16u64 {
+            let mut b = hx.alloc(&frame(i));
+            b.pts = Timestamp::from_nanos(i * 40_000_000);
+            hx.push(b).expect("pushed");
+        }
+        let out = hx.eos().expect("the end");
+        let warned: Vec<String> = hx
+            .bus_messages()
+            .into_iter()
+            .filter_map(|m| match m {
+                BusMessage::Warning { error, .. } => Some(format!("{error}")),
+                _ => None,
+            })
+            .collect();
+        assert!(warned.is_empty(), "{test} warned {warned:?}");
+        assert_eq!(out.len(), 6, "{test} every picture after the flush");
+        assert!(out[0].flags.contains(BufferFlags::KEYFRAME), "{test} the run opens on a key");
     }
 }

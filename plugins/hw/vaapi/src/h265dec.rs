@@ -21,7 +21,9 @@ use profluens_core::log;
 use profluens_core::log::Level;
 use profluens_core::time::Timestamp;
 
+use crate::decproc::{self, Twins};
 use crate::error::{Transient, VaapiErrorKind as K, Verdict, Warned, failed, log_fatal};
+use crate::vpp::Target;
 use crate::ffi;
 use crate::gpuframe::{
     self, F_LAYOUT, F_MODIFIER, FAMILY_VIDEO_GPU, FrameToken, FrameTx, GPU_FRAME_HEADER_LEN,
@@ -116,6 +118,8 @@ struct DpbEntry {
 
 struct PendingOut {
     surface: ffi::VASurfaceID,
+    /// What is exported, the surface or its twin, the geometry below is its.
+    export: ffi::VASurfaceID,
     pts: Timestamp,
     duration: Timestamp,
     width: u32,
@@ -127,11 +131,17 @@ struct PendingOut {
     format: SurfaceFormat,
     color: Color,
     preview: bool,
+    /// Every slice of it is I, the source's scene change most often.
+    intra: bool,
 }
 
 struct VaState {
     // Field order is drop order, the context goes before its surfaces and its config.
     context: Context,
+    /// The scaled twins of the surfaces when the decoder shrinks.
+    twins: Option<Twins>,
+    /// Decoded as Main 12, the extension picture and slice parameters.
+    rext: bool,
     surfaces: Surfaces,
     _config: Config,
     format: SurfaceFormat,
@@ -190,9 +200,12 @@ pub struct VaapiH265Dec {
     export: ExportFn,
     link: Option<(u32, u64)>,
     only: bool,
+    /// Pictures leave scaled into this box by the decode call, bars around them when fixed.
+    shrink: Option<(Target, bool)>,
 }
 
-// SAFETY: an Active element runs on one scheduler thread and never shares its Display.
+// SAFETY: an Active element runs on one scheduler thread after preroll, its display moves there
+// with it and is never used from two threads at once.
 unsafe impl Send for VaapiH265Dec {}
 
 impl Default for VaapiH265Dec {
@@ -213,6 +226,14 @@ impl VaapiH265Dec {
     /// back.
     pub fn new_zerocopy(channel: Arc<GpuFrameChannel>) -> Self {
         Self::with_zerocopy(Some(channel))
+    }
+
+    /// Zero-copy pictures leave scaled into `target` by the decode call itself, placed in its box
+    /// with bars when `fixed`, see [`crate::decproc`]. The driver must do decode processing for
+    /// the stream's profile.
+    pub fn with_shrink(mut self, target: Target, fixed: bool) -> Self {
+        self.shrink = Some((target, fixed));
+        self
     }
 
     #[cfg(test)]
@@ -260,6 +281,7 @@ impl VaapiH265Dec {
             export: ExportedSurface::export,
             link: None,
             scratch: AuScratch::default(),
+            shrink: None,
         }
     }
 
@@ -328,26 +350,56 @@ impl VaapiH265Dec {
         let coded_w = (sps.pic_width_in_ctbs() * ctb).max(16);
         let coded_h = (sps.pic_height_in_ctbs() * ctb).max(16);
         let ten_bit = sps.is_ten_bit();
-        let format = if ten_bit { SurfaceFormat::P010 } else { SurfaceFormat::NV12 };
+        let depth = sps.depth();
+        let format = match depth {
+            12 => SurfaceFormat::P012,
+            10 => SurfaceFormat::P010,
+            _ => SurfaceFormat::NV12,
+        };
+        // VA decodes the format range extensions profiles as Main 12
+        let rext = sps.rext || depth > 10;
         let (refs, reorder) = (sps.ref_frames(), sps.reorder_frames());
         // Exported surfaces stay out of the free pool until released, this covers them and the
         // release-drain latency.
         const PRESENTATION_SLACK: u32 = 6;
         let extra = if self.zerocopy.is_some() { PRESENTATION_SLACK } else { 0 };
         let count = crate::va::decode_surface_count(refs, reorder, extra);
+        if depth > 10 && self.zerocopy.is_none() {
+            self.fail(ctx, unsupported(sps));
+            return false;
+        }
+        // 12 bit pictures leave as P010 twins, a consumer never sees P012
+        let twelve = (Target { max_width: 0, max_height: 0, depth: 10 }, false);
+        let asked = self.shrink.or((depth > 10).then_some(twelve));
+        let shrink = match asked.filter(|_| self.zerocopy.is_some()) {
+            Some((t, fixed)) => match decproc::plan(width, height, depth.min(10), t, fixed) {
+                Some(p) => Some(p),
+                None => {
+                    self.fail(ctx, K::ProcSize { width, height });
+                    return false;
+                }
+            },
+            None => None,
+        };
         if let Some(va) = &self.va {
             if va.width == width
                 && va.height == height
                 && va.format == format
+                && va.rext == rext
+                && va.twins.as_ref().map(|t| t.plan) == shrink
                 && (va.count >= count || !cvs)
             {
                 return true;
             }
-            log!(&*ctx, Level::Debug, "reinit", width = width, height = height, ten_bit = ten_bit);
+            log!(&*ctx, Level::Debug, "reinit", width = width, height = height, depth = depth);
             self.retire_session();
         }
-        if ten_bit && !probe::probe().is_some_and(|caps| caps.decodes_profile("HEVCMain10")) {
+        if ten_bit && !rext && !probe::probe().is_some_and(|caps| caps.decodes_profile("HEVCMain10")) {
             self.fail(ctx, K::NoMain10Profile);
+            return false;
+        }
+        if rext && !probe::probe().is_some_and(|caps| caps.decodes_profile("HEVCMain12")) {
+            self.fail(ctx, unsupported(sps));
             return false;
         }
         let Some(display) = &self.display else {
@@ -361,11 +413,19 @@ impl VaapiH265Dec {
             width = width,
             height = height,
             coded_w = coded_w,
-            ten_bit = ten_bit
+            depth = depth
         );
 
-        let profile = if ten_bit { ffi::VAProfileHEVCMain10 } else { ffi::VAProfileHEVCMain };
-        let config = match Config::new_decode_for(display, profile, format) {
+        let profile = match (rext, ten_bit) {
+            (true, _) => ffi::VAProfileHEVCMain12,
+            (false, true) => ffi::VAProfileHEVCMain10,
+            (false, false) => ffi::VAProfileHEVCMain,
+        };
+        let config = match shrink {
+            Some(_) => Config::new_decode_processing(display, profile, format),
+            None => Config::new_decode_for(display, profile, format),
+        };
+        let config = match config {
             Ok(c) => c,
             Err(e) => {
                 self.fail(ctx, K::SessionSetup(e));
@@ -387,10 +447,26 @@ impl VaapiH265Dec {
                     return false;
                 }
             };
+        // the decoded picture is the SPS's luma size, its conformance window the crop
+        let full = (sps.pic_width_in_luma_samples, sps.pic_height_in_luma_samples);
+        let crop = (crop_x, crop_y, width, height);
+        let twins = match shrink.map(|p| Twins::new(display, p, count, crop, full)).transpose() {
+            Ok(t) => t,
+            Err(e) => {
+                self.fail(ctx, e);
+                return false;
+            }
+        };
+        if let Some(t) = &twins {
+            let (w, h) = (t.plan.width, t.plan.height);
+            log!(&*ctx, Level::Info, "shrink", width = w, height = h, layout = t.kind().name);
+        }
         let free = VecDeque::from(surfaces.ids().to_vec());
         self.va = Some(VaState {
             _config: config,
             context,
+            rext,
+            twins,
             format,
             surfaces,
             free,
@@ -540,17 +616,8 @@ impl VaapiH265Dec {
             return;
         }
 
-        if !sps.supported() {
-            self.fail(
-                ctx,
-                K::UnsupportedSps {
-                    chroma_format_idc: sps.chroma_format_idc,
-                    bit_depth_luma: sps.bit_depth_luma_minus8 + 8,
-                    bit_depth_chroma: sps.bit_depth_chroma_minus8 + 8,
-                    separate_colour_plane: sps.separate_colour_plane_flag,
-                    extension: sps.has_extension,
-                },
-            );
+        if !sps.supported() || pps.other_ext {
+            self.fail(ctx, unsupported(&sps));
             return;
         }
         // 7.4.3.3, every tile is at least one CTB wide and high.
@@ -605,10 +672,17 @@ impl VaapiH265Dec {
             return;
         };
 
-        let Some((width, height, crop_x, crop_y, coded_w, coded_h, format)) = self
-            .va
-            .as_ref()
-            .map(|v| (v.width, v.height, v.crop_x, v.crop_y, v.coded_w, v.coded_h, v.format))
+        let Some((export, width, height, crop_x, crop_y, coded_w, coded_h, format)) =
+            self.va.as_ref().map(|v| match &v.twins {
+                Some(t) => {
+                    let twin = t.of(&v.surfaces, target).unwrap_or(target);
+                    let (w, h) = (t.plan.width, t.plan.height);
+                    (twin, w, h, 0, 0, t.coded.0, t.coded.1, t.kind().surface())
+                }
+                None => {
+                    (target, v.width, v.height, v.crop_x, v.crop_y, v.coded_w, v.coded_h, v.format)
+                }
+            })
         else {
             return;
         };
@@ -643,6 +717,7 @@ impl VaapiH265Dec {
         } else if sh0.pic_output_flag {
             self.output_queue.push_back(PendingOut {
                 surface: target,
+                export,
                 pts,
                 duration,
                 width,
@@ -654,6 +729,7 @@ impl VaapiH265Dec {
                 format,
                 color: Color { hdr: self.hdr, dovi: self.side.dovi, ..sps.colour },
                 preview,
+                intra: sc.headers.iter().all(|h| h.slice_type == SliceType::I),
             });
             self.reorder_output(target, poc);
         }
@@ -846,8 +922,13 @@ impl VaapiH265Dec {
         pic.num_extra_slice_header_bits = pps.num_extra_slice_header_bits as u8;
         pic.st_rps_bits = headers[0].st_rps_bits;
 
-        let pic_buf =
-            VaBuffer::new_struct(display, context, ffi::VAPictureParameterBufferType, &pic)?;
+        let pic_buf = match va.rext {
+            true => {
+                let ext = pic_ext(pic, sps, pps);
+                VaBuffer::new_struct(display, context, ffi::VAPictureParameterBufferType, &ext)?
+            }
+            false => VaBuffer::new_struct(display, context, ffi::VAPictureParameterBufferType, &pic)?,
+        };
 
         let iq_buf = if sps.scaling_list_enabled_flag {
             let lists =
@@ -862,6 +943,16 @@ impl VaapiH265Dec {
             None
         };
 
+        // every picture names its twin, iHD would write the last one's again
+        let mut regions = va.twins.as_ref().map(|t| {
+            let twin = t.of(&va.surfaces, target).unwrap_or(ffi::VA_INVALID_SURFACE);
+            decproc::Regions::new(t, twin)
+        });
+        let proc_buf = match regions.as_mut() {
+            Some(r) => Some(decproc::pipeline(display, context, target, r)?),
+            None => None,
+        };
+
         keep.clear();
         context.begin(target)?;
         let rendered = (|| {
@@ -869,11 +960,17 @@ impl VaapiH265Dec {
                 Some(iq) => context.render(&[pic_buf.id(), iq.id()])?,
                 None => context.render(&[pic_buf.id()])?,
             }
+            if let Some(p) = &proc_buf {
+                context.render(&[p.id()])?;
+            }
             let last = headers.len().saturating_sub(1);
             for (i, (sh, nal)) in headers.iter().zip(slice_nals.iter()).enumerate() {
                 let sp = self.build_slice_param(sps, sh, nal.raw(au), i == last, ref_index);
-                let sp_buf =
-                    VaBuffer::new_struct(display, context, ffi::VASliceParameterBufferType, &sp)?;
+                let ty = ffi::VASliceParameterBufferType;
+                let sp_buf = match va.rext {
+                    true => VaBuffer::new_struct(display, context, ty, &slice_ext(sp, sps, sh))?,
+                    false => VaBuffer::new_struct(display, context, ty, &sp)?,
+                };
                 let data_buf = VaBuffer::new_data(display, context, nal.raw(au))?;
                 context.render(&[sp_buf.id(), data_buf.id()])?;
                 keep.push(sp_buf);
@@ -1185,6 +1282,9 @@ impl VaapiH265Dec {
         if out.preview {
             buf.flags |= BufferFlags::PREVIEW;
         }
+        if out.intra {
+            buf.flags |= BufferFlags::INTRA;
+        }
         drop(image);
         log!(&*ctx, Level::Trace, "frame", pts = buf.pts);
         self.side.attach(buf.pts.0, &mut buf.memory);
@@ -1213,7 +1313,13 @@ impl VaapiH265Dec {
             None => return Ok(true),
         };
 
-        let mut exported = match (self.export)(dpy, out.surface) {
+        // a pending command, a seek's flush, cuts the wait short, the decoder runs again after it
+        if !crate::va::wait_surface(dpy, out.export, || ctx.command_pending()) {
+            self.pending = Some(out);
+            ctx.wake_within(crate::enc::POLL_WAKE);
+            return Ok(false);
+        }
+        let mut exported = match (self.export)(dpy, out.export) {
             Ok(e) => e,
             Err(e) => {
                 // iHD fails `vaSyncSurface` now and then under rapid seeks, for one picture.
@@ -1299,6 +1405,9 @@ impl VaapiH265Dec {
         buf.duration = out.duration;
         if out.preview {
             buf.flags |= BufferFlags::PREVIEW;
+        }
+        if out.intra {
+            buf.flags |= BufferFlags::INTRA;
         }
 
         // Pushed before the buffer so a fast sink cannot pop the token before it is marked in
@@ -1411,7 +1520,9 @@ impl Element for VaapiH265Dec {
         if self.zerocopy.is_none() {
             return Ok(());
         }
-        let display = if self.ensure_display(ctx) { self.display.take() } else { None };
+        // kept for the session, a display opened again on the element's thread is 2 to 5 ms
+        // ahead of its first picture
+        let display = if self.ensure_display(ctx) { self.display.as_ref() } else { None };
         let formats = match display.map(gpuframe::exported_formats) {
             Some(Ok(formats)) => formats,
             Some(Err(e)) => {
@@ -1432,6 +1543,7 @@ impl Element for VaapiH265Dec {
     }
 
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        let emitted = self.emitted;
         if self.failed {
             while inputs.pop().is_some() {
                 ctx.count_drop();
@@ -1466,7 +1578,8 @@ impl Element for VaapiH265Dec {
                     return Ok(Flow::Ok);
                 }
             }
-            if ctx.command_pending() {
+            // a picture put out goes downstream now, the next decode would hold it back
+            if ctx.command_pending() || self.emitted != emitted {
                 return Ok(Flow::Ok);
             }
             let Some(inbuf) = inputs.pop() else { break };
@@ -1610,6 +1723,86 @@ fn de_emulate_prefix(body: &[u8]) -> ([u8; 16], usize) {
         i += 1;
     }
     (out, out_len)
+}
+
+fn unsupported(sps: &Sps) -> K {
+    K::UnsupportedSps {
+        chroma_format_idc: sps.chroma_format_idc,
+        bit_depth_luma: sps.bit_depth_luma_minus8 + 8,
+        bit_depth_chroma: sps.bit_depth_chroma_minus8 + 8,
+        separate_colour_plane: sps.separate_colour_plane_flag,
+        extension: sps.has_extension,
+    }
+}
+
+/// The picture parameters of a range extensions profile, `base` and the SPS's and PPS's range
+/// extensions.
+fn pic_ext(
+    base: ffi::VAPictureParameterBufferHEVC,
+    sps: &Sps,
+    pps: &Pps,
+) -> ffi::VAPictureParameterBufferHEVCExtension {
+    let r = &pps.range;
+    let fields = sps.range_ext
+        | u32::from(r.cross_component_prediction_enabled_flag) << 9
+        | u32::from(r.chroma_qp_offset_list_enabled_flag) << 10;
+    let small = |v: u32| v.min(u32::from(u8::MAX)) as u8;
+    let rext = ffi::VAPictureParameterBufferHEVCRext {
+        range_extension_pic_fields: fields,
+        diff_cu_chroma_qp_offset_depth: small(r.diff_cu_chroma_qp_offset_depth),
+        chroma_qp_offset_list_len_minus1: small(r.chroma_qp_offset_list_len_minus1),
+        log2_sao_offset_scale_luma: small(r.log2_sao_offset_scale_luma),
+        log2_sao_offset_scale_chroma: small(r.log2_sao_offset_scale_chroma),
+        log2_max_transform_skip_block_size_minus2: small(r.log2_max_transform_skip_block_size_minus2),
+        cb_qp_offset_list: r.cb_qp_offset_list,
+        cr_qp_offset_list: r.cr_qp_offset_list,
+    };
+    ffi::VAPictureParameterBufferHEVCExtension {
+        base,
+        rext,
+        scc: ffi::VAPictureParameterBufferHEVCScc::zeroed(),
+    }
+}
+
+/// ChromaOffset (7-56) of a delta weight and delta offset, `half` wpOffsetHalfRangeC.
+fn chroma_offset(delta_w: i32, delta_off: i32, denom: i32, half: i32) -> i32 {
+    let w = (1i32 << denom) + delta_w;
+    (half + delta_off - ((half * w) >> denom)).clamp(-half, half - 1)
+}
+
+/// The slice parameters of a range extensions profile, `base` and the offsets at their full
+/// width, wpOffsetHalfRangeC from high_precision_offsets_enabled_flag (7.4.7.3).
+fn slice_ext(
+    base: ffi::VASliceParameterBufferHEVC,
+    sps: &Sps,
+    sh: &SliceHeader,
+) -> ffi::VASliceParameterBufferHEVCExtension {
+    let mut rext = ffi::VASliceParameterBufferHEVCRext {
+        slice_ext_flags: u32::from(sh.cu_chroma_qp_offset_enabled_flag),
+        ..Default::default()
+    };
+    if let Some(t) = &sh.pred_weights {
+        let high = sps.range_ext & h265parse::RANGE_EXT_HIGH_PRECISION_OFFSETS != 0;
+        let half = if high { 1i32 << (sps.bit_depth_chroma_minus8 + 7) } else { 128 };
+        let denom =
+            (t.luma_log2_weight_denom as i32 + t.delta_chroma_log2_weight_denom).clamp(0, 7);
+        let wide = |v: i32| v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        for (i, e) in t.l0.iter().take(15).enumerate() {
+            rext.luma_offset_l0[i] = wide(e.luma_offset);
+            for c in 0..2 {
+                let o = chroma_offset(e.delta_chroma_weight[c], e.chroma_offset[c], denom, half);
+                rext.ChromaOffsetL0[i][c] = wide(o);
+            }
+        }
+        for (i, e) in t.l1.iter().take(15).enumerate() {
+            rext.luma_offset_l1[i] = wide(e.luma_offset);
+            for c in 0..2 {
+                let o = chroma_offset(e.delta_chroma_weight[c], e.chroma_offset[c], denom, half);
+                rext.ChromaOffsetL1[i][c] = wide(o);
+            }
+        }
+    }
+    ffi::VASliceParameterBufferHEVCExtension { base, rext }
 }
 
 fn zeroed_pic_param_hevc() -> ffi::VAPictureParameterBufferHEVC {
@@ -1797,6 +1990,21 @@ mod tests {
         assert_eq!(&dst[..3], &[30, 10, 20]);
     }
 
+    /// At wpOffsetHalfRangeC 128 the derivation is the 8 bit one, a wider range keeps what 128
+    /// would clip.
+    #[test]
+    fn chroma_offsets_derive_at_any_half_range() {
+        let old = |dw: i32, doff: i32, denom: i32| {
+            let w = (1i32 << denom) + dw;
+            (doff - ((128 * w) >> denom) + 128).clamp(-128, 127)
+        };
+        for (dw, doff, denom) in [(0, 0, 6), (-5, 40, 6), (20, -300, 3), (127, 511, 7), (-128, -512, 0)] {
+            assert_eq!(chroma_offset(dw, doff, denom, 128), old(dw, doff, denom), "{dw} {doff} {denom}");
+        }
+        assert_eq!(chroma_offset(0, 1000, 6, 2048), 1000, "12 bit high precision");
+        assert_eq!(chroma_offset(0, 1000, 6, 128), 127);
+    }
+
     #[test]
     fn long_slice_flags_carry_slice_type_and_last() {
         let mut sh = stub_sh(SliceType::B);
@@ -1839,6 +2047,7 @@ mod tests {
             slice_qp_delta: 0,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            cu_chroma_qp_offset_enabled_flag: false,
             deblocking_filter_override_flag: false,
             slice_deblocking_filter_disabled_flag: false,
             slice_beta_offset_div2: 0,

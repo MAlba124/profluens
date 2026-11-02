@@ -18,6 +18,31 @@ pub struct ProfileCaps {
     pub vld: bool,
     pub enc: bool,
     pub enc_lp: bool,
+    /// The decoder scales in the decode call (`VAConfigAttribDecProcessing`).
+    pub dec_proc: bool,
+    /// What an encoder on EncSlice and on EncSliceLP takes, default where there is none.
+    pub enc_refs: [EncRefs; 2],
+}
+
+/// The references an encode entrypoint takes a picture, and whether its inter pictures are low
+/// delay B (VA_PREDICTION_DIRECTION_BI_NOT_EMPTY).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EncRefs {
+    pub l0: u32,
+    pub l1: u32,
+    pub gpb: bool,
+}
+
+impl EncRefs {
+    pub(crate) fn query(display: &Display, profile: ffi::VAProfile, entrypoint: ffi::VAEntrypoint) -> EncRefs {
+        let (l0, l1) = crate::enc::max_refs(display, profile, entrypoint);
+        let direction = ffi::VAConfigAttribPredictionDirection;
+        let gpb = crate::va::config_attribute(display, profile, entrypoint, direction)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v & ffi::VA_PREDICTION_DIRECTION_BI_NOT_EMPTY != 0);
+        EncRefs { l0, l1, gpb }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +67,12 @@ impl VaCaps {
 
     pub fn decodes_profile(&self, name: &str) -> bool {
         self.profiles.iter().any(|p| p.name == name && p.vld)
+    }
+
+    /// Whether every profile of `family` the hardware decodes also scales in the decode call.
+    pub fn shrinks(&self, family: &str) -> bool {
+        let mut decoded = self.profiles.iter().filter(|p| p.vld && family_named(p.name) == Some(family)).peekable();
+        decoded.peek().is_some() && decoded.all(|p| p.dec_proc)
     }
 }
 
@@ -139,10 +170,23 @@ fn family_of(profile: ffi::VAProfile) -> Option<&'static str> {
         ffi::VAProfileH264Main | ffi::VAProfileH264High | ffi::VAProfileH264ConstrainedBaseline => {
             Some("h264/annexb")
         }
-        ffi::VAProfileHEVCMain | ffi::VAProfileHEVCMain10 => Some("h265/annexb"),
+        ffi::VAProfileHEVCMain | ffi::VAProfileHEVCMain10 | ffi::VAProfileHEVCMain12 => {
+            Some("h265/annexb")
+        }
         ffi::VAProfileVP8Version0_3 => Some("vp8"),
         ffi::VAProfileVP9Profile0 | ffi::VAProfileVP9Profile2 => Some("vp9"),
         ffi::VAProfileAV1Profile0 => Some("av1"),
+        _ => None,
+    }
+}
+
+fn family_named(name: &str) -> Option<&'static str> {
+    match name {
+        "H264ConstrainedBaseline" | "H264Main" | "H264High" => Some("h264/annexb"),
+        "HEVCMain" | "HEVCMain10" | "HEVCMain12" => Some("h265/annexb"),
+        "VP8Version0_3" => Some("vp8"),
+        "VP9Profile0" | "VP9Profile2" => Some("vp9"),
+        "AV1Profile0" => Some("av1"),
         _ => None,
     }
 }
@@ -155,6 +199,7 @@ fn profile_name(profile: ffi::VAProfile) -> &'static str {
         ffi::VAProfileVP8Version0_3 => "VP8Version0_3",
         ffi::VAProfileHEVCMain => "HEVCMain",
         ffi::VAProfileHEVCMain10 => "HEVCMain10",
+        ffi::VAProfileHEVCMain12 => "HEVCMain12",
         ffi::VAProfileVP9Profile0 => "VP9Profile0",
         ffi::VAProfileVP9Profile2 => "VP9Profile2",
         ffi::VAProfileAV1Profile0 => "AV1Profile0",
@@ -211,11 +256,26 @@ fn query_caps(display: &Display, device: PathBuf) -> VaCaps {
                 video_proc |= entries.contains(&ffi::VAEntrypointVideoProc);
                 continue;
             };
+            let vld = entries.contains(&ffi::VAEntrypointVLD);
+            let dec_proc = vld
+                && crate::va::config_attribute(
+                    display,
+                    profile,
+                    ffi::VAEntrypointVLD,
+                    ffi::VAConfigAttribDecProcessing,
+                )
+                .is_ok_and(|v| v == Some(ffi::VA_DEC_PROCESSING));
+            let refs = |ep| match entries.contains(&ep) {
+                true => EncRefs::query(display, profile, ep),
+                false => EncRefs::default(),
+            };
             let caps = ProfileCaps {
                 name: profile_name(profile),
-                vld: entries.contains(&ffi::VAEntrypointVLD),
+                vld,
                 enc: entries.contains(&ffi::VAEntrypointEncSlice),
                 enc_lp: entries.contains(&ffi::VAEntrypointEncSliceLP),
+                dec_proc,
+                enc_refs: [refs(ffi::VAEntrypointEncSlice), refs(ffi::VAEntrypointEncSliceLP)],
             };
             profiles.push(caps);
             if caps.vld && !decode_families.contains(&family) {

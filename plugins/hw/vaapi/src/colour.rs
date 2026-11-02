@@ -2,7 +2,8 @@
 //! and the HDR SEI, mastering display (137) and content light level (144), H.265 D.2.28 and D.2.35.
 
 use profluens_video::color::{
-    ChromaSite, ContentLight, HdrStatic, Mastering, Matrix, Primaries, Range, TransferFn,
+    ChromaSite, ContentLight, HdrStatic, Mastering, Matrix, Primaries, Range, StreamColor,
+    TransferFn,
 };
 use profluens_video::decoder::Color;
 
@@ -38,6 +39,51 @@ pub fn vui_signal(r: &mut BitReader) -> Color {
         r.ue(); // chroma_sample_loc_type_bottom_field
     }
     c
+}
+
+/// What an encoder's VUI states of `c`, the full range flag and the primaries, transfer and
+/// matrix as H.273, 2 where unstated. None when `c` states none of the three.
+pub fn vui_colour(c: &StreamColor) -> Option<(bool, u8, u8, u8)> {
+    if c.primaries.is_none() && c.transfer.is_none() && c.matrix.is_none() {
+        return None;
+    }
+    Some((
+        c.range == Some(Range::Full),
+        c.primaries.map_or(2, Primaries::to_h273),
+        c.transfer.map_or(2, TransferFn::to_h273),
+        c.matrix.map_or(2, Matrix::to_h273),
+    ))
+}
+
+/// The SEI RBSP of `h`'s mastering display (137) and content light level (144), the part each
+/// states, trailing bits included (H.265 D.2.28, D.2.35). None when it states neither.
+// Cold: once per encoder session.
+#[allow(clippy::disallowed_methods)]
+pub fn hdr_sei_rbsp(h: &HdrStatic) -> Option<Vec<u8>> {
+    let (m, l) = (h.mastering, h.light);
+    let (mastering, light) = (m != Mastering::default(), l != ContentLight::default());
+    if !mastering && !light {
+        return None;
+    }
+    let mut p = Vec::with_capacity(36);
+    if mastering {
+        p.extend_from_slice(&[SEI_MASTERING_DISPLAY as u8, 24]);
+        // the SEI states green, blue, red
+        let [r, g, b] = m.primaries;
+        for v in [g, b, r, m.white] {
+            p.extend_from_slice(&v[0].to_be_bytes());
+            p.extend_from_slice(&v[1].to_be_bytes());
+        }
+        p.extend_from_slice(&m.max_luminance.to_be_bytes());
+        p.extend_from_slice(&m.min_luminance.to_be_bytes());
+    }
+    if light {
+        p.extend_from_slice(&[SEI_CONTENT_LIGHT as u8, 4]);
+        p.extend_from_slice(&l.max_cll.to_be_bytes());
+        p.extend_from_slice(&l.max_fall.to_be_bytes());
+    }
+    p.push(0x80);
+    Some(p)
 }
 
 /// Each message found replaces its part whole, it persists until the next of its kind (H.265
@@ -200,6 +246,27 @@ mod tests {
         assert_eq!((m.max_luminance, m.min_luminance), (10_000_000, 50));
         assert_eq!(hdr.light, ContentLight { max_cll: 1000, max_fall: 400 });
         assert_eq!(hdr.max_mastering_nits(), 1000.0);
+    }
+
+    #[test]
+    fn the_written_sei_reads_back_as_it_was() {
+        let mut hdr = HdrStatic::default();
+        assert!(sei_hdr(&hdr10_sei(), &mut hdr));
+        assert_eq!(hdr_sei_rbsp(&hdr).as_deref(), Some(&hdr10_sei()[..]), "x265's bytes");
+        let light = HdrStatic { light: ContentLight { max_cll: 600, max_fall: 0 }, ..HdrStatic::default() };
+        let mut back = HdrStatic::default();
+        assert!(sei_hdr(&hdr_sei_rbsp(&light).expect("a light level"), &mut back));
+        assert_eq!(back, light, "the light level alone");
+        assert_eq!(hdr_sei_rbsp(&HdrStatic::default()), None);
+    }
+
+    #[test]
+    fn the_vui_states_what_is_known_and_unspecified_for_the_rest() {
+        let pq = StreamColor { transfer: Some(TransferFn::Pq), primaries: Some(Primaries::Bt2020), ..StreamColor::default() };
+        assert_eq!(vui_colour(&pq), Some((false, 9, 16, 2)));
+        let full = StreamColor { matrix: Some(Matrix::Bt709), range: Some(Range::Full), ..StreamColor::default() };
+        assert_eq!(vui_colour(&full), Some((true, 2, 2, 1)));
+        assert_eq!(vui_colour(&StreamColor { range: Some(Range::Full), ..StreamColor::default() }), None);
     }
 
     #[test]

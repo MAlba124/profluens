@@ -29,6 +29,7 @@ pub const VA_STATUS_ERROR_HW_BUSY: VAStatus = 0x22;
 /// FRAME_SIZE_OVERFLOW and BAD_BITSTREAM.
 pub const VA_CODED_BUF_STATUS_BROKEN: u32 = 0x200 | 0x1000 | 0x8000;
 pub const VA_STATUS_ERROR_TIMEDOUT: VAStatus = 0x26;
+pub const VA_STATUS_ERROR_UNIMPLEMENTED: VAStatus = 0x14;
 pub const VA_INVALID_ID: VAGenericID = 0xffff_ffff;
 pub const VA_INVALID_SURFACE: VASurfaceID = VA_INVALID_ID;
 
@@ -39,6 +40,7 @@ pub const VAProfileH264ConstrainedBaseline: VAProfile = 13;
 pub const VAProfileVP8Version0_3: VAProfile = 14;
 pub const VAProfileHEVCMain: VAProfile = 17;
 pub const VAProfileHEVCMain10: VAProfile = 18;
+pub const VAProfileHEVCMain12: VAProfile = 23;
 pub const VAProfileVP9Profile0: VAProfile = 19;
 pub const VAProfileVP9Profile2: VAProfile = 21;
 pub const VAProfileAV1Profile0: VAProfile = 32;
@@ -49,6 +51,12 @@ pub const VAEntrypointEncSliceLP: VAEntrypoint = 8;
 pub const VAEntrypointVideoProc: VAEntrypoint = 10;
 
 pub const VAConfigAttribRTFormat: VAConfigAttribType = 0;
+pub const VAConfigAttribDecProcessing: VAConfigAttribType = 8;
+pub const VAConfigAttribPredictionDirection: VAConfigAttribType = 39;
+pub const VA_PREDICTION_DIRECTION_BI_NOT_EMPTY: u32 = 0x0000_0004;
+pub const VA_DEC_PROCESSING: u32 = 0x0000_0001;
+pub const VA_CHROMA_SITING_VERTICAL_CENTER: u8 = 0x02;
+pub const VA_CHROMA_SITING_HORIZONTAL_LEFT: u8 = 0x04;
 pub const VAConfigAttribRateControl: VAConfigAttribType = 5;
 pub const VAConfigAttribEncPackedHeaders: VAConfigAttribType = 10;
 pub const VAConfigAttribEncMaxRefFrames: VAConfigAttribType = 13;
@@ -97,6 +105,7 @@ pub const VAEncPackedHeaderRawData: u32 = 4;
 pub const VAEncMiscParameterTypeFrameRate: u32 = 0;
 pub const VAEncMiscParameterTypeRateControl: u32 = 1;
 pub const VAEncMiscParameterTypeHRD: u32 = 5;
+pub const VAEncMiscParameterTypeQualityLevel: u32 = 6;
 
 pub const VAGenericValueTypeInteger: VAGenericValueType = 1;
 pub const VAGenericValueTypePointer: VAGenericValueType = 3;
@@ -155,6 +164,7 @@ pub struct VADRMPRIMESurfaceDescriptor {
 pub const VA_FOURCC_NV12: u32 = 0x3231_564E;
 pub use profluens_video::gpuframe::DRM_FORMAT_NV12;
 pub const VA_FOURCC_P010: u32 = 0x3031_3050;
+pub const VA_FOURCC_P012: u32 = 0x3231_3050;
 /// With this modifier the EGL import must omit the modifier attributes, some drivers reject
 /// INVALID.
 pub use profluens_video::gpuframe::DRM_FORMAT_MOD_INVALID;
@@ -369,6 +379,14 @@ pub struct VAEncMiscParameterRateControl {
 pub struct VAEncMiscParameterFrameRate {
     pub framerate: u32,
     pub framerate_flags: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// 1 best to 7 fastest, 0 the driver's default (iHD's is 7).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAEncMiscParameterBufferQualityLevel {
+    pub quality_level: u32,
     pub va_reserved: [u32; VA_PADDING_LOW],
 }
 
@@ -612,6 +630,72 @@ pub struct VASliceParameterBufferHEVC {
     pub entry_offset_to_subset_array: u16,
     pub slice_data_num_emu_prevn_bytes: u16,
     pub va_reserved: [u32; VA_PADDING_LOW - 2],
+}
+
+/// va_dec_hevc.h, the range extension of a picture, `range_extension_pic_fields` bits 0 to 8
+/// the SPS's flags, 9 cross_component_prediction, 10 chroma_qp_offset_list.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct VAPictureParameterBufferHEVCRext {
+    pub range_extension_pic_fields: u32,
+    pub diff_cu_chroma_qp_offset_depth: u8,
+    pub chroma_qp_offset_list_len_minus1: u8,
+    pub log2_sao_offset_scale_luma: u8,
+    pub log2_sao_offset_scale_chroma: u8,
+    pub log2_max_transform_skip_block_size_minus2: u8,
+    pub cb_qp_offset_list: [i8; 6],
+    pub cr_qp_offset_list: [i8; 6],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAPictureParameterBufferHEVCScc {
+    pub screen_content_pic_fields: u32,
+    pub palette_max_size: u8,
+    pub delta_palette_max_predictor_size: u8,
+    pub predictor_palette_size: u8,
+    pub predictor_palette_entries: [[u16; 128]; 3],
+    pub pps_act_y_qp_offset_plus5: i8,
+    pub pps_act_cb_qp_offset_plus5: i8,
+    pub pps_act_cr_qp_offset_plus3: i8,
+}
+
+/// The picture parameters a range extensions profile takes in place of the base ones.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAPictureParameterBufferHEVCExtension {
+    pub base: VAPictureParameterBufferHEVC,
+    pub rext: VAPictureParameterBufferHEVCRext,
+    pub scc: VAPictureParameterBufferHEVCScc,
+}
+
+impl VAPictureParameterBufferHEVCScc {
+    pub fn zeroed() -> Self {
+        // SAFETY: integers and integer arrays, all zero is a valid value of each.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// The weighted prediction offsets a range extensions profile reads, wider than the base's.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct VASliceParameterBufferHEVCRext {
+    pub luma_offset_l0: [i16; 15],
+    pub ChromaOffsetL0: [[i16; 2]; 15],
+    pub luma_offset_l1: [i16; 15],
+    pub ChromaOffsetL1: [[i16; 2]; 15],
+    /// Bit 0 cu_chroma_qp_offset_enabled_flag, bit 1 use_integer_mv_flag.
+    pub slice_ext_flags: u32,
+    pub slice_act_y_qp_offset: i8,
+    pub slice_act_cb_qp_offset: i8,
+    pub slice_act_cr_qp_offset: i8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VASliceParameterBufferHEVCExtension {
+    pub base: VASliceParameterBufferHEVC,
+    pub rext: VASliceParameterBufferHEVCRext,
 }
 
 pub const HEVC_LSF_LAST_SLICE_OF_PIC: u32 = 1 << 0;
@@ -1343,6 +1427,8 @@ unsafe extern "C" {
     ) -> VAStatus;
     pub fn vaEndPicture(dpy: VADisplay, context: VAContextID) -> VAStatus;
     pub fn vaSyncSurface(dpy: VADisplay, render_target: VASurfaceID) -> VAStatus;
+    pub fn vaSyncBuffer(dpy: VADisplay, buf_id: VABufferID, timeout_ns: u64) -> VAStatus;
+    pub fn vaSyncSurface2(dpy: VADisplay, surface: VASurfaceID, timeout_ns: u64) -> VAStatus;
 
     pub fn vaDeriveImage(dpy: VADisplay, surface: VASurfaceID, image: *mut VAImage) -> VAStatus;
     pub fn vaCreateImage(
@@ -1422,6 +1508,23 @@ unsafe extern "C" {
 mod layout {
     use super::*;
     use std::mem::{align_of, size_of};
+
+    /// Sizes and offsets a C program printed against libva 2.24's va_dec_hevc.h.
+    #[test]
+    fn hevc_range_extension_buffers_match_libva() {
+        assert_eq!(size_of::<VAPictureParameterBufferHEVC>(), 604);
+        assert_eq!(size_of::<VAPictureParameterBufferHEVCRext>(), 24);
+        assert_eq!(size_of::<VAPictureParameterBufferHEVCScc>(), 780);
+        assert_eq!(size_of::<VAPictureParameterBufferHEVCExtension>(), 1408);
+        assert_eq!(std::mem::offset_of!(VAPictureParameterBufferHEVCExtension, rext), 604);
+        assert_eq!(std::mem::offset_of!(VAPictureParameterBufferHEVCExtension, scc), 628);
+        assert_eq!(std::mem::offset_of!(VAPictureParameterBufferHEVCRext, cb_qp_offset_list), 9);
+        assert_eq!(size_of::<VASliceParameterBufferHEVC>(), 264);
+        assert_eq!(size_of::<VASliceParameterBufferHEVCRext>(), 188);
+        assert_eq!(size_of::<VASliceParameterBufferHEVCExtension>(), 452);
+        assert_eq!(std::mem::offset_of!(VASliceParameterBufferHEVCRext, slice_ext_flags), 180);
+        assert_eq!(std::mem::offset_of!(VASliceParameterBufferHEVCRext, slice_act_y_qp_offset), 184);
+    }
 
     #[test]
     fn struct_sizes_match_libva_2_23() {

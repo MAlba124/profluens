@@ -167,8 +167,9 @@ fn hevc_on_dmabufs_encodes_what_the_cpu_path_does() {
 
 #[test]
 fn main10_on_dmabufs_encodes_what_the_cpu_path_does_and_decodes_to_ten_bits() {
-    let target = Target { max_width: 64, max_height: 64, depth: 10 };
-    let picture = 64 * 64 * 3;
+    // iHD on Gen12 encodes no HEVC picture under 128 wide on either entrypoint
+    let target = Target { max_width: 128, max_height: 128, depth: 10 };
+    let picture = 128 * 128 * 3;
     let test = "main10_on_dmabufs_encodes_what_the_cpu_path_does_and_decodes_to_ten_bits";
     check(
         test,

@@ -34,12 +34,14 @@ use crate::gpuframe::{
     self, F_LAYOUT, F_MODIFIER, FAMILY_VIDEO_GPU, FrameToken, FrameTx, GPU_FRAME_HEADER_LEN,
     GpuFrame, GpuFrameChannel, GpuFrameHeader,
 };
+use crate::decproc::{self, Twins};
 use crate::probe;
 use crate::va::{
     Buffer as VaBuffer, Config, Context, Display, ExportedSurface, ReadbackImage, SurfaceFormat,
     Surfaces, VaError,
 };
 use crate::vp9quant::{ac_q, dc_q};
+use crate::vpp::Target;
 
 const FAMILY: &str = "video/raw";
 const F_WIDTH: &str = "width";
@@ -465,6 +467,8 @@ pub(crate) fn copy_out(
 #[derive(Clone, Copy)]
 pub(crate) struct PendingOut {
     pub surface: ffi::VASurfaceID,
+    /// The surface that leaves, the decode surface's twin when the decoder shrinks.
+    pub export: ffi::VASurfaceID,
     pub pts: Timestamp,
     pub duration: Timestamp,
     pub width: u32,
@@ -486,6 +490,8 @@ struct VaState {
     coded_w: u32,
     coded_h: u32,
     readback: Option<ReadbackImage>,
+    /// The scaled twins of the surfaces when the decoder shrinks, and the frame size planned.
+    twins: Option<(Twins, (u32, u32))>,
 }
 
 pub struct VaapiVp9Dec {
@@ -519,10 +525,11 @@ pub struct VaapiVp9Dec {
     in_flight: Vec<(ffi::VASurfaceID, FrameToken)>,
     link: Option<(u32, u64)>,
     only: bool,
+    shrink: Option<(Target, bool)>,
 }
 
 // SAFETY: `SchedHint::Active`, the element runs on one scheduler thread and never
-// shares its `Display`. The preroll probe opens and closes a display of its own.
+// shares its `Display`. The display preroll opens moves to that thread with the element.
 unsafe impl Send for VaapiVp9Dec {}
 
 impl Default for VaapiVp9Dec {
@@ -572,7 +579,16 @@ impl VaapiVp9Dec {
             next_token: 1,
             in_flight: Vec::with_capacity(16),
             link: None,
+            shrink: None,
         }
+    }
+
+    /// Zero-copy pictures leave scaled into `target` by the decode call itself, placed in its box
+    /// with bars when `fixed`, see [`crate::decproc`]. The driver must do decode processing for
+    /// the stream's profile.
+    pub fn with_shrink(mut self, target: Target, fixed: bool) -> Self {
+        self.shrink = Some((target, fixed));
+        self
     }
 
     fn warn(&mut self, ctx: &mut Ctx, kind: K) {
@@ -634,8 +650,20 @@ impl VaapiVp9Dec {
         let format = if ten_bit { SurfaceFormat::P010 } else { SurfaceFormat::NV12 };
         let (w, hgt) = (h.frame_width, h.frame_height);
         let (mut coded_w, mut coded_h) = (w.next_multiple_of(16), hgt.next_multiple_of(16));
+        let depth = if ten_bit { 10 } else { 8 };
+        let shrink = match self.shrink.filter(|_| self.zerocopy.is_some()) {
+            Some((t, fixed)) => match decproc::plan(w, hgt, depth, t, fixed) {
+                Some(p) => Some((p, (w, hgt))),
+                None => {
+                    self.fail(ctx, K::ProcSize { width: w, height: hgt });
+                    return false;
+                }
+            },
+            None => None,
+        };
         if let Some(va) = &self.va {
-            if va.format == format && va.coded_w >= w && va.coded_h >= hgt {
+            let planned = va.twins.as_ref().map(|(t, at)| (t.plan, *at));
+            if va.format == format && va.coded_w >= w && va.coded_h >= hgt && planned == shrink {
                 return true;
             }
             if h.frame_type != FrameType::KeyFrame {
@@ -674,7 +702,11 @@ impl VaapiVp9Dec {
         );
         let profile = if ten_bit { ffi::VAProfileVP9Profile2 } else { ffi::VAProfileVP9Profile0 };
         let readback_mode = self.zerocopy.is_none();
-        let built = Config::new_decode_for(display, profile, format).and_then(|config| {
+        let config = match shrink {
+            Some(_) => Config::new_decode_processing(display, profile, format),
+            None => Config::new_decode_for(display, profile, format),
+        };
+        let built = config.and_then(|config| {
             let surfaces = Surfaces::new(display, format, coded_w, coded_h, count)?;
             let context =
                 Context::new(display, &config, coded_w as i32, coded_h as i32, &surfaces)?;
@@ -697,6 +729,19 @@ impl VaapiVp9Dec {
                 return false;
             }
         };
+        // a VP9 frame is its exact size, nothing cropped
+        let made = shrink.map(|(p, at)| Twins::new(display, p, count, (0, 0, w, hgt), (w, hgt)).map(|t| (t, at)));
+        let twins = match made.transpose() {
+            Ok(t) => t,
+            Err(e) => {
+                self.fail(ctx, e);
+                return false;
+            }
+        };
+        if let Some((t, _)) = &twins {
+            let (w, h) = (t.plan.width, t.plan.height);
+            log!(&*ctx, Level::Info, "shrink", width = w, height = h, layout = t.kind().name);
+        }
         let free = surfaces.ids().iter().copied().collect();
         self.row = if readback_mode { vec![0u8; coded_w as usize * 2] } else { Vec::new() };
         self.va = Some(VaState {
@@ -708,6 +753,7 @@ impl VaapiVp9Dec {
             coded_w,
             coded_h,
             readback,
+            twins,
         });
         true
     }
@@ -870,10 +916,23 @@ impl VaapiVp9Dec {
         let slice_buf =
             VaBuffer::new_struct(display, &va.context, ffi::VASliceParameterBufferType, &slice)?;
         let data_buf = VaBuffer::new_data(display, &va.context, frame)?;
+        // every picture names its twin, iHD would write the last one's again
+        let mut regions = va.twins.as_ref().map(|(t, _)| {
+            let twin = t.of(&va.surfaces, target).unwrap_or(ffi::VA_INVALID_SURFACE);
+            decproc::Regions::new(t, twin)
+        });
+        let proc_buf = match regions.as_mut() {
+            Some(r) => Some(decproc::pipeline(display, &va.context, target, r)?),
+            None => None,
+        };
         va.context.begin(target)?;
         let rendered = va
             .context
             .render(&[pic_buf.id()])
+            .and_then(|()| match &proc_buf {
+                Some(p) => va.context.render(&[p.id()]),
+                None => Ok(()),
+            })
             .and_then(|()| va.context.render(&[slice_buf.id(), data_buf.id()]));
         // vaEndPicture runs after a failed render too, so the context is not left mid-picture.
         rendered.and(va.context.end())
@@ -896,14 +955,22 @@ impl VaapiVp9Dec {
             return;
         }
         let Some(va) = &self.va else { return };
+        let (export, width, height, coded_w, coded_h) = match &va.twins {
+            Some((t, _)) => {
+                let twin = t.of(&va.surfaces, surface).unwrap_or(surface);
+                (twin, t.plan.width, t.plan.height, t.coded.0, t.coded.1)
+            }
+            None => (surface, width, height, va.coded_w, va.coded_h),
+        };
         self.output_queue.push_back(PendingOut {
             surface,
+            export,
             pts,
             duration,
             width,
             height,
-            coded_w: va.coded_w,
-            coded_h: va.coded_h,
+            coded_w,
+            coded_h,
             format: va.format,
             color: stated_color(&self.state.color),
             preview,
@@ -1009,7 +1076,12 @@ impl VaapiVp9Dec {
         let Some(dpy) = self.display.as_ref().map(Display::raw) else {
             return Ok(true);
         };
-        let mut exported = match ExportedSurface::export(dpy, out.surface) {
+        // a pending command, a seek's flush, cuts the wait short, the decoder runs again after it
+        if !crate::va::wait_surface(dpy, out.export, || ctx.command_pending()) {
+            ctx.wake_within(crate::enc::POLL_WAKE);
+            return Ok(false);
+        }
+        let mut exported = match ExportedSurface::export(dpy, out.export) {
             Ok(e) => e,
             Err(e) => {
                 self.warn(ctx, K::Export(e));
@@ -1189,7 +1261,9 @@ impl Element for VaapiVp9Dec {
         if self.zerocopy.is_none() {
             return Ok(());
         }
-        let display = if self.ensure_display(ctx) { self.display.take() } else { None };
+        // kept for the session, a display opened again on the element's thread is 2 to 5 ms
+        // ahead of its first picture
+        let display = if self.ensure_display(ctx) { self.display.as_ref() } else { None };
         let formats = match display.map(gpuframe::exported_formats) {
             Some(Ok(formats)) => formats,
             Some(Err(e)) => {
@@ -1210,6 +1284,7 @@ impl Element for VaapiVp9Dec {
     }
 
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        let emitted = self.emitted;
         if self.failed {
             while inputs.pop().is_some() {
                 ctx.count_drop();
@@ -1230,7 +1305,8 @@ impl Element for VaapiVp9Dec {
             if !self.emit_queued(ctx, keep)? {
                 return Ok(Flow::Ok);
             }
-            if ctx.command_pending() {
+            // a picture put out goes downstream now, the next decode would hold it back
+            if ctx.command_pending() || self.emitted != emitted {
                 return Ok(Flow::Ok);
             }
             let Some(front) = inputs.front() else { break };

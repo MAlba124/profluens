@@ -1,5 +1,5 @@
 //! Codec-neutral plumbing of the VA-API encoders: session setup, raw frame upload, submit and sync,
-//! and the two rotated reconstruction surfaces of the IDR/P single-reference GOP.
+//! and the ring of reconstruction surfaces, the references of a P picture and the one it codes.
 
 use std::collections::VecDeque;
 
@@ -181,6 +181,29 @@ impl FrameBufs {
         self.hold.clear();
         r
     }
+
+    /// [`Self::submit`] without the wait, the picture then [`InFlight`].
+    pub(crate) fn queue(&mut self, engine: &EncEngine, input: Option<ffi::VASurfaceID>) -> VaResult<()> {
+        self.ids.clear();
+        self.ids.extend(self.hold.iter().map(VaBuffer::id));
+        let r = engine.queue(&self.ids, input.unwrap_or(engine.input));
+        self.hold.clear();
+        r
+    }
+}
+
+/// How long a picture on the GPU waits for a poll, the encoder asks to run again this soon.
+pub(crate) const POLL_WAKE: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The picture the GPU codes while the encoder returns to its caller, so the next decode is
+/// queued behind it. It holds the coded buffer the bytes land in and the producer's frame it
+/// reads, until the bytes are read.
+pub(crate) struct InFlight {
+    pub coded: VaBuffer,
+    /// The parameter sets go in front of the bytes, a driver without packed headers writes none.
+    pub head: bool,
+    pub stamp: Stamp,
+    pub _frame: Option<crate::gpuframe::GpuFrame>,
 }
 
 /// Timing and flags of one coded frame.
@@ -359,13 +382,79 @@ impl Staged {
     }
 }
 
+/// References an engine keeps at most.
+pub(crate) const REFS_MAX: usize = 4;
+
+/// L0 and L1 references a picture takes at most on `entrypoint`, VAConfigAttribEncMaxRefFrames
+/// (low 16 bits L0, high 16 L1), 1 each when the driver does not say.
+pub(crate) fn max_refs(
+    display: &Display,
+    profile: ffi::VAProfile,
+    entrypoint: ffi::VAEntrypoint,
+) -> (u32, u32) {
+    match va::config_attribute(display, profile, entrypoint, ffi::VAConfigAttribEncMaxRefFrames) {
+        Ok(Some(v)) => (v & 0xFFFF, v >> 16),
+        _ => (1, 1),
+    }
+}
+
+/// The spacing of the source's intra pictures, which tells its keyframe grid from scene cuts.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct IntraCadence {
+    /// Pictures since the last intra one.
+    since: u32,
+    /// Pictures since the last intra one on the grid, or any before a grid is known.
+    since_grid: u32,
+    /// Pictures between the last two intra ones, 0 before two came.
+    gap: u32,
+    /// The source's keyframe interval, a gap that came twice in a row, 0 before one did.
+    grid: u32,
+    /// A picture came since the start or the last flush.
+    begun: bool,
+}
+
+impl IntraCadence {
+    /// Each picture in order. True for an intra one off the source's grid, a scene cut. One
+    /// after a cut that keeps the grid's phase is on it.
+    pub(crate) fn note(&mut self, intra: bool) -> bool {
+        // the spacing counts from the start, an intra picture there is that start
+        if !std::mem::replace(&mut self.begun, true) && intra {
+            return false;
+        }
+        self.since = self.since.saturating_add(1);
+        self.since_grid = self.since_grid.saturating_add(1);
+        if !intra {
+            return false;
+        }
+        // within an eighth, a source encoder lets its grid drift a picture or two
+        let near = |a: u32, b: u32| b != 0 && a.abs_diff(b) <= (b / 8).max(1);
+        let repeat = near(self.since, self.gap);
+        if repeat {
+            self.grid = self.since;
+        }
+        let on_grid = repeat || near(self.since, self.grid) || near(self.since_grid, self.grid);
+        if on_grid || self.grid == 0 {
+            self.since_grid = 0;
+        }
+        (self.gap, self.since) = (self.since, 0);
+        !on_grid
+    }
+
+    /// A flush, what comes after starts the spacing over on the source's grid, which stays.
+    pub(crate) fn reset(&mut self) {
+        *self = IntraCadence { grid: self.grid, ..IntraCadence::default() };
+    }
+}
+
 /// Field order is drop order, the teardown order libva wants.
 pub(crate) struct EncEngine {
     context: Context,
     _surfaces: Surfaces,
     _config: Config,
     input: ffi::VASurfaceID,
-    recon: [ffi::VASurfaceID; 2],
+    /// A ring, `recon[cur]` takes the picture coded, the `recon_n - 1` before it are references.
+    recon: [ffi::VASurfaceID; REFS_MAX + 1],
+    recon_n: usize,
     cur: usize,
     pub coded_w: u32,
     pub coded_h: u32,
@@ -387,7 +476,7 @@ impl EncEngine {
         height: u32,
         align: u32,
     ) -> VaResult<EncEngine> {
-        Self::new_packed(display, profile, entrypoint, rc_mode, format, width, height, align, 0)
+        Self::new_packed(display, profile, entrypoint, rc_mode, format, width, height, align, 0, 1)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -401,7 +490,9 @@ impl EncEngine {
         height: u32,
         align: u32,
         packed: u32,
+        refs: usize,
     ) -> VaResult<EncEngine> {
+        let recon_n = refs.clamp(1, REFS_MAX) + 1;
         let coded_w = align_up(width.max(2), align);
         let coded_h = align_up(height.max(2), align);
         let config = Config::new_encode_with(
@@ -412,16 +503,19 @@ impl EncEngine {
             rc_mode,
             packed,
         )?;
-        let surfaces = Surfaces::new(display, format, coded_w, coded_h, 3)?;
+        let surfaces = Surfaces::new(display, format, coded_w, coded_h, 1 + recon_n as u32)?;
         let context = Context::new(display, &config, coded_w as i32, coded_h as i32, &surfaces)?;
         let ids = surfaces.ids();
-        let (input, recon) = (ids[0], [ids[1], ids[2]]);
+        let mut recon = [ffi::VA_INVALID_SURFACE; REFS_MAX + 1];
+        recon[..recon_n].copy_from_slice(&ids[1..=recon_n]);
+        let input = ids[0];
         Ok(EncEngine {
             context,
             _surfaces: surfaces,
             _config: config,
             input,
             recon,
+            recon_n,
             cur: 0,
             coded_w,
             coded_h,
@@ -429,6 +523,11 @@ impl EncEngine {
             height,
             bits_per_pixel: format.bits_per_pixel,
         })
+    }
+
+    /// The coded width and height.
+    pub(crate) fn coded(&self) -> (u32, u32) {
+        (self.coded_w, self.coded_h)
     }
 
     pub(crate) fn context(&self) -> &Context {
@@ -443,12 +542,24 @@ impl EncEngine {
         self.recon[self.cur]
     }
 
+    /// The picture coded last.
     pub(crate) fn recon_ref(&self) -> ffi::VASurfaceID {
-        self.recon[1 - self.cur]
+        self.recon_back(0)
+    }
+
+    /// References kept, the pictures coded before the current one.
+    pub(crate) fn refs(&self) -> usize {
+        self.recon_n - 1
+    }
+
+    /// The picture coded `back + 1` pictures ago, `back` below [`Self::refs`].
+    pub(crate) fn recon_back(&self, back: usize) -> ffi::VASurfaceID {
+        let n = self.recon_n;
+        self.recon[(self.cur + n - 1 - back % (n - 1)) % n]
     }
 
     pub(crate) fn advance_recon(&mut self) {
-        self.cur = 1 - self.cur;
+        self.cur = (self.cur + 1) % self.recon_n;
     }
 
     /// Edges are replicated into the alignment padding so padded blocks predict cheaply.
@@ -548,11 +659,16 @@ impl EncEngine {
         bufs: &[ffi::VABufferID],
         input: ffi::VASurfaceID,
     ) -> VaResult<()> {
+        self.queue(bufs, input)?;
+        va::sync_surface(display, input)
+    }
+
+    /// The picture on `input` handed to the GPU, its coded buffer read when it is done.
+    pub(crate) fn queue(&self, bufs: &[ffi::VABufferID], input: ffi::VASurfaceID) -> VaResult<()> {
         self.context.begin(input)?;
         let rendered = self.context.render(bufs);
         // vaEndPicture runs after a failed render too, so the context is not left mid-picture.
-        rendered.and(self.context.end())?;
-        va::sync_surface(display, input)
+        rendered.and(self.context.end())
     }
 
     /// Raw size plus 4 KiB, output beyond the raw input means something is badly wrong.
@@ -568,7 +684,66 @@ mod tests {
     use profluens_core::error::Error;
     use profluens_core::time::Timestamp;
 
-    use super::{End, Outlet, STAGED_MAX, Staged, Stamp, align_up};
+    use super::{End, IntraCadence, Outlet, STAGED_MAX, Staged, Stamp, align_up};
+
+    /// The cut flags of intra pictures `gaps` pictures apart, the first after `gaps[0]`.
+    fn cuts(gaps: &[u32]) -> Vec<bool> {
+        let mut c = IntraCadence::default();
+        let mut out = Vec::new();
+        for &g in gaps {
+            for _ in 1..g {
+                assert!(!c.note(false), "a picture that is not intra is no cut");
+            }
+            out.push(c.note(true));
+        }
+        out
+    }
+
+    #[test]
+    fn a_keyframe_grid_is_no_scene_cut_and_what_breaks_it_is() {
+        // novocaine.mkv from 600 s, a 21 picture grid with cuts that keep its phase
+        let gaps = [21, 21, 21, 21, 3, 19, 21, 21, 8, 19, 21, 21, 12, 9, 21];
+        let want = [
+            true, false, false, false, true, false, false, false, true, false, false, false, true,
+            false, false,
+        ];
+        assert_eq!(cuts(&gaps), want);
+        // sdr1080.mkv, cuts only, two alike by chance make a grid the next cut is off
+        assert_eq!(cuts(&[113, 72, 149, 93, 93, 40]), [true, true, true, true, false, true]);
+        let mut c = IntraCadence::default();
+        for _ in 0..2 {
+            (1..21).for_each(|_| assert!(!c.note(false)));
+            c.note(true);
+        }
+        (1..21).for_each(|_| assert!(!c.note(false)));
+        c.reset();
+        assert!(!c.note(true), "after a flush an intra picture starts the spacing");
+    }
+
+    /// A seek lands on a keyframe, the first picture after the flush is intra. It starts the
+    /// spacing and the grid learnt before the flush holds.
+    #[test]
+    fn a_seek_onto_a_keyframe_keeps_the_grid() {
+        let mut c = IntraCadence::default();
+        let run = |c: &mut IntraCadence, n: u32| -> Vec<bool> {
+            let mut out = Vec::new();
+            for _ in 0..n {
+                out.push(c.note(true));
+                (1..48).for_each(|_| assert!(!c.note(false)));
+            }
+            out
+        };
+        // from the start, the second keyframe gives the first gap, the third confirms it
+        assert_eq!(run(&mut c, 4), [false, true, false, false]);
+        for _ in 0..3 {
+            c.reset();
+            assert_eq!(run(&mut c, 3), [false, false, false], "no cut after a seek");
+        }
+        c.reset();
+        assert!(!c.note(true));
+        (1..20).for_each(|_| assert!(!c.note(false)));
+        assert!(c.note(true), "off the grid after a seek is a cut");
+    }
 
     /// A pool of `free` slots. Sent pts land in `out`, `holds` counts the passes the end was held.
     struct FakePool {

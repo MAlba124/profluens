@@ -243,8 +243,19 @@ pub struct Sps {
     pub sps_temporal_mvp_enabled_flag: bool,
     pub strong_intra_smoothing_enabled_flag: bool,
     pub has_extension: bool,
+    /// The sps_range_extension flags in VA's order (`range_extension_pic_fields` bits 0 to 8),
+    /// 0 without one.
+    pub range_ext: u32,
+    /// A format range extensions profile (A.3.5), decoded as VA's Main 12.
+    pub rext: bool,
     pub colour: profluens_video::decoder::Color,
 }
+
+/// `range_ext` bits iHD decodes none of, extended_precision_processing_flag and
+/// cabac_bypass_alignment_enabled_flag.
+const RANGE_EXT_REFUSED: u32 = 1 << 4 | 1 << 8;
+/// `range_ext`'s high_precision_offsets_enabled_flag, it widens the weighted prediction offsets.
+pub const RANGE_EXT_HIGH_PRECISION_OFFSETS: u32 = 1 << 6;
 
 impl Sps {
     pub fn ref_frames(&self) -> u32 {
@@ -310,17 +321,24 @@ impl Sps {
     pub fn coded_height(&self) -> u32 {
         self.pic_height_in_luma_samples
     }
-    /// 4:2:0 at 8 or 10 bits with no range or SCC extension (A.3.2, A.3.3).
+    /// 4:2:0 at 8, 10 or 12 bits, Main, Main 10 or a range extensions profile without the
+    /// tools iHD lacks, no multilayer, 3D or SCC extension (A.3.2, A.3.3, A.3.5).
     pub fn supported(&self) -> bool {
         self.chroma_format_idc == 1
             && !self.separate_colour_plane_flag
-            && matches!(self.bit_depth_luma_minus8, 0 | 2)
+            && matches!(self.bit_depth_luma_minus8, 0 | 2 | 4)
             && self.bit_depth_chroma_minus8 == self.bit_depth_luma_minus8
             && !self.has_extension
+            && self.range_ext & RANGE_EXT_REFUSED == 0
     }
 
     pub fn is_ten_bit(&self) -> bool {
         self.bit_depth_luma_minus8 == 2
+    }
+
+    /// Bits a luma sample.
+    pub fn depth(&self) -> u8 {
+        (self.bit_depth_luma_minus8 + 8).min(16) as u8
     }
 }
 
@@ -366,6 +384,63 @@ pub struct Pps {
     pub lists_modification_present_flag: bool,
     pub log2_parallel_merge_level_minus2: u32,
     pub slice_segment_header_extension_present_flag: bool,
+    pub range: PpsRange,
+    /// A multilayer, 3D or SCC extension, decoded by none of these.
+    pub other_ext: bool,
+}
+
+/// pps_range_extension() (7.3.2.3.2), zeros without one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PpsRange {
+    pub log2_max_transform_skip_block_size_minus2: u32,
+    pub cross_component_prediction_enabled_flag: bool,
+    pub chroma_qp_offset_list_enabled_flag: bool,
+    pub diff_cu_chroma_qp_offset_depth: u32,
+    pub chroma_qp_offset_list_len_minus1: u32,
+    pub cb_qp_offset_list: [i8; 6],
+    pub cr_qp_offset_list: [i8; 6],
+    pub log2_sao_offset_scale_luma: u32,
+    pub log2_sao_offset_scale_chroma: u32,
+}
+
+/// The PPS extensions after slice_segment_header_extension_present_flag (7.3.2.3.1), the range
+/// one parsed, whether another is present. None out of range (7.4.3.3.2).
+fn pps_extensions(r: &mut BitReader, transform_skip: bool) -> Option<(PpsRange, bool)> {
+    let mut p = PpsRange::default();
+    if !r.flag() {
+        // pps_extension_present_flag
+        return Some((p, false));
+    }
+    let range = r.flag();
+    let others = r.u(3) != 0; // multilayer, 3d, scc
+    let _four = r.u(4); // pps_extension_4bits
+    if range {
+        if transform_skip {
+            p.log2_max_transform_skip_block_size_minus2 = r.ue();
+        }
+        p.cross_component_prediction_enabled_flag = r.flag();
+        p.chroma_qp_offset_list_enabled_flag = r.flag();
+        if p.chroma_qp_offset_list_enabled_flag {
+            p.diff_cu_chroma_qp_offset_depth = r.ue();
+            p.chroma_qp_offset_list_len_minus1 = r.ue();
+            if p.chroma_qp_offset_list_len_minus1 > 5 {
+                return None;
+            }
+            for i in 0..=p.chroma_qp_offset_list_len_minus1 as usize {
+                let (cb, cr) = (r.se(), r.se());
+                if !(-12..=12).contains(&cb) || !(-12..=12).contains(&cr) {
+                    return None;
+                }
+                (p.cb_qp_offset_list[i], p.cr_qp_offset_list[i]) = (cb as i8, cr as i8);
+            }
+        }
+        p.log2_sao_offset_scale_luma = r.ue();
+        p.log2_sao_offset_scale_chroma = r.ue();
+        if p.log2_max_transform_skip_block_size_minus2 > 3 || p.log2_sao_offset_scale_luma > 6 || p.log2_sao_offset_scale_chroma > 6 {
+            return None;
+        }
+    }
+    Some((p, others))
 }
 
 /// Slice type (7.4.7.1). The values VA's LongSliceFlags.slice_type carries.
@@ -467,6 +542,8 @@ pub struct SliceHeader {
     pub slice_qp_delta: i32,
     pub slice_cb_qp_offset: i32,
     pub slice_cr_qp_offset: i32,
+    /// Read when the PPS's chroma QP offset list is on (7.3.6.1).
+    pub cu_chroma_qp_offset_enabled_flag: bool,
     pub deblocking_filter_override_flag: bool,
     pub slice_deblocking_filter_disabled_flag: bool,
     pub slice_beta_offset_div2: i32,
@@ -480,16 +557,19 @@ pub struct SliceHeader {
 }
 
 /// Skip `profile_tier_level` (7.3.3). True for a Main-family profile.
-fn skip_profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> bool {
+/// Whether the general profile is Main or Main 10, and whether it is a format range extensions
+/// one (4), by its idc or its compatibility flags.
+fn skip_profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> (bool, bool) {
     let _profile_space = r.u(2);
     let _tier = r.flag();
     let general_profile_idc = r.u(5);
-    let mut compat_main = false;
+    let (mut compat_main, mut compat_rext) = (false, false);
     for j in 0..32 {
         let f = r.flag();
         if j == 1 || j == 2 {
             compat_main |= f; // Main (1) or Main10 (2) compatibility
         }
+        compat_rext |= j == 4 && f;
     }
     let _progressive = r.flag();
     let _interlaced = r.flag();
@@ -527,7 +607,99 @@ fn skip_profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> boo
             r.u(8); // sub_layer_level_idc
         }
     }
-    general_profile_idc == 1 || general_profile_idc == 2 || compat_main
+    (general_profile_idc == 1 || general_profile_idc == 2 || compat_main, general_profile_idc == 4 || compat_rext)
+}
+
+/// The VUI past the chroma location, where [`crate::colour::vui_signal`] leaves the reader, to
+/// the end (E.2.1).
+fn skip_vui_rest(r: &mut BitReader, max_sub_layers_minus1: u32) {
+    r.flag(); // neutral_chroma_indication_flag
+    r.flag(); // field_seq_flag
+    r.flag(); // frame_field_info_present_flag
+    if r.flag() {
+        // default_display_window_flag, left, right, top, bottom offsets
+        for _ in 0..4 {
+            r.ue();
+        }
+    }
+    if r.flag() {
+        // vui_timing_info_present_flag
+        r.u(32); // vui_num_units_in_tick
+        r.u(32); // vui_time_scale
+        if r.flag() {
+            r.ue(); // vui_num_ticks_poc_diff_one_minus1
+        }
+        if r.flag() {
+            skip_hrd(r, max_sub_layers_minus1);
+        }
+    }
+    if r.flag() {
+        // bitstream_restriction_flag
+        r.u(3); // tiles_fixed_structure, motion_vectors_over_pic_boundaries, restricted_ref_pic_lists
+        for _ in 0..5 {
+            r.ue(); // min_spatial_segmentation_idc to log2_max_mv_length_vertical
+        }
+    }
+}
+
+/// hrd_parameters(1, max_sub_layers_minus1) (E.2.2).
+fn skip_hrd(r: &mut BitReader, max_sub_layers_minus1: u32) {
+    let nal = r.flag();
+    let vcl = r.flag();
+    let mut sub_pic = false;
+    if nal || vcl {
+        sub_pic = r.flag();
+        if sub_pic {
+            r.u(8 + 5 + 1 + 5); // tick_divisor_minus2 to dpb_output_delay_du_length_minus1
+        }
+        r.u(4 + 4); // bit_rate_scale, cpb_size_scale
+        if sub_pic {
+            r.u(4); // cpb_size_du_scale
+        }
+        r.u(5 + 5 + 5); // the three delay lengths
+    }
+    for _ in 0..=max_sub_layers_minus1.min(7) {
+        let general = r.flag(); // fixed_pic_rate_general_flag
+        let within = general || r.flag(); // fixed_pic_rate_within_cvs_flag
+        let low_delay = if within {
+            r.ue(); // elemental_duration_in_tc_minus1
+            false
+        } else {
+            r.flag()
+        };
+        let cpb_cnt = if low_delay { 0 } else { r.ue().min(31) };
+        for _ in 0..u32::from(nal) + u32::from(vcl) {
+            // sub_layer_hrd_parameters (E.2.3)
+            for _ in 0..=cpb_cnt {
+                r.ue(); // bit_rate_value_minus1
+                r.ue(); // cpb_size_value_minus1
+                if sub_pic {
+                    r.ue(); // cpb_size_du_value_minus1
+                    r.ue(); // bit_rate_du_value_minus1
+                }
+                r.flag(); // cbr_flag
+            }
+        }
+    }
+}
+
+/// The sps_range_extension flags in VA's order, and whether any extension other than the range
+/// one is present (7.3.2.2.1, 7.3.2.2.2).
+fn sps_extensions(r: &mut BitReader) -> (u32, bool) {
+    if !r.flag() {
+        // sps_extension_present_flag
+        return (0, false);
+    }
+    let range = r.flag();
+    // multilayer, 3d, scc, then sps_extension_4bits whose data ends the RBSP
+    let others = r.u(3) != 0 || r.u(4) != 0;
+    let mut flags = 0;
+    if range {
+        for i in 0..9 {
+            flags |= u32::from(r.flag()) << i;
+        }
+    }
+    (flags, others)
 }
 
 const DEFAULT_INTRA: [u8; 64] = [
@@ -865,7 +1037,7 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
     let _sps_video_parameter_set_id = r.u(4);
     let sps_max_sub_layers_minus1 = r.u(3);
     let _sps_temporal_id_nesting_flag = r.flag();
-    let ok_profile = skip_profile_tier_level(&mut r, sps_max_sub_layers_minus1);
+    let (ok_profile, rext) = skip_profile_tier_level(&mut r, sps_max_sub_layers_minus1);
 
     let sps_id = r.ue();
     if sps_id >= 16 {
@@ -1017,12 +1189,24 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
     let sps_temporal_mvp_enabled_flag = r.flag();
     let strong_intra_smoothing_enabled_flag = r.flag();
     let vui_parameters_present_flag = r.flag();
-    // Extension flags follow the VUI, which is not parsed, so refusal relies on the profile and
-    // tool flags.
-    let has_extension = !ok_profile;
     let colour = match vui_parameters_present_flag {
         true => crate::colour::vui_signal(&mut r),
         false => Default::default(),
+    };
+    // Main and Main 10 refuse no extension as before. A range extensions profile is taken only
+    // when the VUI and the extension flags read within the RBSP and name the range one alone.
+    let (has_extension, range_ext) = match (ok_profile, rext) {
+        (true, _) => (false, 0),
+        (false, true) => {
+            if vui_parameters_present_flag {
+                skip_vui_rest(&mut r, sps_max_sub_layers_minus1);
+            }
+            let (flags, others) = sps_extensions(&mut r);
+            // the stop bit right after, else the walk went wrong
+            let within = others || (r.flag() && r.bit_pos() <= rbsp.len() * 8);
+            (others || !within, if within { flags } else { 0 })
+        }
+        (false, false) => (true, 0),
     };
 
     Some(Sps {
@@ -1066,6 +1250,8 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
         sps_temporal_mvp_enabled_flag,
         strong_intra_smoothing_enabled_flag,
         has_extension,
+        range_ext,
+        rext: rext && !ok_profile,
         colour,
     })
 }
@@ -1164,8 +1350,11 @@ pub fn parse_pps(nal: &[u8]) -> Option<Pps> {
         return None;
     }
     let slice_segment_header_extension_present_flag = r.flag();
+    let (range, other_ext) = pps_extensions(&mut r, transform_skip_enabled_flag)?;
 
     Some(Pps {
+        range,
+        other_ext,
         pps_id,
         sps_id,
         dependent_slice_segments_enabled_flag,
@@ -1421,6 +1610,7 @@ fn parse_slice_header_rbsp(
     let mut slice_cb_qp_offset = 0;
     let mut slice_cr_qp_offset = 0;
     let mut deblocking_filter_override_flag = false;
+    let mut cu_chroma_qp_offset_enabled_flag = false;
     let mut slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
     let mut slice_beta_offset_div2 = pps.pps_beta_offset_div2;
     let mut slice_tc_offset_div2 = pps.pps_tc_offset_div2;
@@ -1599,6 +1789,9 @@ fn parse_slice_header_rbsp(
         if !in_range {
             return None;
         }
+        if pps.range.chroma_qp_offset_list_enabled_flag {
+            cu_chroma_qp_offset_enabled_flag = r.flag();
+        }
         let deblocking_filter_override = pps.deblocking_filter_override_enabled_flag;
         if deblocking_filter_override {
             deblocking_filter_override_flag = r.flag();
@@ -1655,6 +1848,7 @@ fn parse_slice_header_rbsp(
             slice_qp_delta: slice_qp_delta_val,
             slice_cb_qp_offset,
             slice_cr_qp_offset,
+            cu_chroma_qp_offset_enabled_flag,
             deblocking_filter_override_flag,
             slice_deblocking_filter_disabled_flag,
             slice_beta_offset_div2,
@@ -1855,7 +2049,7 @@ mod tests {
         // All ones, every sub-layer has its profile and level present.
         let ones = [0xFFu8; 64];
         let mut r = BitReader::new(&ones);
-        assert!(skip_profile_tier_level(&mut r, 0));
+        assert!(skip_profile_tier_level(&mut r, 0).0);
         assert_eq!(r.bit_pos(), 88 + 8, "general profile and level");
         let mut r = BitReader::new(&ones);
         skip_profile_tier_level(&mut r, 2);
@@ -2027,6 +2221,8 @@ mod tests {
             sps_temporal_mvp_enabled_flag: true,
             strong_intra_smoothing_enabled_flag: false,
             has_extension: false,
+            range_ext: 0,
+            rext: false,
             colour: Default::default(),
         }
     }
@@ -2059,6 +2255,7 @@ mod tests {
             slice_qp_delta: 0,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
+            cu_chroma_qp_offset_enabled_flag: false,
             deblocking_filter_override_flag: false,
             slice_deblocking_filter_disabled_flag: false,
             slice_beta_offset_div2: 0,

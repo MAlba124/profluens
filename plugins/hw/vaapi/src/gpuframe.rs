@@ -8,12 +8,12 @@ use crate::va::VaResult;
 /// the display.
 // Once per zero-copy decoder, at preroll.
 #[allow(clippy::disallowed_methods)]
-pub(crate) fn exported_formats(display: crate::va::Display) -> VaResult<Vec<DmabufFormat>> {
+pub(crate) fn exported_formats(display: &crate::va::Display) -> VaResult<Vec<DmabufFormat>> {
     use crate::va::{ExportedSurface, SurfaceFormat};
     let mut formats = Vec::with_capacity(2);
-    let (fourcc, modifier) = ExportedSurface::probe_for(&display, SurfaceFormat::NV12)?;
+    let (fourcc, modifier) = ExportedSurface::probe_for(display, SurfaceFormat::NV12)?;
     formats.push(DmabufFormat { fourcc, modifiers: vec![modifier] });
-    if let Ok((fourcc, modifier)) = ExportedSurface::probe_for(&display, SurfaceFormat::P010) {
+    if let Ok((fourcc, modifier)) = ExportedSurface::probe_for(display, SurfaceFormat::P010) {
         formats.push(DmabufFormat { fourcc, modifiers: vec![modifier] });
     }
     Ok(formats)

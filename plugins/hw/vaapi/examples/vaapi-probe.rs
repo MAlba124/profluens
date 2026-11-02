@@ -42,6 +42,26 @@ fn main() {
         }
     }
 
+    println!("\nencode references (VAConfigAttribEncMaxRefFrames, L0/L1):");
+    if let Ok(d) = pf_vaapi::va::Display::open(&caps.device) {
+        use pf_vaapi::ffi;
+        let profiles = [
+            ("H264High", ffi::VAProfileH264High),
+            ("HEVCMain", ffi::VAProfileHEVCMain),
+            ("HEVCMain10", ffi::VAProfileHEVCMain10),
+        ];
+        let eps =
+            [("EncSlice", ffi::VAEntrypointEncSlice), ("EncSliceLP", ffi::VAEntrypointEncSliceLP)];
+        for (name, profile) in profiles {
+            for (ep_name, ep) in eps {
+                let attr = ffi::VAConfigAttribEncMaxRefFrames;
+                if let Ok(Some(v)) = pf_vaapi::va::config_attribute(&d, profile, ep, attr) {
+                    println!("  {name:<12} {ep_name:<11} {}/{}", v & 0xFFFF, v >> 16);
+                }
+            }
+        }
+    }
+
     let mut registry = Registry::new();
     pf_vaapi::register(&mut registry);
     println!("\nregistered elements:");

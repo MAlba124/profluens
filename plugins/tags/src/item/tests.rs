@@ -45,12 +45,19 @@ fn vorbis(vendor: &str, entries: &[&str]) -> Vec<u8> {
 
 /// A PICTURE block body of `kind` holding `img`.
 fn flac_picture(kind: u32, mime: &str, img: &[u8]) -> Vec<u8> {
+    stated_picture(kind, mime, (0, 0), img)
+}
+
+/// A PICTURE block body stating `size`.
+fn stated_picture(kind: u32, mime: &str, size: (u32, u32), img: &[u8]) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend(kind.to_be_bytes());
     b.extend((mime.len() as u32).to_be_bytes());
     b.extend(mime.as_bytes());
     b.extend(0u32.to_be_bytes());
-    b.extend([0u8; 16]);
+    b.extend(size.0.to_be_bytes());
+    b.extend(size.1.to_be_bytes());
+    b.extend([0u8; 8]);
     b.extend((img.len() as u32).to_be_bytes());
     b.extend(img);
     b
@@ -84,6 +91,77 @@ fn apic(kind: u8, img: &[u8]) -> Vec<u8> {
     body.extend(b"pic\0");
     body.extend(img);
     frame23(b"APIC", &body)
+}
+
+fn webp(chunk: &[u8; 4], head: &[u8]) -> Vec<u8> {
+    let mut b = b"RIFF\0\0\0\0WEBP".to_vec();
+    b.extend(chunk);
+    b.extend((head.len() as u32).to_le_bytes());
+    b.extend(head);
+    b
+}
+
+#[test]
+fn webp_is_sized_by_its_first_chunk() {
+    let mut lossy = vec![0x30, 0x01, 0x00, 0x9D, 0x01, 0x2A];
+    lossy.extend((640u16 | 0x4000).to_le_bytes());
+    lossy.extend(480u16.to_le_bytes());
+    assert_eq!(
+        image_info(&webp(b"VP8 ", &lossy)),
+        Some(("image/webp", 640, 480)),
+        "scale bits off"
+    );
+    let v = (300u32 - 1) | (200 - 1) << 14 | 1 << 28;
+    let mut lossless = vec![0x2F];
+    lossless.extend(v.to_le_bytes());
+    assert_eq!(image_info(&webp(b"VP8L", &lossless)), Some(("image/webp", 300, 200)));
+    let mut ext = vec![0x10, 0, 0, 0];
+    ext.extend(&(4000u32 - 1).to_le_bytes()[..3]);
+    ext.extend(&(100_000u32 - 1).to_le_bytes()[..3]);
+    assert_eq!(image_info(&webp(b"VP8X", &ext)), Some(("image/webp", 4000, 65_535)), "clamped");
+    lossy[3] = 0;
+    assert_eq!(image_info(&webp(b"VP8 ", &lossy)), Some(("image/webp", 0, 0)), "no start code");
+    lossless[0] = 0;
+    assert_eq!(image_info(&webp(b"VP8L", &lossless)), Some(("image/webp", 0, 0)), "no signature");
+    let whole = webp(b"VP8X", &ext);
+    for n in 12..whole.len() {
+        let (_, w, _) = image_info(&whole[..n]).unwrap();
+        assert_eq!(w, 0, "cut to {n} bytes");
+    }
+    assert_eq!(image_info(&webp(b"ALPH", &ext)), Some(("image/webp", 0, 0)));
+}
+
+/// A JPEG with no SOF, its size only where a container states it.
+const JPEG_NO_SOF: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 0, 0, 0xFF, 0xD9];
+
+#[test]
+fn a_stated_size_stands_in_where_the_bytes_tell_none() {
+    let stated = stated_picture(3, "image/jpeg", (600, 600), JPEG_NO_SOF);
+    let p = &flac(none(), [stated.as_slice()]).pictures[0];
+    assert_eq!((p.mime.as_str(), p.width, p.height), ("image/jpeg", 600, 600));
+    let told = stated_picture(3, "image/png", (600, 600), &png(4, 3));
+    let p = &flac(none(), [told.as_slice()]).pictures[0];
+    assert_eq!((p.width, p.height), (4, 3), "the bytes win");
+    let huge = stated_picture(3, "image/jpeg", (70_000, 9), JPEG_NO_SOF);
+    let p = &flac(none(), [huge.as_slice()]).pictures[0];
+    assert_eq!((p.width, p.height), (65_535, 9), "clamped");
+    let entry = format!("METADATA_BLOCK_PICTURE={}", base64(&stated));
+    let t = ogg(&vorbis("v", &[&entry]), &Arena::default());
+    assert_eq!((t.pictures[0].width, t.pictures[0].height), (600, 600), "and in an Ogg comment");
+}
+
+#[test]
+fn a_comment_that_is_no_utf8_keeps_its_title() {
+    let mut vc = 0u32.to_le_bytes().to_vec();
+    vc.extend(2u32.to_le_bytes());
+    for e in [&b"TITLE=Caf\xE9"[..], b"ARTIST=Me"] {
+        vc.extend((e.len() as u32).to_le_bytes());
+        vc.extend(e);
+    }
+    let t = flac([vc.as_slice()], none());
+    assert_eq!(t.tags, [pair("TITLE", "Caf\u{FFFD}"), pair("ARTIST", "Me")]);
+    let t = ogg(&vc, &Arena::default());
+    assert_eq!(t.tags, [pair("TITLE", "Caf\u{FFFD}"), pair("ARTIST", "Me")], "and in Ogg");
 }
 
 #[test]

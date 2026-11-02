@@ -112,8 +112,8 @@ pub fn capped(mut text: Vec<(String, String)>, mut pictures: Vec<ItemPicture>) -
     out
 }
 
-/// The type and pixel size of an image by its bytes, JPEG by its first SOF, PNG by IHDR, WebP
-/// unsized, None for what is none of these.
+/// The type and pixel size of an image by its bytes, JPEG by its first SOF, PNG by IHDR, WebP by
+/// its VP8, VP8L or VP8X head, None for what is none of these.
 pub fn image_info(b: &[u8]) -> Option<(&'static str, u16, u16)> {
     let u16be = |i: usize| b.get(i..i + 2).map_or(0, |x| u16::from_be_bytes([x[0], x[1]]));
     let u32be =
@@ -146,8 +146,28 @@ pub fn image_info(b: &[u8]) -> Option<(&'static str, u16, u16)> {
             Some(("image/png", clamp(u32be(16)), clamp(u32be(20))))
         }
         [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => {
-            Some(("image/webp", 0, 0))
+            let (w, h) = webp_size(b).unwrap_or((0, 0));
+            Some(("image/webp", clamp(w), clamp(h)))
         }
+        _ => None,
+    }
+}
+
+/// The canvas of a WebP by its first chunk, the lossy frame header, the lossless header or the
+/// extended header.
+fn webp_size(b: &[u8]) -> Option<(u32, u32)> {
+    let le = |i: usize, n: usize| {
+        b.get(i..i + n).map(|x| x.iter().rev().fold(0u32, |a, &v| a << 8 | u32::from(v)))
+    };
+    match b.get(12..16)? {
+        b"VP8 " if b.get(23..26)? == [0x9D, 0x01, 0x2A] => {
+            Some((le(26, 2)? & 0x3FFF, le(28, 2)? & 0x3FFF))
+        }
+        b"VP8L" if *b.get(20)? == 0x2F => {
+            let v = le(21, 4)?;
+            Some(((v & 0x3FFF) + 1, (v >> 14 & 0x3FFF) + 1))
+        }
+        b"VP8X" => Some((le(24, 3)? + 1, le(27, 3)? + 1)),
         _ => None,
     }
 }
@@ -247,14 +267,29 @@ impl TagSink for MkvText<'_> {
     fn picture(&mut self, _mime: &str, _data: &[u8]) {}
 }
 
+/// A PICTURE block body into `c`, sized as the block states when its bytes do not tell.
+fn picture_block_into(c: &mut Collect, block: &[u8]) {
+    let n = c.pictures.len();
+    flacmeta::picture_into(block, c);
+    if let Some(p) = c.pictures.get_mut(n)
+        && p.width == 0
+        && let Some((w, h)) = flacmeta::picture_size(block)
+        && w > 0
+    {
+        let clamp = |v: u32| v.min(u32::from(u16::MAX)) as u16;
+        (p.width, p.height) = (clamp(w), clamp(h));
+    }
+}
+
 /// The tags of FLAC VORBIS_COMMENT and PICTURE block bodies, as pf-bare's RawTags spans them.
+/// A comment that is no UTF-8 is kept, each invalid run as U+FFFD.
 pub fn flac<'b>(
     comments: impl IntoIterator<Item = &'b [u8]>,
     pictures: impl IntoIterator<Item = &'b [u8]>,
 ) -> ItemTags {
     let mut c = Collect::default();
-    comments.into_iter().for_each(|b| flacmeta::vorbis_comment_into(b, &mut c));
-    pictures.into_iter().for_each(|b| flacmeta::picture_into(b, &mut c));
+    comments.into_iter().for_each(|b| flacmeta::vorbis_comment_lossy_into(b, &mut c));
+    pictures.into_iter().for_each(|b| picture_block_into(&mut c, b));
     c.finish()
 }
 
@@ -278,10 +313,13 @@ pub fn moov(moov: &[u8], scratch: &Arena) -> ItemTags {
     c.finish()
 }
 
-/// The tags of a Vorbis comment body, the bytes after an Ogg comment packet's codec magic.
+/// The tags of a Vorbis comment body, the bytes after an Ogg comment packet's codec magic. A
+/// comment that is no UTF-8 is kept as [`flac`] keeps it, pictures read as its blocks are.
 pub fn ogg(comment: &[u8], scratch: &Arena) -> ItemTags {
-    let mut c = Collect::default();
-    pf_ogg::parse_comment_body(comment, scratch, &mut c);
+    let mut c = Collect { no_pictures: true, ..Collect::default() };
+    pf_ogg::parse_comment_body_lossy(comment, scratch, &mut c);
+    c.no_pictures = false;
+    pf_ogg::picture_blocks(comment, scratch).for_each(|b| picture_block_into(&mut c, b));
     c.finish()
 }
 

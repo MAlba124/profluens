@@ -46,9 +46,9 @@ pub fn parse_comment_body(body: &[u8], scratch: &Arena, sink: &mut impl TagSink)
 
         if key == PICTURE_FIELD {
             if let Some(block) = base64_decode(value.as_bytes(), scratch)
-                && let Some((mime, data)) = parse_picture_block(block)
+                && let Some((kind, mime, data)) = parse_picture_block(block)
             {
-                sink.picture(mime, data);
+                sink.picture_typed(kind, mime, data);
             }
             // A picture that will not decode is dropped, not emitted as base64 text.
             continue;
@@ -172,13 +172,15 @@ const DECODE: [u8; 256] = {
     t
 };
 
-/// Parse a FLAC `PICTURE` block (RFC 9639 section 8.8, Table 12) into `(media type, image bytes)`.
-fn parse_picture_block(block: &[u8]) -> Option<(&str, &[u8])> {
+/// Parse a FLAC `PICTURE` block (RFC 9639 section 8.8, Table 12) into `(type, media type, image
+/// bytes)`, a type past 255 as 255.
+fn parse_picture_block(block: &[u8]) -> Option<(u8, &str, &[u8])> {
     let be_u32 = |pos: usize| -> Option<usize> {
         let s = block.get(pos..)?.get(..4)?;
         Some(u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize)
     };
-    let mut p = 4; // picture type (section 8.8 Table 13), not part of the sink vocabulary
+    let kind = u8::try_from(be_u32(0)?).unwrap_or(u8::MAX);
+    let mut p = 4;
     let mime_len = be_u32(p)?;
     p += 4;
     let mime = block.get(p..)?.get(..mime_len)?;
@@ -192,7 +194,7 @@ fn parse_picture_block(block: &[u8]) -> Option<(&str, &[u8])> {
     let data_len = be_u32(p)?;
     p += 4;
     let data = block.get(p..)?.get(..data_len)?;
-    Some((mime, data))
+    Some((kind, mime, data))
 }
 
 #[cfg(test)]
@@ -335,6 +337,30 @@ mod tests {
         assert_eq!(rec.pictures.len(), 1);
         assert_eq!(rec.pictures[0].0, "image/jpeg");
         assert_eq!(rec.pictures[0].1, jpeg);
+    }
+
+    #[test]
+    fn a_picture_states_its_type() {
+        struct Kinds(Vec<u8>);
+        impl TagSink for Kinds {
+            fn text(&mut self, _key: &str, _value: &str) {}
+            fn picture(&mut self, _mime: &str, _data: &[u8]) {
+                self.0.push(0);
+            }
+            fn picture_typed(&mut self, kind: u8, _mime: &str, _data: &[u8]) {
+                self.0.push(kind);
+            }
+        }
+        let mut block = picture_block("image/png", "", b"\x89PNG");
+        let mut entries = Vec::new();
+        for kind in [3u32, 8, 300] {
+            block[..4].copy_from_slice(&kind.to_be_bytes());
+            entries.push(format!("METADATA_BLOCK_PICTURE={}", base64_encode(&block)));
+        }
+        let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
+        let mut k = Kinds(Vec::new());
+        parse_comment_body(&body("v", &entries), &arena(), &mut k);
+        assert_eq!(k.0, [3, 8, 255], "past 255 as 255");
     }
 
     #[test]

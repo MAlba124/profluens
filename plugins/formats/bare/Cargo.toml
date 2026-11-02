@@ -1,0 +1,22 @@
+[package]
+name = "pf-bare"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_bare"
+
+[dependencies]
+profluens-core = { path = "../../../core" }
+pf-registry = { path = "../../../lib/registry" }
+# The MPEG audio frame header, the Xing layout and the ID3 and APE lengths.
+pf-mp3 = { path = "../../audio/mp3" }
+
+[dev-dependencies]
+# The Matroska remux of each fixture the bare units are checked against.
+pf-mkv = { path = "../mkv" }
+
+[lints]
+workspace = true

@@ -204,6 +204,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-bare"
+version = "0.1.0"
+dependencies = [
+ "pf-mkv",
+ "pf-mp3",
+ "pf-registry",
+ "profluens-core",
+]
+
+[[package]]
 name = "pf-flv"
 version = "0.1.0"
 dependencies = [

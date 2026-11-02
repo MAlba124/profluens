@@ -47,6 +47,8 @@ pub struct AudioProps {
     pub stream_bytes: Option<u32>,
     /// LAME encoder delay in samples. FFmpeg drops it plus the decoder's 529 at the start.
     pub delay: Option<u32>,
+    /// LAME encoder padding in samples at the end.
+    pub padding: Option<u32>,
     pub frames: Option<u32>,
 }
 
@@ -72,6 +74,7 @@ pub fn probe_props(audio: &[u8], audio_len: u64) -> Option<AudioProps> {
         toc: None,
         stream_bytes: None,
         delay: None,
+        padding: None,
         frames: None,
     };
 
@@ -83,6 +86,7 @@ pub fn probe_props(audio: &[u8], audio_len: u64) -> Option<AudioProps> {
         props.toc = vbr.toc;
         props.stream_bytes = vbr.bytes;
         props.delay = vbr.delay;
+        props.padding = vbr.padding;
         props.frames = Some(vbr.frames);
         let coded = u64::from(vbr.frames) * u64::from(header.samples_per_frame());
         let trim = u64::from(vbr.trim);
@@ -106,6 +110,7 @@ struct Vbr {
     /// Encoder delay plus padding from the LAME extension, 0 without one.
     trim: u32,
     delay: Option<u32>,
+    padding: Option<u32>,
     bytes: Option<u32>,
     toc: Option<XingToc>,
 }
@@ -148,7 +153,8 @@ fn vbr_header(frame: &[u8], header: &Header) -> Option<Vbr> {
         }
         let lame = xing.get(field..).and_then(lame_trim);
         let trim = lame.map_or(0, |(delay, padding)| delay + padding);
-        return Some(Vbr { frames, trim, delay: lame.map(|(delay, _)| delay), bytes, toc });
+        let (delay, padding) = (lame.map(|(delay, _)| delay), lame.map(|(_, padding)| padding));
+        return Some(Vbr { frames, trim, delay, padding, bytes, toc });
     }
     let vbri = frame.get(36..)?;
     if !vbri.starts_with(b"VBRI") {
@@ -158,6 +164,7 @@ fn vbr_header(frame: &[u8], header: &Header) -> Option<Vbr> {
         frames: be32(vbri.get(14..18)?),
         trim: 0,
         delay: None,
+        padding: None,
         bytes: vbri.get(10..14).map(be32),
         toc: None,
     })

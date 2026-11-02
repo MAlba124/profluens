@@ -133,6 +133,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-bare"
+version = "0.1.0"
+dependencies = [
+ "pf-mp3",
+ "pf-registry",
+ "profluens-core",
+]
+
+[[package]]
 name = "pf-flv"
 version = "0.1.0"
 dependencies = [
@@ -156,6 +165,7 @@ dependencies = [
  "pf-mp3",
  "pf-mp4",
  "pf-ogg",
+ "pf-open",
  "pf-opus",
  "pf-probe",
  "pf-ps",
@@ -260,6 +270,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-open"
+version = "0.1.0"
+dependencies = [
+ "pf-avi",
+ "pf-bare",
+ "pf-flv",
+ "pf-mkv",
+ "pf-mp4",
+ "pf-ogg",
+ "pf-probe",
+ "profluens-core",
+ "profluens-video",
+]
+
+[[package]]
 name = "pf-opus"
 version = "0.1.0"
 dependencies = [
@@ -325,6 +350,7 @@ dependencies = [
  "pf-mp3",
  "pf-mp4",
  "pf-ogg",
+ "pf-open",
  "pf-reactor",
  "profluens-core",
 ]

@@ -33,6 +33,7 @@ pf-sim = { path = "../lib/sim" }
 pf-vaapi = { path = "../plugins/hw/vaapi" }
 pf-opus = { path = "../plugins/audio/opus" }
 pf-probe = { path = "../lib/probe" }
+pf-open = { path = "../lib/open" }
 pf-libav = { path = "../plugins/libav" }
 pf-harness = { path = "../lib/harness" }
 
@@ -214,6 +215,13 @@ bench = false
 [[bin]]
 name = "probe"
 path = "fuzz_targets/probe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open"
+path = "fuzz_targets/open.rs"
 test = false
 doc = false
 bench = false

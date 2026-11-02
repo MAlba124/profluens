@@ -7,6 +7,7 @@ use crate::ebml::{self, ReadError, id};
 use crate::encoding::{self, Coding};
 use crate::inflate::InflateError;
 use profluens_core::ctx::Disposition;
+use profluens_core::fetch::{Need, Step};
 use profluens_core::memory::{Demand, Known};
 
 /// A track discovered in the Tracks master.
@@ -1549,31 +1550,100 @@ pub struct CueIndex {
 }
 
 /// The bytes an element header takes at most, a 4 octet ID and an 8 octet size.
-const ELEMENT_HEAD: usize = 12;
+pub(crate) const ELEMENT_HEAD: usize = 12;
 
-/// The Cues the front SeekHead of `header` names, read through `read`, which gives the bytes at
-/// an offset and fewer at the end of the file. Empty for a file without them, for a position
-/// that holds no Cues and for Cues past `max` bytes, which are not read.
+/// The read in flight of [`CuesAt`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CuesState {
+    Start,
+    /// The Cues element's head.
+    Head,
+    /// The Cues whole.
+    Body,
+}
+
+/// The Cues the front SeekHead of a header names, every track's, their element head read and
+/// then the whole of them. Empty for a file without them, for a position that holds no Cues and
+/// for Cues past `max` bytes, which are not read.
+#[derive(Debug)]
+pub struct CuesAt {
+    /// Where the Cues start, None when the header names none.
+    at: Option<u64>,
+    segment_data_start: u64,
+    timestamp_scale: u64,
+    max: u64,
+    state: CuesState,
+    hd: [u8; ELEMENT_HEAD],
+    body: Vec<u8>,
+    got: usize,
+}
+
 // Cold path, once per file.
 #[allow(clippy::disallowed_methods)]
-pub fn read_cues<E>(
-    header: &[u8],
-    max: u64,
-    read: &dyn Fn(u64, usize) -> Result<Vec<u8>, E>,
-) -> Result<CueIndex, E> {
-    let Some(sh) = parse_seek_head(header) else { return Ok(CueIndex::default()) };
-    let Some(at) = sh.cues_pos.and_then(|p| sh.segment_data_start.checked_add(p)) else {
-        return Ok(CueIndex::default());
-    };
-    let head = read(at, ELEMENT_HEAD)?;
-    let Ok(h) = ebml::read_element_header(&head, 0) else { return Ok(CueIndex::default()) };
-    let len = h.size.and_then(|s| (h.data_start as u64).checked_add(s));
-    let Some(len) = len.filter(|&len| h.id == id::CUES && len <= max) else {
-        return Ok(CueIndex::default());
-    };
-    let bytes = read(at, len as usize)?;
-    let cues = parse_cue_tracks(&bytes, sh.segment_data_start, sh.timestamp_scale);
-    Ok(CueIndex { at: (!cues.is_empty()).then_some(at), cues })
+impl CuesAt {
+    pub fn new(header: &[u8], max: u64) -> Self {
+        let sh = parse_seek_head(header);
+        let at = sh.as_ref().and_then(|sh| sh.cues_pos?.checked_add(sh.segment_data_start));
+        CuesAt {
+            at,
+            segment_data_start: sh.as_ref().map_or(0, |sh| sh.segment_data_start),
+            timestamp_scale: sh.as_ref().map_or(0, |sh| sh.timestamp_scale),
+            max,
+            state: CuesState::Start,
+            hd: [0; ELEMENT_HEAD],
+            body: Vec::new(),
+            got: 0,
+        }
+    }
+}
+
+// Cold path, once per file.
+#[allow(clippy::disallowed_methods)]
+impl profluens_core::fetch::Fetch for CuesAt {
+    type Out = CueIndex;
+    type Err = std::convert::Infallible;
+
+    fn poll(&mut self) -> Result<Step<CueIndex>, Self::Err> {
+        let Some(at) = self.at else { return Ok(Step::Done(CueIndex::default())) };
+        match self.state {
+            CuesState::Start => {
+                self.state = CuesState::Head;
+                Ok(Step::Need(Need { at, len: ELEMENT_HEAD }))
+            }
+            CuesState::Head => {
+                self.state = CuesState::Start;
+                let Ok(h) = ebml::read_element_header(&self.hd[..self.got], 0) else {
+                    return Ok(Step::Done(CueIndex::default()));
+                };
+                let len = h.size.and_then(|s| (h.data_start as u64).checked_add(s));
+                let Some(len) = len.filter(|&len| h.id == id::CUES && len <= self.max) else {
+                    return Ok(Step::Done(CueIndex::default()));
+                };
+                self.body = vec![0; len as usize];
+                self.state = CuesState::Body;
+                Ok(Step::Need(Need { at, len: len as usize }))
+            }
+            CuesState::Body => {
+                self.state = CuesState::Start;
+                self.body.truncate(self.got);
+                let cues =
+                    parse_cue_tracks(&self.body, self.segment_data_start, self.timestamp_scale);
+                self.body = Vec::new();
+                Ok(Step::Done(CueIndex { at: (!cues.is_empty()).then_some(at), cues }))
+            }
+        }
+    }
+
+    fn buf(&mut self) -> &mut [u8] {
+        match self.state {
+            CuesState::Body => &mut self.body,
+            _ => &mut self.hd,
+        }
+    }
+
+    fn filled(&mut self, n: usize) {
+        self.got = n.min(self.buf().len());
+    }
 }
 
 /// The largest span between cued Clusters bounds a block, `None` with fewer than two.
@@ -2187,34 +2257,40 @@ mod tests {
     }
 
     #[test]
-    fn cues_are_read_through_the_callback_by_the_seek_head() {
+    fn cues_are_read_by_the_seek_head() {
+        use profluens_core::fetch::{Fetch, drive_slice, drive_slice_log};
         let stream = build_cued_video(&[(0, true, &[1, 2, 3]), (40_000_000, true, &[4, 5])]);
         let head = header_prefix(&stream);
-        let reads = std::cell::RefCell::new(Vec::new());
-        let read = |off: u64, n: usize| -> Result<Vec<u8>, ()> {
-            reads.borrow_mut().push((off, n));
-            let at = (off as usize).min(stream.len());
-            Ok(stream[at..(at + n).min(stream.len())].to_vec())
-        };
-        let ix = read_cues(head, 1 << 20, &read).expect("read");
+        let mut reads = Vec::new();
+        let ix =
+            drive_slice_log(&mut CuesAt::new(head, 1 << 20), &stream, &mut reads).expect("read");
         let info = parse_seek_head(head).expect("SeekHead");
         let at = info.segment_data_start + info.cues_pos.expect("Cues");
         assert_eq!(ix.at, Some(at));
         let times: Vec<u64> = ix.cues.iter().map(|c| c.time_ns).collect();
         assert_eq!(times, [0, 40_000_000]);
         assert!(ix.cues.iter().all(|c| c.track == 1));
-        assert_eq!(reads.borrow().len(), 2, "the element head, then the Cues whole");
-        assert!(reads.borrow().iter().all(|&(off, _)| off == at), "nothing else is read");
-        reads.borrow_mut().clear();
-        assert_eq!(read_cues(head, 8, &read), Ok(CueIndex::default()), "past the cap");
-        assert_eq!(reads.borrow().len(), 1, "only the element head");
-        let refuse = |_: u64, _: usize| -> Result<Vec<u8>, u8> { Err(7) };
-        assert_eq!(read_cues(head, 1 << 20, &refuse), Err(7), "a read error is the caller's");
-        let short = |_: u64, _: usize| -> Result<Vec<u8>, ()> { Ok(Vec::new()) };
-        assert_eq!(read_cues(head, 1 << 20, &short), Ok(CueIndex::default()), "past the end");
+        assert_eq!(reads.len(), 2, "the element head, then the Cues whole");
+        assert!(reads.iter().all(|n| n.at == at), "nothing else is read");
+        reads.clear();
+        let past = drive_slice_log(&mut CuesAt::new(head, 8), &stream, &mut reads);
+        assert_eq!(past, Ok(CueIndex::default()), "past the cap");
+        assert_eq!(reads.len(), 1, "only the element head");
+        let mut m = CuesAt::new(head, 1 << 20);
+        let first = m.poll();
+        assert_eq!(
+            first,
+            Ok(Step::Need(Need { at, len: ELEMENT_HEAD })),
+            "the read is the caller's"
+        );
+        let short = drive_slice(&mut CuesAt::new(head, 1 << 20), &stream[..at as usize]);
+        assert_eq!(short, Ok(CueIndex::default()), "past the end");
         let (plain, _) = build_single(&[&[1]]);
-        assert_eq!(read_cues(header_prefix(&plain), 1 << 20, &read), Ok(CueIndex::default()));
-        assert_eq!(read_cues(&[], 1 << 20, &read), Ok(CueIndex::default()));
+        reads.clear();
+        let none =
+            drive_slice_log(&mut CuesAt::new(header_prefix(&plain), 1 << 20), &plain, &mut reads);
+        assert_eq!((none, reads.len()), (Ok(CueIndex::default()), 0));
+        assert_eq!(drive_slice(&mut CuesAt::new(&[], 1 << 20), &stream), Ok(CueIndex::default()));
     }
 
     #[test]

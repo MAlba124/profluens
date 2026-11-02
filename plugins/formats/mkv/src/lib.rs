@@ -19,6 +19,7 @@ pub mod mux_multi;
 pub(crate) mod pull;
 pub mod reader;
 pub mod tags;
+pub mod walk;
 pub mod writer;
 
 pub use codec::{
@@ -40,9 +41,8 @@ pub use index::{CAPTION_REACH, audio_lead, cue_entries, key_track};
 pub use inflate::InflateError;
 pub use mux_multi::MkvMuxN;
 pub use reader::{
-    Cue, CueIndex, CuedBlock, Frame, MatroskaReader, PTS_NONE, SeekHeadInfo, Track,
+    Cue, CueIndex, CuedBlock, CuesAt, Frame, MatroskaReader, PTS_NONE, SeekHeadInfo, Track,
     cluster_timestamp, cued_block, cues_demand, parse_cue_tracks, parse_cues, parse_seek_head,
-    read_cues,
 };
 pub use writer::{
     APP_NAME, AudioConfig, CLUSTER_BLOCKS_MAX, CLUSTER_BYTES_MAX, ColourConfig,

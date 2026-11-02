@@ -211,11 +211,21 @@ pub struct OpenAt {
     si_bytes: [u8; STREAMINFO_LEN],
     seek: Vec<(u64, u64)>,
     first: u64,
+    /// The file's first bytes read already, the head the first run starts from.
+    seed: Vec<u8>,
 }
 
 impl OpenAt {
     pub fn new(len: u64, kind: BareKind) -> Self {
+        OpenAt::with_head(len, kind, Vec::new())
+    }
+
+    /// Starts from `head`, the file's first bytes read already, and reads only past it. Consumed
+    /// by the first run.
+    pub fn with_head(len: u64, kind: BareKind, mut head: Vec<u8>) -> Self {
+        head.truncate(usize::try_from(len).unwrap_or(usize::MAX));
         OpenAt {
+            seed: head,
             len,
             kind,
             state: OpenState::Start,
@@ -284,6 +294,11 @@ impl OpenAt {
         self.tail.clear();
         self.tail.resize((self.len - at) as usize, 0);
         self.from = 0;
+        // a head that holds the whole file holds the tail too
+        if let Some(b) = self.tags.head.get(at as usize..).filter(|b| b.len() == self.tail.len()) {
+            self.tail.copy_from_slice(b);
+            return None;
+        }
         (at < self.len).then_some(Need { at, len: (self.len - at) as usize })
     }
 
@@ -349,6 +364,7 @@ impl OpenAt {
             let need = match self.state {
                 OpenState::Start => {
                     (self.tags, self.si, self.seek) = (RawTags::default(), None, Vec::new());
+                    self.tags.head = std::mem::take(&mut self.seed);
                     self.extend(OpenState::Head, HEAD)?
                 }
                 OpenState::Head => {

@@ -224,6 +224,44 @@ fn flac_opens_and_seeks_without_reading_the_file() {
 }
 
 #[test]
+fn a_head_read_already_is_not_read_again() {
+    for (name, kind) in
+        [("tone.flac", BareKind::Flac), ("tone.mp3", BareKind::Mp3), ("tone.aac", BareKind::Adts)]
+    {
+        let b = fixture(name);
+        let len = b.len() as u64;
+        let mut want_log = Vec::new();
+        let want = drive_slice_log(&mut OpenAt::new(len, kind), &b, &mut want_log).unwrap();
+        assert_eq!(want_log[0].at, 0, "{name}: the head first");
+        for window in [64 << 10, 128 << 10, 512 << 10] {
+            let w = b[..window.min(b.len())].to_vec();
+            let mut log = Vec::new();
+            let mut m = OpenAt::with_head(len, kind, w);
+            let got = drive_slice_log(&mut m, &b, &mut log).unwrap();
+            assert_eq!(got, want, "{name} {window}");
+            let behind = |n: &profluens_core::fetch::Need| n.at >= window.min(b.len()) as u64;
+            assert!(log.iter().all(behind), "{name} {window}: {log:?}");
+            assert!(log.len() < want_log.len(), "{name} {window}: {log:?} {want_log:?}");
+            assert_eq!(drive_slice(&mut m, &b).unwrap(), want, "{name}: spent, read again");
+        }
+    }
+    // a file past the window reads all but the head
+    let f = flac_file(2000, 777, &[], true);
+    let len = f.bytes.len() as u64;
+    let mut want_log = Vec::new();
+    let want = drive_slice_log(&mut OpenAt::new(len, BareKind::Flac), &f.bytes, &mut want_log);
+    let mut log = Vec::new();
+    let mut m = OpenAt::with_head(len, BareKind::Flac, f.bytes[..128 << 10].to_vec());
+    assert_eq!(drive_slice_log(&mut m, &f.bytes, &mut log), want);
+    assert_eq!((want_log.len(), log.as_slice()), (2, &want_log[1..]), "the tail alone");
+    // a seed longer than the file is cut to it
+    let b = fixture("tone.mp3");
+    let long = [b.clone(), vec![0; 4096]].concat();
+    let got = drive_slice(&mut OpenAt::with_head(b.len() as u64, BareKind::Mp3, long), &b);
+    assert_eq!(got.unwrap(), opened(&b, BareKind::Mp3));
+}
+
+#[test]
 fn flac_frames_survive_false_syncs_and_damage() {
     let mut f = flac_file(40, 4096, &[], false);
     // a damaged frame header in the middle, the frame before runs to the next good one

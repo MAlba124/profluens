@@ -9,6 +9,7 @@ mod ape;
 pub mod fixture;
 mod flac;
 pub mod flacmeta;
+pub mod item;
 mod mkv;
 mod mp3;
 mod mp4;

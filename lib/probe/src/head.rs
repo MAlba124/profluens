@@ -206,6 +206,10 @@ pub struct MkvHeadAt {
     state: MkvState,
     hd: [u8; EL_HEAD],
     head: Vec<u8>,
+    /// The file's first bytes read already, walked without reads and kept as the head.
+    window: Vec<u8>,
+    /// Where the head read in flight starts, past the window's bytes.
+    head_from: usize,
     got: usize,
     tracks: bool,
     cut: Option<u64>,
@@ -215,11 +219,19 @@ pub struct MkvHeadAt {
 
 impl MkvHeadAt {
     pub fn new(max: u64) -> Self {
+        MkvHeadAt::with_window(max, Vec::new())
+    }
+
+    /// Walks `window`, the file's first bytes, without reads. A head inside it is the window
+    /// cut to it, one past it reads only the bytes past the window. Consumed by the first run.
+    pub fn with_window(max: u64, window: Vec<u8>) -> Self {
         MkvHeadAt {
             max,
             state: MkvState::Start,
             hd: [0; EL_HEAD],
             head: Vec::new(),
+            window,
+            head_from: 0,
             got: 0,
             tracks: false,
             cut: None,
@@ -232,6 +244,19 @@ impl MkvHeadAt {
         let ((id, size), data) =
             ebml_header(&self.hd[..self.got], 0).ok_or(MkvHeadError::Malformed { at })?;
         Ok((id, size, at.checked_add(data).ok_or(MkvHeadError::Malformed { at })?))
+    }
+
+    /// An element head the window holds, answered from it. One cut at its end is read.
+    fn windowed(&mut self, need: Need) -> bool {
+        let from = usize::try_from(need.at).ok();
+        let Some(have) = from.and_then(|at| self.window.get(at..)) else { return false };
+        let n = have.len().min(EL_HEAD);
+        if ebml_header(&have[..n], 0).is_none() {
+            return false;
+        }
+        self.hd[..n].copy_from_slice(&have[..n]);
+        self.got = n;
+        true
     }
 
     fn ask(&mut self, state: MkvState, at: u64) -> Step<MkvHead> {
@@ -261,10 +286,17 @@ impl MkvHeadAt {
             return Err(MkvHeadError::TooLarge { at: 0, max });
         }
         let len = usize::try_from(end).map_err(|_| MkvHeadError::TooLarge { at: 0, max })?;
-        self.head.clear();
-        self.head.resize(len, 0);
         self.state = MkvState::Head { first_cluster };
-        Ok(Step::Need(Need { at: 0, len }))
+        if self.window.len() >= len {
+            let mut head = std::mem::take(&mut self.window);
+            head.truncate(len);
+            self.state = MkvState::Start;
+            return Ok(Step::Done(MkvHead { head, first_cluster }));
+        }
+        self.head = std::mem::take(&mut self.window);
+        self.head_from = self.head.len();
+        self.head.resize(len, 0);
+        Ok(Step::Need(Need { at: self.head_from as u64, len: len - self.head_from }))
     }
 
     fn step(&mut self) -> Result<Step<MkvHead>, MkvHeadError> {
@@ -314,10 +346,10 @@ impl MkvHeadAt {
                 self.top(end)
             }
             MkvState::Head { first_cluster } => {
-                if self.got != self.head.len() {
-                    return Err(MkvHeadError::Malformed { at: self.got as u64 });
+                if self.head_from + self.got != self.head.len() {
+                    return Err(MkvHeadError::Malformed { at: (self.head_from + self.got) as u64 });
                 }
-                self.state = MkvState::Start;
+                (self.state, self.head_from) = (MkvState::Start, 0);
                 Ok(Step::Done(MkvHead { head: std::mem::take(&mut self.head), first_cluster }))
             }
         }
@@ -329,16 +361,20 @@ impl Fetch for MkvHeadAt {
     type Err = MkvHeadError;
 
     fn poll(&mut self) -> Result<Step<MkvHead>, MkvHeadError> {
-        let step = self.step();
-        if step.is_err() {
-            self.state = MkvState::Start;
+        loop {
+            let step = self.step();
+            match step {
+                Ok(Step::Need(need)) if self.windowed(need) => continue,
+                Err(_) => (self.state, self.head_from) = (MkvState::Start, 0),
+                _ => {}
+            }
+            return step;
         }
-        step
     }
 
     fn buf(&mut self) -> &mut [u8] {
         match self.state {
-            MkvState::Head { .. } => &mut self.head,
+            MkvState::Head { .. } => &mut self.head[self.head_from..],
             _ => &mut self.hd,
         }
     }
@@ -387,16 +423,26 @@ pub struct AviHeadAt {
     head: Vec<u8>,
     /// Where the step in flight starts, None before the first.
     step: Option<usize>,
+    /// The head holds a window not looked at yet.
+    seeded: bool,
 }
 
 impl AviHeadAt {
     pub fn new(max: usize) -> Self {
-        AviHeadAt { max, head: Vec::new(), step: None }
+        AviHeadAt::with_window(max, Vec::new())
+    }
+
+    /// Looks in `window`, the file's first bytes, before any read, and reads on past it.
+    /// Consumed by the first run.
+    pub fn with_window(max: usize, mut window: Vec<u8>) -> Self {
+        window.truncate(max);
+        let seeded = !window.is_empty();
+        AviHeadAt { max, head: window, step: None, seeded }
     }
 
     fn fail(&mut self) -> AviHeadError {
         let read = self.head.len() as u64;
-        (self.step, self.head) = (None, Vec::new());
+        (self.step, self.head, self.seeded) = (None, Vec::new(), false);
         AviHeadError::NoMovi { read }
     }
 }
@@ -406,6 +452,12 @@ impl Fetch for AviHeadAt {
     type Err = AviHeadError;
 
     fn poll(&mut self) -> Result<Step<Vec<u8>>, AviHeadError> {
+        if std::mem::take(&mut self.seeded)
+            && let Some(p) = self.head.windows(4).position(|w| w == b"movi")
+        {
+            self.head.truncate(p + 4);
+            return Ok(Step::Done(std::mem::take(&mut self.head)));
+        }
         if let Some(at) = self.step.take() {
             // only the new bytes and the 3 before them can hold a match not looked at yet
             let from = at.saturating_sub(3);
@@ -492,6 +544,72 @@ enum Mp4State {
 #[derive(Debug)]
 pub struct Mp4HeadAt<'w> {
     window: &'w [u8],
+    walk: Mp4Walk,
+}
+
+impl<'w> Mp4HeadAt<'w> {
+    /// `len` is the file's length.
+    pub fn new(window: &'w [u8], len: u64) -> Self {
+        Mp4HeadAt { window, walk: Mp4Walk::new(len) }
+    }
+}
+
+impl Fetch for Mp4HeadAt<'_> {
+    type Out = Vec<u8>;
+    type Err = Mp4HeadError;
+
+    fn poll(&mut self) -> Result<Step<Vec<u8>>, Mp4HeadError> {
+        self.walk.poll(self.window)
+    }
+
+    fn buf(&mut self) -> &mut [u8] {
+        &mut self.walk.tail
+    }
+
+    fn filled(&mut self, n: usize) {
+        self.walk.got = n.min(self.walk.tail.len());
+    }
+}
+
+/// [`Mp4HeadAt`] owning its window, to sit inside a machine that owns its bytes.
+#[derive(Debug)]
+pub struct Mp4HeadOwned {
+    window: Vec<u8>,
+    walk: Mp4Walk,
+}
+
+impl Mp4HeadOwned {
+    /// `len` is the file's length.
+    pub fn new(window: Vec<u8>, len: u64) -> Self {
+        Mp4HeadOwned { window, walk: Mp4Walk::new(len) }
+    }
+
+    /// The window back, for the next read into it.
+    pub fn into_window(self) -> Vec<u8> {
+        self.window
+    }
+}
+
+impl Fetch for Mp4HeadOwned {
+    type Out = Vec<u8>;
+    type Err = Mp4HeadError;
+
+    fn poll(&mut self) -> Result<Step<Vec<u8>>, Mp4HeadError> {
+        self.walk.poll(&self.window)
+    }
+
+    fn buf(&mut self) -> &mut [u8] {
+        &mut self.walk.tail
+    }
+
+    fn filled(&mut self, n: usize) {
+        self.walk.got = n.min(self.walk.tail.len());
+    }
+}
+
+/// The walk of [`Mp4HeadAt`] and [`Mp4HeadOwned`], the window handed in at each poll.
+#[derive(Debug)]
+struct Mp4Walk {
     len: u64,
     state: Mp4State,
     /// File bytes from `tail_at`, the last read.
@@ -505,11 +623,9 @@ pub struct Mp4HeadAt<'w> {
     head: Vec<u8>,
 }
 
-impl<'w> Mp4HeadAt<'w> {
-    /// `len` is the file's length.
-    pub fn new(window: &'w [u8], len: u64) -> Self {
-        Mp4HeadAt {
-            window,
+impl Mp4Walk {
+    fn new(len: u64) -> Self {
+        Mp4Walk {
             len,
             state: Mp4State::Boxes { at: 0, n: 0 },
             tail: Vec::new(),
@@ -523,8 +639,8 @@ impl<'w> Mp4HeadAt<'w> {
     }
 
     /// The read that brings `[at, end)` into the window and the tail, None when they hold it.
-    fn ask(&mut self, at: u64, end: u64) -> Option<Need> {
-        let wlen = self.window.len() as u64;
+    fn ask(&mut self, window: &[u8], at: u64, end: u64) -> Option<Need> {
+        let wlen = window.len() as u64;
         if end <= wlen {
             return None;
         }
@@ -540,9 +656,9 @@ impl<'w> Mp4HeadAt<'w> {
     }
 
     /// `[at, end)` as the window and the tail hold it, in two pieces.
-    fn held(&self, at: u64, end: u64) -> (&[u8], &[u8]) {
-        let wlen = self.window.len() as u64;
-        let w = self.window.get(at as usize..end.min(wlen) as usize).unwrap_or(&[]);
+    fn held<'a>(&'a self, window: &'a [u8], at: u64, end: u64) -> (&'a [u8], &'a [u8]) {
+        let wlen = window.len() as u64;
+        let w = window.get(at as usize..end.min(wlen) as usize).unwrap_or(&[]);
         let p = at.max(wlen);
         if p >= end {
             return (w, &[]);
@@ -552,9 +668,9 @@ impl<'w> Mp4HeadAt<'w> {
     }
 
     /// Appends `[at, end)` to the head.
-    fn take(&mut self, at: u64, end: u64) {
+    fn take(&mut self, window: &[u8], at: u64, end: u64) {
         let mut head = std::mem::take(&mut self.head);
-        let (w, t) = self.held(at, end);
+        let (w, t) = self.held(window, at, end);
         head.extend_from_slice(w);
         head.extend_from_slice(t);
         self.head = head;
@@ -567,7 +683,15 @@ impl<'w> Mp4HeadAt<'w> {
         self.tail.clear();
     }
 
-    fn step(&mut self) -> Result<Step<Vec<u8>>, Mp4HeadError> {
+    fn poll(&mut self, window: &[u8]) -> Result<Step<Vec<u8>>, Mp4HeadError> {
+        let step = self.step(window);
+        if matches!(step, Ok(Step::Done(_)) | Err(_)) {
+            self.reset();
+        }
+        step
+    }
+
+    fn step(&mut self, window: &[u8]) -> Result<Step<Vec<u8>>, Mp4HeadError> {
         if let Some((p, end)) = self.reading.take() {
             if (self.got as u64) < end - p {
                 return Err(Mp4HeadError::Truncated { at: p, end, len: p + self.got as u64 });
@@ -584,11 +708,11 @@ impl<'w> Mp4HeadAt<'w> {
                         continue;
                     }
                     let hdr_end = at + 16.min(len - at);
-                    if let Some(need) = self.ask(at, hdr_end) {
+                    if let Some(need) = self.ask(window, at, hdr_end) {
                         return Ok(Step::Need(need));
                     }
                     let mut b = [0u8; 16];
-                    let (w, t) = self.held(at, hdr_end);
+                    let (w, t) = self.held(window, at, hdr_end);
                     b[..w.len()].copy_from_slice(w);
                     b[w.len()..w.len() + t.len()].copy_from_slice(t);
                     let hdr = &b[..w.len() + t.len()];
@@ -633,12 +757,12 @@ impl<'w> Mp4HeadAt<'w> {
                     if prefix > MAX_MOOV {
                         return Err(Mp4HeadError::TooLarge { at: 0, size: prefix, max: MAX_MOOV });
                     }
-                    if let Some(need) = self.ask(0, prefix) {
+                    if let Some(need) = self.ask(window, 0, prefix) {
                         return Ok(Step::Need(need));
                     }
                     let behind = if moov_at >= prefix { moov_len } else { 0 };
                     self.head = Vec::with_capacity((prefix + behind) as usize);
-                    self.take(0, prefix);
+                    self.take(window, 0, prefix);
                     if behind == 0 {
                         return Ok(Step::Done(std::mem::take(&mut self.head)));
                     }
@@ -646,35 +770,14 @@ impl<'w> Mp4HeadAt<'w> {
                 }
                 Mp4State::Moov => {
                     let (at, size) = self.moov.unwrap_or((0, 0));
-                    if let Some(need) = self.ask(at, at + size) {
+                    if let Some(need) = self.ask(window, at, at + size) {
                         return Ok(Step::Need(need));
                     }
-                    self.take(at, at + size);
+                    self.take(window, at, at + size);
                     return Ok(Step::Done(std::mem::take(&mut self.head)));
                 }
             }
         }
-    }
-}
-
-impl Fetch for Mp4HeadAt<'_> {
-    type Out = Vec<u8>;
-    type Err = Mp4HeadError;
-
-    fn poll(&mut self) -> Result<Step<Vec<u8>>, Mp4HeadError> {
-        let step = self.step();
-        if matches!(step, Ok(Step::Done(_)) | Err(_)) {
-            self.reset();
-        }
-        step
-    }
-
-    fn buf(&mut self) -> &mut [u8] {
-        &mut self.tail
-    }
-
-    fn filled(&mut self, n: usize) {
-        self.got = n.min(self.tail.len());
     }
 }
 
@@ -1097,6 +1200,111 @@ mod tests {
         assert!(matches!(err, AviHeadError::NoMovi { read } if read == AVI_STEP as u64 + 10));
         assert_eq!(log[1], at(AVI_STEP, 10), "no read past the cap");
         assert_eq!(first_need(&mut AviHeadAt::new(16 << 20)), at(0, AVI_STEP));
+    }
+
+    #[test]
+    fn mkv_head_in_a_window_reads_nothing() {
+        let mut file = mkv_lead();
+        let meta = file.len();
+        file.extend(el(CLUSTER, &[7; 4096]));
+        let mut log = Vec::new();
+        let want = drive_slice_log(&mut MkvHeadAt::new(1 << 20), &file, &mut log).expect("head");
+        let reads = log.len();
+        assert_eq!(reads, 6, "EBML, Segment, Info, Tracks, Cluster, the head, {log:?}");
+        log.clear();
+        let window = file[..meta + 100].to_vec();
+        let ptr = window.as_ptr();
+        let mut m = MkvHeadAt::with_window(1 << 20, window);
+        let h = drive_slice_log(&mut m, &file, &mut log).expect("head");
+        assert_eq!((&h, log.len()), (&want, 0));
+        assert_eq!(h.head.as_ptr(), ptr, "the window is the head, not a copy");
+        let again = drive_slice_log(&mut m, &file, &mut log).expect("head");
+        assert_eq!((again, log.len()), (want, reads), "the window is spent by the first run");
+    }
+
+    #[test]
+    fn mkv_head_past_a_window_reads_only_past_it() {
+        let mut file = mkv_lead();
+        let meta = file.len();
+        file.extend(el(CLUSTER, &[7; 4096]));
+        let want = drive_slice(&mut MkvHeadAt::new(1 << 20), &file).expect("head");
+        for cut in [1, 20, 30, meta - 3, meta, meta + 3] {
+            let mut log = Vec::new();
+            let mut m = MkvHeadAt::with_window(1 << 20, file[..cut].to_vec());
+            let h = drive_slice_log(&mut m, &file, &mut log).expect("head");
+            assert_eq!(h, want, "a window of {cut}");
+            let past = |n: &Need| n.at + n.len as u64 > cut as u64;
+            assert!(log.iter().all(past), "{cut}: {log:?}");
+            if cut < meta {
+                assert_eq!(log.last(), Some(&Need { at: cut as u64, len: meta - cut }), "{cut}");
+            }
+        }
+        // a window that is the whole file, the head cut in it
+        let short = &file[..meta - 3];
+        let err = drive_slice(&mut MkvHeadAt::with_window(1 << 20, short.to_vec()), short);
+        assert!(matches!(err, Err(MkvHeadError::Malformed { .. })), "{err:?}");
+        let err = drive_slice(&mut MkvHeadAt::with_window(1 << 20, b"no ebml".to_vec()), &file);
+        assert!(matches!(err, Err(MkvHeadError::NotMatroska)), "{err:?}");
+    }
+
+    #[test]
+    fn mkv_head_window_stops_before_attachments_past_the_cap() {
+        let mut lead = mkv_lead();
+        let tracks_end = lead.len();
+        let size: u64 = 80 << 20;
+        lead.extend([0x19, 0x41, 0xA4, 0x69, 0x01]);
+        lead.extend_from_slice(&size.to_be_bytes()[1..]);
+        let rest = el(CLUSTER, b"media");
+        let mut m = MkvHeadAt::with_window(64 << 20, lead.clone());
+        let h = sparse(&mut m, &lead, size, &rest).expect("head");
+        assert_eq!(h.head, lead[..tracks_end]);
+        assert_eq!(h.first_cluster, lead.len() as u64 + size);
+    }
+
+    #[test]
+    fn avi_head_in_a_window_reads_nothing() {
+        let file = b"RIFF\x00\x00\x00\x00AVI LIST\x10\x00\x00\x00hdrlLIST\x00\x00\x00\x00movi00dc";
+        let mut log = Vec::new();
+        let mut m = AviHeadAt::with_window(16 << 20, file.to_vec());
+        let head = drive_slice_log(&mut m, file, &mut log).expect("head");
+        assert_eq!((head.as_slice(), log.len()), (&file[..file.len() - 4], 0));
+        // past the window it reads on from its end, a movi across the edge is found
+        let mut big = vec![0u8; AVI_STEP + 64];
+        big[1000..1004].copy_from_slice(b"movi");
+        let mut m = AviHeadAt::with_window(16 << 20, big[..1002].to_vec());
+        let head = drive_slice_log(&mut m, &big, &mut log).expect("head");
+        assert_eq!(head, big[..1004]);
+        assert_eq!(log, [Need { at: 1002, len: AVI_STEP }]);
+        log.clear();
+        let mut m = AviHeadAt::with_window(16 << 20, big[..999].to_vec());
+        let none = vec![7u8; 1000];
+        let err = drive_slice_log(&mut m, &none, &mut log).unwrap_err();
+        assert!(matches!(err, AviHeadError::NoMovi { read: 1000 }), "{err:?}");
+        assert_eq!(log, [Need { at: 999, len: AVI_STEP }]);
+        // a window past the cap is cut to it
+        let mut m = AviHeadAt::with_window(8, big[..2000].to_vec());
+        assert!(matches!(drive_slice(&mut m, &big), Err(AviHeadError::NoMovi { read: 8 })));
+    }
+
+    #[test]
+    fn mp4_head_owned_reads_what_the_borrowing_one_does() {
+        let media = vec![0x55u8; 300_000];
+        let file =
+            boxes(&[(b"ftyp", b"isom"), (b"free", b""), (b"mdat", &media), (b"moov", b"MOOVDATA")]);
+        let fast = boxes(&[(b"ftyp", b"isom"), (b"moov", b"MOOVDATA"), (b"mdat", b"x")]);
+        for (file, wlen) in [(&file, 4096), (&file, 20), (&fast, fast.len()), (&fast, 10)] {
+            let len = file.len() as u64;
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let want = drive_slice_log(&mut Mp4HeadAt::new(&file[..wlen], len), file, &mut a);
+            let mut m = Mp4HeadOwned::new(file[..wlen].to_vec(), len);
+            assert_eq!(drive_slice_log(&mut m, file, &mut b), want);
+            assert_eq!(a, b);
+            assert_eq!(drive_slice(&mut m, file), want, "a machine that is done starts over");
+            assert_eq!(m.into_window(), file[..wlen]);
+        }
+        let bad = [0, 0, 0, 4, b'f', b'r', b'e', b'e', 0, 0];
+        let err = drive_slice(&mut Mp4HeadOwned::new(Vec::new(), 10), &bad);
+        assert!(matches!(err, Err(Mp4HeadError::Malformed { at: 0 })), "{err:?}");
     }
 
     #[test]

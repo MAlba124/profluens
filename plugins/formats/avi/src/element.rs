@@ -1,5 +1,7 @@
 //! `AviDemux`, the element over the [`crate::riff`] parser with one src pad per stream.
 
+use std::sync::Arc;
+
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::BufferFlags;
 use profluens_core::bus::BusMessage;
@@ -19,7 +21,7 @@ use profluens_core::rate;
 use profluens_core::time::Timestamp;
 
 use crate::codec;
-use crate::index::{self, Scan, Track};
+use crate::index::{self, AviIndex, Scan};
 use crate::riff::{self, AviError, MediaChunk, MoviWalker, Stream, StreamKind};
 
 /// Most of `idx1` asked for at a time, its 8 octet header in the first piece.
@@ -114,6 +116,8 @@ pub struct AviDemux {
     feed: Option<Feed>,
     read: Idx1Read,
     scan: Option<Scan>,
+    /// The index read once for the file, so this run reads no `idx1`.
+    shared: Option<Arc<AviIndex>>,
     whole: bool,
     piece: u32,
     rated: Index,
@@ -148,6 +152,7 @@ impl AviDemux {
             feed: None,
             read: Idx1Read::Off,
             scan: None,
+            shared: None,
             whole: false,
             piece: IDX1_PIECE,
             rated: Index::default(),
@@ -163,6 +168,13 @@ impl AviDemux {
     /// Tells the demuxer the source's length, `None` where it is unknown.
     pub fn with_len(mut self, len: Option<u64>) -> Self {
         self.file_len = len;
+        self
+    }
+
+    /// Publishes `index` at preroll and reads no `idx1`, one index shared by the runs over a
+    /// file.
+    pub fn with_index(mut self, index: Arc<AviIndex>) -> Self {
+        self.shared = Some(index);
         self
     }
 
@@ -451,47 +463,11 @@ impl AviDemux {
         }
     }
 
-    // Cold path, once at preroll.
-    #[allow(clippy::disallowed_methods)]
-    fn scan_for(
-        header: &riff::AviHeader,
-        movi: &riff::MoviLocation,
-        prefix: &[u8],
-        len: Option<u64>,
-    ) -> Option<Scan> {
-        let tracks: Vec<Track> = header
-            .streams
-            .iter()
-            .map(|s| {
-                let audio = s.kind == StreamKind::Audio;
-                let rate = u64::from(s.samples_per_sec);
-                let lead_ns = if audio {
-                    profluens_audio::lead_of(codec::family_for(s), rate, 0, None).pre_roll
-                } else {
-                    0
-                };
-                Track {
-                    number: s.index,
-                    sample_size: s.sample_size,
-                    tick_ns: s.sample_duration_ns().unwrap_or(0),
-                    audio,
-                    lead_ns,
-                }
-            })
-            .collect();
-        let video = header
-            .streams
-            .iter()
-            .zip(&tracks)
-            .position(|(s, t)| s.kind == StreamKind::Video && t.tick_ns > 0)?;
-        let first = riff::first_chunk(prefix, movi.movi_data_start);
-        Some(Scan::new(tracks, video, movi.movi_data_start, first, len))
-    }
-
     // Cold path, at preroll and when the `idx1` read ends.
     #[allow(clippy::disallowed_methods)]
     fn publish(&mut self, ctx: &Ctx) {
-        let entries = match (&self.scan, self.read) {
+        let scan = self.shared.as_ref().map(|i| &i.scan).or(self.scan.as_ref());
+        let entries = match (scan, self.read) {
             (Some(scan), Idx1Read::Off) => scan.entries.clone(),
             _ => Vec::new(),
         };
@@ -670,10 +646,14 @@ impl Element for AviDemux {
         }
         let video = self.pad_streams.iter().find(|ps| ps.is_video);
         self.key = video.unwrap_or(&self.pad_streams[0]).stream_index;
-        self.scan = Self::scan_for(&header, &movi, &self.header, self.file_len);
+        self.scan = match self.shared {
+            Some(_) => None,
+            None => index::scan_for(&header, &movi, &self.header, self.file_len),
+        };
         let sized = movi.movi_end > movi.movi_data_start;
         let fits = self.file_len.is_none_or(|len| movi.movi_end.saturating_add(8) <= len);
         self.read = match (&self.scan, sized && fits) {
+            _ if self.shared.is_some() => Idx1Read::Off,
             (Some(_), true) => Idx1Read::Want { at: movi.movi_end, body: None, hops: 0 },
             (scan, reachable) => {
                 let timed = scan.is_some();
@@ -690,7 +670,7 @@ impl Element for AviDemux {
             duration = duration,
             movi = movi.movi_data_start,
         );
-        self.whole = false;
+        self.whole = self.shared.as_ref().is_some_and(|i| i.whole);
         self.publish(ctx);
         if self.read != Idx1Read::Off {
             ctx.will_index();
@@ -798,7 +778,8 @@ impl AviDemux {
                 let target = ctx.seek_target();
                 self.restart_at(target.map(|t| t.to_byte));
                 let to = target.and_then(|t| t.at.nanos());
-                let clocks = target.and_then(|t| self.scan.as_ref()?.clocks_at(t.to_byte));
+                let scan = self.shared.as_ref().map(|i| &i.scan).or(self.scan.as_ref());
+                let clocks = target.and_then(|t| scan?.clocks_at(t.to_byte));
                 let at = target.map_or(0, |t| t.to_byte);
                 let (seek, clocked) = (target.is_some(), clocks.is_some());
                 log!(&*ctx, Level::Debug, "flush", seek = seek, at = at, clocked = clocked);

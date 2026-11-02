@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pf_avi::AviDemux;
+use pf_avi::{AviDemux, AviIndex, Idx1At};
 use profluens_core::batch::Inputs;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
@@ -13,6 +13,7 @@ use profluens_core::element::{
 use profluens_core::error::Error;
 use profluens_core::event::Event;
 use profluens_core::feedback::{Bitrate, Feedback, RateKind};
+use profluens_core::fetch::drive_slice_log;
 use profluens_core::format::OfferDesc;
 use profluens_core::id::{ElementId, SinkPad, SrcPad};
 use profluens_core::pipeline::{Index, IndexEntry, Pipeline, SeekMode, SeekPlan};
@@ -235,12 +236,22 @@ fn build(
 }
 
 fn play(path: &str, head: &[u8], len: u64, push: bool) -> (Vec<Vec<Row>>, Arc<Index>) {
+    play_by(path, head, len, push, |d| d)
+}
+
+fn play_by(
+    path: &str,
+    head: &[u8],
+    len: u64,
+    push: bool,
+    make: impl FnOnce(AviDemux) -> AviDemux,
+) -> (Vec<Vec<Row>>, Arc<Index>) {
     let mut p = pf_reactor::pipeline();
     let src = match push {
         true => p.add(FileSrc::new(path).push_only()),
         false => p.add(FileSrc::new(path)),
     };
-    let demux = AviDemux::new(head.to_vec()).with_len(Some(len));
+    let demux = make(AviDemux::new(head.to_vec()).with_len(Some(len)));
     let (demux, rows) = build(&mut p, src, demux, Duration::ZERO);
     p.run().expect("run");
     let rows = rows.iter().map(|r| r.lock().unwrap().clone()).collect();
@@ -290,6 +301,42 @@ fn a_chunk_ahead_of_idx1_is_hopped_over() {
     let (_, index) = play(&path, &film.data[..4096], film.len, false);
     assert_eq!(index.entries, keyframes(&film));
     assert!(index.complete);
+}
+
+#[test]
+fn an_index_read_once_is_published_by_each_run_handed_it() {
+    let film = film(150, 300, Tail::JunkIdx1);
+    let path = write("shared.avi", &film.data);
+    let head = &film.data[..4096];
+    let (want_rows, want) = play(&path, head, film.len, false);
+    let movi = pf_avi::probe_header(head).unwrap().1.unwrap();
+    let mut log = Vec::new();
+    let mut m = Idx1At::new(movi.movi_end, film.len);
+    let idx1 = drive_slice_log(&mut m, &film.data, &mut log).unwrap();
+    let piece = pf_avi::element::IDX1_PIECE as usize;
+    assert_eq!(
+        log.len(),
+        2,
+        "the demuxer reads {} pieces",
+        (film.chunks.len() * 16).div_ceil(piece)
+    );
+    let index = Arc::new(AviIndex::build(head, idx1.as_ref(), Some(film.len)).unwrap());
+    let shared = |d: AviDemux| d.with_index(Arc::clone(&index));
+    let (rows, got) = play_by(&path, head, film.len, false, shared);
+    assert_eq!((&got.entries, got.complete), (&want.entries, true));
+    assert_eq!(got.entries, keyframes(&film));
+    assert!(rows == want_rows, "the same frames");
+    // a file with no idx1 shares the estimate
+    let bare = film_without_idx1();
+    let path = write("shared_none.avi", &bare.data);
+    let index = Arc::new(AviIndex::build(&bare.data[..4096], None, Some(bare.len)).unwrap());
+    let (_, got) = play_by(&path, &bare.data[..4096], bare.len, false, |d| d.with_index(index));
+    assert!(got.entries.is_empty() && !got.complete);
+    assert!(AviIndex::build(b"RIFF", None, None).is_none(), "no header");
+}
+
+fn film_without_idx1() -> Film {
+    film(2, 0, Tail::Junk)
 }
 
 #[test]

@@ -7,7 +7,9 @@ use profluens_core::pipeline::{Index, IndexEntry};
 use profluens_core::rate::{self, ByteRate};
 use profluens_core::time::Timestamp;
 
-use crate::riff::{self, IDX1_ENTRY, Idx1Entry, MAX_STREAMS};
+use crate::codec;
+use crate::idx1::Idx1Body;
+use crate::riff::{self, AviHeader, IDX1_ENTRY, Idx1Entry, MAX_STREAMS, MoviLocation, StreamKind};
 
 /// Chunks a keyframe restart may walk back over, about 30 s of film with one audio stream.
 pub const RING: usize = 1024;
@@ -194,6 +196,64 @@ impl Scan {
             self.marks.push(at);
             self.mark_clocks.extend_from_slice(&self.back);
         }
+    }
+}
+
+/// The [`Scan`] of a file whose header is `header`, None without a timed video stream.
+// Cold path, once per open.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn scan_for(
+    header: &AviHeader,
+    movi: &MoviLocation,
+    prefix: &[u8],
+    len: Option<u64>,
+) -> Option<Scan> {
+    let tracks: Vec<Track> = header
+        .streams
+        .iter()
+        .map(|s| {
+            let audio = s.kind == StreamKind::Audio;
+            let rate = u64::from(s.samples_per_sec);
+            let lead_ns = if audio {
+                profluens_audio::lead_of(codec::family_for(s), rate, 0, None).pre_roll
+            } else {
+                0
+            };
+            Track {
+                number: s.index,
+                sample_size: s.sample_size,
+                tick_ns: s.sample_duration_ns().unwrap_or(0),
+                audio,
+                lead_ns,
+            }
+        })
+        .collect();
+    let video = header
+        .streams
+        .iter()
+        .zip(&tracks)
+        .position(|(s, t)| s.kind == StreamKind::Video && t.tick_ns > 0)?;
+    let first = riff::first_chunk(prefix, movi.movi_data_start);
+    Some(Scan::new(tracks, video, movi.movi_data_start, first, len))
+}
+
+/// The `idx1` entries of a file, read once and handed to each [`crate::AviDemux`] over it
+/// through [`crate::AviDemux::with_index`].
+pub struct AviIndex {
+    pub scan: Scan,
+    /// Every entry the `idx1` declares was read.
+    pub whole: bool,
+}
+
+impl AviIndex {
+    /// The index of a file of `len` bytes from its `header` through `movi` and the `idx1`
+    /// [`crate::Idx1At`] read, an empty one for a file without. None for a header that does not
+    /// parse or has no timed video, a demuxer reads no `idx1` for it.
+    pub fn build(header: &[u8], idx1: Option<&Idx1Body>, len: Option<u64>) -> Option<AviIndex> {
+        let (avi, movi) = riff::probe_header(header).ok()?;
+        let mut scan = scan_for(&avi, &movi?, header, len)?;
+        scan.push(idx1.map_or(&[][..], |i| &i.body));
+        Some(AviIndex { scan, whole: idx1.is_some_and(|i| i.whole) })
     }
 }
 

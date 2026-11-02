@@ -32,6 +32,10 @@ pub struct Stream {
     pub channels: u16,
     pub samples_per_sec: u32,
     pub bits_per_sample: u16,
+    /// `nAvgBytesPerSec` of an audio stream's WAVEFORMATEX, 0 for others.
+    pub avg_bytes_per_sec: u32,
+    /// The `strn` chunk's name, empty without one.
+    pub name: String,
 }
 
 impl Stream {
@@ -293,10 +297,17 @@ fn parse_strl(body: &[u8], index: usize) -> Option<Stream> {
     let mut c = Cursor::new(body);
     let mut strh: Option<(StreamKind, FourCc, u32, u32, u32, u32)> = None;
     let mut strf: Vec<u8> = Vec::new();
+    let mut name = String::new();
     while c.remaining() >= 8 {
         let id = c.fourcc()?;
         let size = c.u32le()? as usize;
         match &id {
+            b"strn" => {
+                let b = c.peek(size.min(c.remaining()))?;
+                let b = &b[..b.iter().position(|&x| x == 0).unwrap_or(b.len())];
+                name = String::from_utf8_lossy(b).trim().to_owned();
+                c.at = advance_padded(c.at, size);
+            }
             b"strh" => {
                 let b = c.peek(size)?;
                 strh = Some(parse_strh(b));
@@ -331,6 +342,8 @@ fn parse_strl(body: &[u8], index: usize) -> Option<Stream> {
         channels: 0,
         samples_per_sec: 0,
         bits_per_sample: 0,
+        avg_bytes_per_sec: 0,
+        name,
     };
     match kind {
         StreamKind::Video => parse_bitmapinfoheader(&s.strf.clone(), &mut s),
@@ -371,7 +384,7 @@ fn parse_waveformatex(strf: &[u8], s: &mut Stream) {
     s.format_tag = c.u16le().unwrap_or(0);
     s.channels = c.u16le().unwrap_or(0);
     s.samples_per_sec = c.u32le().unwrap_or(0);
-    let _ = c.u32le(); // nAvgBytesPerSec
+    s.avg_bytes_per_sec = c.u32le().unwrap_or(0);
     let _ = c.u16le(); // nBlockAlign
     s.bits_per_sample = c.u16le().unwrap_or(0);
 }
@@ -748,6 +761,8 @@ mod tests {
             channels: 0,
             samples_per_sec: 0,
             bits_per_sample: 0,
+            avg_bytes_per_sec: 0,
+            name: String::new(),
         };
         assert_eq!(s.codec_head(), [0, 0, 1, 0xB0, 1], "the VOL behind 40 octets");
         s.strf[..4].copy_from_slice(&44u32.to_le_bytes());
@@ -806,7 +821,10 @@ mod tests {
         astrf[0..2].copy_from_slice(&0x2000u16.to_le_bytes());
         astrf[2..4].copy_from_slice(&6u16.to_le_bytes());
         astrf[4..8].copy_from_slice(&48_000u32.to_le_bytes());
-        let astrl = list(b"strl", &[chunk(b"strh", &astrh), chunk(b"strf", &astrf)].concat());
+        astrf[8..12].copy_from_slice(&56_000u32.to_le_bytes());
+        let astrn = chunk(b"strn", b"Commentary \x00junk");
+        let astrl =
+            list(b"strl", &[chunk(b"strh", &astrh), chunk(b"strf", &astrf), astrn].concat());
 
         let hdrl = list(b"hdrl", &[chunk(b"avih", &avih), vstrl, astrl].concat());
 
@@ -843,6 +861,8 @@ mod tests {
         assert_eq!(a.format_tag, 0x2000, "AC-3");
         assert_eq!(a.channels, 6);
         assert_eq!(a.samples_per_sec, 48_000);
+        assert_eq!((a.avg_bytes_per_sec, a.name.as_str()), (56_000, "Commentary"));
+        assert_eq!((v.avg_bytes_per_sec, v.name.as_str()), (0, ""), "no strn, no WAVEFORMATEX");
         assert!(movi.is_some(), "movi located in the full-file prefix");
     }
 

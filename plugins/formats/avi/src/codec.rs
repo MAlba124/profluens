@@ -370,6 +370,8 @@ mod tests {
             channels: 0,
             samples_per_sec: 0,
             bits_per_sample: 0,
+            avg_bytes_per_sec: 0,
+            name: String::new(),
         }
     }
 
@@ -393,6 +395,8 @@ mod tests {
             channels: 6,
             samples_per_sec: 48_000,
             bits_per_sample: bits,
+            avg_bytes_per_sec: 0,
+            name: String::new(),
         }
     }
 

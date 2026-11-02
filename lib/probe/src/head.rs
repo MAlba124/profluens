@@ -130,6 +130,122 @@ fn ebml_header(b: &[u8], at: u64) -> Option<((u32, Option<u64>), u64)> {
     Some(((id, (!unknown).then_some(size)), (s + len) as u64))
 }
 
+/// A Matroska file's head as [`mkv_head_at`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MkvHead {
+    /// The bytes before the first Cluster. Short of it when an element past the cap follows
+    /// Tracks, attached fonts as a rule, the demuxer reads those through the SeekHead.
+    pub head: Vec<u8>,
+    pub first_cluster: u64,
+}
+
+/// `TooLarge` is an element ending past the cap before Tracks is read, `TooMany` no Cluster among
+/// the first top level elements.
+#[derive(Debug)]
+pub enum MkvHeadError<E> {
+    NotMatroska,
+    TooLarge { at: u64, max: u64 },
+    TooMany { at: u64 },
+    Malformed { at: u64 },
+    Unreadable { at: u64, len: usize, source: E },
+}
+
+impl<E: fmt::Display> fmt::Display for MkvHeadError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MkvHeadError::NotMatroska => f.write_str("no EBML header, not a Matroska file"),
+            MkvHeadError::TooLarge { at, max } => {
+                write!(f, "the element at byte {at} ends past the {max} a head may hold")
+            }
+            MkvHeadError::TooMany { at } => {
+                write!(f, "no Cluster in the {MKV_MAX_TOP} top level elements before byte {at}")
+            }
+            MkvHeadError::Malformed { at } => write!(f, "no element header at byte {at}"),
+            MkvHeadError::Unreadable { at, len, source } => {
+                write!(f, "{len} bytes at byte {at} cannot be read, {source}")
+            }
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for MkvHeadError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            MkvHeadError::Unreadable { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// A 4 octet ID and an 8 octet size, the most an element header takes.
+const EL_HEAD: usize = 12;
+
+/// The id, the size and where the data starts of the element at `at`, through `read`.
+fn mkv_element_at<E>(
+    read: &ReadAt<'_, E>,
+    at: u64,
+) -> Result<(u32, Option<u64>, u64), MkvHeadError<E>> {
+    let b = read(at, EL_HEAD).map_err(|source| MkvHeadError::Unreadable {
+        at,
+        len: EL_HEAD,
+        source,
+    })?;
+    let ((id, size), data) = ebml_header(&b, 0).ok_or(MkvHeadError::Malformed { at })?;
+    Ok((id, size, at.checked_add(data).ok_or(MkvHeadError::Malformed { at })?))
+}
+
+/// The head of a Matroska file through `read`, which gives the bytes at an offset and fewer at
+/// the end of the file. The top level elements are walked by their headers alone, so attached
+/// fonts are never read. Once Tracks is read, an element ending past `max` ends the head before
+/// it and the walk goes on past it for the first Cluster. One before Tracks is refused. A walk
+/// that breaks past such a cut takes the cut as the first Cluster, the demuxer finds the real one
+/// by its id.
+pub fn mkv_head_at<E>(read: &ReadAt<'_, E>, max: u64) -> Result<MkvHead, MkvHeadError<E>> {
+    let (id, size, data) = mkv_element_at(read, 0)?;
+    if id != EBML {
+        return Err(MkvHeadError::NotMatroska);
+    }
+    let seg_at = size.and_then(|s| data.checked_add(s)).ok_or(MkvHeadError::Malformed { at: 0 })?;
+    let (id, _, mut at) = mkv_element_at(read, seg_at)?;
+    if id != SEGMENT {
+        return Err(MkvHeadError::Malformed { at: seg_at });
+    }
+    let (mut tracks, mut cut) = (false, None);
+    let mut bounds = None;
+    for _ in 0..MKV_MAX_TOP {
+        let (id, size, data) = match mkv_element_at(read, at) {
+            Ok(h) => h,
+            Err(_) if cut.is_some() => break,
+            Err(e) => return Err(e),
+        };
+        if id == CLUSTER {
+            bounds = Some((at, cut.unwrap_or(at)));
+            break;
+        }
+        let end = match size.and_then(|s| data.checked_add(s)) {
+            Some(end) => end,
+            None if cut.is_some() => break,
+            None => return Err(MkvHeadError::Malformed { at }),
+        };
+        if cut.is_none() && end > max {
+            if !tracks {
+                return Err(MkvHeadError::TooLarge { at, max });
+            }
+            cut = Some(at);
+        }
+        tracks |= id == TRACKS;
+        at = end;
+    }
+    let (first_cluster, end) =
+        bounds.or(cut.map(|c| (c, c))).ok_or(MkvHeadError::TooMany { at })?;
+    let len = usize::try_from(end).map_err(|_| MkvHeadError::TooLarge { at: 0, max })?;
+    let head = read(0, len).map_err(|source| MkvHeadError::Unreadable { at: 0, len, source })?;
+    if head.len() != len {
+        return Err(MkvHeadError::Malformed { at: head.len() as u64 });
+    }
+    Ok(MkvHead { head, first_cluster })
+}
+
 pub fn avi_head(path: &str) -> Result<Vec<u8>, HeadError> {
     avi_head_from(&read_prefix(path, AVI_HEAD_MAX)?)
 }
@@ -141,6 +257,65 @@ pub fn avi_head_from(window: &[u8]) -> Result<Vec<u8>, HeadError> {
 }
 
 pub type ReadAt<'a, E> = dyn Fn(u64, usize) -> Result<Vec<u8>, E> + 'a;
+
+/// Read at a time while looking for the `movi` list.
+const AVI_STEP: usize = 256 << 10;
+
+/// `NoMovi` is no `movi` in the first `read` bytes, the whole file or the cap.
+#[derive(Debug)]
+pub enum AviHeadError<E> {
+    NoMovi { read: u64 },
+    Unreadable { at: u64, len: usize, source: E },
+}
+
+impl<E: fmt::Display> fmt::Display for AviHeadError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AviHeadError::NoMovi { read } => {
+                write!(f, "no 'movi' list in the first {read} bytes, not an AVI file")
+            }
+            AviHeadError::Unreadable { at, len, source } => {
+                write!(f, "{len} bytes at byte {at} cannot be read, {source}")
+            }
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for AviHeadError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            AviHeadError::Unreadable { source, .. } => Some(source),
+            AviHeadError::NoMovi { .. } => None,
+        }
+    }
+}
+
+/// [`avi_head_from`] through `read`, which gives the bytes at an offset and fewer at the end of
+/// the file, a step at a time until the `movi` four-CC shows or `max` bytes are read.
+pub fn avi_head_at<E>(read: &ReadAt<'_, E>, max: usize) -> Result<Vec<u8>, AviHeadError<E>> {
+    let mut head: Vec<u8> = Vec::new();
+    while head.len() < max {
+        let at = head.len();
+        let len = AVI_STEP.min(max - at);
+        let got = read(at as u64, len).map_err(|source| AviHeadError::Unreadable {
+            at: at as u64,
+            len,
+            source,
+        })?;
+        let n = got.len().min(len);
+        head.extend_from_slice(&got[..n]);
+        // only the new bytes and the 3 before them can hold a match not looked at yet
+        let from = at.saturating_sub(3);
+        if let Some(p) = head[from..].windows(4).position(|w| w == b"movi") {
+            head.truncate(from + p + 4);
+            return Ok(head);
+        }
+        if n < len {
+            break;
+        }
+    }
+    Err(AviHeadError::NoMovi { read: head.len() as u64 })
+}
 
 #[derive(Debug)]
 pub enum Mp4HeadError<E> {
@@ -527,6 +702,91 @@ mod tests {
         assert!(matches!(mkv_header_from(&early), Err(HeadError::NoCluster)));
     }
 
+    /// `file` read through a callback, each read recorded.
+    fn at_reads<'a>(
+        file: &'a [u8],
+        log: &'a std::cell::RefCell<Vec<(u64, usize)>>,
+    ) -> impl Fn(u64, usize) -> Result<Vec<u8>, Refused> + 'a {
+        move |off, n| {
+            log.borrow_mut().push((off, n));
+            let at = (off as usize).min(file.len());
+            Ok(file[at..(at + n).min(file.len())].to_vec())
+        }
+    }
+
+    #[test]
+    fn mkv_head_at_reads_element_heads_then_the_head() {
+        let mut file = mkv_lead();
+        let meta = file.len();
+        file.extend(el(CLUSTER, &[7; 4096]));
+        file.extend(el(CLUSTER, &[7; 4096]));
+        let log = std::cell::RefCell::new(Vec::new());
+        let h = mkv_head_at(&at_reads(&file, &log), 1 << 20).expect("head");
+        assert_eq!((h.head.as_slice(), h.first_cluster), (&file[..meta], meta as u64));
+        let cluster_bytes = |&&(off, n): &&(u64, usize)| off + n as u64 > meta as u64 && n > 12;
+        assert!(!log.borrow().iter().any(|r| cluster_bytes(&r)), "{:?}", log.borrow());
+        let refuse = |_: u64, _: usize| Err(Refused::NoRanges);
+        let err = mkv_head_at(&refuse, 1 << 20).unwrap_err();
+        assert!(matches!(err, MkvHeadError::Unreadable { at: 0, source: Refused::NoRanges, .. }));
+        let log = std::cell::RefCell::new(Vec::new());
+        let err = mkv_head_at(&at_reads(b"not a matroska file", &log), 1 << 20).unwrap_err();
+        assert!(matches!(err, MkvHeadError::NotMatroska), "{err:?}");
+        let err = mkv_head_at(&at_reads(&file[..meta - 3], &log), 1 << 20).unwrap_err();
+        assert!(matches!(err, MkvHeadError::Malformed { .. }), "a file cut in the head, {err:?}");
+    }
+
+    /// `prefix`, then `gap` bytes of zeros, then `rest`, read as a sparse file.
+    fn sparse<'a>(
+        prefix: &'a [u8],
+        gap: u64,
+        rest: &'a [u8],
+    ) -> impl Fn(u64, usize) -> Result<Vec<u8>, Refused> + 'a {
+        let behind = prefix.len() as u64 + gap;
+        move |off, n| {
+            let byte = |at: u64| match at {
+                at if at < prefix.len() as u64 => Some(prefix[at as usize]),
+                at if at < behind => Some(0),
+                at => rest.get((at - behind) as usize).copied(),
+            };
+            Ok((off..off + n as u64).map_while(byte).collect())
+        }
+    }
+
+    #[test]
+    fn mkv_head_at_ends_before_attachments_past_the_cap() {
+        let mut lead = mkv_lead();
+        let tracks_end = lead.len();
+        // 80 MB of fonts as a header, their body never read
+        let size: u64 = 80 << 20;
+        lead.extend([0x19, 0x41, 0xA4, 0x69, 0x01]);
+        lead.extend_from_slice(&size.to_be_bytes()[1..]);
+        let rest = el(CLUSTER, b"media");
+        let h = mkv_head_at(&sparse(&lead, size, &rest), 64 << 20).expect("head");
+        assert_eq!(h.head, lead[..tracks_end], "the head ends where the Attachments start");
+        assert_eq!(h.first_cluster, lead.len() as u64 + size, "the Cluster behind them");
+        // a walk that breaks behind the cut takes the cut as the first Cluster
+        let h = mkv_head_at(&sparse(&lead, size, &[0x00]), 64 << 20).expect("head");
+        assert_eq!(h.first_cluster, tracks_end as u64);
+    }
+
+    #[test]
+    fn mkv_head_at_refuses_a_head_past_the_cap_before_reading_it() {
+        let mut f = el(EBML, &el(0x4282, b"matroska"));
+        f.extend([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let mut big = f.clone();
+        // a Void of 2^40 bytes before Tracks, the Cluster behind it
+        big.extend([0xEC, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let rest = el(CLUSTER, b"media");
+        let err = mkv_head_at(&sparse(&big, 1 << 40, &rest), 64 << 20).unwrap_err();
+        assert!(matches!(err, MkvHeadError::TooLarge { .. }), "{err:?}");
+        // more empty Voids than the walk takes
+        for _ in 0..MKV_MAX_TOP + 10 {
+            f.extend([0xEC, 0x80]);
+        }
+        let err = mkv_head_at(&sparse(&f, 0, &rest), 64 << 20).unwrap_err();
+        assert!(matches!(err, MkvHeadError::TooMany { .. }), "{err:?}");
+    }
+
     #[test]
     fn avi_head_keeps_the_movi_fourcc() {
         let file =
@@ -540,6 +800,28 @@ mod tests {
         assert_eq!(from_disk, head);
         assert!(matches!(avi_head_from(&file[..20]), Err(HeadError::NoMovi)));
         assert!(matches!(avi_head("/nonexistent/pf-probe"), Err(HeadError::Io(_))));
+    }
+
+    #[test]
+    fn avi_head_at_reads_a_step_at_a_time_to_the_movi() {
+        let mut file = vec![0u8; AVI_STEP + 64];
+        file[..12].copy_from_slice(b"RIFF\x00\x00\x00\x00AVI ");
+        file[AVI_STEP - 2..AVI_STEP + 2].copy_from_slice(b"movi");
+        let log = std::cell::RefCell::new(Vec::new());
+        let head = avi_head_at(&at_reads(&file, &log), 16 << 20).expect("head");
+        assert_eq!(head, file[..AVI_STEP + 2], "a movi across two reads is found");
+        assert_eq!(*log.borrow(), [(0, AVI_STEP), (AVI_STEP as u64, AVI_STEP)]);
+        let none = vec![7u8; 1000];
+        let err = avi_head_at(&at_reads(&none, &log), 16 << 20).unwrap_err();
+        assert!(matches!(err, AviHeadError::NoMovi { read: 1000 }), "{err:?}");
+        let long = vec![7u8; 3 * AVI_STEP];
+        log.borrow_mut().clear();
+        let err = avi_head_at(&at_reads(&long, &log), AVI_STEP + 10).unwrap_err();
+        assert!(matches!(err, AviHeadError::NoMovi { read } if read == AVI_STEP as u64 + 10));
+        assert_eq!(log.borrow()[1], (AVI_STEP as u64, 10), "no read past the cap");
+        let refuse = |_: u64, _: usize| Err(Refused::NoRanges);
+        let err = avi_head_at(&refuse, 16 << 20).unwrap_err();
+        assert!(matches!(err, AviHeadError::Unreadable { at: 0, source: Refused::NoRanges, .. }));
     }
 
     #[test]

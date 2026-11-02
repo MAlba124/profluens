@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 //! profluens-subparse (`pf-subparse`), text subtitle parsers, the flat `subtitle/cue-ir` cue
-//! and the `subparse` element.
+//! and the `subparse` element, plus `vttwrite`, cues to WebVTT segments.
 
 // The one audited exception is `pod`, the record casts of the wire layouts.
 #![deny(unsafe_code)]
@@ -17,6 +17,7 @@ pub mod ir;
 pub mod pod;
 pub mod ssastyle;
 pub mod vttcss;
+pub mod vttwrite;
 
 pub use cue::{Cue, CueSettings, OutputFormat, ParseContext, ParseError};
 pub use element::{CUE_SLOT, MAX_FILE, SubParse, SubParseError, document_ir};

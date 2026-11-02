@@ -19,7 +19,6 @@ use pf_probe::head::{
 use pf_probe::{Kind, PREFIX_LEN, behind_id3, id3v2_len, probe};
 
 const WINDOWS: [usize; 8] = [0, 8, 16, 100, 1024, 4096, 65536, usize::MAX];
-const CLUSTER: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
 const MAX_BOXES: usize = 256;
 const MAX_MFRA: u64 = 16 << 20;
 const TAIL_FIRST: usize = 1 << 20;
@@ -115,14 +114,12 @@ fn id3(prefix: &[u8]) -> Option<Kind> {
 
 fn mkv(file: &[u8], cut: usize) {
     let got = mkv_header_from(file);
-    let first = file.windows(4).position(|w| w == CLUSTER);
-    match (&got, first) {
-        (Ok(h), Some(at)) => assert_eq!(h[..], file[..at], "a head other than up to the Cluster"),
-        (Err(HeadError::NoCluster), None) => {}
-        _ => panic!("{got:?} with a first Cluster at {first:?}"),
+    if let Ok(h) = &got {
+        assert!(file.starts_with(h), "a head that is not the file's start");
     }
     if let Ok(h) = mkv_header_from(&file[..cut]) {
-        assert_eq!(Some(&h), got.as_ref().ok(), "a cut file found another head");
+        let Ok(whole) = &got else { panic!("a cut file found a head the whole has not") };
+        assert!(whole.starts_with(&h), "a cut file found another head");
     }
 }
 

@@ -8,8 +8,13 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 
-/// Matroska Cluster id, RFC 9559 section 5.1.3.
-const CLUSTER: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
+/// Matroska ids, RFC 9559 section 5.1, as the 32 bit values of their octets.
+const EBML: u32 = 0x1A45_DFA3;
+const SEGMENT: u32 = 0x1853_8067;
+const CLUSTER: u32 = 0x1F43_B675;
+const TRACKS: u32 = 0x1654_AE6B;
+/// Top level elements walked for the first Cluster.
+const MKV_MAX_TOP: usize = 4096;
 const MKV_HEAD_MAX: usize = 8 << 20;
 const AVI_HEAD_MAX: usize = 16 << 20;
 const MP4_WINDOW: usize = 64 << 10;
@@ -65,9 +70,63 @@ pub fn mkv_header_prefix(path: &str) -> Result<Vec<u8>, HeadError> {
     mkv_header_from(&read_prefix(path, MKV_HEAD_MAX)?)
 }
 
+/// `window` up to the first Cluster, walking the top level elements by their sizes. Once Tracks
+/// is read, an element the walk cannot step past in the window ends the head before it,
+/// attached fonts as a rule, the demuxer reads those through the SeekHead. A head of a cut
+/// window is then always the start of the whole one's.
 pub fn mkv_header_from(window: &[u8]) -> Result<Vec<u8>, HeadError> {
-    let at = window.windows(4).position(|w| w == CLUSTER).ok_or(HeadError::NoCluster)?;
-    Ok(window[..at].to_vec())
+    let (ebml, at) = ebml_header(window, 0).ok_or(HeadError::NoCluster)?;
+    let at = match (ebml.0, ebml.1) {
+        (EBML, Some(size)) => at.checked_add(size).ok_or(HeadError::NoCluster)?,
+        _ => return Err(HeadError::NoCluster),
+    };
+    let (seg, mut at) = ebml_header(window, at).ok_or(HeadError::NoCluster)?;
+    if seg.0 != SEGMENT {
+        return Err(HeadError::NoCluster);
+    }
+    let mut tracks = false;
+    for _ in 0..MKV_MAX_TOP {
+        let Some(((id, size), data)) = ebml_header(window, at) else {
+            break;
+        };
+        if id == CLUSTER {
+            return Ok(window[..at as usize].to_vec());
+        }
+        let Some(end) = size.and_then(|s| data.checked_add(s)).filter(|&e| e <= window.len() as u64)
+        else {
+            break;
+        };
+        tracks |= id == TRACKS;
+        at = end;
+    }
+    match tracks {
+        true => Ok(window[..at.min(window.len() as u64) as usize].to_vec()),
+        false => Err(HeadError::NoCluster),
+    }
+}
+
+/// The id and size of the element at `at`, None for the unknown size, and where its data
+/// starts. None when the header is cut or no EBML header (RFC 8794 section 4).
+fn ebml_header(b: &[u8], at: u64) -> Option<((u32, Option<u64>), u64)> {
+    let at = usize::try_from(at).ok()?;
+    let first = *b.get(at)?;
+    let id_len = first.leading_zeros() as usize + 1;
+    if id_len > 4 {
+        return None;
+    }
+    let id = b.get(at..at + id_len)?.iter().fold(0u32, |v, &x| v << 8 | u32::from(x));
+    let s = at + id_len;
+    let lead = *b.get(s)?;
+    let len = lead.leading_zeros() as usize + 1;
+    if len > 8 {
+        return None;
+    }
+    let raw = b.get(s..s + len)?;
+    let mask = if len == 8 { 0 } else { 0xFFu8 >> len };
+    let size = raw[1..].iter().fold(u64::from(lead & mask), |v, &x| v << 8 | u64::from(x));
+    // all ones is the unknown size
+    let unknown = size == (1u64 << (7 * len)) - 1;
+    Some(((id, (!unknown).then_some(size)), (s + len) as u64))
 }
 
 pub fn avi_head(path: &str) -> Result<Vec<u8>, HeadError> {
@@ -412,21 +471,59 @@ mod tests {
         assert_eq!(count.get(), 0, "a file under 16 bytes is read past its end");
     }
 
+    /// An element of `id` with an 8 octet size.
+    fn el(id: u32, body: &[u8]) -> Vec<u8> {
+        let mut v = id.to_be_bytes().iter().copied().skip_while(|&b| b == 0).collect::<Vec<_>>();
+        v.push(0x01);
+        v.extend_from_slice(&(body.len() as u64).to_be_bytes()[1..]);
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// The EBML header and a Segment of unknown size, then Info and Tracks.
+    fn mkv_lead() -> Vec<u8> {
+        let mut f = el(EBML, &el(0x4282, b"matroska"));
+        f.extend([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        f.extend(el(0x1549_A966, &[0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40]));
+        f.extend(el(TRACKS, &el(0xAE, &[0xD7, 0x81, 0x01])));
+        f
+    }
+
     #[test]
     fn mkv_head_stops_at_the_first_cluster() {
-        let mut file = vec![0x1A, 0x45, 0xDF, 0xA3];
-        file.extend_from_slice(b"segment-metadata");
+        let mut file = mkv_lead();
+        // a Cluster id inside an element's data is no Cluster
+        file.extend(el(0xEC, &CLUSTER.to_be_bytes()));
         let meta = file.len();
-        file.extend_from_slice(&CLUSTER);
-        file.extend_from_slice(b"media");
-        file.extend_from_slice(&CLUSTER);
+        file.extend(el(CLUSTER, b"media"));
+        file.extend(el(CLUSTER, b"media"));
         assert_eq!(mkv_header_from(&file).expect("head"), file[..meta]);
         let path = write_tmp("cluster", &file);
         let head = mkv_header_prefix(&path).expect("head");
         let _ = std::fs::remove_file(&path);
         assert_eq!(head, file[..meta]);
-        let err = mkv_header_from(&file[..meta + 3]).unwrap_err();
+        // a window cut in the Cluster's header after Tracks ends the head there
+        assert_eq!(mkv_header_from(&file[..meta + 3]).expect("head"), file[..meta]);
+        let tracks_end = mkv_lead().len();
+        let err = mkv_header_from(&file[..tracks_end - 1]).unwrap_err();
         assert!(matches!(err, HeadError::NoCluster) && err.to_string().contains("Cluster"));
+        assert!(matches!(mkv_header_from(b"segment-metadata"), Err(HeadError::NoCluster)));
+    }
+
+    #[test]
+    fn mkv_head_ends_before_attachments_past_the_window() {
+        let mut file = mkv_lead();
+        let tracks_end = file.len();
+        // 118 MB of fonts as a header, the window holds a little of them
+        file.extend([0x19, 0x41, 0xA4, 0x69, 0x01, 0, 0, 0, 0x07, 0x60, 0, 0]);
+        file.extend([0; 4096]);
+        assert_eq!(mkv_header_from(&file).expect("head"), file[..tracks_end]);
+        // before Tracks the head is not read yet
+        let mut early = el(EBML, &el(0x4282, b"matroska"));
+        early.extend([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        early.extend([0x19, 0x41, 0xA4, 0x69, 0x01, 0, 0, 0, 0x07, 0x60, 0, 0]);
+        early.extend([0; 64]);
+        assert!(matches!(mkv_header_from(&early), Err(HeadError::NoCluster)));
     }
 
     #[test]

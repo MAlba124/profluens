@@ -133,11 +133,77 @@ enum MetaState {
 /// The Tags and image attachments the SeekHead of a head names. Tags in the head need no read,
 /// past it one, and Tags past `max_tags` bytes are left out. The Attachments are walked by their
 /// elements' heads, an attachment's media type is read first and an image's other fields and
-/// data of `max_picture` bytes or less after it, fonts stay unread. An error in the Tags still
-/// walks the Attachments, one in the Attachments keeps the images before it.
+/// data of `max_picture` bytes or less after it, fonts stay unread. Whatever the head holds is
+/// taken from it unread. An error in the Tags still walks the Attachments, one in the
+/// Attachments keeps the images before it.
 #[derive(Debug)]
 pub struct MetaAt<'h> {
     head: &'h [u8],
+    walk: MetaWalk,
+}
+
+impl<'h> MetaAt<'h> {
+    pub fn new(head: &'h [u8], max_tags: u64, max_picture: u64) -> Self {
+        MetaAt { head, walk: MetaWalk::new(head, max_tags, max_picture) }
+    }
+}
+
+impl Fetch for MetaAt<'_> {
+    type Out = Meta;
+    type Err = Infallible;
+
+    fn poll(&mut self) -> Result<Step<Meta>, Infallible> {
+        Ok(self.walk.poll(self.head))
+    }
+
+    fn buf(&mut self) -> &mut [u8] {
+        self.walk.buf()
+    }
+
+    fn filled(&mut self, n: usize) {
+        self.walk.filled(n);
+    }
+}
+
+/// [`MetaAt`] owning its head, a `Vec<u8>` or an `Arc<[u8]>` shared with the demuxer, to sit
+/// inside a machine that owns its bytes.
+#[derive(Debug)]
+pub struct MetaOwned<H> {
+    head: H,
+    walk: MetaWalk,
+}
+
+impl<H: AsRef<[u8]>> MetaOwned<H> {
+    pub fn new(head: H, max_tags: u64, max_picture: u64) -> Self {
+        let walk = MetaWalk::new(head.as_ref(), max_tags, max_picture);
+        MetaOwned { head, walk }
+    }
+
+    pub fn into_head(self) -> H {
+        self.head
+    }
+}
+
+impl<H: AsRef<[u8]>> Fetch for MetaOwned<H> {
+    type Out = Meta;
+    type Err = Infallible;
+
+    fn poll(&mut self) -> Result<Step<Meta>, Infallible> {
+        Ok(self.walk.poll(self.head.as_ref()))
+    }
+
+    fn buf(&mut self) -> &mut [u8] {
+        self.walk.buf()
+    }
+
+    fn filled(&mut self, n: usize) {
+        self.walk.filled(n);
+    }
+}
+
+/// The walk of [`MetaAt`] and [`MetaOwned`], the head handed in at each poll.
+#[derive(Debug)]
+struct MetaWalk {
     /// The SeekHead's Tags and Attachments, None for a head with no Segment.
     index: Option<(Option<u64>, Option<u64>)>,
     max_tags: u64,
@@ -168,12 +234,11 @@ fn keep(pic: &mut Attachment, field: usize, b: &[u8]) {
     }
 }
 
-impl<'h> MetaAt<'h> {
+impl MetaWalk {
     // Empty until the Tags or a field is read whole, cold, once per item.
     #[allow(clippy::disallowed_methods)]
-    pub fn new(head: &'h [u8], max_tags: u64, max_picture: u64) -> Self {
-        MetaAt {
-            head,
+    fn new(head: &[u8], max_tags: u64, max_picture: u64) -> Self {
+        MetaWalk {
             index: index_segment(head).map(|ix| (ix.tags, ix.attachments)),
             max_tags,
             max_picture,
@@ -274,7 +339,7 @@ impl<'h> MetaAt<'h> {
     /// What the read in flight gives, and the next read. None when the walk is done.
     // Cold path, once per item.
     #[allow(clippy::disallowed_methods)]
-    fn step(&mut self) -> Result<Option<Need>, WalkError> {
+    fn step(&mut self, head: &[u8]) -> Result<Option<Need>, WalkError> {
         match self.state {
             MetaState::Start => {
                 (self.meta, self.covers) = (Meta::default(), 0);
@@ -294,7 +359,7 @@ impl<'h> MetaAt<'h> {
                     return Ok(self.attachments());
                 };
                 let from = usize::try_from(at).ok();
-                match from.and_then(|from| self.head.get(from..from.checked_add(len)?)) {
+                match from.and_then(|from| head.get(from..from.checked_add(len)?)) {
                     Some(b) => {
                         self.meta.tags = b.to_vec();
                         Ok(self.attachments())
@@ -352,29 +417,54 @@ impl<'h> MetaAt<'h> {
     }
 }
 
-impl Fetch for MetaAt<'_> {
-    type Out = Meta;
-    type Err = Infallible;
-
-    fn poll(&mut self) -> Result<Step<Meta>, Infallible> {
-        let tags = matches!(self.state, MetaState::TagsHead { .. } | MetaState::Tags);
-        let next = match self.step() {
-            Ok(next) => next,
-            Err(e) if tags => {
-                // an error in the Tags still walks the Attachments
-                self.meta.error = Some(e);
-                self.attachments()
+impl MetaWalk {
+    fn poll(&mut self, head: &[u8]) -> Step<Meta> {
+        loop {
+            let tags = matches!(self.state, MetaState::TagsHead { .. } | MetaState::Tags);
+            let next = match self.step(head) {
+                Ok(next) => next,
+                Err(e) if tags => {
+                    // an error in the Tags still walks the Attachments
+                    self.meta.error = Some(e);
+                    self.attachments()
+                }
+                Err(e) => {
+                    self.meta.error.get_or_insert(e);
+                    None
+                }
+            };
+            match next {
+                Some(need) if self.held(head, need) => {}
+                Some(need) => return Step::Need(need),
+                None => {
+                    self.state = MetaState::Start;
+                    return Step::Done(std::mem::take(&mut self.meta));
+                }
             }
-            Err(e) => {
-                self.meta.error.get_or_insert(e);
-                None
-            }
-        };
-        if let Some(need) = next {
-            return Ok(Step::Need(need));
         }
-        self.state = MetaState::Start;
-        Ok(Step::Done(std::mem::take(&mut self.meta)))
+    }
+
+    /// Answers `need` from the head when it holds it. An element head cut at the head's end is
+    /// taken when what is there parses.
+    fn held(&mut self, head: &[u8], need: Need) -> bool {
+        let from = usize::try_from(need.at).ok();
+        let Some(have) = from.and_then(|at| head.get(at..)).filter(|h| !h.is_empty()) else {
+            return false;
+        };
+        let n = have.len().min(need.len);
+        let heads = matches!(
+            self.state,
+            MetaState::TagsHead { .. }
+                | MetaState::AttHead { .. }
+                | MetaState::File { .. }
+                | MetaState::Field { .. }
+        );
+        if n < need.len && !(heads && matches!(head_in(&have[..n], need.at), Ok(Some(_)))) {
+            return false;
+        }
+        self.buf()[..n].copy_from_slice(&have[..n]);
+        self.filled(n);
+        true
     }
 
     fn buf(&mut self) -> &mut [u8] {
@@ -1110,6 +1200,44 @@ mod tests {
         let held = drive_slice_log(&mut MetaAt::new(&file, 1 << 20, 100), &file, &mut log);
         assert_eq!(held.unwrap().tags, m.tags);
         assert!(log.iter().all(|n| n.len <= ELEMENT_HEAD || n.at > tags_end as u64), "{log:?}");
+    }
+
+    #[test]
+    fn what_the_head_holds_is_taken_unread() {
+        let att = master(
+            id::ATTACHMENTS,
+            &[
+                attached("cover.png", "image/png", &[1, 2]),
+                attached("font.ttf", "font/ttf", &[9; 500]),
+                attached("art.jpg", "image/jpeg", &[3, 4, 5]),
+            ],
+        );
+        let (file, head, _, att_at) = meta_file(&att);
+        let mut log = Vec::new();
+        let want = drive_slice_log(&mut MetaAt::new(&file[..head], 1 << 20, 100), &file, &mut log);
+        let want = want.unwrap();
+        assert_eq!(want.pictures.len(), 2);
+        // Tags 2, Attachments 1, a file's head 1 and its 5 fields' 5, its media type 1, an
+        // image's other 4 fields 4
+        assert_eq!(log.len(), 32, "{log:?}");
+        for cut in [file.len(), att_at as usize + 40, att_at as usize + 3, att_at as usize] {
+            log.clear();
+            let got =
+                drive_slice_log(&mut MetaAt::new(&file[..cut], 1 << 20, 100), &file, &mut log);
+            assert_eq!(got.unwrap(), want, "a head of {cut}");
+            let behind = |n: &Need| n.at + n.len as u64 > cut as u64;
+            assert!(log.iter().all(behind), "{cut}, {log:?}");
+        }
+        assert!(log.len() < 32, "{log:?}");
+        log.clear();
+        let mut m = MetaOwned::new(file.clone(), 1 << 20, 100);
+        assert_eq!(drive_slice_log(&mut m, &file, &mut log).unwrap(), want);
+        assert!(log.is_empty(), "a whole file as the head reads nothing, {log:?}");
+        assert_eq!(m.into_head(), file);
+        let shared: std::sync::Arc<[u8]> = file[..head].into();
+        let mut m = MetaOwned::new(std::sync::Arc::clone(&shared), 1 << 20, 100);
+        assert_eq!(drive_slice(&mut m, &file).unwrap(), want);
+        assert_eq!(drive_slice(&mut m, &file).unwrap(), want, "a walk that is done starts over");
     }
 
     #[test]

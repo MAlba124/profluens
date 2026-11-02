@@ -396,6 +396,25 @@ fn cues_handed_over_are_published_at_preroll() {
     assert_eq!(p.index(demux).expect("published").entries, keys, "nothing grown over the Cues");
 }
 
+#[test]
+fn shared_cues_and_head_are_published_as_handed_over() {
+    let file = film(1_600, 400, false, true);
+    let cues: Arc<[pf_mkv::Cue]> = cues_of(&file).into();
+    let head: Arc<[u8]> = header(&file).into();
+    let mut p = Pipeline::new();
+    let src = p.add(MemSrc { data: file.clone(), chunk: 4096, pos: 0, pull: None });
+    let demux = MkvDemux::with_shared_head(Arc::clone(&head))
+        .with_shared_cues(Arc::clone(&cues), Some(cues_at(&file)));
+    let (demux, _) = build(&mut p, src, demux, &|_| true);
+    let index = p.index(demux).expect("published at preroll");
+    let keys: Vec<IndexEntry> =
+        clusters(&file).iter().map(|&(byte, time)| IndexEntry::key(time, byte)).collect();
+    assert_eq!((&index.entries, index.complete), (&keys, true));
+    assert_eq!((Arc::strong_count(&cues), Arc::strong_count(&head)), (2, 2), "held, not copied");
+    p.run().expect("run");
+    assert_eq!(p.index(demux).expect("published").entries, keys);
+}
+
 fn until(what: &str, mut cond: impl FnMut() -> bool) {
     let began = Instant::now();
     while !cond() {

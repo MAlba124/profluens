@@ -4,7 +4,7 @@
 use profluens_core::event::TagSink;
 
 use crate::ebml::{self, id};
-use crate::reader::{parse_info, read_uint};
+use crate::reader::{Track, parse_info, read_uint};
 
 /// `SimpleTag` nesting is unbounded (section 5.1.8.1.2), the cap bounds a crafted chain.
 pub const MAX_NEST: usize = 6;
@@ -226,6 +226,57 @@ pub fn parse_tags(tags: &[u8], sink: &mut impl TagSink) {
             parse_tag(tag, album_scope, sink);
         }
     });
+}
+
+/// Sets each track's `bitrate` from the `BPS` statistics tag of a `Tags` element that names it
+/// by its TrackUID, as mkvmerge writes them. A tag of no track is left out.
+pub fn bitrates(tags: &[u8], tracks: &mut [Track]) {
+    if let Some(body) = master_body(tags, id::TAGS) {
+        bitrates_in(body, tracks);
+    }
+}
+
+/// [`bitrates`] over the `Tags` element's data.
+pub(crate) fn bitrates_in(body: &[u8], tracks: &mut [Track]) {
+    for_each_child(body, |h, tag| {
+        if h.id != id::TAG {
+            return;
+        }
+        let mut bps = None;
+        for_each_child(tag, |c, simple| {
+            if c.id == id::SIMPLE_TAG {
+                bps = bps.or_else(|| stat_bps(simple));
+            }
+        });
+        let Some(bps) = bps else { return };
+        for_each_child(tag, |c, targets| {
+            if c.id != id::TARGETS {
+                return;
+            }
+            for_each_child(targets, |t, uid| {
+                let uid = read_uint(uid);
+                if t.id != id::TAG_TRACK_UID || uid == 0 {
+                    return;
+                }
+                for track in tracks.iter_mut().filter(|track| track.uid == uid) {
+                    track.bitrate = bps;
+                }
+            });
+        });
+    });
+}
+
+/// The bits a second of a `BPS` SimpleTag, `BPS-eng` as some tools name it.
+fn stat_bps(simple: &[u8]) -> Option<u64> {
+    let (mut name, mut value) = (&[][..], &[][..]);
+    for_each_child(simple, |h, body| match h.id {
+        i if i == id::TAG_NAME => name = ebml::read_string(body),
+        i if i == id::TAG_STRING => value = ebml::read_string(body),
+        _ => {}
+    });
+    let bps = name == b"BPS" || name.starts_with(b"BPS-");
+    let value = core::str::from_utf8(value).ok().filter(|_| bps)?;
+    value.trim().parse::<u64>().ok().filter(|&v| v > 0)
 }
 
 fn has_track_level(body: &[u8]) -> bool {

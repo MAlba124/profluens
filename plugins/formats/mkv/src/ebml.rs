@@ -57,6 +57,14 @@ pub mod id {
     pub const VIDEO: &[u8] = &[0xE0];
     pub const PIXEL_WIDTH: &[u8] = &[0xB0];
     pub const PIXEL_HEIGHT: &[u8] = &[0xBA];
+    pub const DISPLAY_WIDTH: &[u8] = &[0x54, 0xB0];
+    pub const DISPLAY_HEIGHT: &[u8] = &[0x54, 0xBA];
+    pub const DISPLAY_UNIT: &[u8] = &[0x54, 0xB2];
+    pub const PROJECTION: &[u8] = &[0x76, 0x70];
+    pub const PROJECTION_TYPE: &[u8] = &[0x76, 0x71];
+    pub const PROJECTION_POSE_YAW: &[u8] = &[0x76, 0x73];
+    pub const PROJECTION_POSE_PITCH: &[u8] = &[0x76, 0x74];
+    pub const PROJECTION_POSE_ROLL: &[u8] = &[0x76, 0x75];
 
     pub const COLOUR: &[u8] = &[0x55, 0xB0];
     pub const MATRIX_COEFFICIENTS: &[u8] = &[0x55, 0xB1];

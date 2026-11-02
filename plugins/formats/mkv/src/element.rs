@@ -863,12 +863,29 @@ impl Side {
     }
 }
 
+/// Bytes or entries the demuxer owns, or shares with the other runs over one file.
+enum Held<T: 'static> {
+    Own(Vec<T>),
+    Shared(std::sync::Arc<[T]>),
+}
+
+impl<T> std::ops::Deref for Held<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        match self {
+            Held::Own(v) => v,
+            Held::Shared(a) => a,
+        }
+    }
+}
+
 struct Seek {
     tracks: Vec<Track>,
     tick: u64,
     segment_data_start: u64,
     read: CuesRead,
-    cues: Vec<Cue>,
+    cues: Held<Cue>,
     whole: bool,
     grown: Grown,
     file_len: Option<u64>,
@@ -890,7 +907,9 @@ struct Stamp {
 /// Demultiplexes a Matroska/WebM byte stream into one src pad per track. Header bytes come
 /// at construction since a mid-pipeline element gets no input during preroll.
 pub struct MkvDemux {
-    header: Vec<u8>,
+    header: Held<u8>,
+    /// Attachments and Chapters are read and parsed, off for a run that has them already.
+    extras: bool,
     pad_tracks: Vec<PadTrack>,
     reader: MatroskaReader,
     scratch: Vec<u8>,
@@ -992,12 +1011,22 @@ impl MkvDemux {
 
     /// `header` must hold everything up to the first Cluster. The whole stream then arrives on the
     /// sink pad.
+    pub fn new(header: Vec<u8>) -> Self {
+        Self::held(Held::Own(header))
+    }
+
+    /// [`MkvDemux::new`] over a head shared with the other runs over the file, not copied.
+    pub fn with_shared_head(header: std::sync::Arc<[u8]>) -> Self {
+        Self::held(Held::Shared(header))
+    }
+
     // Cold path, construction.
     #[allow(clippy::disallowed_methods)]
-    pub fn new(header: Vec<u8>) -> Self {
+    fn held(header: Held<u8>) -> Self {
         let (handle, publisher) = MkvExtras::new();
         Self {
             header,
+            extras: true,
             pad_tracks: Vec::new(),
             reader: MatroskaReader::new(),
             scratch: Vec::new(),
@@ -1026,7 +1055,7 @@ impl MkvDemux {
                 tick: crate::DEFAULT_TIMESTAMP_SCALE,
                 segment_data_start: 0,
                 read: CuesRead::Done,
-                cues: Vec::new(),
+                cues: Held::Own(Vec::new()),
                 whole: false,
                 grown: Grown::default(),
                 file_len: None,
@@ -1051,7 +1080,8 @@ impl MkvDemux {
     }
 
     fn side_head(&mut self) {
-        let Some(index) = crate::tags::index_segment(&self.header) else {
+        let index = crate::tags::index_segment(&self.header).filter(|_| self.extras);
+        let Some(index) = index else {
             return self.side.publish();
         };
         for (kind, at) in [index.attachments, index.chapters].into_iter().enumerate() {
@@ -1157,10 +1187,26 @@ impl MkvDemux {
         self
     }
 
-    pub fn with_cues(mut self, cues: Vec<Cue>, at: Option<u64>) -> Self {
+    pub fn with_cues(self, cues: Vec<Cue>, at: Option<u64>) -> Self {
+        self.cued_by(Held::Own(cues), at)
+    }
+
+    /// [`MkvDemux::with_cues`] over Cues shared with the other runs over the file, not copied.
+    pub fn with_shared_cues(self, cues: std::sync::Arc<[Cue]>, at: Option<u64>) -> Self {
+        self.cued_by(Held::Shared(cues), at)
+    }
+
+    fn cued_by(mut self, cues: Held<Cue>, at: Option<u64>) -> Self {
         self.seek.whole = !cues.is_empty();
         self.seek.reserve = at.filter(|_| self.seek.whole);
         self.seek.cues = cues;
+        self
+    }
+
+    /// Neither reads nor parses the Attachments and Chapters, for a run that has them from an
+    /// earlier one. [`MkvDemux::extras`] then settles empty at preroll.
+    pub fn without_extras(mut self) -> Self {
+        self.extras = false;
         self
     }
 
@@ -1267,7 +1313,7 @@ impl MkvDemux {
         }
         log!(&*ctx, Level::Info, "cues", positions = cues.len(), whole = whole);
         self.seek.reserve = Some(at);
-        (self.seek.cues, self.seek.whole) = (cues, whole);
+        (self.seek.cues, self.seek.whole) = (Held::Own(cues), whole);
         self.reader.mark(None);
         self.publish(ctx);
     }

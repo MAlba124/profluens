@@ -32,6 +32,20 @@ pub struct Track {
     pub bit_depth: u32,
     pub pixel_width: u32,
     pub pixel_height: u32,
+    /// `DisplayWidth` and `DisplayHeight` in `display_unit`, 0 where absent, their default is
+    /// then the cropped pixel size (RFC 9559 section 5.1.4.1.28.12).
+    pub display_width: u32,
+    pub display_height: u32,
+    /// `DisplayUnit`, 0 pixels, 3 an aspect ratio.
+    pub display_unit: u8,
+    /// Degrees clockwise the picture is turned to show, a quarter turn, from a rectangular
+    /// `Projection`'s `ProjectionPoseRoll` (RFC 9559 section 15.2). 0 for none or any other pose.
+    pub rotation: u16,
+    /// `TrackUID`, what Tags name a track by, 0 where absent.
+    pub uid: u64,
+    /// Bits a second from the `BPS` statistics tag, 0 for unknown. Set from Tags the head
+    /// holds, Tags read apart give it through [`crate::tags::bitrates`].
+    pub bitrate: u64,
     /// H.273 section 8.3 code point. Defaults to `2` (unspecified) since `0` is valid (identity).
     pub colour_matrix: u8,
     pub colour_range: u8,
@@ -533,6 +547,8 @@ impl MatroskaReader {
             }
             // A later Tracks, a chained Segment or a resent header, replaces the last.
             (self.tracks, self.tracks_ready) = (tracks, true);
+        } else if id == id::TAGS {
+            crate::tags::bitrates_in(&self.buf[ds..de], &mut self.tracks);
         } else if id == id::TIMESTAMP {
             self.cluster_base_tick = read_uint(&self.buf[ds..de]) as i64;
         } else if id == id::SIMPLE_BLOCK || id == id::BLOCK_GROUP {
@@ -695,6 +711,12 @@ fn parse_track_entry(data: &[u8], undone: &mut usize) -> Result<Track, ReadError
         bit_depth: 0,
         pixel_width: 0,
         pixel_height: 0,
+        display_width: 0,
+        display_height: 0,
+        display_unit: 0,
+        rotation: 0,
+        uid: 0,
+        bitrate: 0,
         colour_matrix: 2,
         colour_range: 0,
         colour_transfer: 2,
@@ -718,6 +740,8 @@ fn parse_track_entry(data: &[u8], undone: &mut usize) -> Result<Track, ReadError
         let body = &data[h.data_start..end];
         if h.id == id::TRACK_NUMBER {
             track.track_number = read_uint(body);
+        } else if h.id == id::TRACK_UID {
+            track.uid = read_uint(body);
         } else if h.id == id::CODEC_ID {
             track.codec_id = String::from_utf8_lossy(ebml::read_string(body)).into_owned();
         } else if h.id == id::CODEC_PRIVATE {
@@ -890,12 +914,53 @@ fn parse_video(data: &[u8], track: &mut Track) -> Result<(), ReadError> {
             track.pixel_width = read_uint(body) as u32;
         } else if h.id == id::PIXEL_HEIGHT {
             track.pixel_height = read_uint(body) as u32;
+        } else if h.id == id::DISPLAY_WIDTH {
+            track.display_width = read_uint(body).min(u64::from(u32::MAX)) as u32;
+        } else if h.id == id::DISPLAY_HEIGHT {
+            track.display_height = read_uint(body).min(u64::from(u32::MAX)) as u32;
+        } else if h.id == id::DISPLAY_UNIT {
+            track.display_unit = read_uint(body).min(u64::from(u8::MAX)) as u8;
+        } else if h.id == id::PROJECTION {
+            // a pose that does not parse is no turn, the track plays as stored
+            track.rotation = projection_turn(body).unwrap_or(0);
         } else if h.id == id::COLOUR {
             parse_colour(body, track)?;
         }
         at = end;
     }
     Ok(())
+}
+
+/// The quarter turn clockwise a rectangular Projection's pose shows the picture at, its roll
+/// counter-clockwise (RFC 9559 section 5.1.4.1.28.46). 0 for a yaw or pitch, a flip or a sphere.
+fn projection_turn(data: &[u8]) -> Result<u16, ReadError> {
+    let (mut kind, mut pose) = (0, [0.0f64; 3]);
+    let mut at = 0;
+    while at < data.len() {
+        let h = ebml::read_element_header(data, at)?;
+        let end = h.data_end()?.ok_or(ReadError::Malformed("unknown-size child in Projection"))?;
+        if end > data.len() {
+            return Err(ReadError::Malformed("Projection child runs past its master"));
+        }
+        let body = &data[h.data_start..end];
+        let axes = [id::PROJECTION_POSE_YAW, id::PROJECTION_POSE_PITCH, id::PROJECTION_POSE_ROLL];
+        if h.id == id::PROJECTION_TYPE {
+            kind = read_uint(body);
+        } else if let Some(axis) = axes.iter().position(|a| h.id == *a) {
+            pose[axis] = read_float(body)?;
+        }
+        at = end;
+    }
+    let [yaw, pitch, roll] = pose;
+    if kind != 0 || yaw != 0.0 || pitch != 0.0 || !roll.is_finite() {
+        return Ok(0);
+    }
+    let turn = (-roll).rem_euclid(360.0);
+    let quarter = (turn / 90.0).round();
+    Ok(match (turn - quarter * 90.0).abs() < 0.5 {
+        true => (quarter as u16 % 4) * 90,
+        false => 0,
+    })
 }
 
 fn parse_colour(data: &[u8], track: &mut Track) -> Result<(), ReadError> {
@@ -1813,6 +1878,116 @@ mod tests {
         assert_eq!(track.disposition, all);
         let plain = parse_track_entry(&one(&[0xD7], 1), &mut 0).unwrap();
         assert_eq!(plain.disposition, Disposition::MAIN);
+    }
+
+    /// A video TrackEntry of number 1 and uid 77 whose Video holds `video`.
+    fn video_entry(video: &[u8]) -> Vec<u8> {
+        let mut e = Vec::new();
+        ebml::write_uint(&mut e, id::TRACK_NUMBER, 1);
+        ebml::write_uint(&mut e, id::TRACK_UID, 77);
+        ebml::write_binary(&mut e, id::VIDEO, video);
+        e
+    }
+
+    fn projection(kind: u64, yaw: f64, pitch: f64, roll: f32) -> Vec<u8> {
+        let mut p = Vec::new();
+        ebml::write_uint(&mut p, id::PROJECTION_TYPE, kind);
+        ebml::write_f64(&mut p, id::PROJECTION_POSE_YAW, yaw);
+        ebml::write_f64(&mut p, id::PROJECTION_POSE_PITCH, pitch);
+        ebml::write_f32(&mut p, id::PROJECTION_POSE_ROLL, roll);
+        let mut v = Vec::new();
+        ebml::write_binary(&mut v, id::PROJECTION, &p);
+        v
+    }
+
+    #[test]
+    fn a_video_track_gives_its_display_size_and_turn() {
+        let mut video = Vec::new();
+        ebml::write_uint(&mut video, id::PIXEL_WIDTH, 1440);
+        ebml::write_uint(&mut video, id::PIXEL_HEIGHT, 1080);
+        ebml::write_uint(&mut video, id::DISPLAY_WIDTH, 1920);
+        ebml::write_uint(&mut video, id::DISPLAY_HEIGHT, 1080);
+        ebml::write_uint(&mut video, id::DISPLAY_UNIT, 0);
+        video.extend(projection(0, 0.0, 0.0, 90.0));
+        let t = parse_track_entry(&video_entry(&video), &mut 0).unwrap();
+        assert_eq!((t.pixel_width, t.display_width, t.display_height), (1440, 1920, 1080));
+        assert_eq!((t.display_unit, t.uid, t.bitrate), (0, 77, 0));
+        assert_eq!(t.rotation, 270, "a roll of 90 counter-clockwise is 270 clockwise");
+        let turn = |kind, yaw, pitch, roll| {
+            parse_track_entry(&video_entry(&projection(kind, yaw, pitch, roll)), &mut 0)
+                .unwrap()
+                .rotation
+        };
+        assert_eq!(turn(0, 0.0, 0.0, -90.0), 90);
+        assert_eq!(turn(0, 0.0, 0.0, 180.0), 180);
+        assert_eq!(turn(0, 0.0, 0.0, -180.0), 180);
+        assert_eq!(turn(0, 0.0, 0.0, 0.0), 0);
+        assert_eq!(turn(0, 0.0, 0.0, 45.0), 0, "no quarter turn");
+        assert_eq!(turn(0, 180.0, 0.0, 0.0), 0, "a flip is no turn");
+        assert_eq!(turn(0, 0.0, 10.0, 90.0), 0, "a pitch is no turn");
+        assert_eq!(turn(1, 0.0, 0.0, 90.0), 0, "a sphere is no turn");
+        assert_eq!(turn(0, 0.0, 0.0, f32::NAN), 0);
+        let plain = parse_track_entry(&video_entry(&[]), &mut 0).unwrap();
+        assert_eq!((plain.display_width, plain.display_height, plain.rotation), (0, 0, 0));
+        let mut bad = Vec::new();
+        ebml::write_binary(&mut bad, id::PROJECTION, &[0x76, 0x75, 0x83, 1, 2, 3]);
+        let t = parse_track_entry(&video_entry(&bad), &mut 0).unwrap();
+        assert_eq!(t.rotation, 0, "a 3 octet float is no turn and no refusal");
+    }
+
+    #[test]
+    fn statistics_tags_in_the_head_give_each_track_its_bitrate() {
+        let simple = |name: &str, value: &str| {
+            let mut s = Vec::new();
+            ebml::write_string(&mut s, id::TAG_NAME, name);
+            ebml::write_string(&mut s, id::TAG_STRING, value);
+            let mut out = Vec::new();
+            ebml::write_binary(&mut out, id::SIMPLE_TAG, &s);
+            out
+        };
+        let tag = |uid: u64, simples: &[Vec<u8>]| {
+            let mut targets = Vec::new();
+            ebml::write_uint(&mut targets, id::TAG_TRACK_UID, uid);
+            let mut body = Vec::new();
+            ebml::write_binary(&mut body, id::TARGETS, &targets);
+            body.extend(simples.concat());
+            let mut out = Vec::new();
+            ebml::write_binary(&mut out, id::TAG, &body);
+            out
+        };
+        let mut tags = Vec::new();
+        let body = [
+            tag(77, &[simple("DURATION", "00:01:00"), simple("BPS", "4500000")]),
+            tag(78, &[simple("BPS-eng", " 128000 ")]),
+            tag(0, &[simple("BPS", "1")]),
+            tag(79, &[simple("BPS", "fast")]),
+        ]
+        .concat();
+        ebml::write_binary(&mut tags, id::TAGS, &body);
+        let mut a = parse_track_entry(&video_entry(&[]), &mut 0).unwrap();
+        let mut b = a.clone();
+        let mut c = a.clone();
+        (b.uid, c.uid) = (78, 79);
+        let mut tracks = [a.clone(), b, c];
+        crate::tags::bitrates(&tags, &mut tracks);
+        let got: Vec<u64> = tracks.iter().map(|t| t.bitrate).collect();
+        assert_eq!(got, [4_500_000, 128_000, 0]);
+        // Tags the reader walks in the head, after Tracks
+        let mut tracks_el = Vec::new();
+        ebml::write_binary(&mut tracks_el, id::TRACK_ENTRY, &video_entry(&[]));
+        let mut head = Vec::new();
+        ebml::write_binary(&mut head, id::EBML, &[]);
+        ebml::write_id(&mut head, id::SEGMENT);
+        ebml::write_unknown_size(&mut head);
+        ebml::write_binary(&mut head, id::TRACKS, &tracks_el);
+        head.extend_from_slice(&tags);
+        let mut r = MatroskaReader::new();
+        r.push(&head).unwrap();
+        assert_eq!(r.tracks()[0].bitrate, 4_500_000);
+        a.uid = 0;
+        let mut zero = [a];
+        crate::tags::bitrates(&tags, &mut zero);
+        assert_eq!(zero[0].bitrate, 0, "a track with no uid is named by no tag");
     }
 
     #[test]

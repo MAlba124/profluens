@@ -351,6 +351,14 @@ impl Element for Rec {
 }
 
 fn demux(name: &str, pull: bool) -> (Vec<Vec<Buf>>, Vec<&'static str>, MkvExtras) {
+    demux_by(name, pull, MkvDemux::new)
+}
+
+fn demux_by(
+    name: &str,
+    pull: bool,
+    make: impl FnOnce(Vec<u8>) -> MkvDemux,
+) -> (Vec<Vec<Buf>>, Vec<&'static str>, MkvExtras) {
     let (file, _) = film();
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mkv_content");
     std::fs::create_dir_all(&dir).expect("a tmp dir");
@@ -359,7 +367,7 @@ fn demux(name: &str, pull: bool) -> (Vec<Vec<Buf>>, Vec<&'static str>, MkvExtras
     let mut p = pf_reactor::pipeline();
     let src = FileSrc::new(path.to_str().expect("utf-8"));
     let src = p.add(if pull { src } else { src.push_only() });
-    let demux = MkvDemux::new(header(&file));
+    let demux = make(header(&file));
     let extras = demux.extras();
     let demux = p.add(demux);
     p.link(src.src(FileSrc::OUT), demux.sink(MkvDemux::IN)).expect("link");
@@ -415,6 +423,19 @@ fn chapters_come_from_the_header_and_attachments_by_range() {
     assert!(extras.settled());
     assert_eq!(extras.chapters().chapters.len(), 2);
     assert!(extras.attachments().is_empty());
+}
+
+#[test]
+fn a_shared_head_without_extras_plays_alike_and_settles_empty() {
+    let (want, families, _) = demux("plain_pulled.mkv", true);
+    let shared = |h: Vec<u8>| MkvDemux::with_shared_head(h.into()).without_extras();
+    let (got, got_families, extras) = demux_by("shared_pulled.mkv", true, shared);
+    assert_eq!((got, got_families), (want, families));
+    assert!(extras.settled(), "settled at preroll with nothing read");
+    assert!(extras.chapters().chapters.is_empty() && extras.attachments().is_empty());
+    let (_, _, extras) =
+        demux_by("shared_pushed.mkv", false, |h| MkvDemux::with_shared_head(h.into()));
+    assert_eq!(extras.chapters().chapters.len(), 2, "a shared head keeps its Chapters");
 }
 
 fn bits(out: &mut Vec<u8>, acc: &mut (u64, u32), value: u32, len: u32) {

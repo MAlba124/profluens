@@ -162,6 +162,14 @@ pub trait TagSink {
     fn text(&mut self, key: &str, value: &str);
 
     fn picture(&mut self, mime: &str, data: &[u8]);
+
+    /// A picture whose container states its type, the ID3v2 APIC numbering FLAC shares, 3 the
+    /// front cover. A FLAC type past 255 comes as 255. Forwards to [`TagSink::picture`] unless
+    /// the sink keeps the type.
+    fn picture_typed(&mut self, kind: u8, mime: &str, data: &[u8]) {
+        let _ = kind;
+        self.picture(mime, data);
+    }
 }
 
 /// A [`TagSink`] building an owned [`TagList`], copying pictures into pool memory.
@@ -249,5 +257,16 @@ mod tag_tests {
         assert_eq!(&*pic.mime, "image/jpeg");
         assert_eq!(pic.data.len(), art.len());
         assert_eq!(pic.data.data(), &art);
+    }
+
+    #[test]
+    fn a_typed_picture_reaches_a_sink_that_drops_the_type() {
+        let pool = Pool::bounded(64, 4);
+        let mut sink = TagListSink::new(&pool);
+        sink.picture_typed(3, "image/png", b"\x89PNG");
+        let tags = sink.finish();
+        assert_eq!(tags.pictures().len(), 1);
+        assert_eq!(&*tags.pictures()[0].mime, "image/png");
+        assert_eq!(tags.pictures()[0].data.data(), b"\x89PNG");
     }
 }

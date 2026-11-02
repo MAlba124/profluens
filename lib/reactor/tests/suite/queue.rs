@@ -370,13 +370,19 @@ fn a_group_that_never_parks_has_its_pushes_entered_within_hold_passes() {
     one(&mut r, 2, Op::Read { handle, offset: 0, at: 0, len: u32::MAX }, Some(bare(&pool)));
     let mut passes = 0;
     out.clear();
-    while out.is_empty() {
+    while r.enters().submits == before && out.is_empty() {
         passes += 1;
         assert!(passes <= pf_reactor::HOLD as usize + 1, "a read waited past the hold");
         r.run_once(&mut out);
     }
-    assert_eq!(out[0].1.result, IoResult::Ok(4096));
     assert!(r.enters().submits - before <= 1, "one enter for the pass that handed it over");
+    // entered, a read lands once the kernel's worker is done with it
+    let start = Instant::now();
+    while out.is_empty() {
+        assert!(start.elapsed() < PATIENCE, "the read never completed");
+        r.run_once(&mut out);
+    }
+    assert_eq!(out[0].1.result, IoResult::Ok(4096));
 }
 
 #[test]

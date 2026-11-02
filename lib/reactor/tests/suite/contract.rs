@@ -419,3 +419,85 @@ fn a_stream_fills_lent_buffers_and_its_close_ends_the_receive() {
     }
     r.close(handle);
 }
+
+/// Whether every page of `len` bytes at `at` of `f` is in the page cache.
+fn resident(f: &std::fs::File, at: usize, len: usize) -> bool {
+    use std::os::fd::AsRawFd;
+    let page = 4096;
+    // SAFETY: a read-only shared map of an open file, unmapped below, read by `mincore` alone.
+    unsafe {
+        let map = libc::mmap(
+            std::ptr::null_mut(),
+            at + len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            f.as_raw_fd(),
+            0,
+        );
+        assert_ne!(map, libc::MAP_FAILED, "a map");
+        let mut v = vec![0u8; (at + len).div_ceil(page)];
+        assert_eq!(libc::mincore(map, at + len, v.as_mut_ptr()), 0, "mincore");
+        libc::munmap(map, at + len);
+        v[at / page..].iter().all(|b| b & 1 == 1)
+    }
+}
+
+fn drop_cached(f: &std::fs::File, at: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: integers only.
+    let r = unsafe {
+        libc::posix_fadvise(f.as_raw_fd(), at as i64, len as i64, libc::POSIX_FADV_DONTNEED)
+    };
+    assert_eq!(r, 0, "advice");
+}
+
+/// A read lands whole however much of its range the page cache holds, all of it, the front
+/// only or none.
+#[test]
+fn a_read_lands_whole_whatever_the_page_cache_holds() {
+    const LEN: usize = 1 << 20;
+    let mut r = rig(LEN);
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "pf-cached-{}-{}",
+        super::NAME,
+        std::process::id()
+    ));
+    let bytes: Vec<u8> = (0..LEN as u32).map(|i| (i % 253) as u8).collect();
+    std::fs::write(&path, &bytes).expect("fixture");
+    let f = std::fs::File::open(&path).expect("open");
+    f.sync_all().expect("written back, so its pages can drop");
+    drop_cached(&f, 0, 0);
+    if resident(&f, 0, LEN) {
+        eprintln!("skip: the page cache keeps {} here", path.display());
+        return;
+    }
+    let IoResult::File { handle, .. } = r.open(&path, OpenMode::Read) else { panic!("open") };
+    let read = |r: &mut Rig, offset: u64, at: u32, len: u32| {
+        let op = r.submit(Op::Read { handle, offset, at, len }, Some(r.buf(b"")));
+        let c = r.wait(op);
+        (c.result, c.buf.expect("the buffer back").memory.data().to_vec())
+    };
+    for (what, dropped) in
+        [("none", None), ("the back half", Some(LEN as u64 / 2)), ("all", Some(0))]
+    {
+        std::fs::read(&path).expect("cached");
+        if let Some(from) = dropped {
+            drop_cached(&f, from, LEN as u64 - from);
+        }
+        let (result, got) = read(&mut r, 0, 0, u32::MAX);
+        assert_eq!(result, IoResult::Ok(LEN), "{what} dropped");
+        assert!(got == bytes, "{what} dropped, the bytes");
+    }
+    drop_cached(&f, 0, 0);
+    std::fs::File::open(&path)
+        .and_then(|g| {
+            let mut b = vec![0; 8192];
+            std::os::unix::fs::FileExt::read_exact_at(&g, &mut b, 0)
+        })
+        .expect("the front cached");
+    let (result, got) = read(&mut r, 7, 3, 100_000);
+    assert_eq!(result, IoResult::Ok(100_000), "a range over a cached front");
+    assert!(got[3..] == bytes[7..100_007], "the range's bytes after `at`");
+    r.close(handle);
+    let _ = std::fs::remove_file(&path);
+}

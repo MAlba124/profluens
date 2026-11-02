@@ -569,14 +569,18 @@ enum Waits {
     Nothing,
 }
 
-/// The ring is single issuer and needs no descriptor table. Epoll sizes one up to [`MAX_FDS`].
+/// The ring is single issuer and needs no descriptor table, and reads files in the kernel's
+/// workers, a page cache miss would otherwise hold the group's wait for the disk. Epoll sizes
+/// a table up to [`MAX_FDS`].
 fn queue(want: Want, ops: usize, waits: Waits) -> Result<Queue, IoError> {
     let ring = || {
-        let setup = Setup { want: Want::Uring, single_issuer: true, fixed_buffers: 0 };
+        let setup =
+            Setup { want: Want::Uring, single_issuer: true, fixed_buffers: 0, punt_reads: true };
         Queue::new(Owned::new(ops, 0), setup).map_err(|r| setup_error(&r.error))
     };
     let epoll = || {
-        let setup = Setup { want: Want::Epoll, single_issuer: false, fixed_buffers: 0 };
+        let setup =
+            Setup { want: Want::Epoll, single_issuer: false, fixed_buffers: 0, punt_reads: false };
         let fds = if waits == Waits::Any { fd_room() } else { 0 };
         Queue::new(Owned::new(ops, fds), setup).map_err(|r| setup_error(&r.error))
     };

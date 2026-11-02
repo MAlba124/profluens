@@ -69,6 +69,34 @@ pub struct TrackHead {
     pub rate: u32,
 }
 
+/// A video track timed at [`VIDEO_TIMESCALE`].
+pub fn video_head(id: u32, entry: Entry, width: u32, height: u32) -> TrackHead {
+    TrackHead {
+        id,
+        handler: Handler::Video,
+        entry,
+        timescale: VIDEO_TIMESCALE,
+        width,
+        height,
+        channels: 0,
+        rate: 0,
+    }
+}
+
+/// An audio track timed in its own samples.
+pub fn audio_head(id: u32, entry: Entry, rate: u32, channels: u16) -> TrackHead {
+    TrackHead {
+        id,
+        handler: Handler::Audio,
+        entry,
+        timescale: rate.max(1),
+        width: 0,
+        height: 0,
+        channels,
+        rate,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Edit {
     pub empty: u64,

@@ -4,9 +4,11 @@
 #![deny(unsafe_code)]
 
 pub mod boxes;
+pub mod cmaf;
 pub mod codec;
 pub mod edit;
 pub mod element;
+pub mod es;
 pub mod frag;
 pub mod ilst;
 pub mod mux;

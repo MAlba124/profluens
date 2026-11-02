@@ -442,29 +442,11 @@ impl Mp4Mux {
     }
 
     fn audio_head(lane: &Lane, entry: Entry, rate: u32, channels: u32) -> TrackHead {
-        TrackHead {
-            id: lane.id,
-            handler: Handler::Audio,
-            entry,
-            timescale: rate.max(1),
-            width: 0,
-            height: 0,
-            channels: channels.min(u16::MAX as u32) as u16,
-            rate,
-        }
+        writer::audio_head(lane.id, entry, rate, channels.min(u16::MAX as u32) as u16)
     }
 
     fn video_head(lane: &Lane, entry: Entry, width: u32, height: u32) -> TrackHead {
-        TrackHead {
-            id: lane.id,
-            handler: Handler::Video,
-            entry,
-            timescale: writer::VIDEO_TIMESCALE,
-            width,
-            height,
-            channels: 0,
-            rate: 0,
-        }
+        writer::video_head(lane.id, entry, width, height)
     }
 
     // Per buffer, the setup arms that allocate run once per track.

@@ -8,5 +8,9 @@ repository.workspace = true
 [lib]
 name = "pf_probe"
 
+[dependencies]
+# The fetch machines the `*At` heads are read through.
+profluens-core = { path = "../../core" }
+
 [lints]
 workspace = true

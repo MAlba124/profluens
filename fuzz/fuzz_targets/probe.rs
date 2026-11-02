@@ -1,39 +1,40 @@
 //! pf-probe typefind and the head readers over a file held in memory. Input is a knob byte then
-//! the file. Knob bits 0-2 pick the window `mp4_head_at` is handed (0, 8, 16, 100, 1024, 4096,
-//! 65536 bytes or all of it), bits 3-4 how its `read_at` answers (0 exact, 1 on to the end of
-//! the file, 2 half of what is asked, 3 refusing), bits 5-7 where the file is cut for the
-//! prefix checks, at `len * k / 7`. A head is the file's own bytes, what a box walk over the
-//! whole file gives however the window and the reads fall, and no read leaves the file.
+//! the file. Knob bits 0-2 pick the window `Mp4HeadAt` is handed (0, 8, 16, 100, 1024, 4096,
+//! 65536 bytes or all of it), bits 3-4 how its reads are answered (0 exact, 1 with nothing, 2
+//! half of what is asked, 3 refused), bits 5-7 where the file is cut for the prefix checks, at
+//! `len * k / 7`. A head is the file's own bytes, what a box walk over the whole file gives
+//! however the window and the reads fall, and no read leaves the file.
 
 #![no_main]
 // Fuzz target, not an element.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
-use std::cell::RefCell;
-
 use libfuzzer_sys::fuzz_target;
 use pf_probe::head::{
-    HeadError, MAX_MOOV, Mp4HeadError, avi_head_from, mfra_size, mkv_header_from, mp4_head_at,
-    mp4_mfra_at,
+    AviHeadAt, AviHeadError, HeadError, MAX_MOOV, MkvHeadAt, Mp4HeadAt, Mp4HeadError, Mp4MfraAt,
+    avi_head_from, mfra_size, mkv_header_from,
 };
 use pf_probe::{Kind, PREFIX_LEN, behind_id3, id3v2_len, probe};
+use profluens_core::fetch::{Fetch, Need, Step};
 
 const WINDOWS: [usize; 8] = [0, 8, 16, 100, 1024, 4096, 65536, usize::MAX];
 const MAX_BOXES: usize = 256;
 const MAX_MFRA: u64 = 16 << 20;
 const TAIL_FIRST: usize = 1 << 20;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Refused {
-    Always,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Reads {
     Exact,
-    ToEnd,
+    Nothing,
     Half,
     Refuse,
+}
+
+/// What [`drive`] ends with besides the machine's answer.
+#[derive(Debug, PartialEq, Eq)]
+enum Driven<E> {
+    Fetch(E),
+    Refused,
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -45,7 +46,7 @@ fuzz_target!(|data: &[u8]| {
     mkv(file, cut);
     avi(file, cut);
     let reads =
-        [Reads::Exact, Reads::ToEnd, Reads::Half, Reads::Refuse][usize::from(knob >> 3 & 3)];
+        [Reads::Exact, Reads::Nothing, Reads::Half, Reads::Refuse][usize::from(knob >> 3 & 3)];
     let window = &file[..WINDOWS[usize::from(knob & 7)].min(file.len())];
     let head = mp4(file, window, reads);
     let mfra = mfra(file, reads);
@@ -121,6 +122,14 @@ fn mkv(file: &[u8], cut: usize) {
         let Ok(whole) = &got else { panic!("a cut file found a head the whole has not") };
         assert!(whole.starts_with(&h), "a cut file found another head");
     }
+    let mut log = Vec::new();
+    let mut m = MkvHeadAt::new(1 << 20);
+    let read = drive(&mut m, file, Reads::Exact, &mut log);
+    if let Ok(h) = &read {
+        assert!(file.starts_with(&h.head), "a read head that is not the file's start");
+    }
+    assert_eq!(read, drive(&mut m, file, Reads::Exact, &mut log), "a head read twice differs");
+    assert!(log.iter().all(|n| n.len <= 12 || n.at == 0), "a read past the heads {log:?}");
 }
 
 fn avi(file: &[u8], cut: usize) {
@@ -134,6 +143,15 @@ fn avi(file: &[u8], cut: usize) {
     if let Ok(h) = avi_head_from(&file[..cut]) {
         assert_eq!(Some(&h), got.as_ref().ok(), "a cut file found another head");
     }
+    let mut log = Vec::new();
+    let read = drive(&mut AviHeadAt::new(file.len() + 1), file, Reads::Exact, &mut log);
+    match (&read, &got) {
+        (Ok(r), Ok(h)) => assert_eq!(r, h, "a read head other than the window's"),
+        (Err(Driven::Fetch(AviHeadError::NoMovi { read })), Err(_)) => {
+            assert_eq!(*read, file.len() as u64);
+        }
+        _ => panic!("{read:?} where the window gives {got:?}"),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -143,6 +161,14 @@ enum Walk {
     TooLarge,
     Truncated,
     Malformed,
+}
+
+/// No read of `log` leaves `file`.
+fn inside(file: &[u8], log: &[Need]) {
+    let len = file.len() as u64;
+    for &Need { at, len: n } in log {
+        assert!(at <= len && n as u64 <= len - at, "a read of {n} at {at} past {len}");
+    }
 }
 
 /// ISO/IEC 14496-12 section 4.2 boxes walked over the whole file in place.
@@ -193,65 +219,72 @@ fn walk(file: &[u8]) -> Walk {
     Walk::Head(head)
 }
 
-/// A `read_at` over `file` that logs each request and answers as `reads` says.
-fn reader<'a>(
-    file: &'a [u8],
+/// Runs `m` over `file`, each Need logged and answered as `reads` says, short past its end.
+fn drive<F: Fetch>(
+    m: &mut F,
+    file: &[u8],
     reads: Reads,
-    log: &'a RefCell<Vec<(u64, usize)>>,
-) -> impl Fn(u64, usize) -> Result<Vec<u8>, Refused> + 'a {
-    move |off, n| {
-        log.borrow_mut().push((off, n));
-        let len = file.len() as u64;
-        assert!(off <= len && n as u64 <= len - off, "a read of {n} at {off} past {len}");
-        let off = off as usize;
-        match reads {
-            Reads::Exact => Ok(file[off..off + n].to_vec()),
-            Reads::ToEnd => Ok(file[off..].to_vec()),
-            Reads::Half => Ok(file[off..off + n / 2].to_vec()),
-            Reads::Refuse => Err(Refused::Always),
+    log: &mut Vec<Need>,
+) -> Result<F::Out, Driven<F::Err>> {
+    loop {
+        match m.poll().map_err(Driven::Fetch)? {
+            Step::Done(out) => return Ok(out),
+            Step::Need(need) => {
+                log.push(need);
+                let at = usize::try_from(need.at).map_or(file.len(), |at| at.min(file.len()));
+                let held = need.len.min(file.len() - at);
+                let buf = m.buf();
+                assert_eq!(buf.len(), need.len, "a buffer other than the read");
+                let n = match reads {
+                    Reads::Exact => held,
+                    Reads::Nothing => 0,
+                    Reads::Half => held / 2,
+                    Reads::Refuse => return Err(Driven::Refused),
+                };
+                buf[..n].copy_from_slice(&file[at..at + n]);
+                m.filled(n);
+            }
         }
     }
 }
 
 fn mp4(file: &[u8], window: &[u8], reads: Reads) -> Walk {
-    let log = RefCell::new(Vec::new());
-    let read = reader(file, reads, &log);
-    let got = mp4_head_at(window, file.len() as u64, &read);
-    let again = mp4_head_at(window, file.len() as u64, &read);
+    let mut log = Vec::new();
+    let got = drive(&mut Mp4HeadAt::new(window, file.len() as u64), file, reads, &mut log);
+    let again = drive(&mut Mp4HeadAt::new(window, file.len() as u64), file, reads, &mut log);
     assert_eq!(format!("{got:?}"), format!("{again:?}"), "an mp4 head is not deterministic");
     let want = walk(file);
-    drop(read);
-    let log = log.into_inner();
+    inside(file, &log);
     assert!(log.len() <= 2 * (MAX_BOXES + 2), "{} reads", log.len());
-    for &(_, n) in &log {
-        assert!(n <= MAX_MOOV as usize + TAIL_FIRST, "a read of {n}");
+    for n in &log {
+        assert!(n.len <= MAX_MOOV as usize + TAIL_FIRST, "a read of {}", n.len);
     }
-    let lossy = matches!(reads, Reads::Half | Reads::Refuse);
+    let lossy = !matches!(reads, Reads::Exact);
     match got {
         Ok(h) => {
             assert!(h.len() as u64 <= 2 * MAX_MOOV && h.len() <= 2 * file.len(), "{}", h.len());
             assert_eq!(Walk::Head(h), want, "a head the walk does not give");
         }
-        Err(Mp4HeadError::NoMoov) => assert_eq!(want, Walk::NoMoov),
-        Err(Mp4HeadError::TooLarge { size, max, .. }) => {
+        Err(Driven::Fetch(Mp4HeadError::NoMoov)) => assert_eq!(want, Walk::NoMoov),
+        Err(Driven::Fetch(Mp4HeadError::TooLarge { size, max, .. })) => {
             assert!(size > max && max == MAX_MOOV);
             assert_eq!(want, Walk::TooLarge);
         }
-        Err(Mp4HeadError::Malformed { .. }) => assert_eq!(want, Walk::Malformed),
-        Err(Mp4HeadError::Truncated { .. }) => assert!(lossy || want == Walk::Truncated),
-        Err(Mp4HeadError::Unreadable { source, .. }) => {
-            assert!(reads == Reads::Refuse && source == Refused::Always);
+        Err(Driven::Fetch(Mp4HeadError::Malformed { .. })) => assert_eq!(want, Walk::Malformed),
+        Err(Driven::Fetch(Mp4HeadError::Truncated { .. })) => {
+            assert!(lossy || want == Walk::Truncated);
         }
+        Err(Driven::Refused) => assert!(reads == Reads::Refuse),
     }
     want
 }
 
 fn mfra(file: &[u8], reads: Reads) -> usize {
-    let log = RefCell::new(Vec::new());
-    let read = reader(file, reads, &log);
+    let mut log = Vec::new();
     let len = file.len() as u64;
-    let got = mp4_mfra_at(len, &read);
-    assert!(log.borrow().len() <= 2, "{} reads for an mfra", log.borrow().len());
+    let got = drive(&mut Mp4MfraAt::new(len), file, reads, &mut log).unwrap_or_default();
+    assert!(log.len() <= 2, "{} reads for an mfra", log.len());
+    inside(file, &log);
     let size = mfra_size(file).filter(|s| (16..=MAX_MFRA.min(len)).contains(s));
     if let Some(n) = mfra_size(file) {
         let t = &file[file.len() - 16..];
@@ -260,8 +293,8 @@ fn mfra(file: &[u8], reads: Reads) -> usize {
     }
     let want = size.map_or(&[][..], |s| &file[(len - s) as usize..]);
     match reads {
-        Reads::Exact | Reads::ToEnd => assert_eq!(got, want, "an mfra other than the file's"),
-        Reads::Half | Reads::Refuse => assert!(got.is_empty() || got == want),
+        Reads::Exact => assert_eq!(got, want, "an mfra other than the file's"),
+        Reads::Nothing | Reads::Half | Reads::Refuse => assert!(got.is_empty() || got == want),
     }
     got.len()
 }

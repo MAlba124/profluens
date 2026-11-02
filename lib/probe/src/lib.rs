@@ -1,5 +1,6 @@
 //! Typefind from a file's first bytes, and the head each container's demuxer is built from.
-//! App-side setup before any pipeline exists, std only.
+//! App-side setup before any pipeline exists, the heads read through `profluens-core` fetch
+//! machines.
 
 pub mod head;
 

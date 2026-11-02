@@ -23,7 +23,7 @@ const MAX_MOOV: u64 = 64 << 20;
 const MAX_BOXES: u32 = 256;
 const MAX_MFRA: u64 = 16 << 20;
 
-/// `lib/play`'s `mp4_head_at` over a file in memory.
+/// pf-probe's `Mp4HeadAt` over a file in memory.
 pub fn head(file: &[u8]) -> Option<Vec<u8>> {
     let len = file.len() as u64;
     let (mut at, mut mdat, mut moov) = (0u64, None, None);

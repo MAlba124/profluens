@@ -362,6 +362,9 @@ dependencies = [
 [[package]]
 name = "pf-probe"
 version = "0.1.0"
+dependencies = [
+ "profluens-core",
+]
 
 [[package]]
 name = "pf-ps"

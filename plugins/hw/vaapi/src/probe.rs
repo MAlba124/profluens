@@ -34,7 +34,11 @@ pub struct EncRefs {
 }
 
 impl EncRefs {
-    pub(crate) fn query(display: &Display, profile: ffi::VAProfile, entrypoint: ffi::VAEntrypoint) -> EncRefs {
+    pub(crate) fn query(
+        display: &Display,
+        profile: ffi::VAProfile,
+        entrypoint: ffi::VAEntrypoint,
+    ) -> EncRefs {
         let (l0, l1) = crate::enc::max_refs(display, profile, entrypoint);
         let direction = ffi::VAConfigAttribPredictionDirection;
         let gpb = crate::va::config_attribute(display, profile, entrypoint, direction)
@@ -71,7 +75,11 @@ impl VaCaps {
 
     /// Whether every profile of `family` the hardware decodes also scales in the decode call.
     pub fn shrinks(&self, family: &str) -> bool {
-        let mut decoded = self.profiles.iter().filter(|p| p.vld && family_named(p.name) == Some(family)).peekable();
+        let mut decoded = self
+            .profiles
+            .iter()
+            .filter(|p| p.vld && family_named(p.name) == Some(family))
+            .peekable();
         decoded.peek().is_some() && decoded.all(|p| p.dec_proc)
     }
 }

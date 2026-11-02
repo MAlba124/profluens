@@ -45,7 +45,12 @@ impl Dec {
                 let mut at = usize::from(u16::from_le_bytes([stream[6], stream[7]]));
                 let mut out = Vec::new();
                 while at + 12 <= stream.len() {
-                    let n = u32::from_le_bytes([stream[at], stream[at + 1], stream[at + 2], stream[at + 3]]) as usize;
+                    let n = u32::from_le_bytes([
+                        stream[at],
+                        stream[at + 1],
+                        stream[at + 2],
+                        stream[at + 3],
+                    ]) as usize;
                     out.push(stream[at + 12..at + 12 + n].to_vec());
                     at += 12 + n;
                 }
@@ -57,8 +62,12 @@ impl Dec {
     fn make(self, ch: &Arc<GpuFrameChannel>, shrink: Option<Target>) -> Box<dyn Element> {
         let ch = Arc::clone(ch);
         match (self, shrink) {
-            (Dec::Nal(Codec::H264), Some(t)) => Box::new(VaapiH264Dec::new_zerocopy(ch).with_shrink(t, true)),
-            (Dec::Nal(Codec::H265), Some(t)) => Box::new(VaapiH265Dec::new_zerocopy(ch).with_shrink(t, true)),
+            (Dec::Nal(Codec::H264), Some(t)) => {
+                Box::new(VaapiH264Dec::new_zerocopy(ch).with_shrink(t, true))
+            }
+            (Dec::Nal(Codec::H265), Some(t)) => {
+                Box::new(VaapiH265Dec::new_zerocopy(ch).with_shrink(t, true))
+            }
             (Dec::Vp9, Some(t)) => Box::new(VaapiVp9Dec::new_zerocopy(ch).with_shrink(t, true)),
             (Dec::Nal(Codec::H264), None) => Box::new(VaapiH264Dec::new_zerocopy(ch)),
             (Dec::Nal(Codec::H265), None) => Box::new(VaapiH265Dec::new_zerocopy(ch)),
@@ -69,7 +78,12 @@ impl Dec {
 
 /// The pictures of `units` decoded, scaled into `shrink` by the decoder when it is set, then into
 /// `target`'s box and read back by vaapipostproc.
-fn run(codec: Dec, units: &[Vec<u8>], shrink: Option<Target>, target: Target) -> (Vec<(Timestamp, Vec<u8>)>, Vec<String>) {
+fn run(
+    codec: Dec,
+    units: &[Vec<u8>],
+    shrink: Option<Target>,
+    target: Target,
+) -> (Vec<(Timestamp, Vec<u8>)>, Vec<String>) {
     let (tx, rx) = mpsc::channel();
     let mut p = Pipeline::new();
     p.set_pool(256 * 1024, 16);
@@ -120,7 +134,8 @@ fn black_rows(pic: &[u8], width: usize, rows: std::ops::Range<usize>, wide: bool
     let bps = if wide { 2 } else { 1 };
     rows.flat_map(|r| (0..width).map(move |x| (r, x))).all(|(r, x)| {
         let i = (r * width + x) * bps;
-        let v = if wide { u16::from_le_bytes([pic[i], pic[i + 1]]) >> 8 } else { u16::from(pic[i]) };
+        let v =
+            if wide { u16::from_le_bytes([pic[i], pic[i + 1]]) >> 8 } else { u16::from(pic[i]) };
         v.abs_diff(16) <= 1
     })
 }
@@ -128,7 +143,15 @@ fn black_rows(pic: &[u8], width: usize, rows: std::ops::Range<usize>, wide: bool
 /// The decoder shrinking into `shrink` then vaapipostproc into `target`, against vaapipostproc
 /// alone, `bar` rows black above and below in vaapipostproc's picture, `2 * bar` below in the
 /// decoder's, which places at the top left.
-fn check(test: &str, codec: Dec, profile: &str, stream: &[u8], shrink: Target, target: Target, bar: usize) {
+fn check(
+    test: &str,
+    codec: Dec,
+    profile: &str,
+    stream: &[u8],
+    shrink: Target,
+    target: Target,
+    bar: usize,
+) {
     if !shrinks(codec, profile, test) {
         return;
     }
@@ -136,16 +159,23 @@ fn check(test: &str, codec: Dec, profile: &str, stream: &[u8], shrink: Target, t
     let (vpp, vw) = run(codec, &units, None, target);
     let (dec, dw) = run(codec, &units, Some(shrink), target);
     assert!(vw.is_empty() && dw.is_empty(), "{test} warned {vw:?} {dw:?}");
-    assert_eq!((vpp.len(), dec.len()), (units.len(), units.len()), "{test} every picture both ways");
+    assert_eq!(
+        (vpp.len(), dec.len()),
+        (units.len(), units.len()),
+        "{test} every picture both ways"
+    );
     let (w, h) = (target.max_width as usize, target.max_height as usize);
     let wide = target.depth > 8;
     let mut worst = f64::INFINITY;
     // DUMP=DIR writes the first pair's luma as PGM
-    if let (Some(dir), Some((_, a)), Some((_, b))) = (std::env::var_os("DUMP"), vpp.first(), dec.first()) {
+    if let (Some(dir), Some((_, a)), Some((_, b))) =
+        (std::env::var_os("DUMP"), vpp.first(), dec.first())
+    {
         for (name, pic) in [("vpp", a), ("dec", b)] {
             let mut out = format!("P5 {w} {h} 255\n").into_bytes();
             out.extend((0..w * h).map(|i| if wide { pic[2 * i + 1] } else { pic[i] }));
-            std::fs::write(std::path::Path::new(&dir).join(format!("{test}_{name}.pgm")), out).expect("dump");
+            std::fs::write(std::path::Path::new(&dir).join(format!("{test}_{name}.pgm")), out)
+                .expect("dump");
         }
     }
     for ((pa, a), (pb, b)) in vpp.iter().zip(&dec) {
@@ -154,14 +184,29 @@ fn check(test: &str, codec: Dec, profile: &str, stream: &[u8], shrink: Target, t
         let bps = if wide { 2 } else { 1 };
         let (ra, rb) = (&a[bar * w * bps..(h - bar) * w * bps], &b[..(h - 2 * bar) * w * bps]);
         worst = worst.min(psnr(ra, rb, w * (h - 2 * bar), wide));
-        let luma: Vec<u16> = (0..w * h).map(|i| if wide { u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) >> 8 } else { u16::from(b[i]) }).collect();
-        let (lo, hi) = (luma.iter().copied().min().unwrap_or(0), luma.iter().copied().max().unwrap_or(0));
+        let luma: Vec<u16> = (0..w * h)
+            .map(|i| {
+                if wide {
+                    u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) >> 8
+                } else {
+                    u16::from(b[i])
+                }
+            })
+            .collect();
+        let (lo, hi) =
+            (luma.iter().copied().min().unwrap_or(0), luma.iter().copied().max().unwrap_or(0));
         assert!(hi - lo > 40, "{test} a picture, not a flat field, {lo}..{hi}");
-        assert!(black_rows(a, w, 0..bar, wide) && black_rows(b, w, h - 2 * bar..h, wide), "{test} bars black at {pb:?}");
+        assert!(
+            black_rows(a, w, 0..bar, wide) && black_rows(b, w, h - 2 * bar..h, wide),
+            "{test} bars black at {pb:?}"
+        );
     }
     eprintln!("{test}: {} pictures, worst luma psnr {worst:.1} dB", dec.len());
     // the same scaler on Gen9, about 33 dB apart on Gen12, a misplaced picture is near 15
-    assert!(worst > 28.0, "{test} the decoder's scale is the VPP's within the scalers' difference, {worst:.1} dB");
+    assert!(
+        worst > 28.0,
+        "{test} the decoder's scale is the VPP's within the scalers' difference, {worst:.1} dB"
+    );
 }
 
 const IPB: &[u8] = include_bytes!("fixtures/ipb_320x240.hevc");
@@ -184,7 +229,15 @@ fn h265_shrunk_into_a_taller_box_sits_in_black_bars() {
 
 #[test]
 fn main10_shrunk_in_the_decoder_stays_ten_bit() {
-    check("main10_shrunk", Dec::Nal(Codec::H265), "HEVCMain10", PQ, t(64, 64, 10), t(64, 64, 10), 0);
+    check(
+        "main10_shrunk",
+        Dec::Nal(Codec::H265),
+        "HEVCMain10",
+        PQ,
+        t(64, 64, 10),
+        t(64, 64, 10),
+        0,
+    );
 }
 
 /// A 10 bit SDR source to 8 bits, the decoder's scaler converts.
@@ -216,7 +269,11 @@ fn pq_shrunk_then_tone_mapped_is_the_vpp_scaling_then_tone_mapping() {
     let src = p.add(UnitSrc::new(units.clone()));
     let (a, b) = (GpuFrameChannel::new(), GpuFrameChannel::new());
     let dec = p.add(VaapiH265Dec::new_zerocopy(Arc::clone(&a)));
-    let v1 = p.add(VaapiPostProc::new_zerocopy(t(64, 64, 10), a).with_fixed_size().with_gpu_output(Arc::clone(&b)));
+    let v1 = p.add(
+        VaapiPostProc::new_zerocopy(t(64, 64, 10), a)
+            .with_fixed_size()
+            .with_gpu_output(Arc::clone(&b)),
+    );
     let v2 = p.add(VaapiPostProc::new_zerocopy(t(64, 64, 8), b).with_fixed_size());
     let sink = p.add(Collect(tx));
     p.preroll().expect("preroll");
@@ -241,7 +298,11 @@ fn pq_shrunk_then_tone_mapped_is_the_vpp_scaling_then_tone_mapping() {
         let db = psnr(a, b, 64 * 64, false);
         assert!(db > 50.0, "{test} at {pd:?} {db:.1} dB");
     }
-    let one_db = one.iter().zip(&dec).map(|(a, b)| psnr(&a.1, &b.1, 64 * 64, false)).fold(f64::INFINITY, f64::min);
+    let one_db = one
+        .iter()
+        .zip(&dec)
+        .map(|(a, b)| psnr(&a.1, &b.1, 64 * 64, false))
+        .fold(f64::INFINITY, f64::min);
     eprintln!("{test}: one VPP pass against the decoder's shrink, worst {one_db:.1} dB");
 }
 
@@ -251,10 +312,42 @@ fn pq_shrunk_then_tone_mapped_is_the_vpp_scaling_then_tone_mapping() {
 fn a_cropped_picture_is_the_vpps_picture() {
     let hevc = include_bytes!("fixtures/crop_320x236.hevc");
     let avc = include_bytes!("fixtures/crop_320x236.h264");
-    check("hevc_crop_1to1", Dec::Nal(Codec::H265), "HEVCMain", hevc, t(320, 236, 8), t(320, 236, 8), 0);
-    check("hevc_crop_half", Dec::Nal(Codec::H265), "HEVCMain", hevc, t(160, 118, 8), t(160, 118, 8), 0);
-    check("h264_crop_1to1", Dec::Nal(Codec::H264), "H264High", avc, t(320, 236, 8), t(320, 236, 8), 0);
-    check("h264_crop_half", Dec::Nal(Codec::H264), "H264High", avc, t(160, 118, 8), t(160, 118, 8), 0);
+    check(
+        "hevc_crop_1to1",
+        Dec::Nal(Codec::H265),
+        "HEVCMain",
+        hevc,
+        t(320, 236, 8),
+        t(320, 236, 8),
+        0,
+    );
+    check(
+        "hevc_crop_half",
+        Dec::Nal(Codec::H265),
+        "HEVCMain",
+        hevc,
+        t(160, 118, 8),
+        t(160, 118, 8),
+        0,
+    );
+    check(
+        "h264_crop_1to1",
+        Dec::Nal(Codec::H264),
+        "H264High",
+        avc,
+        t(320, 236, 8),
+        t(320, 236, 8),
+        0,
+    );
+    check(
+        "h264_crop_half",
+        Dec::Nal(Codec::H264),
+        "H264High",
+        avc,
+        t(160, 118, 8),
+        t(160, 118, 8),
+        0,
+    );
 }
 
 /// VP9 profile 0 and the 10 bit profile 2, shrunk and in bars, hidden frames and superframes in

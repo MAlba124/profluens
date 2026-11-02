@@ -16,11 +16,19 @@ fn main() {
         let open = t.elapsed();
         let t = Instant::now();
         drop(d);
-        println!("open {i}: {:.2} ms, close {:.2} ms", open.as_secs_f64() * 1e3, t.elapsed().as_secs_f64() * 1e3);
+        println!(
+            "open {i}: {:.2} ms, close {:.2} ms",
+            open.as_secs_f64() * 1e3,
+            t.elapsed().as_secs_f64() * 1e3
+        );
     }
     for i in 0..3 {
         let t = Instant::now();
         kept.push(Display::open(Path::new(node)).expect("open"));
-        println!("open {i} with {} held: {:.2} ms", kept.len() - 1, t.elapsed().as_secs_f64() * 1e3);
+        println!(
+            "open {i} with {} held: {:.2} ms",
+            kept.len() - 1,
+            t.elapsed().as_secs_f64() * 1e3
+        );
     }
 }

@@ -253,7 +253,8 @@ mod tests {
         let mut hdr = HdrStatic::default();
         assert!(sei_hdr(&hdr10_sei(), &mut hdr));
         assert_eq!(hdr_sei_rbsp(&hdr).as_deref(), Some(&hdr10_sei()[..]), "x265's bytes");
-        let light = HdrStatic { light: ContentLight { max_cll: 600, max_fall: 0 }, ..HdrStatic::default() };
+        let light =
+            HdrStatic { light: ContentLight { max_cll: 600, max_fall: 0 }, ..HdrStatic::default() };
         let mut back = HdrStatic::default();
         assert!(sei_hdr(&hdr_sei_rbsp(&light).expect("a light level"), &mut back));
         assert_eq!(back, light, "the light level alone");
@@ -262,11 +263,22 @@ mod tests {
 
     #[test]
     fn the_vui_states_what_is_known_and_unspecified_for_the_rest() {
-        let pq = StreamColor { transfer: Some(TransferFn::Pq), primaries: Some(Primaries::Bt2020), ..StreamColor::default() };
+        let pq = StreamColor {
+            transfer: Some(TransferFn::Pq),
+            primaries: Some(Primaries::Bt2020),
+            ..StreamColor::default()
+        };
         assert_eq!(vui_colour(&pq), Some((false, 9, 16, 2)));
-        let full = StreamColor { matrix: Some(Matrix::Bt709), range: Some(Range::Full), ..StreamColor::default() };
+        let full = StreamColor {
+            matrix: Some(Matrix::Bt709),
+            range: Some(Range::Full),
+            ..StreamColor::default()
+        };
         assert_eq!(vui_colour(&full), Some((true, 2, 2, 1)));
-        assert_eq!(vui_colour(&StreamColor { range: Some(Range::Full), ..StreamColor::default() }), None);
+        assert_eq!(
+            vui_colour(&StreamColor { range: Some(Range::Full), ..StreamColor::default() }),
+            None
+        );
     }
 
     #[test]

@@ -119,8 +119,12 @@ pub fn shrinking_decoder_for(
         return None;
     }
     match family {
-        "h264/annexb" => Some(Box::new(VaapiH264Dec::new_zerocopy(channel).with_shrink(target, fixed))),
-        "h265/annexb" => Some(Box::new(VaapiH265Dec::new_zerocopy(channel).with_shrink(target, fixed))),
+        "h264/annexb" => {
+            Some(Box::new(VaapiH264Dec::new_zerocopy(channel).with_shrink(target, fixed)))
+        }
+        "h265/annexb" => {
+            Some(Box::new(VaapiH265Dec::new_zerocopy(channel).with_shrink(target, fixed)))
+        }
         "vp9" => Some(Box::new(VaapiVp9Dec::new_zerocopy(channel).with_shrink(target, fixed))),
         _ => None,
     }

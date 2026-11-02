@@ -54,7 +54,9 @@ pub fn regions(crop: Rect, full: (u32, u32), place: Rect, bounds: (u32, u32)) ->
         return (crop, place);
     }
     let (px, py, pw, ph) = place;
-    let stretch = |p: u32, f: u32, c: u32| ((u64::from(p) * u64::from(f) + u64::from(c) / 2) / u64::from(c)) as u32;
+    let stretch = |p: u32, f: u32, c: u32| {
+        ((u64::from(p) * u64::from(f) + u64::from(c) / 2) / u64::from(c)) as u32
+    };
     let (dw, dh) = (stretch(pw, fw, cw), stretch(ph, fh, ch));
     let shown = |p: u32, s: u32, d: u32, b: u32| d > s && p + s < b;
     if shown(px, pw, dw, bounds.0) || shown(py, ph, dh, bounds.1) {
@@ -67,7 +69,13 @@ impl Twins {
     /// `crop` and `full` as [`regions`] takes them.
     // Cold: once per decoder session.
     #[allow(clippy::disallowed_methods)]
-    pub fn new(display: &Display, plan: Plan, count: u32, crop: Rect, full: (u32, u32)) -> Result<Twins, K> {
+    pub fn new(
+        display: &Display,
+        plan: Plan,
+        count: u32,
+        crop: Rect,
+        full: (u32, u32),
+    ) -> Result<Twins, K> {
         let (src, dst) = regions(crop, full, plan.place, (plan.width, plan.height));
         let extent = (plan.width.max(dst.0 + dst.2), plan.height.max(dst.1 + dst.3));
         let coded = (extent.0.next_multiple_of(ALIGN), extent.1.next_multiple_of(ALIGN));
@@ -174,11 +182,23 @@ mod tests {
     #[test]
     fn a_crop_at_the_origin_is_read_whole_and_stretched() {
         // 1036 shown of 1040 decoded, 1:1
-        assert_eq!(regions((0, 0, 1920, 1036), (1920, 1040), (0, 0, 1920, 1036), (1920, 1036)), ((0, 0, 1920, 1040), (0, 0, 1920, 1040)));
+        assert_eq!(
+            regions((0, 0, 1920, 1036), (1920, 1040), (0, 0, 1920, 1036), (1920, 1036)),
+            ((0, 0, 1920, 1040), (0, 0, 1920, 1040))
+        );
         // 2160 shown of 2176, to 1080p
-        assert_eq!(regions((0, 0, 3840, 2160), (3840, 2176), (0, 0, 1920, 1080), (1920, 1080)), ((0, 0, 3840, 2176), (0, 0, 1920, 1088)));
-        assert_eq!(regions((0, 0, 1920, 1080), (1920, 1080), (0, 0, 960, 540), (960, 540)), ((0, 0, 1920, 1080), (0, 0, 960, 540)));
-        assert_eq!(regions((8, 0, 1904, 1080), (1920, 1080), (0, 0, 952, 540), (952, 540)), ((8, 0, 1904, 1080), (0, 0, 952, 540)));
+        assert_eq!(
+            regions((0, 0, 3840, 2160), (3840, 2176), (0, 0, 1920, 1080), (1920, 1080)),
+            ((0, 0, 3840, 2176), (0, 0, 1920, 1088))
+        );
+        assert_eq!(
+            regions((0, 0, 1920, 1080), (1920, 1080), (0, 0, 960, 540), (960, 540)),
+            ((0, 0, 1920, 1080), (0, 0, 960, 540))
+        );
+        assert_eq!(
+            regions((8, 0, 1904, 1080), (1920, 1080), (0, 0, 952, 540), (952, 540)),
+            ((8, 0, 1904, 1080), (0, 0, 952, 540))
+        );
     }
 
     /// In a fixed box the stretched rest would land in the bars below or right of the picture,
@@ -187,10 +207,16 @@ mod tests {
     fn a_crop_in_bars_keeps_its_region() {
         // 2.39:1, 804 shown of 816, letterboxed in 1080p
         let crop = (0, 0, 1920, 804);
-        assert_eq!(regions(crop, (1920, 816), (0, 0, 1920, 804), (1920, 1080)), (crop, (0, 0, 1920, 804)));
+        assert_eq!(
+            regions(crop, (1920, 816), (0, 0, 1920, 804), (1920, 1080)),
+            (crop, (0, 0, 1920, 804))
+        );
         // pillarboxed, 1436 shown of 1440
         let crop = (0, 0, 1436, 1080);
-        assert_eq!(regions(crop, (1440, 1080), (0, 0, 1436, 1080), (1920, 1080)), (crop, (0, 0, 1436, 1080)));
+        assert_eq!(
+            regions(crop, (1440, 1080), (0, 0, 1436, 1080), (1920, 1080)),
+            (crop, (0, 0, 1436, 1080))
+        );
         // the same picture fitted, the rest lands past the box
         let (src, dst) = regions((0, 0, 1920, 804), (1920, 816), (0, 0, 1920, 804), (1920, 804));
         assert_eq!((src, dst), ((0, 0, 1920, 816), (0, 0, 1920, 816)));
@@ -200,6 +226,9 @@ mod tests {
     fn the_scaler_goes_no_further_than_an_eighth() {
         assert!(plan(7680, 4320, 8, t(960, 540, 8), true).is_some(), "an eighth");
         assert!(plan(7680, 4320, 8, t(640, 360, 8), true).is_none(), "a twelfth");
-        assert!(plan(1280, 720, 8, t(1920, 1080, 8), true).is_some(), "fixed, a smaller picture fills the box");
+        assert!(
+            plan(1280, 720, 8, t(1920, 1080, 8), true).is_some(),
+            "fixed, a smaller picture fills the box"
+        );
     }
 }

@@ -109,8 +109,12 @@ const fn desc(
     }
 }
 
-static STREAMS: [OfferDesc; 4] =
-    [OfferDesc::any("h264/annexb"), OfferDesc::any("h265/annexb"), OfferDesc::any("av1"), OfferDesc::any("vp9")];
+static STREAMS: [OfferDesc; 4] = [
+    OfferDesc::any("h264/annexb"),
+    OfferDesc::any("h265/annexb"),
+    OfferDesc::any("av1"),
+    OfferDesc::any("vp9"),
+];
 static TAKEN: [OfferDesc; 3] =
     [OfferDesc::any("h264/annexb"), OfferDesc::any("h265/annexb"), OfferDesc::any("video/raw")];
 static SRC_PADS: [PadDesc; 1] = [PadDesc { name: "src", offers: &STREAMS }];

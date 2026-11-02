@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 use crate::decproc::{self, Twins};
 use crate::error::{Transient, VaapiErrorKind as K, Verdict, Warned, failed, log_fatal};
-use crate::vpp::Target;
 use crate::ffi;
 use crate::gpuframe::{
     self, F_LAYOUT, F_MODIFIER, FAMILY_VIDEO_GPU, FrameToken, FrameTx, GPU_FRAME_HEADER_LEN,
@@ -34,9 +33,10 @@ use crate::h264parse::{
 };
 use crate::probe;
 use crate::va::{
-    Buffer as VaBuffer, Config, Context, Display, ExportFn, ExportedSurface, MappedImage, SurfaceFormat,
-    Surfaces,
+    Buffer as VaBuffer, Config, Context, Display, ExportFn, ExportedSurface, MappedImage,
+    SurfaceFormat, Surfaces,
 };
+use crate::vpp::Target;
 use profluens_video::color::{self as colour, HdrStatic};
 use profluens_video::decoder::{Color, color_fields};
 use profluens_video::format::COLOR_OFFER_FIELDS;
@@ -436,7 +436,10 @@ impl VaapiH264Dec {
             };
         // the decoded picture is whole macroblocks, frame cropping the crop
         let crop = (crop_x, crop_y, width, height);
-        let twins = match shrink.map(|p| Twins::new(display, p, count, crop, (coded_w, coded_h))).transpose() {
+        let twins = match shrink
+            .map(|p| Twins::new(display, p, count, crop, (coded_w, coded_h)))
+            .transpose()
+        {
             Ok(t) => t,
             Err(e) => {
                 self.fail(ctx, e);

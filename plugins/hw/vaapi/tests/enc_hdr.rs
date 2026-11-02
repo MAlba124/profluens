@@ -15,7 +15,9 @@ use pf_harness::Harness;
 use profluens_core::id::{SinkPad, SrcPad};
 use profluens_core::pipeline::Pipeline;
 use profluens_core::time::Timestamp;
-use profluens_video::color::{ContentLight, HdrStatic, Mastering, Matrix, Primaries, Range, StreamColor, TransferFn};
+use profluens_video::color::{
+    ContentLight, HdrStatic, Mastering, Matrix, Primaries, Range, StreamColor, TransferFn,
+};
 
 use pf_vaapi::gpuframe::GpuFrameChannel;
 use pf_vaapi::{VaapiH265Dec, VaapiH265Enc};
@@ -74,7 +76,8 @@ fn transcode(units: &[Vec<u8>]) -> Vec<Vec<u8>> {
 fn hdr10_keeps_its_colour_and_metadata_through_the_encoder() {
     let test = "hdr10_keeps_its_colour";
     let ok = pf_vaapi::probe().is_some_and(|c| {
-        c.decodes_profile("HEVCMain10") && c.profiles.iter().any(|p| p.name == "HEVCMain10" && (p.enc || p.enc_lp))
+        c.decodes_profile("HEVCMain10")
+            && c.profiles.iter().any(|p| p.name == "HEVCMain10" && (p.enc || p.enc_lp))
     });
     if !ok {
         return eprintln!("skip {test}: no HEVC Main 10 decode and encode");
@@ -83,9 +86,13 @@ fn hdr10_keeps_its_colour_and_metadata_through_the_encoder() {
     let out = transcode(&units);
     assert_eq!(out.len(), units.len(), "{test} every picture encoded");
     // a prefix SEI after the parameter sets and before the IDR's slice
-    let types: Vec<u8> = out[0].windows(4).filter(|w| w[..3] == [0, 0, 1]).map(|w| (w[3] >> 1) & 0x3F).collect();
+    let types: Vec<u8> =
+        out[0].windows(4).filter(|w| w[..3] == [0, 0, 1]).map(|w| (w[3] >> 1) & 0x3F).collect();
     let at = |t: u8| types.iter().position(|&x| x == t);
-    assert!(at(34) < at(39) && at(39) < types.iter().position(|&x| x < 32), "{test} order {types:?}");
+    assert!(
+        at(34) < at(39) && at(39) < types.iter().position(|&x| x < 32),
+        "{test} order {types:?}"
+    );
     let mut h = Harness::with_pool(VaapiH265Dec::new(), 128 * 128 * 3, 8);
     h.fix_sink_format(VaapiH265Dec::IN, "h265/annexb", &[]);
     for (i, au) in out.iter().enumerate() {

@@ -290,7 +290,11 @@ impl Config {
 /// says so first. A driver without it, or a failure, is left to the sync after.
 // `dpy` outlives the call, the element owns it on its single thread.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn wait_surface(dpy: ffi::VADisplay, surface: ffi::VASurfaceID, stop: impl Fn() -> bool) -> bool {
+pub fn wait_surface(
+    dpy: ffi::VADisplay,
+    surface: ffi::VASurfaceID,
+    stop: impl Fn() -> bool,
+) -> bool {
     loop {
         // SAFETY: surface is a live surface on this display.
         let status = unsafe { ffi::vaSyncSurface2(dpy, surface, WAIT_STEP_NS) };

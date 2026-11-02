@@ -436,7 +436,10 @@ fn pps_extensions(r: &mut BitReader, transform_skip: bool) -> Option<(PpsRange, 
         }
         p.log2_sao_offset_scale_luma = r.ue();
         p.log2_sao_offset_scale_chroma = r.ue();
-        if p.log2_max_transform_skip_block_size_minus2 > 3 || p.log2_sao_offset_scale_luma > 6 || p.log2_sao_offset_scale_chroma > 6 {
+        if p.log2_max_transform_skip_block_size_minus2 > 3
+            || p.log2_sao_offset_scale_luma > 6
+            || p.log2_sao_offset_scale_chroma > 6
+        {
             return None;
         }
     }
@@ -607,7 +610,10 @@ fn skip_profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> (bo
             r.u(8); // sub_layer_level_idc
         }
     }
-    (general_profile_idc == 1 || general_profile_idc == 2 || compat_main, general_profile_idc == 4 || compat_rext)
+    (
+        general_profile_idc == 1 || general_profile_idc == 2 || compat_main,
+        general_profile_idc == 4 || compat_rext,
+    )
 }
 
 /// The VUI past the chroma location, where [`crate::colour::vui_signal`] leaves the reader, to

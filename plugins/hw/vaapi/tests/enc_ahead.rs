@@ -32,10 +32,16 @@ fn encode(hevc: bool, ahead: Option<(u32, u32)>) -> Vec<(Timestamp, Vec<u8>)> {
     let src = p.add(UnitSrc::new(Codec::H264.units(IPB)));
     let dec = p.add(VaapiH264Dec::new_zerocopy(Arc::clone(&ch)));
     let enc: Box<dyn Element> = match (hevc, ahead) {
-        (true, Some((w, h))) => Box::new(VaapiH265Enc::new_zerocopy(ch).with_fps(25, 1).with_bitrate(1000).with_ahead(w, h)),
+        (true, Some((w, h))) => Box::new(
+            VaapiH265Enc::new_zerocopy(ch).with_fps(25, 1).with_bitrate(1000).with_ahead(w, h),
+        ),
         (true, None) => Box::new(VaapiH265Enc::new_zerocopy(ch).with_fps(25, 1).with_bitrate(1000)),
-        (false, Some((w, h))) => Box::new(VaapiH264Enc::new_zerocopy(ch).with_fps(25, 1).with_bitrate(1000).with_ahead(w, h)),
-        (false, None) => Box::new(VaapiH264Enc::new_zerocopy(ch).with_fps(25, 1).with_bitrate(1000)),
+        (false, Some((w, h))) => Box::new(
+            VaapiH264Enc::new_zerocopy(ch).with_fps(25, 1).with_bitrate(1000).with_ahead(w, h),
+        ),
+        (false, None) => {
+            Box::new(VaapiH264Enc::new_zerocopy(ch).with_fps(25, 1).with_bitrate(1000))
+        }
     };
     let enc = p.add_boxed(enc);
     let sink = p.add(Collect(tx));

@@ -209,15 +209,8 @@ mod lav {
     pub const AGAIN: u8 = 0x40;
 }
 
-pub const TARGETS: [&str; 7] = [
-    "vaapi_h264",
-    "vaapi_h265",
-    "vaapi_av1",
-    "vaapi_vp9",
-    "libav_dec",
-    "opus_dec",
-    "probe",
-];
+pub const TARGETS: [&str; 7] =
+    ["vaapi_h264", "vaapi_h265", "vaapi_av1", "vaapi_vp9", "libav_dec", "opus_dec", "probe"];
 
 /// opus_dec knobs: s16 at 48 kHz, f32, s16 at 16 kHz with a sink delay, f32 at 24 kHz in batches
 /// of two.

@@ -92,7 +92,8 @@ pub fn mkv_header_from(window: &[u8]) -> Result<Vec<u8>, HeadError> {
         if id == CLUSTER {
             return Ok(window[..at as usize].to_vec());
         }
-        let Some(end) = size.and_then(|s| data.checked_add(s)).filter(|&e| e <= window.len() as u64)
+        let Some(end) =
+            size.and_then(|s| data.checked_add(s)).filter(|&e| e <= window.len() as u64)
         else {
             break;
         };

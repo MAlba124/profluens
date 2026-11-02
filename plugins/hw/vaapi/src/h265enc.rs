@@ -23,7 +23,6 @@ use profluens_core::time::Timestamp;
 
 use crate::bitwriter::{BitWriter, annexb_nal};
 use crate::colour;
-use profluens_video::color::StreamColor;
 use crate::enc::{self, EncEngine, FrameBufs, InFormat, PadOut, RawPixFmt, Staged, Stamp};
 use crate::encshell;
 use crate::error::{VaapiErrorKind as K, Warned, failed};
@@ -33,6 +32,7 @@ use crate::gpuin::{self, GpuIn, Input};
 use crate::h264parse;
 use crate::probe;
 use crate::va::{self, Buffer as VaBuffer, Display, SurfaceFormat};
+use profluens_video::color::StreamColor;
 
 const FAM_ANNEXB: &str = "h265/annexb";
 const FAM_HVCC: &str = "h265/hvcc";
@@ -428,11 +428,15 @@ impl VaapiH265Enc {
         let rc_mode = if self.bitrate_kbps > 0 { ffi::VA_RC_VBR } else { ffi::VA_RC_CQP };
         let (mut opened, mut refused) = (None, None);
         for entrypoint in order.into_iter().flatten() {
-            let packed_mask =
-                va::config_attribute(display, profile, entrypoint, ffi::VAConfigAttribEncPackedHeaders)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
+            let packed_mask = va::config_attribute(
+                display,
+                profile,
+                entrypoint,
+                ffi::VAConfigAttribEncPackedHeaders,
+            )
+            .ok()
+            .flatten()
+            .unwrap_or(0);
             // a driver that takes no P slice wants low delay B, both lists the previous pictures
             // (as ffmpeg's p_to_gpb)
             let r = probe::EncRefs::query(display, profile, entrypoint);
@@ -476,7 +480,8 @@ impl VaapiH265Enc {
         let vps_nal = write_vps(level_idc, ten, refs);
         let colour = colour::vui_colour(self.pinned.as_ref().unwrap_or(&self.color));
         let sps_nal = write_sps(engine.coded(), fmt, level_idc, ctb_log2, refs, colour);
-        let sei = colour::hdr_sei_rbsp(&self.color.hdr).map(|r| annexb_nal(&nal_header(NAL_PREFIX_SEI), &r));
+        let sei = colour::hdr_sei_rbsp(&self.color.hdr)
+            .map(|r| annexb_nal(&nal_header(NAL_PREFIX_SEI), &r));
         let pps_nal = write_pps(self.qp, brc, ctb_log2, refs);
         let ctu_count =
             engine.coded_w.div_ceil(1 << ctb_log2) * engine.coded_h.div_ceil(1 << ctb_log2);
@@ -567,7 +572,8 @@ impl VaapiH265Enc {
                     ctx.wake_within(enc::POLL_WAKE);
                     return Ok(false);
                 }
-                // read by the map below, iHD fails every picture after a coded buffer destroyed unread
+                // read by the map below, iHD fails every picture after a coded buffer destroyed
+                // unread
                 Err(e) => self.warn(ctx, K::Encode(e)),
             }
         }
@@ -584,7 +590,8 @@ impl VaapiH265Enc {
             self.warn(ctx, K::Encode(e));
             return Ok(true);
         }
-        if let (true, Some(sei)) = (f.stamp.key, self.session.as_ref().and_then(|s| s.sei.as_ref())) {
+        if let (true, Some(sei)) = (f.stamp.key, self.session.as_ref().and_then(|s| s.sei.as_ref()))
+        {
             insert_before_slices(&mut b.coded, sei);
         }
         log!(&*ctx, Level::Trace, "encoded", bytes = b.coded.len(), key = f.stamp.key);
@@ -1313,7 +1320,8 @@ impl Element for VaapiH265Enc {
         }
         let ahead = self.ahead.zip(self.gpu.as_ref().and_then(|g| Some((g.link?.0, g.fps))));
         if let Some(((width, height), (kind, fps))) = ahead {
-            let pixfmt = if kind == crate::vpp::format::P010 { RawPixFmt::P010 } else { RawPixFmt::Nv12 };
+            let pixfmt =
+                if kind == crate::vpp::format::P010 { RawPixFmt::P010 } else { RawPixFmt::Nv12 };
             if self.ensure_display(ctx) {
                 self.ensure_session(ctx, InFormat { width, height, pixfmt, fps });
             }
@@ -1652,7 +1660,8 @@ mod tests {
             return eprintln!("skip {test}: no encode entrypoint");
         }
         let (w, h) = (128u32, 64u32);
-        let mut hx = pf_harness::Harness::with_pool(VaapiH265Enc::new().with_bitrate(500), 256 * 1024, 16);
+        let mut hx =
+            pf_harness::Harness::with_pool(VaapiH265Enc::new().with_bitrate(500), 256 * 1024, 16);
         hx.fix_sink_format(
             VaapiH265Enc::IN,
             "video/raw",
@@ -1663,7 +1672,9 @@ mod tests {
                 ("fps", ValueDesc::Rat(25, 1)),
             ],
         );
-        let frame = |i: u64| -> Vec<u8> { (0..(w * h * 3 / 2) as usize).map(|p| ((p as u64 + i * 7) % 220 + 16) as u8).collect() };
+        let frame = |i: u64| -> Vec<u8> {
+            (0..(w * h * 3 / 2) as usize).map(|p| ((p as u64 + i * 7) % 220 + 16) as u8).collect()
+        };
         for i in 0..4u64 {
             let mut b = hx.alloc(&frame(i));
             b.pts = Timestamp::from_nanos(i * 40_000_000);

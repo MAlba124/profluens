@@ -38,7 +38,10 @@ fn run(encode: bool) -> Vec<Vec<u8>> {
     let sink = p.add(Collect(tx));
     let next = match encode {
         true => p.add(VaapiH265Enc::new_zerocopy(ch).with_fps(25, 1).with_gop(120).with_qp(26)),
-        false => p.add(VaapiPostProc::new_zerocopy(Target { max_width: W as u32, max_height: H as u32, depth: 8 }, ch)),
+        false => p.add(VaapiPostProc::new_zerocopy(
+            Target { max_width: W as u32, max_height: H as u32, depth: 8 },
+            ch,
+        )),
     };
     p.preroll().expect("preroll");
     p.link(src.src(SrcPad(0)), dec.sink(SinkPad(0))).expect("src to decoder");
@@ -56,7 +59,9 @@ fn run(encode: bool) -> Vec<Vec<u8>> {
 
 #[test]
 fn moving_pictures_decode_back_to_what_the_encoder_took() {
-    let ok = pf_vaapi::probe().is_some_and(|c| c.supports("h264/annexb") && c.supports("h265/annexb") && c.supports_encode("h265/annexb"));
+    let ok = pf_vaapi::probe().is_some_and(|c| {
+        c.supports("h264/annexb") && c.supports("h265/annexb") && c.supports_encode("h265/annexb")
+    });
     if !ok {
         return eprintln!("skip: no H.264 decode, HEVC decode and encode");
     }
@@ -77,7 +82,9 @@ fn moving_pictures_decode_back_to_what_the_encoder_took() {
     let mut worst = f64::INFINITY;
     for (i, (a, b)) in input.iter().zip(&back).enumerate() {
         let a = &a[..W * H];
-        let mse = a.iter().zip(b).map(|(x, y)| (f64::from(*x) - f64::from(*y)).powi(2)).sum::<f64>() / (W * H) as f64;
+        let mse =
+            a.iter().zip(b).map(|(x, y)| (f64::from(*x) - f64::from(*y)).powi(2)).sum::<f64>()
+                / (W * H) as f64;
         let db = if mse == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 / mse).log10() };
         worst = worst.min(db);
         assert!(db > 38.0, "picture {i} decodes {db:.1} dB from the encoder's input");

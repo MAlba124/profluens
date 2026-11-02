@@ -4,10 +4,10 @@
 // Test code.
 #![allow(clippy::disallowed_methods)]
 
+use pf_harness::Harness;
 use pf_vaapi::ffi;
 use pf_vaapi::va::{Display, ReadbackImage, UploadImage};
 use pf_vaapi::vpp::format::{self, Kind, P010};
-use pf_harness::Harness;
 use pf_vaapi::vpp::proc::{Color, Hdr10, Out, Proc, Src, surfaces};
 use pf_vaapi::vpp::{Target, VaapiPostProc};
 use profluens_core::format::ValueDesc;
@@ -137,7 +137,9 @@ fn through_element(depth: u8, transfer: &'static str) -> (Vec<u8>, StreamColor) 
     let target = Target { max_width: 192, max_height: 108, depth };
     let mut hn = Harness::with_pool(VaapiPostProc::new(target), 2 << 20, 8);
     let m = mastering();
-    let pack = |a: [u16; 4]| ((a[0] as u64) << 48 | (a[1] as u64) << 32 | (a[2] as u64) << 16 | a[3] as u64) as i64;
+    let pack = |a: [u16; 4]| {
+        ((a[0] as u64) << 48 | (a[1] as u64) << 32 | (a[2] as u64) << 16 | a[3] as u64) as i64
+    };
     let [r, g, b] = m.primaries;
     hn.fix_sink_format(
         VaapiPostProc::IN,
@@ -152,7 +154,12 @@ fn through_element(depth: u8, transfer: &'static str) -> (Vec<u8>, StreamColor) 
             ("primaries", ValueDesc::Id("bt2020")),
             ("mastering-rg", ValueDesc::Int(pack([r[0], r[1], g[0], g[1]]))),
             ("mastering-bw", ValueDesc::Int(pack([b[0], b[1], m.white[0], m.white[1]]))),
-            ("mastering-luminance", ValueDesc::Int(((m.max_luminance as u64) << 32 | u64::from(m.min_luminance)) as i64)),
+            (
+                "mastering-luminance",
+                ValueDesc::Int(
+                    ((m.max_luminance as u64) << 32 | u64::from(m.min_luminance)) as i64,
+                ),
+            ),
             ("content-light", ValueDesc::Int(i64::from(m.max_cll) << 16 | i64::from(m.max_fall))),
         ],
     );
@@ -178,7 +185,11 @@ fn the_element_tone_maps_pq_to_an_sdr_picture_that_says_so() {
     eprintln!("bands 1, 100, 10000 cd/m2 came out as Y {y:?}");
     // the PQ codes as they are would read 48, 127, 235
     assert!(y[0] < y[1] && y[1] < y[2] && y[0] < 35 && y[2] > 180, "tone mapped, {y:?}");
-    assert_eq!((c.transfer, c.primaries), (Some(TransferFn::Bt709), Some(Primaries::Bt709)), "{c:?}");
+    assert_eq!(
+        (c.transfer, c.primaries),
+        (Some(TransferFn::Bt709), Some(Primaries::Bt709)),
+        "{c:?}"
+    );
     assert!(c.hdr.is_empty(), "no mastering display past the tone map, {c:?}");
 }
 
@@ -191,7 +202,9 @@ fn ten_bits_out_keep_the_pq_samples_and_their_colour() {
     let (pic, c) = through_element(10, "pq");
     let (w, h) = (192usize, 108usize);
     assert_eq!(pic.len(), w * h * 3, "p010");
-    let at = |x: usize| u16::from_le_bytes([pic[2 * (h / 2 * w + x)], pic[2 * (h / 2 * w + x) + 1]]) >> 6;
+    let at = |x: usize| {
+        u16::from_le_bytes([pic[2 * (h / 2 * w + x)], pic[2 * (h / 2 * w + x) + 1]]) >> 6
+    };
     let y = [at(w / 6), at(w / 2), at(w * 5 / 6)];
     for (got, want) in y.iter().zip(BANDS) {
         assert!(got.abs_diff(want) <= 4, "PQ codes kept, {y:?}");

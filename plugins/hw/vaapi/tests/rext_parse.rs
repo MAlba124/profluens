@@ -13,8 +13,16 @@ const HRD: &[u8] = include_bytes!("fixtures/rext12_hrd_sets.hevc");
 
 fn sets(stream: &[u8]) -> (h265parse::Sps, h265parse::Pps) {
     let nals = split_nals(stream);
-    let sps = nals.iter().find(|n| n.nal_type == 33).and_then(|n| parse_sps(n.raw(stream))).expect("an SPS");
-    let pps = nals.iter().find(|n| n.nal_type == 34).and_then(|n| parse_pps(n.raw(stream))).expect("a PPS");
+    let sps = nals
+        .iter()
+        .find(|n| n.nal_type == 33)
+        .and_then(|n| parse_sps(n.raw(stream)))
+        .expect("an SPS");
+    let pps = nals
+        .iter()
+        .find(|n| n.nal_type == 34)
+        .and_then(|n| parse_pps(n.raw(stream)))
+        .expect("a PPS");
     (sps, pps)
 }
 
@@ -35,7 +43,8 @@ fn x265_main12_parses_through_every_slice() {
     let mut prev = None;
     let mut slices = 0;
     for n in nals.iter().filter(|n| n.nal_type < 32) {
-        let sh = parse_slice_header_after(n.raw(X265), n.nal_type, &sps, &pps, prev.as_ref()).expect("a slice header");
+        let sh = parse_slice_header_after(n.raw(X265), n.nal_type, &sps, &pps, prev.as_ref())
+            .expect("a slice header");
         prev = Some(sh);
         slices += 1;
     }
@@ -46,5 +55,8 @@ fn x265_main12_parses_through_every_slice() {
 #[test]
 fn main10_is_still_main10() {
     let (sps, _) = sets(include_bytes!("fixtures/hdr10_128x128.hevc"));
-    assert_eq!((sps.depth(), sps.rext, sps.has_extension, sps.supported()), (10, false, false, true));
+    assert_eq!(
+        (sps.depth(), sps.rext, sps.has_extension, sps.supported()),
+        (10, false, false, true)
+    );
 }

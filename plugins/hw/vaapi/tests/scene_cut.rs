@@ -33,8 +33,12 @@ fn idrs(hevc: bool) -> Vec<usize> {
     let src = p.add(UnitSrc::new(Codec::H264.units(CUT)));
     let dec = p.add(VaapiH264Dec::new_zerocopy(Arc::clone(&ch)));
     let enc: Box<dyn Element> = match hevc {
-        true => Box::new(VaapiH265Enc::new_zerocopy(ch).with_fps(25, 1).with_gop(120).with_bitrate(1000)),
-        false => Box::new(VaapiH264Enc::new_zerocopy(ch).with_fps(25, 1).with_gop(120).with_bitrate(1000)),
+        true => Box::new(
+            VaapiH265Enc::new_zerocopy(ch).with_fps(25, 1).with_gop(120).with_bitrate(1000),
+        ),
+        false => Box::new(
+            VaapiH264Enc::new_zerocopy(ch).with_fps(25, 1).with_gop(120).with_bitrate(1000),
+        ),
     };
     let enc = p.add_boxed(enc);
     let sink = p.add(Collect(tx));
@@ -62,7 +66,8 @@ fn idrs(hevc: bool) -> Vec<usize> {
 
 fn device(test: &str, hevc: bool) -> bool {
     let ok = pf_vaapi::probe().is_some_and(|c| {
-        c.supports("h264/annexb") && c.supports_encode(if hevc { "h265/annexb" } else { "h264/annexb" })
+        c.supports("h264/annexb")
+            && c.supports_encode(if hevc { "h265/annexb" } else { "h264/annexb" })
     });
     if !ok {
         eprintln!("skip {test}: no VA-API H.264 decode and the encoder");

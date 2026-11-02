@@ -412,9 +412,19 @@ impl VaapiPostProc {
             let dst = surfaces(d, NV12, w, h, 1).map_err(K::SessionSetup)?;
             let tm = proc.tone_map(&hdr10_of(&HdrStatic::default())).map_err(K::SessionSetup)?;
             let pq = Color::explicit(9, 16, 9, ffi::VA_SOURCE_RANGE_REDUCED);
-            let out = Out { surface: dst.ids()[0], place: (0, 0, w, h), fill: false, color: Color::SDR, rotation: 0 };
-            proc.run(Src { surface: src.ids()[0], at: (0, 0), size: (w, h), color: pq }, out, Some(&tm))
-                .map_err(K::Process)?;
+            let out = Out {
+                surface: dst.ids()[0],
+                place: (0, 0, w, h),
+                fill: false,
+                color: Color::SDR,
+                rotation: 0,
+            };
+            proc.run(
+                Src { surface: src.ids()[0], at: (0, 0), size: (w, h), color: pq },
+                out,
+                Some(&tm),
+            )
+            .map_err(K::Process)?;
             crate::va::sync_surface(d, dst.ids()[0]).map_err(K::Process)?;
         }
         self.warm = Some(proc);
@@ -764,7 +774,10 @@ impl VaapiPostProc {
             }
             let color = explicit_of(&self.color);
             let tone = s.tone.as_ref().map(|(t, _)| t);
-            if s.proc.run(Src { surface: src, at: src_at, size, color }, place(Color::SDR), tone).is_ok() {
+            if s.proc
+                .run(Src { surface: src, at: src_at, size, color }, place(Color::SDR), tone)
+                .is_ok()
+            {
                 return Ok(());
             }
             // iHD 26.1 on Gen9 refuses an HLG source this way
@@ -773,7 +786,9 @@ impl VaapiPostProc {
         }
         let s = self.session.as_mut().ok_or(K::NoDevice)?;
         let color = color_of(&self.color, f.height);
-        s.proc.run(Src { surface: src, at: src_at, size, color }, place(color), None).map_err(K::Process)
+        s.proc
+            .run(Src { surface: src, at: src_at, size, color }, place(color), None)
+            .map_err(K::Process)
     }
 
     fn send(

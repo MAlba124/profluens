@@ -1523,7 +1523,10 @@ mod layout {
         assert_eq!(size_of::<VASliceParameterBufferHEVCRext>(), 188);
         assert_eq!(size_of::<VASliceParameterBufferHEVCExtension>(), 452);
         assert_eq!(std::mem::offset_of!(VASliceParameterBufferHEVCRext, slice_ext_flags), 180);
-        assert_eq!(std::mem::offset_of!(VASliceParameterBufferHEVCRext, slice_act_y_qp_offset), 184);
+        assert_eq!(
+            std::mem::offset_of!(VASliceParameterBufferHEVCRext, slice_act_y_qp_offset),
+            184
+        );
     }
 
     #[test]

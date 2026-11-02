@@ -627,8 +627,15 @@ impl MiscParam for ffi::VAEncMiscParameterBufferQualityLevel {}
 pub(crate) const QUALITY_BALANCED: u32 = 4;
 
 /// The quality level misc buffer, 1 best to 7 fastest.
-pub(crate) fn quality_buffer(display: &Display, engine: &EncEngine, level: u32) -> VaResult<VaBuffer> {
-    let q = ffi::VAEncMiscParameterBufferQualityLevel { quality_level: level, va_reserved: [0; ffi::VA_PADDING_LOW] };
+pub(crate) fn quality_buffer(
+    display: &Display,
+    engine: &EncEngine,
+    level: u32,
+) -> VaResult<VaBuffer> {
+    let q = ffi::VAEncMiscParameterBufferQualityLevel {
+        quality_level: level,
+        va_reserved: [0; ffi::VA_PADDING_LOW],
+    };
     misc_buffer(display, engine, ffi::VAEncMiscParameterTypeQualityLevel, &q)
 }
 

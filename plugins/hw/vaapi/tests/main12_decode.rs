@@ -59,7 +59,8 @@ fn psnr10(a: &[u8], b: &[u8], n: usize) -> f64 {
 }
 
 fn main12(test: &str) -> bool {
-    let ok = pf_vaapi::probe().is_some_and(|c| c.decodes_profile("HEVCMain12") && c.shrinks("h265/annexb"));
+    let ok = pf_vaapi::probe()
+        .is_some_and(|c| c.decodes_profile("HEVCMain12") && c.shrinks("h265/annexb"));
     if !ok {
         eprintln!("skip {test}: no HEVC Main 12 decode processing");
     }
@@ -89,7 +90,11 @@ fn main12_shrunk_in_the_decoder_is_the_vpps_picture() {
     let (dec, w) = run(Some(t), t);
     assert!(w.is_empty(), "warned {w:?}");
     assert_eq!((vpp.len(), dec.len()), (8, 8));
-    let worst = vpp.iter().zip(&dec).map(|(a, b)| psnr10(&a.1, &b.1, 64 * 64)).fold(f64::INFINITY, f64::min);
+    let worst = vpp
+        .iter()
+        .zip(&dec)
+        .map(|(a, b)| psnr10(&a.1, &b.1, 64 * 64))
+        .fold(f64::INFINITY, f64::min);
     eprintln!("main12 shrunk by the decoder against the vpp, worst {worst:.1} dB");
     assert!(worst > 40.0, "{worst:.1} dB");
 }

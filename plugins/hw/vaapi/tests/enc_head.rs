@@ -49,7 +49,11 @@ fn nals(au: &[u8]) -> Vec<&[u8]> {
     }
     let ends = starts.iter().skip(1).map(|&s| s - 3).chain([au.len()]);
     // a four byte start code leaves a zero on the unit before
-    starts.iter().zip(ends).map(|(&a, b)| au[a..b].strip_suffix(&[0]).unwrap_or(&au[a..b])).collect()
+    starts
+        .iter()
+        .zip(ends)
+        .map(|(&a, b)| au[a..b].strip_suffix(&[0]).unwrap_or(&au[a..b]))
+        .collect()
 }
 
 /// The parameter set units of `au`, H.264 SPS and PPS or HEVC VPS, SPS and PPS.
@@ -65,7 +69,11 @@ fn sets(au: &[u8], hevc: bool) -> Vec<Vec<u8>> {
 }
 
 /// The first coded unit of `stream` decoded and coded again by `enc`.
-fn first_unit(source: Codec, stream: &[u8], enc: impl FnOnce(Arc<GpuFrameChannel>) -> Box<dyn Element>) -> Vec<u8> {
+fn first_unit(
+    source: Codec,
+    stream: &[u8],
+    enc: impl FnOnce(Arc<GpuFrameChannel>) -> Box<dyn Element>,
+) -> Vec<u8> {
     let (tx, rx) = mpsc::channel();
     let mut p = Pipeline::new();
     p.set_pool(256 * 1024, 16);
@@ -92,7 +100,8 @@ fn first_unit(source: Codec, stream: &[u8], enc: impl FnOnce(Arc<GpuFrameChannel
 }
 
 fn device(test: &str, decode: &str, encode: &str) -> bool {
-    let ok = pf_vaapi::probe().is_some_and(|c| c.decodes_profile(decode) && c.supports_encode(encode));
+    let ok =
+        pf_vaapi::probe().is_some_and(|c| c.decodes_profile(decode) && c.supports_encode(encode));
     if !ok {
         eprintln!("skip {test}: no VA-API {decode} decode and {encode} encode");
     }
@@ -105,12 +114,19 @@ fn the_h264_head_is_the_sessions_sets() {
         return;
     }
     let au = first_unit(Codec::H264, IPB, |ch| {
-        Box::new(VaapiH264Enc::new_zerocopy(ch).with_fps(25, 1).with_bitrate(1000).with_low_power(true).with_colour(bt709()))
+        Box::new(
+            VaapiH264Enc::new_zerocopy(ch)
+                .with_fps(25, 1)
+                .with_bitrate(1000)
+                .with_low_power(true)
+                .with_colour(bt709()),
+        )
     });
     let (sps, pps) = h264enc::parameter_sets(320, 240, (25, 1), h264enc::DEFAULT_QP, &bt709());
     assert_eq!(sets(&au, false).len(), 2, "SPS and PPS in band");
     assert_eq!(sets(&au, false), sets(&[sps, pps].concat(), false));
-    let (unpinned, _) = h264enc::parameter_sets(320, 240, (25, 1), h264enc::DEFAULT_QP, &StreamColor::default());
+    let (unpinned, _) =
+        h264enc::parameter_sets(320, 240, (25, 1), h264enc::DEFAULT_QP, &StreamColor::default());
     assert_ne!(sets(&au, false)[0], sets(&unpinned, false)[0], "the pinned colour is in the SPS");
 }
 
@@ -120,9 +136,21 @@ fn the_hevc_head_is_the_sessions_sets() {
         return;
     }
     let au = first_unit(Codec::H264, IPB, |ch| {
-        Box::new(VaapiH265Enc::new_zerocopy(ch).with_fps(25, 1).with_bitrate(1000).with_colour(bt709()))
+        Box::new(
+            VaapiH265Enc::new_zerocopy(ch).with_fps(25, 1).with_bitrate(1000).with_colour(bt709()),
+        )
     });
-    let head = h265enc::parameter_sets(320, 240, (25, 1), false, h265enc::DEFAULT_QP, true, true, &bt709()).expect("a head");
+    let head = h265enc::parameter_sets(
+        320,
+        240,
+        (25, 1),
+        false,
+        h265enc::DEFAULT_QP,
+        true,
+        true,
+        &bt709(),
+    )
+    .expect("a head");
     assert_eq!(sets(&au, true).len(), 3, "VPS, SPS and PPS in band");
     assert_eq!(sets(&au, true), sets(&head, true));
 }
@@ -132,11 +160,18 @@ fn the_hevc_main10_head_is_the_sessions_sets() {
     if !device("main10_head", "HEVCMain10", "h265/annexb") {
         return;
     }
-    let pq = StreamColor { transfer: TransferFn::from_h273(16), primaries: Primaries::from_h273(9), matrix: Matrix::from_h273(9), ..bt709() };
+    let pq = StreamColor {
+        transfer: TransferFn::from_h273(16),
+        primaries: Primaries::from_h273(9),
+        matrix: Matrix::from_h273(9),
+        ..bt709()
+    };
     let au = first_unit(Codec::H265, PQ, |ch| {
         Box::new(VaapiH265Enc::new_zerocopy(ch).with_fps(25, 1).with_bitrate(1000).with_colour(pq))
     });
-    let head = h265enc::parameter_sets(128, 128, (25, 1), true, h265enc::DEFAULT_QP, true, true, &pq).expect("a head");
+    let head =
+        h265enc::parameter_sets(128, 128, (25, 1), true, h265enc::DEFAULT_QP, true, true, &pq)
+            .expect("a head");
     assert_eq!(sets(&au, true).len(), 3, "VPS, SPS and PPS in band");
     assert_eq!(sets(&au, true), sets(&head, true));
 }

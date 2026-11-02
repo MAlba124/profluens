@@ -28,13 +28,13 @@ use profluens_video::color::{self as colour, Matrix, Range};
 use profluens_video::decoder::{COLOR_FIELDS, Color, color_fields};
 use profluens_video::format::COLOR_OFFER_FIELDS;
 
+use crate::decproc::{self, Twins};
 use crate::error::{Transient, VaapiErrorKind as K, Verdict, Warned, failed, log_fatal};
 use crate::ffi;
 use crate::gpuframe::{
     self, F_LAYOUT, F_MODIFIER, FAMILY_VIDEO_GPU, FrameToken, FrameTx, GPU_FRAME_HEADER_LEN,
     GpuFrame, GpuFrameChannel, GpuFrameHeader,
 };
-use crate::decproc::{self, Twins};
 use crate::probe;
 use crate::va::{
     Buffer as VaBuffer, Config, Context, Display, ExportedSurface, ReadbackImage, SurfaceFormat,
@@ -730,7 +730,9 @@ impl VaapiVp9Dec {
             }
         };
         // a VP9 frame is its exact size, nothing cropped
-        let made = shrink.map(|(p, at)| Twins::new(display, p, count, (0, 0, w, hgt), (w, hgt)).map(|t| (t, at)));
+        let made = shrink.map(|(p, at)| {
+            Twins::new(display, p, count, (0, 0, w, hgt), (w, hgt)).map(|t| (t, at))
+        });
         let twins = match made.transpose() {
             Ok(t) => t,
             Err(e) => {

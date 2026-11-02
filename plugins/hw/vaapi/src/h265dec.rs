@@ -23,7 +23,6 @@ use profluens_core::time::Timestamp;
 
 use crate::decproc::{self, Twins};
 use crate::error::{Transient, VaapiErrorKind as K, Verdict, Warned, failed, log_fatal};
-use crate::vpp::Target;
 use crate::ffi;
 use crate::gpuframe::{
     self, F_LAYOUT, F_MODIFIER, FAMILY_VIDEO_GPU, FrameToken, FrameTx, GPU_FRAME_HEADER_LEN,
@@ -35,6 +34,7 @@ use crate::va::{
     Buffer as VaBuffer, Config, Context, Display, ExportFn, ExportedSurface, MappedImage,
     SurfaceFormat, Surfaces,
 };
+use crate::vpp::Target;
 use profluens_video::color::{self as colour, HdrStatic};
 use profluens_video::decoder::{Color, color_fields};
 use profluens_video::format::COLOR_OFFER_FIELDS;
@@ -394,7 +394,10 @@ impl VaapiH265Dec {
             log!(&*ctx, Level::Debug, "reinit", width = width, height = height, depth = depth);
             self.retire_session();
         }
-        if ten_bit && !rext && !probe::probe().is_some_and(|caps| caps.decodes_profile("HEVCMain10")) {
+        if ten_bit
+            && !rext
+            && !probe::probe().is_some_and(|caps| caps.decodes_profile("HEVCMain10"))
+        {
             self.fail(ctx, K::NoMain10Profile);
             return false;
         }
@@ -927,7 +930,9 @@ impl VaapiH265Dec {
                 let ext = pic_ext(pic, sps, pps);
                 VaBuffer::new_struct(display, context, ffi::VAPictureParameterBufferType, &ext)?
             }
-            false => VaBuffer::new_struct(display, context, ffi::VAPictureParameterBufferType, &pic)?,
+            false => {
+                VaBuffer::new_struct(display, context, ffi::VAPictureParameterBufferType, &pic)?
+            }
         };
 
         let iq_buf = if sps.scaling_list_enabled_flag {
@@ -1753,7 +1758,9 @@ fn pic_ext(
         chroma_qp_offset_list_len_minus1: small(r.chroma_qp_offset_list_len_minus1),
         log2_sao_offset_scale_luma: small(r.log2_sao_offset_scale_luma),
         log2_sao_offset_scale_chroma: small(r.log2_sao_offset_scale_chroma),
-        log2_max_transform_skip_block_size_minus2: small(r.log2_max_transform_skip_block_size_minus2),
+        log2_max_transform_skip_block_size_minus2: small(
+            r.log2_max_transform_skip_block_size_minus2,
+        ),
         cb_qp_offset_list: r.cb_qp_offset_list,
         cr_qp_offset_list: r.cr_qp_offset_list,
     };
@@ -1998,8 +2005,14 @@ mod tests {
             let w = (1i32 << denom) + dw;
             (doff - ((128 * w) >> denom) + 128).clamp(-128, 127)
         };
-        for (dw, doff, denom) in [(0, 0, 6), (-5, 40, 6), (20, -300, 3), (127, 511, 7), (-128, -512, 0)] {
-            assert_eq!(chroma_offset(dw, doff, denom, 128), old(dw, doff, denom), "{dw} {doff} {denom}");
+        for (dw, doff, denom) in
+            [(0, 0, 6), (-5, 40, 6), (20, -300, 3), (127, 511, 7), (-128, -512, 0)]
+        {
+            assert_eq!(
+                chroma_offset(dw, doff, denom, 128),
+                old(dw, doff, denom),
+                "{dw} {doff} {denom}"
+            );
         }
         assert_eq!(chroma_offset(0, 1000, 6, 2048), 1000, "12 bit high precision");
         assert_eq!(chroma_offset(0, 1000, 6, 128), 127);

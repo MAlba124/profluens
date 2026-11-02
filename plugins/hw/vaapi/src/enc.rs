@@ -183,7 +183,11 @@ impl FrameBufs {
     }
 
     /// [`Self::submit`] without the wait, the picture then [`InFlight`].
-    pub(crate) fn queue(&mut self, engine: &EncEngine, input: Option<ffi::VASurfaceID>) -> VaResult<()> {
+    pub(crate) fn queue(
+        &mut self,
+        engine: &EncEngine,
+        input: Option<ffi::VASurfaceID>,
+    ) -> VaResult<()> {
         self.ids.clear();
         self.ids.extend(self.hold.iter().map(VaBuffer::id));
         let r = engine.queue(&self.ids, input.unwrap_or(engine.input));

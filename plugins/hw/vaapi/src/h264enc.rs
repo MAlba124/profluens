@@ -141,7 +141,13 @@ pub const DEFAULT_QP: u8 = 26;
 
 /// The SPS and PPS (Annex B) a session writes, known before a device opens, `color` the one
 /// [`VaapiH264Enc::with_colour`] pins.
-pub fn parameter_sets(width: u32, height: u32, fps: (u32, u32), qp: u8, color: &StreamColor) -> (Vec<u8>, Vec<u8>) {
+pub fn parameter_sets(
+    width: u32,
+    height: u32,
+    fps: (u32, u32),
+    qp: u8,
+    color: &StreamColor,
+) -> (Vec<u8>, Vec<u8>) {
     let (coded_w, coded_h) = (enc::align_up(width.max(2), 16), enc::align_up(height.max(2), 16));
     let level = pick_level(coded_w / 16, coded_h / 16, fps);
     let refs = sps_refs(coded_w / 16, coded_h / 16, level);
@@ -359,7 +365,8 @@ impl VaapiH264Enc {
 
     fn ensure_session(&mut self, ctx: &mut Ctx, fmt: InFormat) -> bool {
         if let Some(s) = &self.session {
-            if s.engine.width == fmt.width && s.engine.height == fmt.height && s.color == self.color {
+            if s.engine.width == fmt.width && s.engine.height == fmt.height && s.color == self.color
+            {
                 return true;
             }
             log!(&*ctx, Level::Debug, "reinit", width = fmt.width, height = fmt.height);
@@ -401,11 +408,15 @@ impl VaapiH264Enc {
         };
         let (mut opened, mut refused) = (None, None);
         for entrypoint in order.into_iter().flatten() {
-            let packed_mask =
-                va::config_attribute(display, profile, entrypoint, ffi::VAConfigAttribEncPackedHeaders)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
+            let packed_mask = va::config_attribute(
+                display,
+                profile,
+                entrypoint,
+                ffi::VAConfigAttribEncPackedHeaders,
+            )
+            .ok()
+            .flatten()
+            .unwrap_or(0);
             let l0 = enc::max_refs(display, profile, entrypoint).0;
             let refs = sps_refs.min(l0).max(1);
             let engine = EncEngine::new_packed(
@@ -442,7 +453,8 @@ impl VaapiH264Enc {
 
         let (w, h, refs) = (engine.width, engine.height, engine.refs() as u32);
         let vui = colour::vui_colour(&self.color);
-        let sps_nal = write_sps(engine.coded_w, engine.coded_h, w, h, fmt.fps, level, sps_refs, vui);
+        let sps_nal =
+            write_sps(engine.coded_w, engine.coded_h, w, h, fmt.fps, level, sps_refs, vui);
         let pps_nal = write_pps(self.qp);
         log!(&*ctx, Level::Info, "session", width = w, height = h, level = level, low_power = lp);
         log!(&*ctx, Level::Info, "references", refs = refs, sps_refs = sps_refs);
@@ -523,7 +535,8 @@ impl VaapiH264Enc {
                     ctx.wake_within(enc::POLL_WAKE);
                     return Ok(false);
                 }
-                // read by the map below, iHD fails every picture after a coded buffer destroyed unread
+                // read by the map below, iHD fails every picture after a coded buffer destroyed
+                // unread
                 Err(e) => self.warn(ctx, K::Encode(e)),
             }
         }
@@ -1414,7 +1427,8 @@ mod tests {
 
     #[test]
     fn the_parameter_sets_are_known_before_a_session() {
-        let (sps, pps) = parameter_sets(1920, 1038, (23_976, 1000), DEFAULT_QP, &StreamColor::default());
+        let (sps, pps) =
+            parameter_sets(1920, 1038, (23_976, 1000), DEFAULT_QP, &StreamColor::default());
         let p = h264parse::parse_sps(&sps[4..]).expect("own SPS parses");
         assert_eq!((p.width(), p.height()), (1920, 1038), "cropped to the picture");
         assert_eq!((p.profile_idc, p.level_idc), (100, 41));
@@ -1436,12 +1450,18 @@ mod tests {
         };
         let (sps, _) = parameter_sets(720, 576, (25, 1), DEFAULT_QP, &sd);
         let p = h264parse::parse_sps(&sps[4..]).expect("own SPS parses");
-        assert_eq!((p.colour.matrix, p.colour.primaries, p.colour.transfer), (sd.matrix, sd.primaries, sd.transfer));
+        assert_eq!(
+            (p.colour.matrix, p.colour.primaries, p.colour.transfer),
+            (sd.matrix, sd.primaries, sd.transfer)
+        );
         assert_eq!(p.colour.range, Some(Range::Limited));
         assert_eq!(p.max_num_reorder_frames, Some(0), "the restriction after the colour");
         let full = StreamColor { range: Some(Range::Full), ..sd };
         let (sps, _) = parameter_sets(720, 576, (25, 1), DEFAULT_QP, &full);
-        assert_eq!(h264parse::parse_sps(&sps[4..]).map(|p| p.colour.range), Some(Some(Range::Full)));
+        assert_eq!(
+            h264parse::parse_sps(&sps[4..]).map(|p| p.colour.range),
+            Some(Some(Range::Full))
+        );
         let (sps, _) = parameter_sets(720, 576, (25, 1), DEFAULT_QP, &StreamColor::default());
         let p = h264parse::parse_sps(&sps[4..]).expect("own SPS parses");
         assert_eq!((p.colour.matrix, p.colour.range), (None, None), "no colour stated");
@@ -1465,7 +1485,8 @@ mod tests {
 
     #[test]
     fn p_slice_headers_state_their_references() {
-        let (sps_nal, pps_nal) = parameter_sets(320, 240, (25, 1), DEFAULT_QP, &StreamColor::default());
+        let (sps_nal, pps_nal) =
+            parameter_sets(320, 240, (25, 1), DEFAULT_QP, &StreamColor::default());
         let sps = h264parse::parse_sps(&sps_nal[4..]).expect("SPS");
         let pps = h264parse::parse_pps(&pps_nal[4..]).expect("PPS");
         let mut w = BitWriter::new();
@@ -1576,7 +1597,8 @@ mod tests {
             return eprintln!("skip {test}: no encode entrypoint");
         }
         let (w, h) = (128u32, 64u32);
-        let mut hx = pf_harness::Harness::with_pool(VaapiH264Enc::new().with_bitrate(500), 256 * 1024, 16);
+        let mut hx =
+            pf_harness::Harness::with_pool(VaapiH264Enc::new().with_bitrate(500), 256 * 1024, 16);
         hx.fix_sink_format(
             VaapiH264Enc::IN,
             "video/raw",
@@ -1587,7 +1609,9 @@ mod tests {
                 ("fps", ValueDesc::Rat(25, 1)),
             ],
         );
-        let frame = |i: u64| -> Vec<u8> { (0..(w * h * 3 / 2) as usize).map(|p| ((p as u64 + i * 7) % 220 + 16) as u8).collect() };
+        let frame = |i: u64| -> Vec<u8> {
+            (0..(w * h * 3 / 2) as usize).map(|p| ((p as u64 + i * 7) % 220 + 16) as u8).collect()
+        };
         for i in 0..4u64 {
             let mut b = hx.alloc(&frame(i));
             b.pts = Timestamp::from_nanos(i * 40_000_000);

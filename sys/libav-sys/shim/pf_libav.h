@@ -150,6 +150,10 @@ int pf_lav_parse(pf_lav_dec *d, const uint8_t *in, size_t len, int64_t pts, cons
 /* Skip non-reference pictures from the next packet on, or decode all again. */
 void pf_lav_skip_nonref(pf_lav_dec *d, int on);
 
+/* Pictures the decoder holds back for reordering, has_b_frames, the decoder being single
+ * threaded. */
+int pf_lav_delay(const pf_lav_dec *d);
+
 /* Pictures libavcodec had to place in its own memory, since open. */
 uint64_t pf_lav_fallbacks(const pf_lav_dec *d);
 

@@ -451,6 +451,12 @@ impl Decoder {
         unsafe { ffi::pf_lav_skip_nonref(self.raw, on as c_int) }
     }
 
+    /// Pictures held back for reordering, how many units in may wait for theirs.
+    pub fn delay(&self) -> usize {
+        // SAFETY: the decoder is open.
+        usize::try_from(unsafe { ffi::pf_lav_delay(self.raw) }).unwrap_or(0)
+    }
+
     pub fn fallbacks(&self) -> u64 {
         // SAFETY: the decoder is open.
         unsafe { ffi::pf_lav_fallbacks(self.raw) }

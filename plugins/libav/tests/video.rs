@@ -282,6 +282,41 @@ fn mpeg4_odd_size_matches_ffmpeg() {
     run_case(&c, LibavMpeg4Dec::new());
 }
 
+/// The vop_coding_type of an MPEG-4 Part 2 unit's VOP, 2 for B (14496-2 6.2.5).
+fn vop_type(unit: &[u8]) -> Option<u8> {
+    let at = unit.windows(4).position(|w| w == [0, 0, 1, 0xB6])?;
+    unit.get(at + 4).map(|b| b >> 6)
+}
+
+/// AVI stamps in decode order. A unit in a B's place that makes no picture takes no stamp with
+/// it, every picture after it keeps the one it has in a whole decode.
+#[test]
+fn mpeg4_a_unit_that_makes_no_picture_leaves_the_stamps_after_it() {
+    let args = &["-c:v", "mpeg4", "-q:v", "4", "-bf", "2", "-g", "12"];
+    let Some(bytes) = stream("mpeg4_gap.m4v", "320x240", 30, "yuv420p", args, "m4v") else {
+        return;
+    };
+    let units = support::mpeg4_units(&bytes);
+    assert_eq!(units.len(), 30);
+    let mut h = Harness::with_slot_size(LibavMpeg4Dec::new(), SLOT);
+    let whole = decode_all(&mut h, &units);
+    assert_eq!(whole.len(), 30);
+    let gap = (4..units.len()).find(|&i| vop_type(&units[i]) == Some(2)).expect("a B unit");
+    // user data alone, a unit with no VOP that leaves the decoder as it was
+    let mut cut = units.clone();
+    cut[gap] = vec![0, 0, 1, 0xB2, b'p', b'f'];
+    let mut h = Harness::with_slot_size(LibavMpeg4Dec::new(), SLOT);
+    let out = decode_all(&mut h, &cut);
+    assert_eq!(out.len(), 29, "the unit makes no picture");
+    let mut last = None;
+    for o in &out {
+        let w = whole.iter().find(|w| w.bytes == o.bytes).expect("a picture of the whole decode");
+        assert_eq!(o.pts, w.pts, "a picture stamped as another");
+        assert!(last < Some(o.pts), "stamps in order");
+        last = Some(o.pts);
+    }
+}
+
 #[test]
 fn vp8_matches_ffmpeg() {
     let args = &["-c:v", "libvpx", "-deadline", "realtime", "-cpu-used", "8", "-g", "10"];

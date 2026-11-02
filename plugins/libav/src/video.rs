@@ -196,7 +196,8 @@ pub struct LavVideo<const KIND: u8> {
 
 /// Families whose units mostly come stamped in decode order, from AVI and FLV, which know no
 /// presentation time. Pictures leave a decoder in display order, so the k-th picture takes the
-/// k-th smallest stamp, right for decode order stamps and for presentation stamps alike.
+/// k-th smallest stamp, right for decode order stamps and for presentation stamps alike. A unit
+/// that makes no picture leaves its stamp behind, [`LavVideo::trim`] drops it.
 const fn decode_order(kind: u8) -> bool {
     matches!(kind, MPEG4 | FLV1 | VP6 | VP6F | VP6A | VP7)
 }
@@ -323,6 +324,19 @@ impl<const KIND: u8> LavVideo<KIND> {
                     return out.warn(LavVideoError::Picture(e));
                 }
             }
+        }
+    }
+
+    /// Keeps the stamps of the pictures the decoder holds back and no more. One past them is
+    /// of a unit that made no picture, skipped as late, refused, in error or a VOP not coded,
+    /// and the smallest go, whose display slots passed.
+    fn trim(&mut self) {
+        if !decode_order(KIND) {
+            return;
+        }
+        let delay = self.decoder.as_ref().map_or(0, Decoder::delay);
+        while self.stamps.len() > delay {
+            self.stamps.pop();
         }
     }
 
@@ -554,6 +568,7 @@ impl<const KIND: u8> Codec for LavVideo<KIND> {
             log!(out.ctx(), Level::Warn, "unit_refused", bytes = unit.len(), pts = stamp);
         }
         self.receive_all(out);
+        self.trim();
     }
 
     fn finish(&mut self, out: &mut Out<'_>) {
@@ -576,6 +591,7 @@ impl<const KIND: u8> Codec for LavVideo<KIND> {
             );
             d.flush();
         }
+        self.stamps.clear();
     }
 
     fn scan(&mut self, unit: &[u8], scan: &mut Scan<'_>) {

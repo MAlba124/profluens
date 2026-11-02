@@ -149,6 +149,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn pf_lav_fallbacks(d: *const pf_lav_dec) -> u64;
     pub fn pf_lav_skip_nonref(d: *mut pf_lav_dec, on: c_int);
+    pub fn pf_lav_delay(d: *const pf_lav_dec) -> c_int;
     pub fn pf_lav_enc_open(
         out: *mut *mut pf_lav_enc,
         codec: c_int,

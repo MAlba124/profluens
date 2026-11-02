@@ -485,6 +485,8 @@ void pf_lav_skip_nonref(pf_lav_dec *d, int on)
     d->ctx->skip_frame = on ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
 }
 
+int pf_lav_delay(const pf_lav_dec *d) { return d->ctx->has_b_frames; }
+
 struct pf_lav_enc {
     AVCodecContext *ctx;
     AVFrame *frame;

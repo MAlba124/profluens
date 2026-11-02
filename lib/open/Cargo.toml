@@ -1,0 +1,35 @@
+[package]
+name = "pf-open"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_open"
+
+[features]
+default = []
+# Builds the demuxer of an opened file and finds a track on it.
+pipeline = ["dep:profluens-elements"]
+
+[dependencies]
+profluens-core = { path = "../../core" }
+# The SPS colour, size and depth a container leaves out.
+profluens-video = { path = "../video" }
+pf-probe = { path = "../probe" }
+pf-mkv = { path = "../../plugins/formats/mkv" }
+pf-mp4 = { path = "../../plugins/formats/mp4" }
+pf-avi = { path = "../../plugins/formats/avi" }
+pf-ogg = { path = "../../plugins/formats/ogg" }
+pf-bare = { path = "../../plugins/formats/bare" }
+pf-flv = { path = "../../plugins/formats/flv" }
+# The filesrc in front of a demuxer.
+profluens-elements = { path = "../elements", optional = true }
+
+[dev-dependencies]
+# Pipelines the built demuxers run in.
+pf-reactor = { path = "../reactor" }
+
+[lints]
+workspace = true

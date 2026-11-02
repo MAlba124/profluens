@@ -6,6 +6,7 @@ members = [
     "lib/elements",
     "lib/harness",
     "lib/memory",
+    "lib/open",
     "lib/probe",
     "lib/reactor",
     "lib/registry",

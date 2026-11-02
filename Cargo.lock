@@ -344,6 +344,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-open"
+version = "0.1.0"
+dependencies = [
+ "pf-avi",
+ "pf-bare",
+ "pf-flv",
+ "pf-mkv",
+ "pf-mp4",
+ "pf-ogg",
+ "pf-probe",
+ "pf-reactor",
+ "profluens-core",
+ "profluens-elements",
+ "profluens-video",
+]
+
+[[package]]
 name = "pf-opus"
 version = "0.1.0"
 dependencies = [

@@ -83,7 +83,8 @@ pub fn demuxer(
             return Ok(p.add(BareSrc::new(file, (**h).clone(), o.len)));
         }
         (Kind::Mkv, index) => {
-            let mut d = MkvDemux::with_shared_head(Arc::clone(&o.head));
+            // tags come from the open, attachments and chapters have no user
+            let mut d = MkvDemux::with_shared_head(Arc::clone(&o.head)).without_extras();
             if let Index::Mkv { cues, at, .. } = index
                 && !cues.is_empty()
             {

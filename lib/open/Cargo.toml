@@ -30,6 +30,11 @@ profluens-elements = { path = "../elements", optional = true }
 [dev-dependencies]
 # Pipelines the built demuxers run in.
 pf-reactor = { path = "../reactor" }
+# The decoders a bare file plays through, today's FileSrc path against baresrc.
+pf-libflac = { path = "../../plugins/audio/libflac", features = ["encoder"] }
+pf-libav = { path = "../../plugins/libav" }
+# The stamps a decoder's PCM is checked on.
+profluens-audio = { path = "../audio" }
 
 [lints]
 workspace = true

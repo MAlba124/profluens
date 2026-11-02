@@ -67,10 +67,10 @@ impl Out {
     }
 }
 
-/// `filesrc ! demuxer` for `o`, or the `baresrc` that reads a bare file itself, the element the
-/// tracks come out of. The demuxer starts from the head, the Cues, the idx1 index and the
-/// duration the open read, so it reads none of them. A `held` Matroska demuxer reads nothing
-/// until the seek that follows its start.
+/// `filesrc ! demuxer` for `o`, or the `baresrc` that reads a bare file itself for a decoder (see
+/// [`BareSrc::for_decoder`]), the element the tracks come out of. The demuxer starts from the
+/// head, the Cues, the idx1 index and the duration the open read, so it reads none of them. A
+/// `held` Matroska demuxer reads nothing until the seek that follows its start.
 pub fn demuxer(
     p: &mut Pipeline,
     file: File,
@@ -80,7 +80,7 @@ pub fn demuxer(
 ) -> Result<ElementId, BuildError> {
     let (demux, input) = match (o.kind, &o.index) {
         (Kind::Flac | Kind::Mp3 | Kind::AdtsAac, Index::Bare(h)) => {
-            return Ok(p.add(BareSrc::new(file, (**h).clone(), o.len)));
+            return Ok(p.add(BareSrc::new(file, (**h).clone(), o.len).for_decoder()));
         }
         (Kind::Mkv, index) => {
             // tags come from the open, attachments and chapters have no user

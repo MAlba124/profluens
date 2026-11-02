@@ -470,6 +470,35 @@ pub fn nal_head_from_config(
     if is_hevc { parse_hvcc(codec_private) } else { parse_avcc(codec_private) }
 }
 
+/// The bits of a luma sample a codec configuration states, 8 where it states none. An hvcC
+/// carries bitDepthLumaMinus8 (ISO/IEC 14496-15 section 8.3.3.1), an av1C the high_bitdepth and
+/// twelve_bit flags (AV1 in ISOBMFF section 2.3.3), a Matroska VP9 CodecPrivate is a feature list
+/// whose id 3 is the bit depth (WebM codec mapping).
+pub fn config_depth(family: &str, codec_private: &[u8]) -> u8 {
+    match family {
+        "h265/annexb" => codec_private.get(17).map_or(8, |b| (b & 7) + 8),
+        "av1" => match codec_private.get(2) {
+            Some(b) if b & 0x20 != 0 => 12,
+            Some(b) if b & 0x40 != 0 => 10,
+            _ => 8,
+        },
+        "vp9" => {
+            let mut at = 0;
+            while let (Some(&id), Some(&len)) = (codec_private.get(at), codec_private.get(at + 1)) {
+                let value = codec_private.get(at + 2..at + 2 + usize::from(len));
+                if id == 3
+                    && let Some(&d) = value.and_then(|v| v.first())
+                {
+                    return d;
+                }
+                at += 2 + usize::from(len);
+            }
+            8
+        }
+        _ => 8,
+    }
+}
+
 /// `AVCDecoderConfigurationRecord` (ISO/IEC 14496-15 section 5.3.3.1).
 // Cold path, once per stream.
 #[allow(clippy::disallowed_methods)]
@@ -934,6 +963,25 @@ mod tests {
             let r = nal_head_from_config(bytes, *is_hevc);
             assert!(r.is_err(), "{name} must error, not parse");
         }
+    }
+
+    #[test]
+    fn depth_from_the_codec_configs() {
+        let mut hvcc = vec![
+            1u8, 2, 0x20, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 0x99, 0xf0, 0, 0xfc, 0xfd, 0xfa, 0xfa, 0,
+        ];
+        assert_eq!(config_depth("h265/annexb", &hvcc), 10);
+        hvcc[17] = 0xf8;
+        assert_eq!(config_depth("h265/annexb", &hvcc), 8);
+        assert_eq!(config_depth("h265/annexb", &[1, 2]), 8, "a short config is 8 bit");
+        assert_eq!(config_depth("av1", &[0x81, 0x00, 0x4c, 0x00]), 10);
+        assert_eq!(config_depth("av1", &[0x81, 0x00, 0x6c, 0x00]), 12);
+        assert_eq!(config_depth("av1", &[0x81, 0x00, 0x0c, 0x00]), 8);
+        assert_eq!(config_depth("vp9", &[1, 1, 2, 2, 1, 31, 3, 1, 10, 4, 1, 1]), 10);
+        assert_eq!(config_depth("vp9", &[1, 1, 0]), 8);
+        assert_eq!(config_depth("vp9", &[3, 0]), 8, "an empty value");
+        assert_eq!(config_depth("h264/annexb", &[1, 100, 0, 31]), 8);
+        assert_eq!(config_depth("vp8", &[]), 8);
     }
 
     #[test]

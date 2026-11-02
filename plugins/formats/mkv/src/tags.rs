@@ -373,7 +373,9 @@ fn emit_attachment(file: &[u8], cover_pass: bool, sink: &mut impl TagSink) {
     }
 }
 
-fn is_cover_name(name: &str) -> bool {
+/// A cover's file name by the Matroska attachment convention, `cover`, `small_cover`,
+/// `cover_land` and `cover_port`, any extension and case.
+pub fn is_cover_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or("");
     let stem = strip_suffix_ascii_ci(stem, "_land")
         .or_else(|| strip_suffix_ascii_ci(stem, "_port"))

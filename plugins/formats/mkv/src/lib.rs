@@ -22,8 +22,8 @@ pub mod tags;
 pub mod writer;
 
 pub use codec::{
-    Lead, ReframeError, Reframer, family_for, is_audio_family, is_video_family, lead_of,
-    nal_head_from_config, track_family, track_offers,
+    Lead, ReframeError, Reframer, config_depth, family_for, is_audio_family, is_video_family,
+    lead_of, nal_head_from_config, track_family, track_offers,
 };
 pub use element::{MkvDemux, MkvMux};
 
@@ -40,8 +40,9 @@ pub use index::{CAPTION_REACH, audio_lead, cue_entries, key_track};
 pub use inflate::InflateError;
 pub use mux_multi::MkvMuxN;
 pub use reader::{
-    Cue, CuedBlock, Frame, MatroskaReader, PTS_NONE, SeekHeadInfo, Track, cluster_timestamp,
-    cued_block, cues_demand, parse_cue_tracks, parse_cues, parse_seek_head,
+    Cue, CueIndex, CuedBlock, Frame, MatroskaReader, PTS_NONE, SeekHeadInfo, Track,
+    cluster_timestamp, cued_block, cues_demand, parse_cue_tracks, parse_cues, parse_seek_head,
+    read_cues,
 };
 pub use writer::{
     APP_NAME, AudioConfig, CLUSTER_BLOCKS_MAX, CLUSTER_BYTES_MAX, ColourConfig,

@@ -1540,6 +1540,42 @@ pub fn parse_cue_tracks(
     out
 }
 
+/// A file's Cues as read once, every track's, for every demuxer of it to take.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CueIndex {
+    pub cues: Vec<Cue>,
+    /// Where the Cues element starts, `None` when none were read.
+    pub at: Option<u64>,
+}
+
+/// The bytes an element header takes at most, a 4 octet ID and an 8 octet size.
+const ELEMENT_HEAD: usize = 12;
+
+/// The Cues the front SeekHead of `header` names, read through `read`, which gives the bytes at
+/// an offset and fewer at the end of the file. Empty for a file without them, for a position
+/// that holds no Cues and for Cues past `max` bytes, which are not read.
+// Cold path, once per file.
+#[allow(clippy::disallowed_methods)]
+pub fn read_cues<E>(
+    header: &[u8],
+    max: u64,
+    read: &dyn Fn(u64, usize) -> Result<Vec<u8>, E>,
+) -> Result<CueIndex, E> {
+    let Some(sh) = parse_seek_head(header) else { return Ok(CueIndex::default()) };
+    let Some(at) = sh.cues_pos.and_then(|p| sh.segment_data_start.checked_add(p)) else {
+        return Ok(CueIndex::default());
+    };
+    let head = read(at, ELEMENT_HEAD)?;
+    let Ok(h) = ebml::read_element_header(&head, 0) else { return Ok(CueIndex::default()) };
+    let len = h.size.and_then(|s| (h.data_start as u64).checked_add(s));
+    let Some(len) = len.filter(|&len| h.id == id::CUES && len <= max) else {
+        return Ok(CueIndex::default());
+    };
+    let bytes = read(at, len as usize)?;
+    let cues = parse_cue_tracks(&bytes, sh.segment_data_start, sh.timestamp_scale);
+    Ok(CueIndex { at: (!cues.is_empty()).then_some(at), cues })
+}
+
 /// The largest span between cued Clusters bounds a block, `None` with fewer than two.
 // Cold path, once per open.
 #[allow(clippy::disallowed_methods)]
@@ -2148,6 +2184,37 @@ mod tests {
             assert_eq!(stream[a], 0x1F, "cue byte points AT a Cluster ID (0x1F...)");
             assert_eq!(&stream[a..a + 4], id::CLUSTER, "cue byte is the full Cluster ID");
         }
+    }
+
+    #[test]
+    fn cues_are_read_through_the_callback_by_the_seek_head() {
+        let stream = build_cued_video(&[(0, true, &[1, 2, 3]), (40_000_000, true, &[4, 5])]);
+        let head = header_prefix(&stream);
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read = |off: u64, n: usize| -> Result<Vec<u8>, ()> {
+            reads.borrow_mut().push((off, n));
+            let at = (off as usize).min(stream.len());
+            Ok(stream[at..(at + n).min(stream.len())].to_vec())
+        };
+        let ix = read_cues(head, 1 << 20, &read).expect("read");
+        let info = parse_seek_head(head).expect("SeekHead");
+        let at = info.segment_data_start + info.cues_pos.expect("Cues");
+        assert_eq!(ix.at, Some(at));
+        let times: Vec<u64> = ix.cues.iter().map(|c| c.time_ns).collect();
+        assert_eq!(times, [0, 40_000_000]);
+        assert!(ix.cues.iter().all(|c| c.track == 1));
+        assert_eq!(reads.borrow().len(), 2, "the element head, then the Cues whole");
+        assert!(reads.borrow().iter().all(|&(off, _)| off == at), "nothing else is read");
+        reads.borrow_mut().clear();
+        assert_eq!(read_cues(head, 8, &read), Ok(CueIndex::default()), "past the cap");
+        assert_eq!(reads.borrow().len(), 1, "only the element head");
+        let refuse = |_: u64, _: usize| -> Result<Vec<u8>, u8> { Err(7) };
+        assert_eq!(read_cues(head, 1 << 20, &refuse), Err(7), "a read error is the caller's");
+        let short = |_: u64, _: usize| -> Result<Vec<u8>, ()> { Ok(Vec::new()) };
+        assert_eq!(read_cues(head, 1 << 20, &short), Ok(CueIndex::default()), "past the end");
+        let (plain, _) = build_single(&[&[1]]);
+        assert_eq!(read_cues(header_prefix(&plain), 1 << 20, &read), Ok(CueIndex::default()));
+        assert_eq!(read_cues(&[], 1 << 20, &read), Ok(CueIndex::default()));
     }
 
     #[test]

@@ -35,6 +35,12 @@ pub struct SampleEntry {
     pub reframer: Reframer,
     pub colour: StreamColor,
     pub pcm: Option<Pcm>,
+    /// Bits a second the entry states, its `btrt` avgBitrate (8.5.2.2), else the esds
+    /// DecoderConfigDescriptor's (ISO/IEC 14496-1 7.2.6.6). 0 where neither does.
+    pub avg_bitrate: u32,
+    /// Bits a sample of an audio entry, a PCM entry's depth, FLAC's or ALAC's from its config,
+    /// else the AudioSampleEntry samplesize (12.2.3), 16 for most coded audio. 0 for video.
+    pub bit_depth: u32,
 }
 
 pub fn family_for(kind: boxes::FourCc) -> &'static str {
@@ -161,6 +167,8 @@ fn parse_sample_entry(h: &BoxHeader, data: &[u8]) -> Result<SampleEntry, BoxErro
         reframer: Reframer::Passthrough,
         colour: StreamColor::default(),
         pcm: None,
+        avg_bitrate: 0,
+        bit_depth: 0,
     };
     if is_video_family(family) || is_nal_entry(&kind) {
         parse_visual_entry(payload, &mut entry)?;
@@ -223,7 +231,15 @@ fn parse_visual_entry(payload: &[u8], entry: &mut SampleEntry) -> Result<(), Box
     if &entry.kind == b"mp4v" {
         mp4v_esds(children, entry);
     }
+    entry.avg_bitrate = btrt_avg(children).unwrap_or(entry.avg_bitrate);
     Ok(())
+}
+
+/// The avgBitrate of a `btrt` among `children` (8.5.2.2), None without one or for 0.
+fn btrt_avg(children: &[u8]) -> Option<u32> {
+    let btrt = boxes::find_child(children, boxes::fourcc(b"btrt")).ok().flatten()?;
+    let b = btrt.body(children).get(8..12)?;
+    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]])).filter(|&v| v != 0)
 }
 
 /// Promotes `mp4v` by its esds objectTypeIndication (ISO/IEC 14496-1 7.2.6.6 Table 5, FFmpeg
@@ -233,7 +249,8 @@ fn mp4v_esds(children: &[u8], entry: &mut SampleEntry) {
     let Some(esds) = boxes::find_child(children, boxes::fourcc(b"esds")).ok().flatten() else {
         return;
     };
-    let Some((oti, dsi)) = parse_esds(esds.body(children)) else { return };
+    let Some((oti, dsi, avg)) = parse_esds(esds.body(children)) else { return };
+    entry.avg_bitrate = avg;
     entry.family = match oti {
         0x20 => "mpeg4/asp",
         0x60..=0x65 => "mpeg2",
@@ -286,6 +303,7 @@ fn pcm_entry<'a>(
         _ => None,
     };
     let Some((bits, float, le, signed)) = shape else { return };
+    entry.bit_depth = bits;
     let order = |width: u8| if le { Reframer::Passthrough } else { Reframer::Swap { width } };
     let (sample, reframer) = match (bits, float, signed) {
         (8, false, false) => ("u8", Reframer::Passthrough),
@@ -380,6 +398,7 @@ fn parse_audio_entry(payload: &[u8], entry: &mut SampleEntry) -> Result<(), BoxE
     // A QTFF SoundDescription (version at octet 8) inserts 16 (v1) or 36 (v2) octets
     // before the children.
     let version = u16::from_be_bytes([payload[8], payload[9]]);
+    entry.bit_depth = u32::from(u16::from_be_bytes([payload[18], payload[19]]));
     let children_off = match version {
         1 => CHILDREN_OFF + 16,
         2 => CHILDREN_OFF + 36,
@@ -395,6 +414,10 @@ fn parse_audio_entry(payload: &[u8], entry: &mut SampleEntry) -> Result<(), BoxE
                 if let Some(rate) = streaminfo_rate(&head) {
                     entry.sample_rate = rate;
                 }
+                // STREAMINFO's bits per sample less one, 5 bits behind the channels
+                if let Some(b) = head.get(20..22) {
+                    entry.bit_depth = u32::from((b[0] & 1) << 4 | b[1] >> 4) + 1;
+                }
                 entry.config_record = head.clone();
                 entry.codec_head = head;
             }
@@ -407,6 +430,8 @@ fn parse_audio_entry(payload: &[u8], entry: &mut SampleEntry) -> Result<(), BoxE
         }
         b"alac" => {
             if let Some(cookie) = child(b"alac").and_then(|b| b.get(4..)) {
+                // ALACSpecificConfig bitDepth, behind frameLength and compatibleVersion
+                entry.bit_depth = cookie.get(5).map_or(entry.bit_depth, |&d| u32::from(d));
                 entry.config_record = cookie.to_vec();
                 entry.codec_head = cookie.to_vec();
             }
@@ -421,7 +446,8 @@ fn parse_audio_entry(payload: &[u8], entry: &mut SampleEntry) -> Result<(), BoxE
                 .flatten()
                 .map(|h| h.body(children).to_vec())
         });
-        if let Some((oti, asc)) = esds.as_deref().and_then(parse_esds) {
+        if let Some((oti, asc, avg)) = esds.as_deref().and_then(parse_esds) {
+            entry.avg_bitrate = avg;
             // 14496-1 7.2.6.6 Table 8. 0x40 and 0x66-0x68 are AAC and need the ASC. 0x6B and 0x69
             // are MPEG audio with no DecoderSpecificInfo.
             match oti {
@@ -434,6 +460,10 @@ fn parse_audio_entry(payload: &[u8], entry: &mut SampleEntry) -> Result<(), BoxE
                 _ => {}
             }
         }
+    }
+    // a btrt wins over the esds
+    if let Some(avg) = payload.get(children_off..).and_then(btrt_avg) {
+        entry.avg_bitrate = avg;
     }
     Ok(())
 }
@@ -494,9 +524,9 @@ fn read_descriptor(data: &[u8], at: usize) -> Option<(u8, core::ops::Range<usize
     Some((tag, i..end))
 }
 
-/// `(objectTypeIndication, DecoderSpecificInfo)` from an `esds` payload (ISO/IEC 14496-14
-/// 5.6, 14496-1 7.2.6.5). `None` on any structural violation.
-fn parse_esds(payload: &[u8]) -> Option<(u8, Vec<u8>)> {
+/// `(objectTypeIndication, DecoderSpecificInfo, avgBitrate)` from an `esds` payload (ISO/IEC
+/// 14496-14 5.6, 14496-1 7.2.6.5). `None` on any structural violation.
+fn parse_esds(payload: &[u8]) -> Option<(u8, Vec<u8>, u32)> {
     let (tag, es) = read_descriptor(payload, 4)?;
     if tag != TAG_ES_DESCR {
         return None;
@@ -518,15 +548,17 @@ fn parse_esds(payload: &[u8]) -> Option<(u8, Vec<u8>)> {
         if tag == TAG_DECODER_CONFIG {
             let dc = &es_data[r];
             let oti = *dc.first()?;
+            // behind streamType, bufferSizeDB and maxBitrate
+            let avg = dc.get(9..13).map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
             let mut dat = 13usize;
             while dat < dc.len() {
                 let (t, r) = read_descriptor(dc, dat)?;
                 if t == TAG_DECODER_SPECIFIC_INFO {
-                    return Some((oti, dc[r].to_vec()));
+                    return Some((oti, dc[r].to_vec(), avg));
                 }
                 dat = r.end;
             }
-            return Some((oti, Vec::new())); // no DecoderSpecificInfo
+            return Some((oti, Vec::new(), avg)); // no DecoderSpecificInfo
         }
         at = r.end;
     }
@@ -873,6 +905,7 @@ mod tests {
             "only the last block is flagged"
         );
         assert_eq!(entry.sample_rate, 96_000, "the rate STREAMINFO states");
+        assert_eq!(entry.bit_depth, 32, "the depth STREAMINFO states");
         assert_eq!(entry.config_record, entry.codec_head);
         for bad in [
             [&[1u8, 0, 0, 0][..], &blocks].concat(),
@@ -901,6 +934,40 @@ mod tests {
             stsd.extend_from_slice(&box_bytes(kind, &[0u8; 8]));
             assert_eq!(parse_stsd(&stsd).unwrap().family, family);
         }
+    }
+
+    #[test]
+    fn an_entry_states_its_bitrate_and_an_audio_one_its_depth() {
+        let btrt = |avg: u32| {
+            let body = [&[0u8; 4][..], &9_000_000u32.to_be_bytes(), &avg.to_be_bytes()].concat();
+            box_bytes(b"btrt", &body)
+        };
+        let mut esds = esds_body(0x40, &[0x11, 0x90], false);
+        // the DecoderConfigDescriptor's avgBitrate, 13 octets into its 15 octet head
+        let dc = esds.iter().position(|&b| b == TAG_DECODER_CONFIG).unwrap() + 2;
+        esds[dc + 9..dc + 13].copy_from_slice(&128_000u32.to_be_bytes());
+        let mut ae = mp4a_entry(&esds, 48_000, 2);
+        ae[18..20].copy_from_slice(&16u16.to_be_bytes());
+        let aac = |ae: &[u8]| {
+            parse_stsd(&[&[0u8; 4][..], &1u32.to_be_bytes(), &box_bytes(b"mp4a", ae)].concat())
+                .unwrap()
+        };
+        let e = aac(&ae);
+        assert_eq!((e.family, e.avg_bitrate, e.bit_depth), ("aac", 128_000, 16));
+        ae.extend_from_slice(&btrt(96_000));
+        assert_eq!(aac(&ae).avg_bitrate, 96_000, "a btrt wins over the esds");
+        let mut ve = mp4v_stsd(None);
+        ve.extend_from_slice(&btrt(2_500_000));
+        let grown = (u32::from_be_bytes(ve[8..12].try_into().unwrap()) + 20).to_be_bytes();
+        ve[8..12].copy_from_slice(&grown);
+        let e = parse_stsd(&ve).unwrap();
+        assert_eq!((e.avg_bitrate, e.bit_depth), (2_500_000, 0));
+        assert_eq!(parse_stsd(&mp4v_stsd(None)).unwrap().avg_bitrate, 0, "no btrt");
+        let twos = parse_stsd(&lpcm_stsd(48_000.0, 2, 24, 0x4)).unwrap();
+        assert_eq!(twos.bit_depth, 24, "the v2 fields' depth");
+        let cookie = [0u8, 0, 0x10, 0, 0, 0x18, 0x28, 0x0A, 0x0E, 2, 0, 0xFF];
+        let alac = box_bytes(b"alac", &[&[0u8; 4][..], &cookie].concat());
+        assert_eq!(parse_stsd(&audio_stsd(b"alac", 44_100, &alac)).unwrap().bit_depth, 24);
     }
 
     #[test]

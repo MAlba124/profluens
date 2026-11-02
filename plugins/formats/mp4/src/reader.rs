@@ -156,6 +156,9 @@ pub struct Track {
     pub alternate_group: i16,
     pub disposition: Disposition,
     pub forced: bool,
+    /// Bits a second, the entry's stated avgBitrate, else its sample sizes summed over the
+    /// media's duration. 0 for unknown, a fragmented track's samples are not in the head.
+    pub bitrate: u64,
 }
 
 impl Track {
@@ -1700,6 +1703,12 @@ fn resolve_track(
     let media_time = edits.as_ref().map_or(0, EditList::first_media);
     let kind = track_kind(entry.family);
 
+    let bytes =
+        sizes_box.and_then(|b| sizes_total(b.body(stbl_body), b.kind == boxes::boxtype::STZ2));
+    let bitrate = match entry.avg_bitrate {
+        0 => bytes.map_or(0, |b| bits_per_second(b, mdhd.duration, mdhd.timescale)),
+        avg => u64::from(avg),
+    };
     let stbl = match (stts, sizes_box, stsc, chunk_offsets_box) {
         (Some(stts), Some(sizes_box), Some(stsc), Some(chunk_offsets_box)) => {
             let stz2 = sizes_box.kind == boxes::boxtype::STZ2;
@@ -1765,8 +1774,40 @@ fn resolve_track(
         alternate_group: tkhd.map_or(0, |t| t.alternate_group),
         disposition: role,
         forced,
+        bitrate,
     };
     Ok(Some((track, stbl)))
+}
+
+/// The bytes an `stsz` or `stz2` body's samples sum to, walked in place. None for a table the
+/// box does not hold whole.
+fn sizes_total(body: &[u8], stz2: bool) -> Option<u64> {
+    let be32 = |o: usize| body.get(o..o + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let (size, count) = (be32(4)?, u64::from(be32(8)?));
+    if !stz2 && size != 0 {
+        return Some(u64::from(size) * count);
+    }
+    let bits = if stz2 { u64::from(body[7]) } else { 32 };
+    let table = body.get(12..)?;
+    if !matches!(bits, 4 | 8 | 16 | 32) || (count * bits).div_ceil(8) > table.len() as u64 {
+        return None;
+    }
+    let n = count as usize;
+    Some(match bits {
+        32 => table.as_chunks::<4>().0[..n].iter().map(|b| u64::from(u32::from_be_bytes(*b))).sum(),
+        16 => table.as_chunks::<2>().0[..n].iter().map(|b| u64::from(u16::from_be_bytes(*b))).sum(),
+        8 => table[..n].iter().map(|&b| u64::from(b)).sum(),
+        _ => (0..n).map(|k| u64::from(table[k / 2] >> (4 * (1 - k % 2)) & 0x0F)).sum(),
+    })
+}
+
+/// `bytes` over `duration` ticks of `timescale` a second, as bits a second.
+fn bits_per_second(bytes: u64, duration: u64, timescale: u32) -> u64 {
+    if duration == 0 || timescale == 0 {
+        return 0;
+    }
+    let bits = u128::from(bytes) * 8 * u128::from(timescale) / u128::from(duration);
+    u64::try_from(bits).unwrap_or(u64::MAX)
 }
 
 /// ISO/IEC 23009-1 5.8.5.5.
@@ -2337,6 +2378,27 @@ mod tests {
             build_samples(0, 4, &sizes, &stts, &[], &stsc, &chunk_offsets, None, 0, 0, &mut out)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn sample_sizes_are_summed_in_place() {
+        let constant = [0, 0, 0, 0, 0, 0, 0, 5, 0, 0x0F, 0x42, 0x40];
+        assert_eq!(sizes_total(&constant, false), Some(5_000_000));
+        let two = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 7, 0, 1, 0, 9];
+        assert_eq!(sizes_total(&two, false), Some(7 + 65_545));
+        assert_eq!(sizes_total(&two[..19], false), None, "a table cut short");
+        let nibbles = [0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 3, 0x12, 0x30];
+        assert_eq!(sizes_total(&nibbles, true), Some(1 + 2 + 3));
+        let bytes = [0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 2, 200, 100];
+        assert_eq!(sizes_total(&bytes, true), Some(300));
+        let wide = [0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 1, 1, 0];
+        assert_eq!(sizes_total(&wide, true), Some(256));
+        let odd = [0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 1, 0];
+        assert_eq!(sizes_total(&odd, true), None);
+        assert_eq!(sizes_total(&[0; 8], false), None);
+        assert_eq!(bits_per_second(1_000, 2, 1), 4_000);
+        assert_eq!(bits_per_second(1_000, 0, 1), 0, "no duration, no rate");
+        assert_eq!(bits_per_second(u64::MAX, 1, u32::MAX), u64::MAX, "saturates");
     }
 
     #[test]

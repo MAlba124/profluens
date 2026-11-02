@@ -7,6 +7,7 @@ pub mod batch;
 pub mod buffer;
 pub mod bus;
 pub mod clock;
+pub mod codec;
 pub mod command;
 pub mod counters;
 pub mod couple;

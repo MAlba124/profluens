@@ -81,7 +81,7 @@ static SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: &SRC_OFFERS }];
 
 // Cold, once per default build.
 #[allow(clippy::disallowed_methods)]
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "vaapih264dec",
     sinks: &SINKS,
     srcs: &SRCS,

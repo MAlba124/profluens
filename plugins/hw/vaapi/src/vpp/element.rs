@@ -107,7 +107,7 @@ fn make_default() -> Box<dyn Element> {
     Box::new(VaapiPostProc::new(Target::default()))
 }
 
-static DESCS: [[ElementDesc; 2]; 2] = [
+pub(crate) static DESCS: [[ElementDesc; 2]; 2] = [
     [desc(&RAW_SINKS, &RAW_SRCS, Some(make_default)), desc(&RAW_SINKS, &GPU_SRCS, None)],
     [desc(&GPU_SINKS, &RAW_SRCS, None), desc(&GPU_SINKS, &GPU_SRCS, None)],
 ];

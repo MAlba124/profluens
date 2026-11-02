@@ -81,7 +81,7 @@ fn make_default() -> Box<dyn profluens_core::element::Element> {
 
 static SRC_OFFERS: [OfferDesc; 1] = [OfferDesc { family: "av1", fields: &OUT_FIELDS }];
 static SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: &SRC_OFFERS }];
-static DESC: ElementDesc =
+pub(crate) static DESC: ElementDesc =
     encshell::desc("vaapiav1enc", &RAW_SINKS, &SRCS, Some(make_default as MakeFn));
 static DESC_GPU: ElementDesc = encshell::desc("vaapiav1enc", &GPU_SINKS, &SRCS, None);
 

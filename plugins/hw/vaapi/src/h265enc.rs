@@ -85,7 +85,7 @@ static PROPS: [PropDesc; 5] = [
 
 // Cold, once per default build.
 #[allow(clippy::disallowed_methods)]
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "vaapih265enc",
     sinks: &SINKS,
     srcs: &SRCS,

@@ -59,7 +59,7 @@ static PROPS: [PropDesc; 5] = [
 
 // Cold: make_default boxes one element when the registry builds the default, not per-frame.
 #[allow(clippy::disallowed_methods)]
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "vaapivp8enc",
     sinks: &SINKS,
     srcs: &SRCS,

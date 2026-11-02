@@ -81,7 +81,7 @@ static SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: &SRC_OFFERS }];
 
 // Cold: make_default boxes one element when the registry builds the default.
 #[allow(clippy::disallowed_methods)]
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "vaapivp9dec",
     sinks: &SINKS,
     srcs: &SRCS,

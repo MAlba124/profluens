@@ -1,7 +1,11 @@
 //! `opusenc`, 48 kHz `s16` PCM to one Opus packet per buffer, the last frame zero padded. Stamps
 //! count from an input that begins a frame, so a gap or seek upstream carries through.
+//! `aligned` puts the frames on absolute multiples of the frame duration instead, so a run
+//! started mid-stream cuts and stamps its frames where a full run did. It drops the samples
+//! before the first grid point and starts over on the grid when a stamp slips from the count.
 
 use profluens_core::batch::Inputs;
+use profluens_core::buffer::BufferFlags;
 use profluens_core::bus::BusMessage;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
@@ -52,6 +56,9 @@ const MAX_UNFORMATTED_BYTES: usize = OPUS_RATE as usize * 2 * 2;
 
 const DEFAULT_FRAME_TENTHS: u16 = 200;
 
+/// Aligned, a stamp this far from the count starts over on the grid.
+const SLIP_NS: i128 = 5_000_000;
+
 static SINK_FIELDS: [FieldDesc; 3] = [
     FieldDesc {
         field: F_RATE,
@@ -77,11 +84,13 @@ static SRC_OFFERS: [OfferDesc; 2] = [OfferDesc::any(FAMILY_OPUS), OfferDesc::any
 static SINKS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &SINK_OFFERS }];
 static SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: &SRC_OFFERS }];
 
-/// `bitrate` 0 derives from channels, `vbr` 0 is CBR, `complexity` 0 to 10.
-static PROPS: [PropDesc; 3] = [
+/// `bitrate` 0 derives from channels, `vbr` 0 is CBR, `complexity` 0 to 10, `aligned` 1 puts
+/// frames on absolute multiples of the frame duration.
+static PROPS: [PropDesc; 4] = [
     PropDesc { name: "bitrate", allowed: Constraint::Any, live: false },
     PropDesc { name: "vbr", allowed: Constraint::Any, live: false },
     PropDesc { name: "complexity", allowed: Constraint::Any, live: false },
+    PropDesc { name: "aligned", allowed: Constraint::Any, live: false },
 ];
 
 #[allow(clippy::disallowed_methods)] // make_default boxes once at parse time
@@ -106,6 +115,7 @@ pub struct OpusEnc {
     application: Application,
     vbr: bool,
     complexity: u8,
+    aligned: bool,
     enc: Option<Box<dyn EncBackend>>,
     channels: usize,
     frame_bytes: usize,
@@ -114,6 +124,8 @@ pub struct OpusEnc {
     packet: Vec<u8>,
     origin: Timestamp,
     sent: u64,
+    /// Aligned, samples still to drop before the first grid point.
+    skip: u64,
     packets: u64,
     rejected: u64,
 }
@@ -136,6 +148,7 @@ impl OpusEnc {
             application: Application::Audio,
             vbr: true,
             complexity: 10,
+            aligned: false,
             enc: None,
             channels: 0,
             frame_bytes: 0,
@@ -143,9 +156,75 @@ impl OpusEnc {
             packet: Vec::new(),
             origin: Timestamp::NONE,
             sent: 0,
+            skip: 0,
             packets: 0,
             rejected: 0,
         }
+    }
+
+    /// Frames on absolute multiples of the frame duration, so a mid-stream start cuts and
+    /// stamps where a full run did.
+    pub fn aligned(mut self) -> Self {
+        self.aligned = true;
+        self
+    }
+
+    fn frame_ns(&self) -> u64 {
+        u64::from(self.frame_ms_tenths) * 100_000
+    }
+
+    /// Aligned, the input's place on the grid. A stamp off the count by more than `SLIP_NS` or a
+    /// discont pads out the carry and starts over at the next grid point.
+    fn place(&mut self, ctx: &mut Ctx, pts: Timestamp, discont: bool) -> Result<(), Error> {
+        // Unformatted input has no sample size yet, it is placed once and counted after.
+        let stride = self.channels * 2;
+        if self.origin.is_some() && pts.is_some() && stride > 0 {
+            let due = (self.sent + (self.acc.len() / stride) as u64) as i128 - self.skip as i128;
+            let expected = self.origin.0 as i128 + due * 1_000_000_000 / i128::from(OPUS_RATE);
+            let slip = pts.0 as i128 - expected;
+            if !discont && slip.abs() <= SLIP_NS {
+                return Ok(());
+            }
+            log!(&*ctx, Level::Debug, "slip", ns = slip as i64, discont = discont);
+            self.pad_tail(ctx)?;
+            (self.origin, self.skip) = (Timestamp::NONE, 0);
+        }
+        if self.origin.is_some() {
+            return Ok(());
+        }
+        let p = pts.nanos().unwrap_or(0);
+        let f = self.frame_ns();
+        let grid = p.div_ceil(f).saturating_mul(f);
+        let ns = u128::from(grid.saturating_sub(p));
+        self.skip = ((ns * u128::from(OPUS_RATE) + 500_000_000) / 1_000_000_000) as u64;
+        (self.origin, self.sent) = (Timestamp(grid), 0);
+        log!(&*ctx, Level::Debug, "origin", pts = Timestamp(grid), skip = self.skip);
+        Ok(())
+    }
+
+    /// Bytes of `data` that go before the grid, taken off the pending skip.
+    fn skipped(&mut self, len: usize) -> usize {
+        let stride = (self.channels * 2) as u64;
+        if self.skip == 0 || stride == 0 {
+            return 0;
+        }
+        let n = (self.skip * stride).min(len as u64);
+        self.skip -= n / stride;
+        n as usize
+    }
+
+    /// Encodes the partial frame in `acc` zero padded, the padding left out of its duration.
+    fn pad_tail(&mut self, ctx: &mut Ctx) -> Result<usize, Error> {
+        if self.frame_bytes == 0 || self.acc.is_empty() {
+            return Ok(0);
+        }
+        let padded = self.frame_bytes.saturating_sub(self.acc.len());
+        self.acc.resize(self.frame_bytes, 0);
+        let mut carry = std::mem::take(&mut self.acc);
+        let res = self.encode_frame_bytes(ctx, &carry[..self.frame_bytes], padded);
+        carry.clear();
+        self.acc = carry;
+        res.map(|()| padded)
     }
 
     fn anchor(&mut self, ctx: &Ctx, pts: Timestamp) {
@@ -176,6 +255,8 @@ impl OpusEnc {
         if self.enc.is_none() {
             self.build_encoder(ctx);
         }
+        let n = self.skipped(self.acc.len());
+        self.acc.drain(..n);
         self.encode_carry(ctx)
     }
 
@@ -263,7 +344,9 @@ impl OpusEnc {
         buf.memory.set_len(n);
         let samples = (frame.len().saturating_sub(pad) / (self.channels.max(1) * 2)) as u64;
         buf.pts = self.at(self.sent);
+        buf.dts = buf.pts;
         buf.duration = self.at(self.sent + samples).saturating_sub(buf.pts);
+        buf.flags = BufferFlags::KEYFRAME;
         self.sent += samples;
         self.packets += 1;
         ctx.out(Self::OUT).push(buf);
@@ -338,11 +421,14 @@ impl Element for OpusEnc {
         if let Some(Value::Int(c)) = ctx.prop("complexity") {
             self.complexity = c.clamp(0, 10) as u8;
         }
+        if let Some(Value::Int(a)) = ctx.prop("aligned") {
+            self.aligned = a != 0;
+        }
         self.enc = None;
         self.channels = 0;
         self.frame_bytes = 0;
         self.acc.clear();
-        (self.origin, self.sent) = (Timestamp::NONE, 0);
+        (self.origin, self.sent, self.skip) = (Timestamp::NONE, 0, 0);
         (self.packets, self.rejected) = (0, 0);
         // Link-time negotiation may already have fixed the sink format.
         self.build_from_sink(ctx)
@@ -351,8 +437,15 @@ impl Element for OpusEnc {
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
         self.build_from_sink(ctx)?;
         while let Some(buf) = inputs.pop() {
-            self.anchor(ctx, buf.pts);
-            self.feed(ctx, buf.memory.data())?;
+            let data = buf.memory.data();
+            if !self.aligned {
+                self.anchor(ctx, buf.pts);
+                self.feed(ctx, data)?;
+                continue;
+            }
+            self.place(ctx, buf.pts, buf.flags.contains(BufferFlags::DISCONT))?;
+            let n = self.skipped(data.len());
+            self.feed(ctx, &data[n..])?;
         }
         Ok(Flow::Ok)
     }
@@ -366,20 +459,13 @@ impl Element for OpusEnc {
                     enc.reset();
                 }
                 self.acc.clear();
-                (self.origin, self.sent) = (Timestamp::NONE, 0);
+                (self.origin, self.sent, self.skip) = (Timestamp::NONE, 0, 0);
             }
             Event::Eos => {
                 // A format fixed without a FormatChange still gets the buffered input encoded.
                 self.build_from_sink(ctx)?;
-                let tail = self.frame_bytes > 0 && !self.acc.is_empty();
-                let padded = if tail { self.frame_bytes.saturating_sub(self.acc.len()) } else { 0 };
-                if tail {
-                    self.acc.resize(self.frame_bytes, 0);
-                    let mut carry = std::mem::take(&mut self.acc);
-                    self.encode_frame_bytes(ctx, &carry[..self.frame_bytes], padded)?;
-                    carry.clear();
-                    self.acc = carry;
-                } else if self.frame_bytes == 0 && !self.acc.is_empty() {
+                let padded = self.pad_tail(ctx)?;
+                if self.frame_bytes == 0 && !self.acc.is_empty() {
                     log!(&*ctx, Level::Error, "eos_unformatted", bytes = self.acc.len());
                 }
                 let level = if self.rejected > 0 { Level::Warn } else { Level::Info };

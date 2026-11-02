@@ -42,6 +42,22 @@ impl Stream {
         }
         Some((self.scale as u64).saturating_mul(1_000_000_000) / self.rate as u64)
     }
+
+    /// The codec's own bytes behind the fixed format header of `strf`, behind the
+    /// BITMAPINFOHEADER (its `biSize`, 40 at least) of a video stream, behind the 18 octets of
+    /// WAVEFORMATEX of an audio one, the VOL of an MPEG-4 stream. Empty for other streams.
+    pub fn codec_head(&self) -> &[u8] {
+        let fixed = match self.kind {
+            StreamKind::Video => {
+                let size =
+                    self.strf.get(..4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                usize::try_from(size).unwrap_or(usize::MAX).max(40)
+            }
+            StreamKind::Audio => 18,
+            StreamKind::Other => return &[],
+        };
+        self.strf.get(fixed..).unwrap_or(&[])
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -714,6 +730,38 @@ mod odml_tests {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_codec_head_is_what_follows_the_format_header() {
+        let mut s = Stream {
+            index: 0,
+            kind: StreamKind::Video,
+            handler: *b"XVID",
+            scale: 1,
+            rate: 25,
+            sample_size: 0,
+            length: 0,
+            width: 0,
+            height: 0,
+            strf: [&40u32.to_le_bytes()[..], &[0; 36], &[0, 0, 1, 0xB0, 1]].concat(),
+            format_tag: 0,
+            channels: 0,
+            samples_per_sec: 0,
+            bits_per_sample: 0,
+        };
+        assert_eq!(s.codec_head(), [0, 0, 1, 0xB0, 1], "the VOL behind 40 octets");
+        s.strf[..4].copy_from_slice(&44u32.to_le_bytes());
+        assert_eq!(s.codec_head(), [1], "behind a longer biSize");
+        s.strf[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(s.codec_head().is_empty(), "a biSize past the strf");
+        s.strf.truncate(10);
+        assert!(s.codec_head().is_empty(), "a cut header");
+        s.kind = StreamKind::Audio;
+        s.strf = [&[0u8; 18][..], &[0x12, 0x10]].concat();
+        assert_eq!(s.codec_head(), [0x12, 0x10], "behind WAVEFORMATEX");
+        s.kind = StreamKind::Other;
+        assert!(s.codec_head().is_empty());
+    }
 
     fn build_avi(data_chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
         fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {

@@ -335,7 +335,7 @@ impl SubParse {
         let mut text = String::with_capacity(self.text.len());
         decode_all(&self.text, self.charset, &mut text);
         self.text.clear();
-        let Some(format) = detect_format(&text) else {
+        let Some(format) = autodetect::detect_document(&text) else {
             self.warn(ctx, SubParseError::UnknownFormat { bytes: text.len() });
             self.end_document(ctx, 0);
             return;
@@ -408,19 +408,6 @@ impl SubParse {
         }
         log!(&*ctx, Level::Info, "eos", cues = emitted, dropped = self.dropped);
     }
-}
-
-/// The C typefinder's eleven formats, then SSA/ASS by its section headers (a separate element in
-/// the C).
-fn detect_format(text: &str) -> Option<Format> {
-    autodetect::detect(text).or_else(|| {
-        let head = text.strip_prefix('\u{feff}').unwrap_or(text);
-        let head = &head[..head.char_indices().nth(4096).map_or(head.len(), |(i, _)| i)];
-        ["[Script Info]", "[V4+ Styles]", "[V4 Styles]", "[Events]"]
-            .iter()
-            .any(|section| head.contains(section))
-            .then_some(Format::Ssa)
-    })
 }
 
 /// Build one document cue into `b`.

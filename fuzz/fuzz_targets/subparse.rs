@@ -53,7 +53,7 @@ fn document(raw: &[u8], forced: Option<Format>, cut: u8) {
     let mut text = String::new();
     decode_all(raw, None, &mut text);
     let _ = autodetect::detect(&String::from_utf8_lossy(&raw[..raw.len().min(128)]));
-    let Some(format) = forced.or_else(|| detect_format(&text)) else {
+    let Some(format) = forced.or_else(|| autodetect::detect_document(&text)) else {
         assert!(element_document(raw, cut).is_empty(), "an undetected document put out cues");
         return;
     };
@@ -137,17 +137,6 @@ fn feed(
     buf.drain(..p.consumed);
     cues.extend(p.cues);
     Ok(())
-}
-
-fn detect_format(text: &str) -> Option<Format> {
-    autodetect::detect(text).or_else(|| {
-        let head = text.strip_prefix('\u{feff}').unwrap_or(text);
-        let head = &head[..head.char_indices().nth(4096).map_or(head.len(), |(i, _)| i)];
-        ["[Script Info]", "[V4+ Styles]", "[V4 Styles]", "[Events]"]
-            .iter()
-            .any(|section| head.contains(section))
-            .then_some(Format::Ssa)
-    })
 }
 
 fn element_document(raw: &[u8], cut: u8) -> Vec<Out> {

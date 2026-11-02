@@ -50,6 +50,21 @@ pub fn detect(body: &str) -> Option<Format> {
     None
 }
 
+/// The SSA/ASS section headers, a separate element in the C.
+const SSA_SECTIONS: [&str; 4] = ["[Script Info]", "[V4+ Styles]", "[V4 Styles]", "[Events]"];
+
+/// How far into the body an SSA section header is looked for, in chars.
+const SSA_HEAD: usize = 4096;
+
+/// What the element parses a document as, [`detect`] then SSA/ASS by its section headers.
+pub fn detect_document(body: &str) -> Option<Format> {
+    detect(body).or_else(|| {
+        let head = body.strip_prefix('\u{feff}').unwrap_or(body);
+        let head = &head[..head.char_indices().nth(SSA_HEAD).map_or(head.len(), |(i, _)| i)];
+        SSA_SECTIONS.iter().any(|s| head.contains(s)).then_some(Format::Ssa)
+    })
+}
+
 /// PCRE `\s` and C `isspace`, the ASCII whitespace set.
 #[inline]
 fn is_ws(c: u8) -> bool {
@@ -392,6 +407,21 @@ fn lrc_timestamp(line: &[u8], ms_width: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_takes_ssa_by_its_sections() {
+        let ass = "\u{feff}[Script Info]\nScriptType: v4.00+\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,hi\n";
+        assert_eq!(detect(ass), None, "not in the C typefinder");
+        assert_eq!(detect_document(ass), Some(Format::Ssa));
+        assert_eq!(detect_document("; comment\n[V4 Styles]\nFormat: Name\n"), Some(Format::Ssa));
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\n[Events]\n";
+        assert_eq!(detect_document(srt), Some(Format::SubRip), "the C cascade first");
+        assert_eq!(detect_document("Just some text\n"), None);
+        let late = format!("{}[Events]\n", "x".repeat(SSA_HEAD));
+        assert_eq!(detect_document(&late), None, "a header past the head");
+        let multibyte = format!("{}[Events]\n", "\u{e9}".repeat(SSA_HEAD - 8));
+        assert_eq!(detect_document(&multibyte), Some(Format::Ssa), "the head counts chars");
+    }
 
     #[test]
     fn detect_microdvd() {

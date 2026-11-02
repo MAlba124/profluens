@@ -407,6 +407,7 @@ fn fixtures_are_valid() {
     assert_eq!(count(SRT), 3);
     assert_eq!(count(VTT), 2);
     assert!(autodetect::detect(ASS).is_none(), "SSA is not in the C typefinder");
+    assert_eq!(autodetect::detect_document(ASS), Some(Format::Ssa));
     let ass = Format::Ssa.parser().parse(ASS, &ParseContext::default()).expect("parses");
     assert_eq!(ass.len(), 2);
     let d = framed_dialogue(MKV_ASS).expect("a row");

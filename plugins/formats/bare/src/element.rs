@@ -24,11 +24,13 @@ use profluens_core::time::Timestamp;
 use std::fmt;
 
 use crate::BareError;
-use crate::head::BareHead;
+use crate::head::{BareHead, Codec};
 use crate::reader::{Reader, Unit};
 
 /// Frames put out per process call at most, the scheduler comes back for more.
 const BURST: usize = 64;
+/// ADTS frames a decoder runs ahead of a seek, one for the MDCT overlap and one more for SBR.
+const AAC_PREROLL: u64 = 2;
 
 static FLAC: [OfferDesc; 1] = [OfferDesc::any("flac")];
 static MP3: [OfferDesc; 1] = [OfferDesc::any("mp3")];
@@ -98,6 +100,8 @@ pub struct BareSrc {
     phase: Phase,
     /// A frame read that no buffer took yet.
     held: Option<Unit>,
+    /// See [`BareSrc::for_decoder`].
+    decoder: bool,
 }
 
 impl BareSrc {
@@ -107,7 +111,55 @@ impl BareSrc {
     #[allow(clippy::disallowed_types)]
     pub fn new(file: File, head: BareHead, len: u64) -> Self {
         let rd = Reader::new(&head);
-        BareSrc { file, head, len, started: false, rd, phase: Phase::Head, held: None }
+        BareSrc {
+            file,
+            head,
+            len,
+            started: false,
+            rd,
+            phase: Phase::Head,
+            held: None,
+            decoder: false,
+        }
+    }
+
+    /// A decoder takes the frames. The format declares the LAME delay and the decoder's own for
+    /// it to cut, as a decoder reading the file from byte 0 does, a seek starts the frames back
+    /// that the bit reservoir or the MDCT overlap needs, and the index is final and ends where
+    /// the PCM does.
+    pub fn for_decoder(mut self) -> Self {
+        self.decoder = true;
+        self
+    }
+
+    /// Samples the decoder cuts off the front.
+    fn delay(&self) -> u64 {
+        match self.head.codec {
+            Codec::Mpa { .. } if self.decoder && self.head.gapless != (0, 0) => {
+                u64::from(self.head.gapless.0) + pf_mp3::index::DECODER_DELAY
+            }
+            _ => 0,
+        }
+    }
+
+    /// Frames a seek starts ahead of its target.
+    fn lead_frames(&self) -> u64 {
+        match self.head.codec {
+            _ if !self.decoder => 0,
+            Codec::Mpa { stream } => pf_mp3::index::preroll_frames(&stream, self.head.cbr),
+            Codec::Adts { .. } => AAC_PREROLL,
+            Codec::Flac { .. } => 0,
+        }
+    }
+
+    /// How long the PCM a decoder puts out lasts, 0 unknown.
+    fn duration_ns(&self) -> i64 {
+        let (h, delay) = (&self.head, self.delay());
+        match (delay, h.samples) {
+            (0, _) => h.duration_ns,
+            (d, 0) => h.duration_ns.saturating_sub(h.ns(d)).max(0),
+            (d, n) => h.ns(n.saturating_sub(d)),
+        }
     }
 
     fn fail(ctx: &Ctx, e: BareSrcError) -> Error {
@@ -115,11 +167,14 @@ impl BareSrc {
     }
 
     fn announce(&self, ctx: &mut Ctx) {
+        let delay = self.delay();
         let fields = [
             ("rate", ValueDesc::Int(i64::from(self.head.rate))),
             ("channels", ValueDesc::Int(i64::from(self.head.channels()))),
+            (profluens_audio::FIELD_DELAY, ValueDesc::Int(self.head.ns(delay))),
         ];
-        ctx.announce_format(Self::OUT, self.head.family, &fields);
+        let n = if delay > 0 { 3 } else { 2 };
+        ctx.announce_format(Self::OUT, self.head.family, &fields[..n]);
     }
 
     /// The next frame, the held one first.
@@ -147,10 +202,12 @@ impl Element for BareSrc {
 
     fn preroll(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         ctx.publish_serves(Serves::FILE);
-        let duration = u64::try_from(self.head.duration_ns).ok().filter(|&d| d > 0);
+        let duration = u64::try_from(self.duration_ns()).ok().filter(|&d| d > 0);
         ctx.publish_index(Index {
             file_len: Some(self.len),
             duration: duration.map_or(Timestamp::NONE, Timestamp),
+            // nothing is added later, a reader of the index need not wait on it
+            complete: self.decoder && duration.is_some(),
             ..Index::default()
         });
         if let Some(d) = duration {
@@ -214,8 +271,12 @@ impl Element for BareSrc {
             return Ok(());
         }
         let at = ctx.seek_target().and_then(|t| t.at.nanos()).unwrap_or(0);
+        let at = at.min(i64::MAX as u64) as i64;
+        let back = self.lead_frames() * u64::from(self.head.spf);
+        let at =
+            if back > 0 { self.head.ns(self.head.sample_at(at).saturating_sub(back)) } else { at };
         // A seek probes a few frames at most per bisection step, blocking preads as in `frame`.
-        let mut seek = self.rd.seek(&self.head, at.min(i64::MAX as u64) as i64);
+        let mut seek = self.rd.seek(&self.head, at);
         drive_file(&mut seek, &self.file)
             .map_err(|e| Self::fail(ctx, BareSrcError::Read(e.into())))?;
         (self.phase, self.held) = (Phase::Head, None);

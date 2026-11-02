@@ -13,6 +13,8 @@ profluens-core = { path = "../../../core" }
 pf-registry = { path = "../../../lib/registry" }
 # The MPEG audio frame header, the Xing layout and the ID3 and APE lengths.
 pf-mp3 = { path = "../../audio/mp3" }
+# The delay field a decoder takes off the stamps.
+profluens-audio = { path = "../../../lib/audio" }
 
 [dev-dependencies]
 # The Matroska remux of each fixture the bare units are checked against.

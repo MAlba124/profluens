@@ -13,6 +13,8 @@ profluens-core = { path = "../../../core" }
 pf-registry = { path = "../../../lib/registry" }
 # Shared avcC/hvcC reframers.
 pf-mkv = { path = "../mkv" }
+# The ID3v1 genre table behind `gnre`.
+pf-mp3 = { path = "../../audio/mp3" }
 stein-arena = { workspace = true }
 profluens-audio = { path = "../../../lib/audio" }
 profluens-video = { path = "../../../lib/video" }

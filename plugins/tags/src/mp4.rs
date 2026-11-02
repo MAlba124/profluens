@@ -54,7 +54,7 @@ mod tests {
     use profluens_core::event::TagListSink;
     use profluens_core::memory::Pool;
 
-    use crate::fixture::m4a;
+    use crate::fixture::{ilst_data, m4a, m4a_with, mp4_box};
 
     fn run(f: &[u8]) -> (Props, profluens_core::event::TagList) {
         let pool = Pool::bounded(4096, 8);
@@ -107,6 +107,20 @@ mod tests {
         let props = parse(chunk, rel, len, &arena, &mut sink);
         assert_eq!(props.duration_ns, Some(1_000_000_000));
         assert_eq!(sink.finish().get("TITLE"), Some("Tail"));
+    }
+
+    #[test]
+    fn a_gnre_index_gives_the_genre_when_there_is_no_text_genre() {
+        let gnre = mp4_box(b"gnre", &ilst_data(0, &53u16.to_be_bytes()));
+        let f = m4a_with(44_100, 2, 44_100, &[("©nam", "G")], None, None, true, &gnre);
+        assert_eq!(run(&f).1.get("GENRE"), Some("Electronic"));
+
+        let f = m4a_with(44_100, 2, 44_100, &[("©gen", "Techno")], None, None, true, &gnre);
+        assert_eq!(run(&f).1.get("GENRE"), Some("Techno"), "the text genre wins");
+
+        let none = mp4_box(b"gnre", &ilst_data(0, &0u16.to_be_bytes()));
+        let f = m4a_with(44_100, 2, 44_100, &[("©nam", "G")], None, None, true, &none);
+        assert_eq!(run(&f).1.get("GENRE"), None, "0 is no genre");
     }
 
     #[test]

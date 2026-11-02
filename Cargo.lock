@@ -316,6 +316,7 @@ version = "0.1.0"
 dependencies = [
  "pf-libav",
  "pf-mkv",
+ "pf-mp3",
  "pf-reactor",
  "pf-registry",
  "pf-sim",

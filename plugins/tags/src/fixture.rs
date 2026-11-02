@@ -654,7 +654,7 @@ fn fourcc(key: &str) -> [u8; 4] {
     out
 }
 
-fn ilst_data(well_known: u32, value: &[u8]) -> Vec<u8> {
+pub fn ilst_data(well_known: u32, value: &[u8]) -> Vec<u8> {
     let mut b = well_known.to_be_bytes().to_vec();
     b.extend_from_slice(&0u32.to_be_bytes()); // locale
     b.extend_from_slice(value);
@@ -670,6 +670,21 @@ pub fn m4a(
     track: Option<u16>,
     cover: Option<(&str, &[u8])>,
     faststart: bool,
+) -> Vec<u8> {
+    m4a_with(rate, channels, samples, text, track, cover, faststart, &[])
+}
+
+/// [`m4a`] with `extra`, raw `ilst` items, after the others.
+#[allow(clippy::too_many_arguments)]
+pub fn m4a_with(
+    rate: u32,
+    channels: u16,
+    samples: u64,
+    text: &[(&str, &str)],
+    track: Option<u16>,
+    cover: Option<(&str, &[u8])>,
+    faststart: bool,
+    extra: &[u8],
 ) -> Vec<u8> {
     let mut ftyp = b"M4A ".to_vec();
     ftyp.extend_from_slice(&0u32.to_be_bytes()); // minor version
@@ -762,6 +777,7 @@ pub fn m4a(
         let ty = if mime == "image/png" { 14 } else { 13 };
         ilst.extend_from_slice(&mp4_box(b"covr", &ilst_data(ty, data)));
     }
+    ilst.extend_from_slice(extra);
     let mut meta = vec![0u8; 4]; // `meta` is a FullBox: version + flags precede its children
     meta.extend_from_slice(&mp4_box(b"hdlr", &{
         let mut h = vec![0u8; 4];

@@ -3,7 +3,7 @@
 // Test fixtures allocate freely.
 #![allow(clippy::disallowed_methods)]
 
-use pf_mp3::id3::{ape_tail_len, parse_ape, parse_v1, parse_v2, v2_total_len};
+use pf_mp3::id3::{ape_tail_len, parse_ape, parse_v1, parse_v2, v1_genre, v2_total_len};
 use profluens_core::event::TagSink;
 use profluens_core::scratch::Arena;
 
@@ -410,10 +410,13 @@ fn id3v1_genre_table_is_indexed_correctly_at_its_boundaries() {
         let mut sink = Collect::default();
         parse_v1(&v1_tag(b"t", b"", b"", b"", b"", index), &a, &mut sink);
         assert_eq!(sink.get("GENRE"), Some(name), "genre index {index}");
+        assert_eq!(v1_genre(index), Some(name));
     }
     let mut sink = Collect::default();
     parse_v1(&v1_tag(b"t", b"", b"", b"", b"", 148), &a, &mut sink);
     assert_eq!(sink.get("GENRE"), None);
+    assert_eq!(v1_genre(148), None);
+    assert_eq!(v1_genre(255), None);
 }
 
 #[test]

@@ -14,6 +14,7 @@ const HDLR: FourCc = boxes::fourcc(b"hdlr");
 const ILST: FourCc = boxes::fourcc(b"ilst");
 const DATA: FourCc = boxes::fourcc(b"data");
 const NAME: FourCc = boxes::fourcc(b"name");
+const GNRE: FourCc = boxes::fourcc(b"gnre");
 
 /// The Mac OS Roman copyright octet prefixing Apple's QuickTime keys. One octet, so the
 /// four-CC stays four octets (QTFF Metadata).
@@ -118,7 +119,8 @@ fn probe_box(prefix: &[u8], at: usize, file_len: u64) -> Probe {
     Probe::Found(kind, total)
 }
 
-/// Parses iTunes metadata in a complete `moov` box, header included, into `sink`.
+/// Parses iTunes metadata in a complete `moov` box, header included, into `sink`. The `gnre`
+/// genre is emitted last and only when no item gave a `GENRE`.
 pub fn parse_moov_tags(moov: &[u8], scratch: &Arena, sink: &mut impl TagSink) {
     let Some(body) = moov_body(moov) else { return };
 
@@ -133,10 +135,46 @@ pub fn parse_moov_tags(moov: &[u8], scratch: &Arena, sink: &mut impl TagSink) {
         return;
     };
 
+    let mut sink = GenreSeen { sink, seen: false };
+    let mut gnre = None;
     let _ = boxes::for_each_child(ilst, |item| {
-        parse_item(item.kind, item.body(ilst), scratch, sink);
+        if item.kind == GNRE {
+            gnre = gnre.or(Some(item.body(ilst)));
+        } else {
+            parse_item(item.kind, item.body(ilst), scratch, &mut sink);
+        }
         Ok(())
     });
+    if !sink.seen
+        && let Some(genre) = gnre.and_then(legacy_genre)
+    {
+        sink.sink.text("GENRE", genre);
+    }
+}
+
+/// Forwards to `sink`, noting whether a `GENRE` went through.
+struct GenreSeen<'s, S> {
+    sink: &'s mut S,
+    seen: bool,
+}
+
+impl<S: TagSink> TagSink for GenreSeen<'_, S> {
+    fn text(&mut self, key: &str, value: &str) {
+        self.seen |= key == "GENRE";
+        self.sink.text(key, value);
+    }
+
+    fn picture(&mut self, mime: &str, data: &[u8]) {
+        self.sink.picture(mime, data);
+    }
+}
+
+/// The legacy `gnre` item, an ID3v1 genre index plus one as a u16 BE in its first `data`,
+/// whatever the type. 0 is no genre.
+fn legacy_genre(item: &[u8]) -> Option<&'static str> {
+    let data = boxes::find_child(item, DATA).ok().flatten()?.body(item);
+    let n = u16::from_be_bytes([*data.get(8)?, *data.get(9)?]);
+    pf_mp3::id3::v1_genre(u8::try_from(n.checked_sub(1)?).ok()?)
 }
 
 fn moov_body(moov: &[u8]) -> Option<&[u8]> {
@@ -161,8 +199,6 @@ fn parse_item(kind: FourCc, item: &[u8], scratch: &Arena, sink: &mut impl TagSin
         b"disk" => number_pair(item, "DISCNUMBER", sink),
         b"covr" => cover(item, sink),
         b"----" => freeform(item, scratch, sink),
-        // Legacy ID3v1 genre index. Skipped, files with it carry the text genre too.
-        b"gnre" => {}
         _ => {
             if let Some(key) = text_key(kind) {
                 text_item(item, key, sink);
@@ -716,13 +752,58 @@ mod tests {
     }
 
     #[test]
-    fn gnre_is_skipped_but_gen_is_kept() {
+    fn a_text_genre_wins_over_gnre_in_either_order() {
+        let gnre = item(b"gnre", TYPE_IMPLICIT, &18u16.to_be_bytes());
+        let gen_ = item(b"\xA9gen", TYPE_UTF8, b"Techno");
+        let want = vec![("GENRE".to_string(), "Techno".to_string())];
+        assert_eq!(tags_of(&moov_with_items(&[gnre.clone(), gen_.clone()])).text, want);
+        assert_eq!(tags_of(&moov_with_items(&[gen_, gnre])).text, want);
+    }
+
+    #[test]
+    fn a_freeform_genre_also_wins_over_gnre() {
+        let mut ff = full_bx(b"mean", b"com.apple.iTunes");
+        ff.extend_from_slice(&full_bx(b"name", b"genre"));
+        ff.extend_from_slice(&data_box(TYPE_UTF8, b"Dub"));
         let moov = moov_with_items(&[
             item(b"gnre", TYPE_IMPLICIT, &18u16.to_be_bytes()),
-            item(b"\xA9gen", TYPE_UTF8, b"Techno"),
+            bx(b"----", &ff),
         ]);
-        let t = tags_of(&moov);
-        assert_eq!(t.text, vec![("GENRE".to_string(), "Techno".to_string())]);
+        assert_eq!(tags_of(&moov).text, vec![("GENRE".to_string(), "Dub".to_string())]);
+    }
+
+    #[test]
+    fn a_gnre_index_reads_as_its_id3v1_genre() {
+        let genre = |n: u16| {
+            tags_of(&moov_with_items(&[item(b"gnre", TYPE_IMPLICIT, &n.to_be_bytes())]))
+                .get("GENRE")
+                .map(str::to_string)
+        };
+        // 53 is index 52 plus one, as in an iTunes file
+        assert_eq!(genre(53).as_deref(), Some("Electronic"));
+        assert_eq!(genre(1).as_deref(), Some("Blues"));
+        assert_eq!(genre(148).as_deref(), Some("Synthpop"), "the last entry");
+        assert_eq!(genre(0), None, "0 is no genre");
+        assert_eq!(genre(149), None, "past the table");
+        assert_eq!(genre(500), None, "past a u8 index");
+
+        let ilst = bx(b"ilst", &item(b"gnre", TYPE_IMPLICIT, &18u16.to_be_bytes()));
+        let moov = bx(b"moov", &bx(b"udta", &bx(b"meta", &ilst)));
+        assert_eq!(tags_of(&moov).get("GENRE"), Some("Rock"), "a meta box without version");
+
+        let short = moov_with_items(&[item(b"gnre", TYPE_IMPLICIT, &[53])]);
+        assert!(tags_of(&short).text.is_empty(), "a one octet index is no genre");
+        let bare = moov_with_items(&[bx(b"gnre", b"")]);
+        assert!(tags_of(&bare).text.is_empty(), "no data is no genre");
+    }
+
+    #[test]
+    fn an_undecodable_text_genre_falls_back_to_gnre() {
+        let moov = moov_with_items(&[
+            item(b"\xA9gen", TYPE_UTF8, b"\xFF\xFE"),
+            item(b"gnre", TYPE_IMPLICIT, &53u16.to_be_bytes()),
+        ]);
+        assert_eq!(tags_of(&moov).text, vec![("GENRE".to_string(), "Electronic".to_string())]);
     }
 
     #[test]

@@ -444,7 +444,7 @@ pub fn parse_v1(tail: &[u8], scratch: &Arena, sink: &mut impl TagSink) {
         let mut buf = [0u8; 3];
         sink.text(TRACKNUMBER, decimal(n, &mut buf));
     }
-    if let Some(genre) = GENRES.get(t[127] as usize) {
+    if let Some(genre) = v1_genre(t[127]) {
         sink.text(GENRE, genre);
     }
 }
@@ -468,6 +468,11 @@ fn decimal(n: u8, buf: &mut [u8; 3]) -> &str {
         }
     }
     std::str::from_utf8(&buf[i..]).unwrap_or("")
+}
+
+/// The ID3v1 genre name of `index`, `None` past the table. MP4 `gnre` items index it too.
+pub fn v1_genre(index: u8) -> Option<&'static str> {
+    GENRES.get(index as usize).copied()
 }
 
 /// ID3v1 genre names. 0..=79 are the original list, 80..=147 the Winamp extension.

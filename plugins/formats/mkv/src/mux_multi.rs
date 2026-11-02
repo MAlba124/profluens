@@ -113,7 +113,7 @@ static MUXN_SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: &OFFERS }];
 
 // Cold path, once at construction.
 #[allow(clippy::disallowed_methods)]
-static MUXN_DESC: ElementDesc = ElementDesc {
+pub(crate) static MUXN_DESC: ElementDesc = ElementDesc {
     name: "mkvmuxn",
     sinks: &MUXN_SINKS,
     srcs: &MUXN_SRCS,

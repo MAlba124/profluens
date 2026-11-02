@@ -22,6 +22,19 @@ pub const FAMILY_VP6: &str = "vp6";
 pub const FAMILY_VP7: &str = "vp7";
 pub const FAMILY_FLV1: &str = "flv1";
 
+/// Every family a stream can be announced as, `bytes` aside.
+pub static EMITS: &[&str] = &[
+    FAMILY_MPEG4_ASP,
+    FAMILY_H264_ANNEXB,
+    FAMILY_VP6,
+    FAMILY_VP7,
+    FAMILY_FLV1,
+    FAMILY_AC3,
+    FAMILY_DTS,
+    FAMILY_MP3,
+    FAMILY_AUDIO_RAW,
+];
+
 /// The announce family for a discovered [`Stream`].
 pub fn family_for(stream: &Stream) -> &'static str {
     match stream.kind {
@@ -257,6 +270,10 @@ pub fn is_video_family(family: &str) -> bool {
 
 /// The per-track offer menu, the stream's [`family_for`] family plus the `bytes` escape.
 pub fn offers_for(stream: &Stream) -> &'static [OfferDesc] {
+    offers_of(family_for(stream))
+}
+
+fn offers_of(family: &str) -> &'static [OfferDesc] {
     static MPEG4: [OfferDesc; 2] = [OfferDesc::any("mpeg4/asp"), OfferDesc::any("bytes")];
     static H264: [OfferDesc; 2] = [OfferDesc::any("h264/annexb"), OfferDesc::any("bytes")];
     static VP6: [OfferDesc; 2] = [OfferDesc::any(FAMILY_VP6), OfferDesc::any("bytes")];
@@ -267,7 +284,7 @@ pub fn offers_for(stream: &Stream) -> &'static [OfferDesc] {
     static MP3: [OfferDesc; 2] = [OfferDesc::any("mp3"), OfferDesc::any("bytes")];
     static RAW: [OfferDesc; 2] = [OfferDesc::any("audio/raw"), OfferDesc::any("bytes")];
     static BYTES: [OfferDesc; 1] = [OfferDesc::any("bytes")];
-    match family_for(stream) {
+    match family {
         FAMILY_MPEG4_ASP => &MPEG4,
         FAMILY_H264_ANNEXB => &H264,
         FAMILY_VP6 => &VP6,
@@ -284,6 +301,25 @@ pub fn offers_for(stream: &Stream) -> &'static [OfferDesc] {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
+    #[test]
+    fn emits_names_every_family_a_stream_is_announced_as() {
+        let named = |f: &str| f == super::FAMILY_BYTES || super::EMITS.contains(&f);
+        for tag in 0..=u16::MAX {
+            for bits in [8, 16, 24, 32, 64] {
+                assert!(named(super::audio_family(tag, bits)), "{tag:#x}");
+            }
+        }
+        let fixed = [*b"VP60", *b"VP71", *b"FLV1", *b"S263", *b"????"];
+        let tags = super::MPEG4_TAGS.iter().chain(&super::H264_TAGS).chain(&fixed);
+        for cc in tags {
+            let family = super::video_family(*cc, &[]);
+            assert!(named(family), "{family}");
+        }
+        for family in super::EMITS {
+            assert_eq!(super::offers_of(family)[0].family, *family);
+        }
+    }
+
     fn ac3(kbps: u32, fill: u8) -> Vec<u8> {
         let code = super::AC3_KBPS.iter().position(|&k| k == kbps).unwrap() as u8 * 2;
         let mut f = vec![0x0b, 0x77, 0, 0, code, 8 << 3];

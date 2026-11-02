@@ -96,6 +96,9 @@ pub fn parse_speex_head(packet: &[u8]) -> Option<SpeexHead> {
     Some(SpeexHead { sample_rate, channels })
 }
 
+/// Every family a stream goes out as, skeleton streams are skipped.
+pub static EMITS: &[&str] = &["opus", "flac/ogg", "vorbis", "speex", "theora"];
+
 /// The codec mapping of a logical bitstream, from the identification packet on its bos page (RFC
 /// 3533 section 6 puts exactly that packet there).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,6 +224,25 @@ pub fn flac_frame_samples(frame: &[u8]) -> Option<u32> {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emits_names_every_stream_family() {
+        // Exhaustive, so a new mapping does not build until it is placed here.
+        let next = |m| match m {
+            Mapping::Opus => Some(Mapping::Flac),
+            Mapping::Flac => Some(Mapping::Vorbis),
+            Mapping::Vorbis => Some(Mapping::Speex),
+            Mapping::Speex => Some(Mapping::Theora),
+            Mapping::Theora => Some(Mapping::Skeleton),
+            Mapping::Skeleton => Some(Mapping::Unknown),
+            Mapping::Unknown => None,
+        };
+        for m in std::iter::successors(Some(Mapping::Opus), |&m| next(m)) {
+            let family = m.family();
+            let skipped = m == Mapping::Skeleton || family == "bytes";
+            assert_eq!(EMITS.contains(&family), !skipped, "{family}");
+        }
+    }
 
     fn opus_head(version: u8, channels: u8, pre_skip: u16, rate: u32) -> Vec<u8> {
         let mut p = b"OpusHead".to_vec();

@@ -64,7 +64,7 @@ static PCM_FIELDS: [FieldDesc; 3] = [
     FieldDesc { field: FIELD_SAMPLE, allowed: ConstraintDesc::Set(&SAMPLES), preferred: None },
 ];
 
-static SRC_OFFERS: [OfferDesc; 11] = [
+pub(crate) static SRC_OFFERS: [OfferDesc; 11] = [
     OfferDesc::any("bytes"),
     OfferDesc::any("mpeg1"),
     OfferDesc::any("mpeg2"),
@@ -78,9 +78,23 @@ static SRC_OFFERS: [OfferDesc; 11] = [
     OfferDesc::any("subtitle/vobsub"),
 ];
 
+/// Every family the src pads offer, `bytes` aside.
+pub static EMITS: &[&str] = &[
+    "mpeg1",
+    "mpeg2",
+    "mpeg4/asp",
+    "h264/annexb",
+    "h265/annexb",
+    "mp3",
+    "ac3",
+    "dts",
+    profluens_audio::FAMILY,
+    "subtitle/vobsub",
+];
+
 static PADS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &SINK_OFFERS }];
 
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "psdemux",
     sinks: &PADS,
     srcs: &[],

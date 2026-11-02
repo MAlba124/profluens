@@ -5,39 +5,83 @@ use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc};
 
 use crate::reader::Track;
 
-/// The announce family for a track's CodecID (RFC 9559 section 12), matching the decoders' sink
-/// offers. Anything unknown is `bytes`.
+/// The announce family of each CodecID (RFC 9559 section 12), matching the decoders' sink offers.
+pub static CODEC_IDS: [(&str, &str); 33] = [
+    ("A_FLAC", "flac"),
+    ("A_AAC", "aac"),
+    ("A_AC3", "ac3"),
+    ("A_EAC3", "eac3"),
+    ("A_DTS", "dts"),
+    ("A_MPEG/L1", "mp3"),
+    ("A_MPEG/L2", "mp3"),
+    ("A_MPEG/L3", "mp3"),
+    ("A_OPUS", "opus"),
+    ("A_VORBIS", "vorbis"),
+    ("A_ALAC", "alac"),
+    ("A_TRUEHD", "truehd"),
+    ("A_MLP", "mlp"),
+    ("A_PCM/INT/LIT", "audio/raw"),
+    ("A_PCM/INT/BIG", "audio/raw"),
+    ("A_PCM/FLOAT/IEEE", "audio/raw"),
+    ("V_VP8", "vp8"),
+    ("V_VP9", "vp9"),
+    ("V_AV1", "av1"),
+    ("V_MPEG4/ISO/AVC", "h264/annexb"),
+    ("V_MPEGH/ISO/HEVC", "h265/annexb"),
+    ("V_MPEG4/ISO/SP", "mpeg4/asp"),
+    ("V_MPEG4/ISO/ASP", "mpeg4/asp"),
+    ("V_MPEG4/ISO/AP", "mpeg4/asp"),
+    ("V_MPEG2", "mpeg2"),
+    ("V_MS/VFW/FOURCC", "vfw"),
+    ("S_TEXT/UTF8", "subtitle/srt"),
+    ("S_TEXT/ASS", "subtitle/ass"),
+    ("S_TEXT/SSA", "subtitle/ass"),
+    ("S_TEXT/WEBVTT", "subtitle/vtt"),
+    ("S_HDMV/PGS", "subtitle/pgs"),
+    ("S_VOBSUB", "subtitle/vobsub"),
+    ("S_DVBSUB", "subtitle/dvb"),
+];
+
+/// The announce family for a track's CodecID, `bytes` for anything [`CODEC_IDS`] leaves out.
 pub fn family_for(codec_id: &str) -> &'static str {
-    match codec_id {
-        "A_FLAC" => "flac",
-        "A_AAC" => "aac",
-        "A_AC3" => "ac3",
-        "A_EAC3" => "eac3",
-        "A_DTS" => "dts",
-        "A_MPEG/L1" | "A_MPEG/L2" | "A_MPEG/L3" => "mp3",
-        "A_OPUS" => "opus",
-        "A_VORBIS" => "vorbis",
-        "A_ALAC" => "alac",
-        "A_TRUEHD" => "truehd",
-        "A_MLP" => "mlp",
-        "A_PCM/INT/LIT" | "A_PCM/INT/BIG" | "A_PCM/FLOAT/IEEE" => "audio/raw",
-        "V_VP8" => "vp8",
-        "V_VP9" => "vp9",
-        "V_AV1" => "av1",
-        "V_MPEG4/ISO/AVC" => "h264/annexb",
-        "V_MPEGH/ISO/HEVC" => "h265/annexb",
-        "V_MPEG4/ISO/SP" | "V_MPEG4/ISO/ASP" | "V_MPEG4/ISO/AP" => "mpeg4/asp",
-        "V_MPEG2" => "mpeg2",
-        "V_MS/VFW/FOURCC" => "vfw",
-        "S_TEXT/UTF8" => "subtitle/srt",
-        "S_TEXT/ASS" | "S_TEXT/SSA" => "subtitle/ass",
-        "S_TEXT/WEBVTT" => "subtitle/vtt",
-        "S_HDMV/PGS" => "subtitle/pgs",
-        "S_VOBSUB" => "subtitle/vobsub",
-        "S_DVBSUB" => "subtitle/dvb",
-        _ => "bytes",
-    }
+    CODEC_IDS.iter().find(|e| e.0 == codec_id).map_or("bytes", |e| e.1)
 }
+
+/// Every family a track can be announced as, from [`CODEC_IDS`], the VFW fourccs and the refusals.
+pub static EMITS: &[&str] = &[
+    "flac",
+    "aac",
+    "ac3",
+    "eac3",
+    "dts",
+    "mp3",
+    "opus",
+    "vorbis",
+    "alac",
+    "truehd",
+    "mlp",
+    "audio/raw",
+    "pcm",
+    "vp8",
+    "vp9",
+    "av1",
+    "h264/annexb",
+    "h265/annexb",
+    "mpeg4/asp",
+    "mpeg2",
+    "vfw",
+    "vp6",
+    "vp7",
+    "flv1",
+    "subtitle/srt",
+    "subtitle/ass",
+    "subtitle/vtt",
+    "subtitle/pgs",
+    "subtitle/vobsub",
+    "subtitle/dvb",
+    "encrypted",
+    "compressed",
+];
 
 pub fn is_audio_family(family: &str) -> bool {
     matches!(
@@ -780,6 +824,24 @@ mod tests {
             let mut t = track("A_AAC", 48_000.0, 0, &[]);
             t.sampling_frequency = rate;
             assert_eq!(lead_of(&t).pre_roll, 128_000_000, "1024 samples at 8 kHz, for {rate}");
+        }
+    }
+
+    #[test]
+    fn emits_names_every_family_a_track_is_announced_as() {
+        use crate::encoding::Refusal;
+        let mut bih = [0u8; 40];
+        let vfw = [*b"VP60", *b"VP70", *b"FLV1", *b"XVID", *b"H264", *b"????"].map(|cc| {
+            bih[16..20].copy_from_slice(&cc);
+            vfw_family(&bih)
+        });
+        let refused = [Refusal::Encrypted, Refusal::Algo(1)].map(Refusal::family);
+        let table = CODEC_IDS.iter().map(|e| e.1);
+        for family in table.chain(vfw).chain(refused).chain(["pcm"]) {
+            assert!(EMITS.contains(&family), "{family} missing from EMITS");
+        }
+        for &(id, family) in &CODEC_IDS {
+            assert_eq!(offers_for(id)[0].family, family, "{id}");
         }
     }
 

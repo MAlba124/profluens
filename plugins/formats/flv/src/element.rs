@@ -53,7 +53,7 @@ impl std::error::Error for FlvError {}
 static SINK_OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
 static PADS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &SINK_OFFERS }];
 
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "flvdemux",
     sinks: &PADS,
     srcs: &[],

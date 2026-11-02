@@ -15,7 +15,7 @@ use pf_mpegts::{
     Codec, Config, ConfigError, Demux, Encryption, Limits, PesUnit, Step, StreamInfo, Unwrapper,
 };
 use pf_mpegts::{UF_DISCONTINUITY, UF_ENCRYPTED, UF_RANDOM_ACCESS, UF_SCRAMBLED};
-use pf_registry::Registry;
+use pf_registry::{Elements, Registry};
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::BufferFlags;
 use profluens_core::bus::BusMessage;
@@ -88,6 +88,20 @@ static SRC_OFFERS: [OfferDesc; 13] = [
     OfferDesc::any("eac3"),
     OfferDesc::any("mp3"),
     OfferDesc::any(DVB_FAMILY),
+];
+
+/// Every family the src pads offer, `bytes` aside.
+pub static EMITS: &[&str] = &[
+    "h264/annexb",
+    "h265/annexb",
+    "mpeg1",
+    "mpeg2",
+    "mpeg4/asp",
+    "aac",
+    "ac3",
+    "eac3",
+    "mp3",
+    DVB_FAMILY,
 ];
 
 /// As Matroska `S_DVBSUB` names it and `dvbsubdec` takes it.
@@ -1148,14 +1162,26 @@ impl AacHeads {
     }
 }
 
-#[allow(clippy::disallowed_methods)] // one-time registry setup
+pub static ELEMENTS: Elements = &[&DESC];
+
 pub fn register(registry: &mut Registry) {
-    registry.register(TsDemux::new(Vec::new()).desc());
+    registry.register_all(ELEMENTS);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emits_is_every_src_offer_family() {
+        for o in &SRC_OFFERS {
+            assert!(o.family == "bytes" || EMITS.contains(&o.family), "{}", o.family);
+        }
+        for (i, f) in EMITS.iter().enumerate() {
+            assert!(SRC_OFFERS.iter().any(|o| o.family == *f), "{f} not offered");
+            assert!(!EMITS[i + 1..].contains(f), "{f} twice");
+        }
+    }
 
     #[test]
     fn the_config_of_a_unit_is_the_last_put_from_at_or_before_its_stamp() {

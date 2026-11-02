@@ -52,7 +52,7 @@ static SINKS: [PadDesc; MAX_STREAMS] = [
 ];
 static SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: &OFFERS }];
 
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "oggmuxn",
     sinks: &SINKS,
     srcs: &SRCS,

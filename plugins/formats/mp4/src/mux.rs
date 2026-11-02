@@ -184,7 +184,7 @@ static PROPS: [PropDesc; 1] =
 
 // Cold path, once per construction.
 #[allow(clippy::disallowed_methods)]
-static DESC: ElementDesc = ElementDesc {
+pub(crate) static DESC: ElementDesc = ElementDesc {
     name: "mp4mux",
     sinks: &SINKS,
     srcs: &SRCS,

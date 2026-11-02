@@ -25,19 +25,18 @@ pub use duration::{
 };
 pub use element::{DEFAULT_SERIAL, DemuxError, OggDemux, OggMux};
 pub use ident::{
-    Mapping, OpusHead, SPEEX_MAGIC, SpeexHead, VorbisIdent, flac_frame_samples,
+    EMITS, Mapping, OpusHead, SPEEX_MAGIC, SpeexHead, VorbisIdent, flac_frame_samples,
     opus_packet_samples, parse_opus_head, parse_speex_head, parse_vorbis_ident,
 };
 pub use mux_multi::{MuxError, OggMuxN};
 
-use pf_registry::Registry;
-use profluens_core::element::Element;
+use pf_registry::{Elements, Registry};
+
+pub static ELEMENTS: Elements = &[&element::DEMUX_DESC, &element::MUX_DESC, &mux_multi::DESC];
 
 /// Register this crate's elements for name-based construction.
 pub fn register(registry: &mut Registry) {
-    registry.register(OggDemux::new().desc());
-    registry.register(OggMux::new().desc());
-    registry.register(OggMuxN::new().desc());
+    registry.register_all(ELEMENTS);
 }
 pub use page::{
     CAPTURE_PATTERN, GRANULE_NONE, HEADER_FIXED_LEN, MAX_PAGE_SIZE, MAX_SEGMENTS, PageError,

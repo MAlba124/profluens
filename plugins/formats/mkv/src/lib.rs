@@ -23,8 +23,8 @@ pub mod walk;
 pub mod writer;
 
 pub use codec::{
-    Lead, ReframeError, Reframer, config_depth, family_for, is_audio_family, is_video_family,
-    lead_of, nal_head_from_config, track_family, track_offers,
+    EMITS, Lead, ReframeError, Reframer, config_depth, family_for, is_audio_family,
+    is_video_family, lead_of, nal_head_from_config, track_family, track_offers,
 };
 pub use element::{MkvDemux, MkvMux};
 
@@ -50,17 +50,14 @@ pub use writer::{
     WriteError,
 };
 
-use pf_registry::Registry;
-use profluens_core::element::Element;
+use pf_registry::{Elements, Registry};
+
+pub static ELEMENTS: Elements = &[&element::MUX_DESC, &mux_multi::MUXN_DESC, &element::DEMUX_DESC];
 
 /// Register this crate's elements by name. `mkvdemux` has no default since it needs the header
 /// bytes.
-// Cold path, once at registration.
-#[allow(clippy::disallowed_methods)]
 pub fn register(registry: &mut Registry) {
-    registry.register(MkvMux::from_caps().desc());
-    registry.register(MkvMuxN::new().desc());
-    registry.register(MkvDemux::new(Vec::new()).desc());
+    registry.register_all(ELEMENTS);
 }
 
 #[cfg(test)]

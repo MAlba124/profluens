@@ -171,6 +171,21 @@ impl Audio {
     }
 }
 
+/// Every family a tag stream can be announced as.
+pub static EMITS: &[&str] = &[
+    "h264/annexb",
+    "h265/annexb",
+    "av1",
+    "vp9",
+    "vp8",
+    "flv1",
+    "vp6f",
+    "vp6a",
+    "audio/raw",
+    "mp3",
+    "aac",
+];
+
 /// The offer menu of a family, the one Matroska puts its tracks of that codec on.
 pub fn offers(family: &str) -> &'static [OfferDesc] {
     static SIZE: [FieldDesc; 2] = [
@@ -463,6 +478,21 @@ pub fn nal4_whole(b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emits_names_every_family_a_tag_stream_is_announced_as() {
+        let ids = (0..=u8::MAX).map(Video::from_id);
+        let ccs =
+            [b"avc1", b"hvc1", b"av01", b"vp09", b"vp08", b"vvc1"].map(|cc| Video::from_fourcc(cc));
+        let video = ids.chain(ccs).filter_map(Video::family);
+        let audio = (0..=u8::MAX).filter_map(|f| Audio::from_format(f).family());
+        for family in video.chain(audio) {
+            assert!(EMITS.contains(&family), "{family} missing from EMITS");
+        }
+        for family in EMITS {
+            assert_eq!(offers(family)[0].family, *family);
+        }
+    }
 
     #[test]
     fn legacy_avc_carries_its_composition_time() {

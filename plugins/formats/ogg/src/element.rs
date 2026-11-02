@@ -40,7 +40,7 @@ static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
 static DEMUX_SINKS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &OFFERS }];
 static DEMUX_SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: &OFFERS }];
 
-static DEMUX_DESC: ElementDesc = ElementDesc {
+pub(crate) static DEMUX_DESC: ElementDesc = ElementDesc {
     name: "oggdemux",
     sinks: &DEMUX_SINKS,
     srcs: &DEMUX_SRCS,
@@ -55,7 +55,7 @@ static DEMUX_DESC: ElementDesc = ElementDesc {
     couplings: &[],
 };
 
-static STREAMS_DESC: ElementDesc = ElementDesc {
+pub(crate) static STREAMS_DESC: ElementDesc = ElementDesc {
     name: "oggdemux",
     sinks: &DEMUX_SINKS,
     srcs: &[],
@@ -163,7 +163,11 @@ impl Run {
 
     /// The granule where `packet` starts, the end of its page less the samples from it on
     /// there, `after` the packets queued behind it.
-    fn start<'a>(&self, packet: &Packet, mut after: impl Iterator<Item = &'a Packet>) -> Option<u64> {
+    fn start<'a>(
+        &self,
+        packet: &Packet,
+        mut after: impl Iterator<Item = &'a Packet>,
+    ) -> Option<u64> {
         let mut samples = u64::from(self.length(&packet.data)?);
         let mut end = packet;
         while !end.last {
@@ -475,13 +479,7 @@ impl OggDemux {
         ctx.publish_index(index);
     }
 
-    fn emit_packet(
-        ctx: &mut Ctx,
-        pad: SrcPad,
-        data: &[u8],
-        pts: Timestamp,
-        head: bool,
-    ) -> bool {
+    fn emit_packet(ctx: &mut Ctx, pad: SrcPad, data: &[u8], pts: Timestamp, head: bool) -> bool {
         let buf = match ctx.try_alloc_sized(data.len()) {
             Ok(Some(buf)) => buf,
             Ok(None) => return false,
@@ -995,7 +993,7 @@ impl Element for OggDemux {
 static MUX_SINKS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &OFFERS }];
 static MUX_SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: &OFFERS }];
 
-static MUX_DESC: ElementDesc = ElementDesc {
+pub(crate) static MUX_DESC: ElementDesc = ElementDesc {
     name: "oggmux",
     sinks: &MUX_SINKS,
     srcs: &MUX_SRCS,

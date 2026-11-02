@@ -58,7 +58,7 @@ static RAW_FIELDS: [FieldDesc; 3] = [
     },
 ];
 
-static DEMUX_SRC_OFFERS: [OfferDesc; 28] = [
+pub(crate) static DEMUX_SRC_OFFERS: [OfferDesc; 28] = [
     OfferDesc::any(FAMILY_BYTES),
     OfferDesc::any("h264/annexb"),
     OfferDesc::any("h265/annexb"),
@@ -92,9 +92,33 @@ static DEMUX_SRC_OFFERS: [OfferDesc; 28] = [
     OfferDesc::any("subtitle/ttml"),
 ];
 
+/// Every family the src pads offer, `bytes` aside.
+pub static EMITS: &[&str] = &[
+    "h264/annexb",
+    "h265/annexb",
+    "vp9",
+    "av1",
+    "mpeg4/asp",
+    "mpeg2",
+    "mpeg1",
+    "h264/avcc",
+    "h265/hvcc",
+    "opus",
+    "aac",
+    "ac3",
+    "eac3",
+    "flac",
+    "mp3",
+    "alac",
+    "audio/raw",
+    "subtitle/srt",
+    "subtitle/vtt",
+    "subtitle/ttml",
+];
+
 static DEMUX_PADS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &SINK_OFFERS }];
 
-static DEMUX_DESC: ElementDesc = ElementDesc {
+pub(crate) static DEMUX_DESC: ElementDesc = ElementDesc {
     name: "mp4demux",
     sinks: &DEMUX_PADS,
     srcs: &[],

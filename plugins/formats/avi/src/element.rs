@@ -54,7 +54,7 @@ static SINK_OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
 
 static DEMUX_PADS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &SINK_OFFERS }];
 
-static DEMUX_DESC: ElementDesc = ElementDesc {
+pub(crate) static DEMUX_DESC: ElementDesc = ElementDesc {
     name: "avidemux",
     sinks: &DEMUX_PADS,
     srcs: &[],

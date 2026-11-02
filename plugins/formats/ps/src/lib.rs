@@ -14,13 +14,29 @@ pub mod seek;
 pub mod streams;
 
 pub use demux::{Anomaly, AnomalyKind, Demux, Event, Stats, Unit, key_of};
-pub use element::{Head, PsDemux, PsError, Seen, TAIL_LEN, last_ticks, scan_head};
+pub use element::{EMITS, Head, PsDemux, PsError, Seen, TAIL_LEN, last_ticks, scan_head};
 pub use streams::Codec;
 
-use pf_registry::Registry;
-use profluens_core::element::Element;
+use pf_registry::{Elements, Registry};
 
-#[allow(clippy::disallowed_methods)] // one-time registry setup
+pub static ELEMENTS: Elements = &[&element::DESC];
+
 pub fn register(registry: &mut Registry) {
-    registry.register(PsDemux::new(Vec::new()).desc());
+    registry.register_all(ELEMENTS);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emits_is_every_src_offer_family() {
+        for o in &element::SRC_OFFERS {
+            assert!(o.family == "bytes" || EMITS.contains(&o.family), "{}", o.family);
+        }
+        for (i, f) in EMITS.iter().enumerate() {
+            assert!(element::SRC_OFFERS.iter().any(|o| o.family == *f), "{f} not offered");
+            assert!(!EMITS[i + 1..].contains(f), "{f} twice");
+        }
+    }
 }

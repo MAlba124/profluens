@@ -8,7 +8,7 @@ pub mod idx1;
 pub mod index;
 pub mod riff;
 
-pub use codec::{family_for, offers_for};
+pub use codec::{EMITS, family_for, offers_for};
 pub use element::AviDemux;
 pub use idx1::{Idx1At, Idx1Body};
 pub use index::AviIndex;
@@ -17,9 +17,10 @@ pub use riff::{
     parse_idx1, probe_header,
 };
 
-use pf_registry::Registry;
-use profluens_core::element::Element;
+use pf_registry::{Elements, Registry};
 use profluens_core::pipeline::Index;
+
+pub static ELEMENTS: Elements = &[&element::DEMUX_DESC];
 
 /// A time to byte [`Index`] from a header prefix and the raw `idx1` payload.
 pub fn build_seek_index(header: &[u8], idx1_payload: &[u8], file_len: u64) -> Option<Index> {
@@ -35,10 +36,8 @@ pub fn build_seek_index(header: &[u8], idx1_payload: &[u8], file_len: u64) -> Op
 }
 
 /// Register this crate's elements for name-based lookup.
-// Cold path, one-time registration.
-#[allow(clippy::disallowed_methods)]
 pub fn register(registry: &mut Registry) {
-    registry.register(AviDemux::new(Vec::new()).desc());
+    registry.register_all(ELEMENTS);
 }
 
 #[cfg(test)]

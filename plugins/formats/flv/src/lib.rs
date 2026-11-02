@@ -9,15 +9,15 @@ pub mod element;
 pub mod index;
 pub mod tag;
 
+pub use codec::EMITS;
 pub use element::{FlvDemux, FlvError, HEAD};
 
-use pf_registry::Registry;
-use profluens_core::element::Element;
+use pf_registry::{Elements, Registry};
 
-// Cold path, one-time registration.
-#[allow(clippy::disallowed_methods)]
+pub static ELEMENTS: Elements = &[&element::DESC];
+
 pub fn register(registry: &mut Registry) {
-    registry.register(FlvDemux::new(Vec::new()).desc());
+    registry.register_all(ELEMENTS);
 }
 
 #[cfg(test)]

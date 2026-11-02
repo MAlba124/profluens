@@ -16,7 +16,7 @@ pub use element::{BareSrc, BareSrcError};
 pub use head::{BareHead, BareKind, Codec, OpenAt, RawTags};
 pub use reader::{NextAt, Reader, SeekAt, Unit};
 
-use pf_registry::Registry;
+use pf_registry::{Elements, Registry};
 use profluens_core::fetch::FileError;
 use std::fmt;
 
@@ -60,6 +60,8 @@ impl fmt::Display for BareError {
 }
 
 impl std::error::Error for BareError {}
+
+pub static ELEMENTS: Elements = &[&element::REGISTRY_DESC];
 
 /// Register this crate's elements for name-based lookup.
 pub fn register(registry: &mut Registry) {

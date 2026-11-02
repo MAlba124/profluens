@@ -13,29 +13,114 @@ const KEY_STACK_MAX: usize = 64;
 
 /// Parse the body of a Vorbis comment block, the bytes after any codec magic (Vorbis I 5.2.2.1).
 pub fn parse_comment_body(body: &[u8], scratch: &Arena, sink: &mut impl TagSink) {
-    let Some(vendor_len) = le_u32(body, 0) else {
-        return;
-    };
-    let Some(count_at) = 4usize.checked_add(vendor_len) else {
-        return;
-    };
-    let Some(count) = le_u32(body, count_at) else {
-        return;
-    };
-    let mut pos = count_at + 4;
+    comments_into(body, false, scratch, sink);
+}
 
-    let mut key_buf = [0u8; KEY_STACK_MAX];
-    for _ in 0..count {
-        let Some(len) = le_u32(body, pos) else { break };
-        pos += 4;
-        let Some(entry) = body.get(pos..).and_then(|rest| rest.get(..len)) else {
-            break;
+/// [`parse_comment_body`] keeping an entry that is no UTF-8, each invalid run as U+FFFD.
+pub fn parse_comment_body_lossy(body: &[u8], scratch: &Arena, sink: &mut impl TagSink) {
+    comments_into(body, true, scratch, sink);
+}
+
+/// The decoded `METADATA_BLOCK_PICTURE` blocks of a comment body in file order, unchecked.
+pub fn picture_blocks<'a>(body: &'a [u8], scratch: &'a Arena) -> PictureBlocks<'a> {
+    PictureBlocks { entries: Entries::new(body), scratch }
+}
+
+/// What [`picture_blocks`] returns, FLAC `PICTURE` block bodies (RFC 9639 section 8.8).
+pub struct PictureBlocks<'a> {
+    entries: Entries<'a>,
+    scratch: &'a Arena,
+}
+
+impl<'a> Iterator for PictureBlocks<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        for entry in self.entries.by_ref() {
+            let Some(eq) = entry.iter().position(|&b| b == b'=') else { continue };
+            if !entry[..eq].eq_ignore_ascii_case(PICTURE_FIELD.as_bytes()) {
+                continue;
+            }
+            if let Some(block) = base64_decode(&entry[eq + 1..], self.scratch) {
+                return Some(block);
+            }
+        }
+        None
+    }
+}
+
+/// The raw entries of a comment body, stopping at the first one cut short.
+struct Entries<'a> {
+    body: &'a [u8],
+    pos: usize,
+    left: usize,
+}
+
+impl<'a> Entries<'a> {
+    fn new(body: &'a [u8]) -> Self {
+        let count_at = le_u32(body, 0).and_then(|v| 4usize.checked_add(v));
+        match count_at.and_then(|at| Some((at, le_u32(body, at)?))) {
+            Some((at, left)) => Entries { body, pos: at + 4, left },
+            None => Entries { body, pos: 0, left: 0 },
+        }
+    }
+}
+
+impl<'a> Iterator for Entries<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        let entry = le_u32(self.body, self.pos).and_then(|len| {
+            let at = self.pos + 4;
+            Some((at + len, self.body.get(at..)?.get(..len)?))
+        });
+        let Some((next, entry)) = entry else {
+            self.left = 0;
+            return None;
         };
-        pos += len;
+        self.pos = next;
+        Some(entry)
+    }
+}
 
+/// `raw` with each invalid run as U+FFFD, in the arena when it needs that.
+fn lossy<'a>(raw: &'a [u8], scratch: &'a Arena) -> Option<&'a str> {
+    if let Ok(s) = std::str::from_utf8(raw) {
+        return Some(s);
+    }
+    const FFFD: &[u8] = "\u{FFFD}".as_bytes();
+    let len: usize = raw
+        .utf8_chunks()
+        .map(|c| c.valid().len() + if c.invalid().is_empty() { 0 } else { FFFD.len() })
+        .sum();
+    let out = scratch.alloc_bytes(len).ok()?;
+    let mut at = 0;
+    for c in raw.utf8_chunks() {
+        out[at..at + c.valid().len()].copy_from_slice(c.valid().as_bytes());
+        at += c.valid().len();
+        if !c.invalid().is_empty() {
+            out[at..at + FFFD.len()].copy_from_slice(FFFD);
+            at += FFFD.len();
+        }
+    }
+    std::str::from_utf8(out).ok()
+}
+
+fn comments_into(body: &[u8], keep_invalid: bool, scratch: &Arena, sink: &mut impl TagSink) {
+    let mut key_buf = [0u8; KEY_STACK_MAX];
+    for entry in Entries::new(body) {
         // Split at the first '=' (Vorbis I section 5.2.2.1), a value may itself contain '='.
-        let Ok(entry) = std::str::from_utf8(entry) else {
-            continue;
+        let entry = match std::str::from_utf8(entry) {
+            Ok(s) => s,
+            Err(_) if keep_invalid => match lossy(entry, scratch) {
+                Some(s) => s,
+                None => continue,
+            },
+            Err(_) => continue,
         };
         let Some((raw_key, value)) = entry.split_once('=') else {
             continue;
@@ -361,6 +446,51 @@ mod tests {
         let mut k = Kinds(Vec::new());
         parse_comment_body(&body("v", &entries), &arena(), &mut k);
         assert_eq!(k.0, [3, 8, 255], "past 255 as 255");
+    }
+
+    fn raw_body(entries: &[&[u8]]) -> Vec<u8> {
+        let mut b = 1u32.to_le_bytes().to_vec();
+        b.push(b'v');
+        b.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for e in entries {
+            b.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            b.extend_from_slice(e);
+        }
+        b
+    }
+
+    #[test]
+    fn the_lossy_parse_keeps_an_entry_that_is_no_utf8() {
+        let b = raw_body(&[b"TITLE=Caf\xE9 \xFF\xFEx", b"ALBUM=ok"]);
+        let mut rec = Rec::default();
+        parse_comment_body(&b, &arena(), &mut rec);
+        assert_eq!(rec.text, vec![("ALBUM".to_string(), "ok".to_string())], "the strict parse");
+        let mut rec = Rec::default();
+        parse_comment_body_lossy(&b, &arena(), &mut rec);
+        assert_eq!(
+            rec.text,
+            vec![
+                ("TITLE".to_string(), "Caf\u{FFFD} \u{FFFD}\u{FFFD}x".to_string()),
+                ("ALBUM".to_string(), "ok".to_string())
+            ]
+        );
+        for n in 0..b.len() {
+            parse_comment_body_lossy(&b[..n], &arena(), &mut Rec::default());
+        }
+    }
+
+    #[test]
+    fn picture_blocks_come_decoded_in_order() {
+        let one = picture_block("image/png", "", b"\x89PNG");
+        let two = picture_block("image/jpeg", "", b"\xFF\xD8\xFF");
+        let e1 = format!("METADATA_BLOCK_PICTURE={}", base64_encode(&one));
+        let e2 = format!("metadata_block_picture={}", base64_encode(&two));
+        let b = body("v", &["TITLE=x", &e1, "METADATA_BLOCK_PICTURE=!!", &e2]);
+        let a = arena();
+        let got: Vec<&[u8]> = picture_blocks(&b, &a).collect();
+        assert_eq!(got, [one.as_slice(), two.as_slice()]);
+        let a = arena();
+        assert_eq!(picture_blocks(&b[..b.len() - 1], &a).count(), 1, "cut short");
     }
 
     #[test]

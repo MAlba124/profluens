@@ -14,7 +14,10 @@ pub mod seek;
 pub mod streams;
 pub mod writer;
 
-pub use comment::{parse_comment_body, parse_opus_tags, parse_vorbis_comments};
+pub use comment::{
+    PictureBlocks, parse_comment_body, parse_comment_body_lossy, parse_opus_tags,
+    parse_vorbis_comments, picture_blocks,
+};
 pub use crc::{Crc32, crc32};
 pub use duration::{
     GranuleClock, OGG_TAIL_FIRST, OGG_TAIL_LEN, OPUS_GRANULE_RATE, granule_clock, last_granule,

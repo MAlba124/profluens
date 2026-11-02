@@ -238,6 +238,28 @@ pub fn bitrates(tags: &[u8], tracks: &mut [Track]) {
 
 /// [`bitrates`] over the `Tags` element's data.
 pub(crate) fn bitrates_in(body: &[u8], tracks: &mut [Track]) {
+    track_bps(body, |uid, bps| {
+        for track in tracks.iter_mut().filter(|track| track.uid == uid) {
+            track.bitrate = bps;
+        }
+    });
+}
+
+/// The bits a second the `BPS` statistics tag of the track whose TrackUID is `uid` states in a
+/// `Tags` element, the last such tag as [`bitrates`] takes it.
+pub fn bitrate_of(tags: &[u8], uid: u64) -> Option<u64> {
+    let body = master_body(tags, id::TAGS)?;
+    let mut out = None;
+    track_bps(body, |of, bps| {
+        if of == uid {
+            out = Some(bps);
+        }
+    });
+    out
+}
+
+/// Each `BPS` statistics tag of the Tags data `body` with every TrackUID it targets.
+fn track_bps(body: &[u8], mut each: impl FnMut(u64, u64)) {
     for_each_child(body, |h, tag| {
         if h.id != id::TAG {
             return;
@@ -255,11 +277,8 @@ pub(crate) fn bitrates_in(body: &[u8], tracks: &mut [Track]) {
             }
             for_each_child(targets, |t, uid| {
                 let uid = read_uint(uid);
-                if t.id != id::TAG_TRACK_UID || uid == 0 {
-                    return;
-                }
-                for track in tracks.iter_mut().filter(|track| track.uid == uid) {
-                    track.bitrate = bps;
+                if t.id == id::TAG_TRACK_UID && uid != 0 {
+                    each(uid, bps);
                 }
             });
         });

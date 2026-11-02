@@ -1972,6 +1972,12 @@ mod tests {
         crate::tags::bitrates(&tags, &mut tracks);
         let got: Vec<u64> = tracks.iter().map(|t| t.bitrate).collect();
         assert_eq!(got, [4_500_000, 128_000, 0]);
+        let of = |uid| crate::tags::bitrate_of(&tags, uid);
+        assert_eq!(
+            (of(77), of(78), of(79), of(0), of(5)),
+            (Some(4_500_000), Some(128_000), None, None, None)
+        );
+        assert_eq!(crate::tags::bitrate_of(&body, 77), None, "the Tags element with its head");
         // Tags the reader walks in the head, after Tracks
         let mut tracks_el = Vec::new();
         ebml::write_binary(&mut tracks_el, id::TRACK_ENTRY, &video_entry(&[]));

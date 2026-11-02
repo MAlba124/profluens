@@ -271,12 +271,12 @@ fn picture_frame(data: &[u8], v22: bool, sink: &mut impl TagSink) {
         }
         (mime, rest)
     };
-    let Some(rest) = rest.get(1..) else { return }; // picture type byte
+    let Some((&kind, rest)) = rest.split_first() else { return };
     let (_description, image) = split_terminated(rest, enc);
     if image.is_empty() {
         return;
     }
-    sink.picture(mime, image);
+    sink.picture_typed(kind, mime, image);
 }
 
 fn deunsync<'a>(src: &[u8], scratch: &'a Arena) -> &'a [u8] {

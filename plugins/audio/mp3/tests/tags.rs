@@ -342,6 +342,44 @@ fn v22_pic_maps_the_three_character_format_code() {
     assert_eq!(sink.pictures[0].1, b"\x89PNG\r\n\x1a\n");
 }
 
+/// Keeps the type the parser states for each picture.
+#[derive(Default)]
+struct Typed(Vec<(u8, Vec<u8>)>);
+
+impl TagSink for Typed {
+    fn text(&mut self, _key: &str, _value: &str) {}
+    fn picture(&mut self, _mime: &str, data: &[u8]) {
+        self.0.push((0xFF, data.to_vec()));
+    }
+    fn picture_typed(&mut self, kind: u8, _mime: &str, data: &[u8]) {
+        self.0.push((kind, data.to_vec()));
+    }
+}
+
+#[test]
+fn every_picture_frame_states_its_type() {
+    let a = arena();
+    let mut back = apic_body(ART);
+    back[12] = 4;
+    let mut body = f24(b"APIC", [0, 0x02], &unsync(&back));
+    body.extend_from_slice(&f24(b"APIC", [0, 0], &apic_body(b"\x89PNG")));
+    let mut sink = Typed::default();
+    parse_v2(&v2_tag(4, 0x00, &body), &a, &mut sink);
+    assert_eq!(
+        sink.0,
+        [(4, ART.to_vec()), (3, b"\x89PNG".to_vec())],
+        "v2.4, one frame unsynchronised"
+    );
+
+    let mut sink = Typed::default();
+    parse_v2(&v2_tag(3, 0x80, &unsync(&f23(b"APIC", [0, 0], &back))), &a, &mut sink);
+    assert_eq!(sink.0, [(4, ART.to_vec())], "v2.3 unsynchronised whole");
+
+    let mut sink = Typed::default();
+    parse_v2(&v2_tag(2, 0x00, &f22(b"PIC", b"\x00JPG\x08\x00\xFF\xD8\xFF")), &a, &mut sink);
+    assert_eq!(sink.0, [(8, b"\xFF\xD8\xFF".to_vec())], "v2.2 PIC");
+}
+
 fn v1_tag(
     title: &[u8],
     artist: &[u8],

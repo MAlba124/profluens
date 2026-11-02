@@ -1,6 +1,6 @@
 //! `vaapipostproc`, frames scaled and converted through the VA processor to nv12 or p010.
 //! `video/raw` or `video/gpu` in and out. Frames wholly before a seek's presentation point are
-//! dropped.
+//! dropped. A PQ or HLG input to nv12 is tone mapped to BT.709 SDR by the driver's HDR10 filter.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +18,9 @@ use profluens_core::format::{ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, 
 use profluens_core::id::{SinkPad, SrcPad};
 use profluens_core::log;
 use profluens_core::log::Level;
-use profluens_video::color::{Matrix, Range, StreamColor};
+use profluens_video::color::{
+    ContentLight, HdrStatic, Mastering, Matrix, Primaries, Range, StreamColor, TransferFn,
+};
 use profluens_video::format::{
     COLOR_OFFER_FIELDS, FAMILY, FIELD_FPS, FIELD_HEIGHT, FIELD_PIXFMT, FIELD_WIDTH, PixelFormat,
 };
@@ -34,7 +36,9 @@ use crate::probe;
 use crate::va::{Display, ExportedSurface, ReadbackImage, SurfaceFormat, Surfaces, UploadImage};
 use crate::vpp::format::{self, Kind, NV12, P010};
 use crate::vpp::plan::{Plan, Target};
-use crate::vpp::proc::{Color, Imported, Out, Proc, Src, dmabuf_key, import, surfaces};
+use crate::vpp::proc::{
+    Color, Hdr10, Imported, Out, Proc, Src, ToneMap, dmabuf_key, import, surfaces,
+};
 
 const NAME: &str = "vaapipostproc";
 const IN_PAD: SinkPad = SinkPad(0);
@@ -177,6 +181,62 @@ fn color_of(c: &StreamColor, height: u32) -> Color {
     Color { standard, range, ..Color::default() }
 }
 
+/// Whether `c` is PQ or HLG.
+fn is_hdr(c: &StreamColor) -> bool {
+    c.transfer.is_some_and(TransferFn::is_hdr)
+}
+
+/// The colour a tone mapped picture states, BT.709 limited, no HDR metadata.
+fn sdr() -> StreamColor {
+    StreamColor {
+        matrix: Some(Matrix::Bt709),
+        range: Some(Range::Limited),
+        transfer: Some(TransferFn::Bt709),
+        primaries: Some(Primaries::Bt709),
+        ..StreamColor::default()
+    }
+}
+
+/// The filter's input, the stream's own, else a 1000 cd/m2 BT.2020 display. Zeros map every
+/// sample to black.
+fn hdr10_of(h: &HdrStatic) -> Hdr10 {
+    let m = match h.mastering == Mastering::default() {
+        true => Mastering {
+            primaries: [[35400, 14600], [8500, 39850], [6550, 2300]],
+            white: [15635, 16450],
+            max_luminance: 10_000_000,
+            min_luminance: 1,
+        },
+        false => h.mastering,
+    };
+    let l = match h.light == ContentLight::default() {
+        true => ContentLight { max_cll: 1000, max_fall: 400 },
+        false => h.light,
+    };
+    Hdr10 {
+        primaries: m.primaries,
+        white: m.white,
+        max_luminance: m.max_luminance,
+        min_luminance: m.min_luminance,
+        max_cll: l.max_cll,
+        max_fall: l.max_fall,
+    }
+}
+
+/// The source colour the filter reads, every code point stated, unknowns as BT.2020.
+fn explicit_of(c: &StreamColor) -> Color {
+    let range = match c.range {
+        Some(Range::Full) => ffi::VA_SOURCE_RANGE_FULL,
+        _ => ffi::VA_SOURCE_RANGE_REDUCED,
+    };
+    Color::explicit(
+        c.primaries.map_or(9, Primaries::to_h273),
+        c.transfer.map_or(16, TransferFn::to_h273),
+        c.matrix.map_or(9, Matrix::to_h273),
+        range,
+    )
+}
+
 // Cold, once at preroll.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn exported(d: &Display, formats: &[SurfaceFormat]) -> Vec<DmabufFormat> {
@@ -196,6 +256,12 @@ struct Session {
     dst: Surfaces,
     coded: (u32, u32),
     read: Option<ReadbackImage>,
+    /// The driver has the HDR10 to SDR filter.
+    can_tone: bool,
+    /// The filter and the metadata it was made from.
+    tone: Option<(ToneMap, HdrStatic)>,
+    /// The driver refused a tone mapped picture of this session.
+    tone_refused: bool,
 }
 
 struct GpuIn {
@@ -247,6 +313,9 @@ pub struct VaapiPostProc {
     rotation: u16,
     // field order is drop order, what holds the display's handle goes first
     session: Option<Session>,
+    /// A processor made and warmed at start, the first session takes it.
+    warm: Option<Proc>,
+    warm_asked: bool,
     gpu_in: Option<GpuIn>,
     gpu_out: Option<GpuOut>,
     display: Option<Display>,
@@ -270,6 +339,8 @@ impl VaapiPostProc {
             fixed: false,
             rotation: 0,
             session: None,
+            warm: None,
+            warm_asked: false,
             gpu_in: None,
             gpu_out: None,
             display: None,
@@ -323,6 +394,33 @@ impl VaapiPostProc {
         self
     }
 
+    /// Makes the processor at start and runs the tone map once, off the first picture's path.
+    /// iHD sets a context's tone map up on its first picture, 12 ms on Alder Lake-N, 33 ms the
+    /// first time in a process.
+    pub fn with_warm_tone_map(mut self) -> Self {
+        self.warm_asked = true;
+        self
+    }
+
+    /// The processor, its tone map run once on a target sized picture.
+    fn warm_up(&mut self) -> Result<(), K> {
+        let (w, h) = (self.target.max_width.max(64), self.target.max_height.max(64));
+        let d = self.display()?;
+        let proc = Proc::new(d).map_err(K::SessionSetup)?;
+        if proc.tone_maps() {
+            let src = surfaces(d, P010, w, h, 1).map_err(K::SessionSetup)?;
+            let dst = surfaces(d, NV12, w, h, 1).map_err(K::SessionSetup)?;
+            let tm = proc.tone_map(&hdr10_of(&HdrStatic::default())).map_err(K::SessionSetup)?;
+            let pq = Color::explicit(9, 16, 9, ffi::VA_SOURCE_RANGE_REDUCED);
+            let out = Out { surface: dst.ids()[0], place: (0, 0, w, h), fill: false, color: Color::SDR, rotation: 0 };
+            proc.run(Src { surface: src.ids()[0], at: (0, 0), size: (w, h), color: pq }, out, Some(&tm))
+                .map_err(K::Process)?;
+            crate::va::sync_surface(d, dst.ids()[0]).map_err(K::Process)?;
+        }
+        self.warm = Some(proc);
+        Ok(())
+    }
+
     pub fn with_fixed_size(mut self) -> Self {
         self.fixed = true;
         self
@@ -359,6 +457,19 @@ impl VaapiPostProc {
         self.display.as_ref().ok_or(K::NoDevice)
     }
 
+    /// Whether pictures to `out` are tone mapped, a PQ or HLG input to nv12 on a driver with
+    /// the filter.
+    fn maps_tones(&self, out: Kind) -> bool {
+        out == NV12
+            && is_hdr(&self.color)
+            && self.session.as_ref().is_some_and(|s| s.can_tone && !s.tone_refused)
+    }
+
+    /// The colour the output states, BT.709 when tone mapped, else the input's.
+    fn out_color(&self, out: Kind) -> StreamColor {
+        if self.maps_tones(out) { sdr() } else { self.color }
+    }
+
     fn plan_of(&self, f: InFormat) -> Option<Plan> {
         Plan::turned(f.width, f.height, f.kind(), self.target, self.rotation, self.fixed)
     }
@@ -387,8 +498,12 @@ impl VaapiPostProc {
         }
         self.session = None;
         let (upload, gpu_out) = (self.gpu_in.is_none(), self.gpu_out.as_ref().map(|g| g.align));
+        let warm = self.warm.take();
         let d = self.display()?;
-        let proc = Proc::new(d).map_err(K::SessionSetup)?;
+        let proc = match warm {
+            Some(p) => p,
+            None => Proc::new(d).map_err(K::SessionSetup)?,
+        };
         if !proc.caps.turns(p.rotation) {
             return Err(K::DriverLacks(match p.rotation {
                 90 => "a turn of 90 degrees",
@@ -414,9 +529,12 @@ impl VaapiPostProc {
         let dst = surfaces(d, p.out, coded.0, coded.1, count).map_err(K::SessionSetup)?;
         let read = match gpu_out {
             Some(_) => {
-                // the alignment padding is coded too, black costs the least
-                for &s in dst.ids() {
-                    black(d, s, p.out, coded)?;
+                // bars are black, the alignment rows are cropped and left as allocated, a CPU
+                // fill of every surface costs a start tens of ms
+                if p.bars() {
+                    for &s in dst.ids() {
+                        black(d, s, p.out, coded)?;
+                    }
                 }
                 None
             }
@@ -430,8 +548,20 @@ impl VaapiPostProc {
             g.free.extend_from_slice(dst.ids());
             g.out.clear();
         }
-        self.session =
-            Some(Session { key: f, proc, out, src, src_size: (sw, sh), dst, coded, read });
+        let can_tone = proc.tone_maps();
+        self.session = Some(Session {
+            key: f,
+            proc,
+            out,
+            src,
+            src_size: (sw, sh),
+            dst,
+            coded,
+            read,
+            can_tone,
+            tone: None,
+            tone_refused: false,
+        });
         log!(
             ctx,
             Level::Info,
@@ -488,7 +618,8 @@ impl VaapiPostProc {
             }
         };
         let fixed = if self.gpu_out.is_none() && f.fps.is_none() { 3 } else { 4 };
-        let n = fixed + self.color.write_fields(&mut out[fixed..]);
+        let kind = if pixfmt == PixelFormat::P010 { P010 } else { NV12 };
+        let n = fixed + self.out_color(kind).write_fields(&mut out[fixed..]);
         ctx.announce_format(OUT_PAD, family, &out[..n]);
     }
 
@@ -505,6 +636,10 @@ impl VaapiPostProc {
             self.disabled = true;
             return Err(Self::fail(ctx, e));
         }
+        if p.out == NV12 && is_hdr(&self.color) && !self.maps_tones(p.out) {
+            // the samples pass as they are, the picture looks washed out
+            self.warn(ctx, K::DriverLacks("HDR10 to SDR tone mapping"));
+        }
         let len = match self.gpu_out {
             Some(_) => GPU_FRAME_HEADER_LEN,
             None => frame_size(out_pixfmt(p.out), p.width, p.height),
@@ -513,6 +648,7 @@ impl VaapiPostProc {
             Some(g) => {
                 g.reclaim();
                 let Some(&s) = g.free.last() else {
+                    log!(&*ctx, Level::Trace, "wait_surface", out = g.out.len() as u64);
                     ctx.await_recycle();
                     return Ok(Prepared::Wait);
                 };
@@ -532,6 +668,7 @@ impl VaapiPostProc {
         };
         let Some(buf) = ctx.try_alloc_sized(len).map_err(|_| Self::fail(ctx, too_large(ctx)))?
         else {
+            log!(&*ctx, Level::Trace, "wait_slot");
             ctx.await_recycle();
             return Ok(Prepared::Wait);
         };
@@ -556,24 +693,11 @@ impl VaapiPostProc {
         p: Plan,
         sink: Sink,
     ) -> Result<Buffer, K> {
-        let color = color_of(&self.color, f.height);
-        let s = self.session.as_mut().ok_or(K::NoDevice)?;
         let buf = match sink {
             Sink::Raw(mut buf, len) => {
-                let dst = s.dst.ids()[0];
-                s.proc
-                    .run(
-                        Src { surface: src, at: src_at, size: (f.width, f.height), color },
-                        Out {
-                            surface: dst,
-                            place: p.place,
-                            fill: p.bars(),
-                            color,
-                            rotation: p.va_rotation(),
-                        },
-                        None,
-                    )
-                    .map_err(K::Process)?;
+                let dst = self.session.as_ref().ok_or(K::NoDevice)?.dst.ids()[0];
+                self.convert(ctx, src, src_at, f, p, dst)?;
+                let s = self.session.as_mut().ok_or(K::NoDevice)?;
                 let read = s.read.as_mut().ok_or(K::NoDevice)?;
                 let view = read.read(dst, p.width, p.height).map_err(K::Readback)?;
                 let row = p.width as usize * out_pixfmt(p.out).bytes_per_sample();
@@ -596,21 +720,8 @@ impl VaapiPostProc {
                 buf
             }
             Sink::Gpu(mut buf, dst) => {
-                let coded = s.coded;
-                let ran = s
-                    .proc
-                    .run(
-                        Src { surface: src, at: src_at, size: (f.width, f.height), color },
-                        Out {
-                            surface: dst,
-                            place: p.place,
-                            fill: p.bars(),
-                            color,
-                            rotation: p.va_rotation(),
-                        },
-                        None,
-                    )
-                    .map_err(K::Process);
+                let coded = self.session.as_ref().ok_or(K::NoDevice)?.coded;
+                let ran = self.convert(ctx, src, src_at, f, p, dst);
                 let r = ran.and_then(|_| self.send(ctx, &mut buf, dst, coded, p));
                 if let Err(e) = r {
                     if let Some(g) = &mut self.gpu_out {
@@ -623,6 +734,46 @@ impl VaapiPostProc {
         };
         self.stats.frames.fetch_add(1, Ordering::Relaxed);
         Ok(buf)
+    }
+
+    /// `src` into `dst` by plan `p`, tone mapped when [`Self::maps_tones`]. A tone map the
+    /// driver refuses is warned once and the session converts without it from then on.
+    fn convert(
+        &mut self,
+        ctx: &mut Ctx,
+        src: ffi::VASurfaceID,
+        src_at: (u32, u32),
+        f: InFormat,
+        p: Plan,
+        dst: ffi::VASurfaceID,
+    ) -> Result<(), K> {
+        let maps = self.maps_tones(p.out);
+        let s = self.session.as_mut().ok_or(K::NoDevice)?;
+        let place = |color| Out {
+            surface: dst,
+            place: p.place,
+            fill: p.bars(),
+            color,
+            rotation: p.va_rotation(),
+        };
+        let size = (f.width, f.height);
+        if maps {
+            if s.tone.as_ref().is_none_or(|(_, h)| *h != self.color.hdr) {
+                let tm = s.proc.tone_map(&hdr10_of(&self.color.hdr)).map_err(K::SessionSetup)?;
+                s.tone = Some((tm, self.color.hdr));
+            }
+            let color = explicit_of(&self.color);
+            let tone = s.tone.as_ref().map(|(t, _)| t);
+            if s.proc.run(Src { surface: src, at: src_at, size, color }, place(Color::SDR), tone).is_ok() {
+                return Ok(());
+            }
+            // iHD 26.1 on Gen9 refuses an HLG source this way
+            s.tone_refused = true;
+            self.warn(ctx, K::DriverLacks("HDR to SDR tone mapping of this source"));
+        }
+        let s = self.session.as_mut().ok_or(K::NoDevice)?;
+        let color = color_of(&self.color, f.height);
+        s.proc.run(Src { surface: src, at: src_at, size, color }, place(color), None).map_err(K::Process)
     }
 
     fn send(
@@ -699,7 +850,8 @@ impl VaapiPostProc {
     }
 
     fn process_raw(&mut self, ctx: &mut Ctx, inputs: &mut Inputs<'_>) -> Result<(), Error> {
-        while ctx.room(OUT_PAD) {
+        // a seek's flush waits behind no picture it would discard
+        while ctx.room(OUT_PAD) && !ctx.command_pending() {
             if inputs.front().is_some_and(|b| self.early(ctx, b)) {
                 if let Some(b) = inputs.pop() {
                     log!(&*ctx, Level::Trace, "early", pts = b.pts);
@@ -759,12 +911,18 @@ impl VaapiPostProc {
                 (inbuf.pts, inbuf.dts, inbuf.duration, inbuf.flags);
             self.announce(ctx, f, p.width, p.height, out_pixfmt(p.out));
             ctx.out(OUT_PAD).push(out);
+            // the picture goes downstream now, the next would hold it back
+            break;
         }
         Ok(())
     }
 
     fn process_gpu(&mut self, ctx: &mut Ctx, inputs: &mut Inputs<'_>) -> Result<(), Error> {
-        while ctx.room(OUT_PAD) {
+        if let Some(b) = inputs.front() {
+            log!(&*ctx, Level::Trace, "run", pts = b.pts, queued = inputs.len() as u64);
+        }
+        // a seek's flush waits behind no picture it would discard
+        while ctx.room(OUT_PAD) && !ctx.command_pending() {
             let Some(front) = inputs.front() else { break };
             let Some(h) = GpuFrameHeader::from_bytes(front.memory.data()) else {
                 inputs.pop();
@@ -823,8 +981,11 @@ impl VaapiPostProc {
             drop(frame);
             (out.pts, out.dts, out.duration, out.flags) =
                 (inbuf.pts, inbuf.dts, inbuf.duration, inbuf.flags);
+            log!(&*ctx, Level::Trace, "processed", pts = out.pts);
             self.announce(ctx, f, p.width, p.height, out_pixfmt(p.out));
             ctx.out(OUT_PAD).push(out);
+            // the picture goes downstream now, the next would hold it back
+            break;
         }
         Ok(())
     }
@@ -856,7 +1017,7 @@ impl VaapiPostProc {
     }
 }
 
-fn black(
+pub(crate) fn black(
     display: &Display,
     surface: ffi::VASurfaceID,
     kind: Kind,
@@ -963,6 +1124,12 @@ impl Element for VaapiPostProc {
     }
 
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        if self.warm_asked && self.warm.is_none() && self.session.is_none() {
+            match self.warm_up() {
+                Ok(()) => log!(&*ctx, Level::Debug, "warm"),
+                Err(e) => self.warn(ctx, e),
+            }
+        }
         let link = read_link(ctx, ctx.negotiated_sink(IN_PAD));
         if let Some(g) = &mut self.gpu_in {
             g.link = link.or(g.link);

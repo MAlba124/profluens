@@ -2,6 +2,11 @@
 //! Typed construction stays the primary path, this is "element by name" for `pf-launch` and tests.
 
 pub mod convert;
+pub mod lookup;
+
+pub use lookup::{
+    BYTES, Elements, Raw, decoder_for, decoders_for, encoder_for, encoders_for, raw_of,
+};
 
 use std::collections::HashMap;
 
@@ -26,6 +31,12 @@ impl Registry {
     /// it.
     pub fn register(&mut self, desc: &'static ElementDesc) {
         self.by_name.insert(desc.name, desc);
+    }
+
+    pub fn register_all(&mut self, set: Elements) {
+        for desc in set {
+            self.register(desc);
+        }
     }
 
     /// The descriptor registered under `name`, if any.

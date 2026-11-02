@@ -16,6 +16,7 @@ members = [
     "plugins/audio/opus",
     "plugins/formats/avi",
     "plugins/formats/flv",
+    "plugins/formats/hls",
     "plugins/formats/mkv",
     "plugins/formats/mp4",
     "plugins/formats/ogg",

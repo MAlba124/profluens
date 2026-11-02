@@ -1,0 +1,12 @@
+[package]
+name = "pf-hls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_hls"
+
+[lints]
+workspace = true

@@ -158,7 +158,8 @@ fn walk_blocks<'a>(bytes: &'a [u8], mut visit: impl FnMut(u8, &'a [u8]) -> bool)
     None
 }
 
-fn vorbis_comment_into(block: &[u8], sink: &mut impl TagSink) {
+/// The comments of one VORBIS_COMMENT block body (section 8.6), keys uppercased.
+pub fn vorbis_comment_into(block: &[u8], sink: &mut impl TagSink) {
     let le = |b: &[u8], p: usize| {
         b.get(p..p + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
     };
@@ -199,11 +200,14 @@ fn upper_key<'k>(key: &'k str, buf: &'k mut [u8; KEY_STACK_MAX]) -> &'k str {
     std::str::from_utf8(out).unwrap_or(key)
 }
 
-fn picture_into(block: &[u8], sink: &mut impl TagSink) {
+/// The picture of one PICTURE block body (section 8.8) with its type, past 255 as 255.
+pub fn picture_into(block: &[u8], sink: &mut impl TagSink) {
     let be = |b: &[u8], p: usize| {
         b.get(p..p + 4).map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize)
     };
-    let mut p = 4; // skip picture type
+    let Some(kind) = be(block, 0) else { return };
+    let kind = u8::try_from(kind).unwrap_or(u8::MAX);
+    let mut p = 4;
     let Some(mime_len) = be(block, p) else { return };
     p += 4;
     let Some(mime) = block.get(p..p + mime_len).and_then(|s| std::str::from_utf8(s).ok()) else {
@@ -218,7 +222,7 @@ fn picture_into(block: &[u8], sink: &mut impl TagSink) {
     let Some(data) = block.get(p..p + data_len) else {
         return;
     };
-    sink.picture(mime, data);
+    sink.picture_typed(kind, mime, data);
 }
 
 fn parse_streaminfo(block: &[u8]) -> Option<StreamInfo> {
@@ -335,6 +339,34 @@ mod tests {
         assert_eq!(tags.pictures[0].0, "image/jpeg");
         assert_eq!(tags.pictures[0].1, b"\xFF\xD8\xFF\xE0jpeg-ish bytes");
         assert!(tags.comments.is_empty());
+    }
+
+    #[derive(Default)]
+    struct Kinds(Vec<(u8, String)>);
+
+    impl TagSink for Kinds {
+        fn text(&mut self, _key: &str, _value: &str) {}
+        fn picture(&mut self, _mime: &str, _data: &[u8]) {
+            panic!("a PICTURE block states its type");
+        }
+        fn picture_typed(&mut self, kind: u8, mime: &str, _data: &[u8]) {
+            self.0.push((kind, mime.to_string()));
+        }
+    }
+
+    #[test]
+    fn a_picture_block_states_its_type() {
+        let mut body = picture_block_body("image/png", b"\x89PNG");
+        let mut k = Kinds::default();
+        picture_into(&body, &mut k);
+        body[..4].copy_from_slice(&4u32.to_be_bytes());
+        picture_into(&body, &mut k);
+        body[..4].copy_from_slice(&256u32.to_be_bytes());
+        picture_into(&body, &mut k);
+        picture_into(&body[..body.len() - 1], &mut k);
+        picture_into(&body[..3], &mut k);
+        let png = "image/png".to_string();
+        assert_eq!(k.0, [(3, png.clone()), (4, png.clone()), (255, png)], "past 255 as 255");
     }
 
     fn flac_with_comment_and_picture() -> Vec<u8> {

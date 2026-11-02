@@ -15,6 +15,7 @@ pub mod element;
 pub mod error;
 pub mod event;
 pub mod feedback;
+pub mod fetch;
 pub mod format;
 pub mod id;
 pub mod io;

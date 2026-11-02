@@ -12,7 +12,7 @@ use pf_mp3::frame::Header as MpaHeader;
 use profluens_core::fetch::{Fetch, Need, Step};
 
 /// Read ahead at a time.
-const CHUNK: u64 = 128 << 10;
+pub(crate) const CHUNK: u64 = 128 << 10;
 /// The window never holds more, a FLAC frame is far below it.
 const MAX_WINDOW: usize = 32 << 20;
 /// How far a FLAC frame's end or a resync is looked for.
@@ -212,6 +212,15 @@ impl Reader {
             want = want.min(h.samples - 1);
         }
         SeekAt { rd: self, h, want, st: SeekSt::Start }
+    }
+
+    /// The machine `p` left, its fill still to come.
+    pub(crate) fn resume_next<'a>(&'a mut self, h: &'a BareHead, p: NextPark) -> NextAt<'a> {
+        NextAt { rd: self, h, st: p.0 }
+    }
+
+    pub(crate) fn resume_seek<'a>(&'a mut self, h: &'a BareHead, p: SeekPark) -> SeekAt<'a> {
+        SeekAt { rd: self, h, want: p.want, st: p.st }
     }
 }
 
@@ -625,6 +634,17 @@ impl NextAt<'_> {
     }
 }
 
+/// Where a [`NextAt`] waits on its read, see [`Reader::resume_next`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NextPark(NextSt);
+
+impl NextAt<'_> {
+    /// Its place, kept while the read of its last Need is in flight.
+    pub(crate) fn park(self) -> NextPark {
+        NextPark(self.st)
+    }
+}
+
 impl Fetch for NextAt<'_> {
     type Out = Option<Unit>;
     type Err = BareError;
@@ -937,6 +957,19 @@ impl SeekAt<'_> {
     }
 }
 
+/// Where a [`SeekAt`] waits on its read, see [`Reader::resume_seek`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SeekPark {
+    want: u64,
+    st: SeekSt,
+}
+
+impl SeekAt<'_> {
+    pub(crate) fn park(self) -> SeekPark {
+        SeekPark { want: self.want, st: self.st }
+    }
+}
+
 impl Fetch for SeekAt<'_> {
     type Out = ();
     type Err = BareError;
@@ -1018,6 +1051,55 @@ mod tests {
         w.settle();
         assert_eq!((w.at, w.end(), w.ahead), (CHUNK - 10, CHUNK, CHUNK), "the bytes it had");
         assert_eq!(w.get(CHUNK - 10, 10), &file[CHUNK as usize - 10..CHUNK as usize]);
+    }
+
+    /// Answers `need` from `file` into `buf`, short past its end.
+    fn answer(file: &[u8], need: Need, buf: &mut [u8]) -> usize {
+        let at = (need.at as usize).min(file.len());
+        let n = need.len.min(file.len() - at);
+        buf[..n].copy_from_slice(&file[at..at + n]);
+        n
+    }
+
+    #[test]
+    fn a_machine_parked_on_every_read_goes_on_where_it_stopped() {
+        let f = flac_file(400, 1000, &[], false);
+        let file = &f.bytes[..];
+        let (h, _) =
+            drive_slice(&mut OpenAt::new(file.len() as u64, BareKind::Flac), file).unwrap();
+        let (mut a, mut b) = (Reader::new(&h), Reader::new(&h));
+        for ns in [h.ns(300 * 4096), 0, h.ns(123 * 4096 + 7), h.ns(399 * 4096)] {
+            let (mut got, mut want) = (Vec::new(), Vec::new());
+            let mut m = a.seek(&h, ns);
+            while let Step::Need(need) = m.poll().unwrap() {
+                got.push(need);
+                let p = m.park();
+                m = a.resume_seek(&h, p);
+                let n = answer(file, need, m.buf());
+                m.filled(n);
+            }
+            drive_slice_log(&mut b.seek(&h, ns), file, &mut want).unwrap();
+            assert_eq!(got, want, "the same probes at {ns}");
+            for _ in 0..40 {
+                let mut m = a.next(&h);
+                let u = loop {
+                    match m.poll().unwrap() {
+                        Step::Done(u) => break u,
+                        Step::Need(need) => {
+                            let p = m.park();
+                            m = a.resume_next(&h, p);
+                            let n = answer(file, need, m.buf());
+                            m.filled(n);
+                        }
+                    }
+                };
+                let w = drive_slice(&mut b.next(&h), file).unwrap();
+                assert_eq!(u, w);
+                if let Some(u) = u {
+                    assert_eq!(a.bytes(&u), b.bytes(&u));
+                }
+            }
+        }
     }
 
     #[test]

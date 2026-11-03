@@ -978,6 +978,7 @@ impl Pipeline {
         if let Some(run) = &mut self.live_run {
             run.journal.push(Undo::Unlink(id));
         }
+        self.relinked(src.0);
         self.publish();
         Ok(id)
     }
@@ -1607,11 +1608,22 @@ impl Pipeline {
     pub fn unlink(&mut self, link: LinkId) -> Result<(), Error> {
         let none = Error::Topology(TopologyError::NoSuchLink { link });
         let edge = self.take_edge(link).ok_or(none)?;
+        let src = edge.src;
         if let Some(run) = &mut self.live_run {
             run.journal.push(Undo::Restore(link, edge));
         }
         self.publish();
+        self.relinked(src);
         Ok(())
+    }
+
+    /// A link of `el` changed. The restarts of an index it published follow what is linked, so
+    /// planning on it waits until the element saw the change, see [`Ctx::link_seen`].
+    fn relinked(&self, el: ElementId) {
+        let counters = &self.rows[self.ix(el)].counters;
+        if counters.index.get().is_some() {
+            counters.set_relinked(true);
+        }
     }
 
     /// Move the sink end of a link to another sink pad, keeping its id.
@@ -2579,6 +2591,7 @@ impl Pipeline {
         if let Some(row) = self.row_of(el) {
             row.counters.index.publish(index);
             row.counters.set_indexing(false);
+            row.counters.set_relinked(false);
             self.control.resolve_pending();
         }
     }

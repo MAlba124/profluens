@@ -400,7 +400,7 @@ fn an_ffmpeg_file_starts_over_too() {
 fn each_track_restarts_at_its_own_sample() {
     let (_, head) = movie();
     let tables = Mp4Reader::new(&head).expect("resolves").tables();
-    let restart = tables.restart(2_500_000_000, 2_000_000_000);
+    let restart = tables.restart(2_500_000_000, 2_000_000_000, &|_| true);
     assert_eq!(restart, Restart { to_byte: picture_at(&head, 50), at_ns: 2_000_000_000 });
     assert!(
         packet_at(&head, 110) > restart.to_byte && packet_at(&head, 110) < packet_at(&head, 116)
@@ -415,7 +415,7 @@ fn each_track_restarts_at_its_own_sample() {
 fn a_target_on_the_sync_sample_restarts_the_file_ahead_of_it_for_the_audio() {
     let (_, head) = movie();
     let tables = Mp4Reader::new(&head).expect("resolves").tables();
-    let restart = tables.restart(2_000_000_000, 2_000_000_000);
+    let restart = tables.restart(2_000_000_000, 2_000_000_000, &|_| true);
     // 2000 ms less 21.33 ms is 1978.67 ms, and packet 92 is stamped 1962.67 ms.
     assert_eq!(restart, Restart { to_byte: packet_at(&head, 92), at_ns: packet_ns(92) });
     assert!(
@@ -431,7 +431,7 @@ fn a_target_on_the_sync_sample_restarts_the_file_ahead_of_it_for_the_audio() {
 fn a_time_inside_a_gop_names_its_sync_sample() {
     let (_, head) = movie();
     let tables = Mp4Reader::new(&head).expect("resolves").tables();
-    let restart = tables.restart(1_000_000_000, 1_990_000_000);
+    let restart = tables.restart(1_000_000_000, 1_990_000_000, &|_| true);
     let (video, audio) =
         run(Jump::Each { to_time: MS(1_000), to_byte: restart.to_byte, video_from: MS(1_990) });
     assert_eq!(video, pictures(25), "the sync sample at one second, the last at or before 1.99 s");
@@ -465,7 +465,7 @@ fn a_byte_inside_a_sample_starts_each_track_at_its_next() {
 fn a_target_past_the_end_hands_on_the_last_gop_and_the_last_packet() {
     let (_, head) = movie();
     let tables = Mp4Reader::new(&head).expect("resolves").tables();
-    let restart = tables.restart(9_000_000_000, 9_000_000_000);
+    let restart = tables.restart(9_000_000_000, 9_000_000_000, &|_| true);
     assert_eq!(restart.to_byte, picture_at(&head, 75));
     let (video, audio) =
         run(Jump::Each { to_time: MS(9_000), to_byte: restart.to_byte, video_from: MS(9_000) });
@@ -499,7 +499,11 @@ fn the_restart_is_the_rule_for_every_target() {
             to_byte: picture_at(&head, key).min(packet_at(&head, packet)),
             at_ns: picture_ns(key).min(packet_ns(packet)),
         };
-        assert_eq!(tables.restart(target, picture_ns(key)), want, "target {target_ms} ms");
+        assert_eq!(
+            tables.restart(target, picture_ns(key), &|_| true),
+            want,
+            "target {target_ms} ms"
+        );
     }
 }
 
@@ -529,7 +533,7 @@ fn the_demuxer_publishes_its_sync_samples_and_where_each_restarts() {
     let tables = Mp4Reader::new(&head).expect("resolves").tables();
     for e in &index.entries {
         assert_eq!(
-            tables.restart(e.time_ns, e.time_ns),
+            tables.restart(e.time_ns, e.time_ns, &|_| true),
             Restart { to_byte: e.restart, at_ns: e.restart_ns }
         );
     }
@@ -571,7 +575,7 @@ fn a_source_that_goes_back_for_one_track_puts_nothing_out_twice() {
     assert_eq!(before, (0..50).map(|n| (0, n)).collect::<Vec<_>>());
 
     let point = 1_500_000_000;
-    let restart = reader.tables().track_restart(1, point);
+    let restart = reader.tables().track_restart(1, point, &|_| true);
     // AAC is primed 1024 samples ahead, so the packet is the last at or before the point less one.
     let line = point - packet_ns(1) - 1;
     let first = (0..PACKETS).rev().find(|n| packet_ns(*n) <= line).expect("a packet");

@@ -63,21 +63,38 @@ pub fn cue_entries(
             (own, audio_lead(t, tick))
         })
         .collect();
-    let mut captions: Vec<(u64, u64, u64)> = tracks
+    let caption = |t: &&Track| {
+        !is_audio_family(family_for(&t.codec_id)) && !is_video_family(family_for(&t.codec_id))
+    };
+    // A cue without a duration, a bitmap composition, is up until its track's next cue.
+    let mut captions: Vec<(u64, u64, u64)> = Vec::new();
+    for t in tracks.iter().filter(on).filter(caption) {
+        let own: Vec<&Cue> = cues.iter().filter(|c| c.track == t.track_number).collect();
+        for (i, c) in own.iter().enumerate() {
+            let end = match c.duration_ns {
+                Some(d) => c.time_ns.saturating_add(d),
+                None => {
+                    own.get(i + 1).map_or(c.time_ns.saturating_add(CAPTION_REACH), |n| n.time_ns)
+                }
+            };
+            captions.push((c.time_ns, end.max(c.time_ns), c.byte));
+        }
+    }
+    captions.sort_unstable();
+    // A linked caption track the Cues leave out may have a caption up at any key, so every
+    // entry goes back the reach for it.
+    let uncued = tracks
         .iter()
         .filter(on)
-        .filter(|t| {
-            !is_audio_family(family_for(&t.codec_id)) && !is_video_family(family_for(&t.codec_id))
-        })
-        .flat_map(|t| cues.iter().filter(move |c| c.track == t.track_number))
-        .filter_map(|c| Some((c.time_ns, c.time_ns.saturating_add(c.duration_ns?), c.byte)))
-        .collect();
-    captions.sort_unstable();
+        .filter(caption)
+        .any(|t| !cues.iter().any(|c| c.track == t.track_number));
     let floor =
         |list: &[(u64, u64)], ns: u64| list[..list.partition_point(|p| p.0 <= ns)].last().copied();
-    // A caption up at a key restarts at the key below its block, so the keys are also held
-    // ascending by byte, and the captions up are swept once in key time order. Both were a scan
-    // per key, minutes on a Cues of a few hundred thousand points.
+    // A caption up at a key, or starting before the next key, restarts at the key below its
+    // block. A remux writes a bitmap block by its decode time, ahead of the key of the time it
+    // shows at, so the one up at a target past the key may lie before the key's Cluster. The
+    // keys are also held ascending by byte, and the captions are swept once in key time order.
+    // Both were a scan per key, minutes on a Cues of a few hundred thousand points.
     let mut by_byte: Vec<(u64, u64)> = keys.iter().map(|&(t, b)| (b, t)).collect();
     by_byte.sort_unstable();
     let mut order: Vec<usize> = (0..keys.len()).collect();
@@ -85,9 +102,10 @@ pub fn cue_entries(
     let mut text: Vec<Option<(u64, u64)>> = vec![None; keys.len()];
     let mut up: BinaryHeap<Reverse<(u64, u64, u64)>> = BinaryHeap::new();
     let mut next = 0;
-    for i in order {
+    for (n, &i) in order.iter().enumerate() {
         let time = keys[i].0;
-        while let Some(&(start, end, byte)) = captions.get(next).filter(|c| c.0 <= time) {
+        let until = order.get(n + 1).map_or(u64::MAX, |&k| keys[k].0);
+        while let Some(&(start, end, byte)) = captions.get(next).filter(|c| c.0 < until) {
             up.push(Reverse((byte, start, end)));
             next += 1;
         }
@@ -114,6 +132,9 @@ pub fn cue_entries(
                 }
             }
             if let Some(at) = text {
+                earliest = earliest.min(at);
+            }
+            if uncued && let Some(at) = floor(&keys, time.saturating_sub(CAPTION_REACH)) {
                 earliest = earliest.min(at);
             }
             let (restart_ns, restart) = if earliest.0 < time { earliest } else { (time, byte) };
@@ -290,6 +311,24 @@ mod tests {
         assert_eq!(restarts(&entries), want);
     }
 
+    /// The Cues say nothing of what is up on a caption track they leave out, so every entry
+    /// goes back the reach for it, and none while the track is not linked.
+    #[test]
+    fn an_uncued_caption_track_restarts_the_reach_before_every_entry() {
+        let cues: Vec<Cue> = (0..20).map(|n| cue(1, n * 2 * S, 1_000 + n * 1_000, None)).collect();
+        let tracks = vec![track(1, "V_VP9"), track(2, "A_OPUS"), track(3, "S_TEXT/UTF8")];
+        let entries = cue_entries(&cues, &tracks, &|n| n == 3, 1_000_000);
+        let want: Vec<(u64, u64)> = (0..20u64)
+            .map(|n| {
+                let k = (n * 2 * S).saturating_sub(CAPTION_REACH) / (2 * S);
+                (1_000 + k * 1_000, k * 20)
+            })
+            .collect();
+        assert_eq!(restarts(&entries), want);
+        let unlinked = cue_entries(&cues, &tracks, &|n| n == 1, 1_000_000);
+        assert!(unlinked.iter().all(|e| (e.restart, e.restart_ns) == (e.byte, e.time_ns)));
+    }
+
     #[test]
     fn a_caption_on_screen_restarts_at_the_entry_below_its_block() {
         let (mut cues, mut tracks) = film(false);
@@ -311,6 +350,40 @@ mod tests {
         );
         let hidden = cue_entries(&cues, &tracks, &|_| false, 1_000_000);
         assert_eq!((hidden[3].restart, hidden[3].restart_ns), (4_000, 6 * S));
+    }
+
+    /// A caption cue without a duration, a bitmap composition, is up until its track's next cue,
+    /// the last one for the reach.
+    #[test]
+    fn a_caption_cue_without_a_duration_is_up_until_the_next() {
+        let (mut cues, mut tracks) = film(false);
+        tracks.push(track(3, "S_HDMV/PGS"));
+        cues.push(cue(3, 55 * S / 10, 3_400, None));
+        cues.push(cue(3, 9 * S, 5_600, None));
+        cues.sort_by_key(|c| c.time_ns);
+        let entries = cue_entries(&cues, &tracks, &|n| n == 3, 1_000_000);
+        let at = |n: usize| (entries[n].restart, entries[n].restart_ns / (S / 10));
+        assert_eq!(at(2), (3_000, 40), "4 s, nothing up");
+        assert_eq!(at(3), (3_000, 40), "6 s, the composition from 5.5 is up");
+        assert_eq!(at(4), (3_000, 40), "8 s, still up");
+        assert_eq!(at(5), (5_000, 80), "10 s, the one from 9 replaced it, under the key at 8");
+        assert_eq!(at(7), (5_000, 80), "14 s, the last one is up for the reach");
+    }
+
+    /// A remux stores a bitmap block ahead of its time, so a caption starting between a key and
+    /// the next may lie before the key's Cluster, and is gone back for from that key on.
+    #[test]
+    fn a_caption_starting_before_the_next_key_restarts_at_the_key_below_its_block() {
+        let (mut cues, mut tracks) = film(false);
+        tracks.push(track(3, "S_HDMV/PGS"));
+        cues.push(cue(3, 65 * S / 10, 3_400, Some(3 * S)));
+        cues.sort_by_key(|c| c.time_ns);
+        let entries = cue_entries(&cues, &tracks, &|n| n == 3, 1_000_000);
+        let at = |n: usize| (entries[n].restart, entries[n].restart_ns / (S / 10));
+        assert_eq!(at(2), (3_000, 40), "4 s, the key below the block is its own");
+        assert_eq!(at(3), (3_000, 40), "6 s, the caption from 6.5 is stored before this key");
+        assert_eq!(at(4), (3_000, 40), "8 s, still up");
+        assert_eq!(at(5), (6_000, 100), "10 s, gone");
     }
 
     #[test]

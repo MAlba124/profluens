@@ -282,6 +282,8 @@ const BY_NONE: u8 = 2 << 1;
 const BY_MASK: u8 = 3 << 1;
 const REMOTE: u8 = 1 << 3;
 const INDEXING: u8 = 1 << 4;
+/// A link of the element changed since its index was published, the restarts may move.
+const RELINKED: u8 = 1 << 5;
 
 /// An element's published [`Index`]. Writers take turns, a reader never waits.
 pub(crate) struct IndexSlot {
@@ -349,7 +351,7 @@ impl ElementCounters {
             Addressed::No => BY_NONE,
         };
         let packed = SERVED | by | if serves.remote { REMOTE } else { 0 };
-        self.serves.fetch_and(INDEXING, Ordering::AcqRel);
+        self.serves.fetch_and(INDEXING | RELINKED, Ordering::AcqRel);
         self.serves.fetch_or(packed, Ordering::AcqRel);
     }
 
@@ -370,8 +372,16 @@ impl ElementCounters {
         };
     }
 
+    /// An index is coming or the published one may move, planning on it waits.
     pub(crate) fn indexing(&self) -> bool {
-        self.serves.load(Ordering::Acquire) & INDEXING != 0
+        self.serves.load(Ordering::Acquire) & (INDEXING | RELINKED) != 0
+    }
+
+    pub(crate) fn set_relinked(&self, on: bool) {
+        match on {
+            true => self.serves.fetch_or(RELINKED, Ordering::AcqRel),
+            false => self.serves.fetch_and(!RELINKED, Ordering::AcqRel),
+        };
     }
 
     pub(crate) fn set_duration(&self, ns: u64) {

@@ -115,6 +115,9 @@ impl Cued {
         c
     }
 
+    /// Reads on from the blocks up at `from_ns`. One without a duration, a bitmap composition,
+    /// is up until its track's next, so each track's last one before `from_ns` is read too,
+    /// within the caption reach.
     pub(crate) fn restart(&mut self, from_ns: u64) {
         self.slots.clear();
         self.proposal = None;
@@ -122,10 +125,24 @@ impl Cued {
             self.heads[h].1 = Head::Unknown;
         }
         let up = |r: &Ref| {
-            r.time_ns.saturating_add(r.duration_ns.unwrap_or(0)) > from_ns || r.time_ns >= from_ns
+            r.time_ns >= from_ns
+                || r.duration_ns.is_some_and(|d| r.time_ns.saturating_add(d) > from_ns)
         };
-        self.next = self.refs.iter().position(up).unwrap_or(self.refs.len());
-        self.first = self.next;
+        let mut next = self.refs.iter().position(up).unwrap_or(self.refs.len());
+        let reach = from_ns.saturating_sub(crate::index::CAPTION_REACH);
+        let ahead = next;
+        for i in (0..ahead).rev() {
+            let r = self.refs[i];
+            if r.time_ns < reach {
+                break;
+            }
+            let last = !self.refs[i + 1..ahead].iter().any(|o| o.track == r.track);
+            if r.duration_ns.is_none() && last {
+                next = i;
+            }
+        }
+        self.next = next;
+        self.first = next;
     }
 
     pub(crate) fn untrusted(&self) -> bool {
@@ -363,6 +380,34 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A composition without a duration is up until its track's next, so a restart between
+    /// two reads the one before, one with a duration only while it lasts, nothing past the reach.
+    #[test]
+    fn a_restart_reads_the_block_up_on_each_track() {
+        let cue = |track: u64, ms: u64, dur: Option<u64>| Cue {
+            time_ns: ms * 1_000_000,
+            track,
+            byte: ms,
+            duration_ns: dur.map(|d| d * 1_000_000),
+            relative: Some(1),
+        };
+        let open = [cue(3, 1_000, None), cue(3, 3_000, None), cue(3, 5_000, None)];
+        let refs = Cued::refs(&open, &[3]).expect("placed");
+        let c = Cued::new(refs.clone(), 1_000_000, 4_000_000_000);
+        assert_eq!(c.resume_time(), Some(3_000_000_000), "the one up at 4 s");
+        let c = Cued::new(refs.clone(), 1_000_000, 5_000_000_000);
+        assert_eq!(c.resume_time(), Some(3_000_000_000), "up until 5 s, the next starts there");
+        let c = Cued::new(refs, 1_000_000, 40_000_000_000);
+        assert_eq!(c.resume_time(), None, "past the reach");
+        let timed = [cue(3, 1_000, Some(500)), cue(3, 3_000, Some(500)), cue(3, 5_000, Some(500))];
+        let c = Cued::new(Cued::refs(&timed, &[3]).expect("placed"), 1_000_000, 4_000_000_000);
+        assert_eq!(c.resume_time(), Some(5_000_000_000), "the one from 3 s ended");
+        let two =
+            [cue(3, 1_000, None), cue(7, 2_000, None), cue(3, 3_000, None), cue(7, 6_000, None)];
+        let c = Cued::new(Cued::refs(&two, &[3, 7]).expect("placed"), 1_000_000, 4_000_000_000);
+        assert_eq!(c.resume_time(), Some(2_000_000_000), "track 7's last before 4 s too");
     }
 
     #[test]

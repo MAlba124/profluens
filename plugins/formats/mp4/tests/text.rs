@@ -184,6 +184,112 @@ fn cues(file: Vec<u8>) -> (Vec<Cue>, Option<String>) {
 
 const MS: u64 = 1_000_000;
 
+/// `movie` beside a `vp09` track of `pictures` one second keyframes, the text chunk stored ahead
+/// of the video chunk.
+fn movie_beside_video(text: &[(u32, Vec<u8>)], pictures: u32) -> Vec<u8> {
+    let mut vp09 = vec![0u8; 78];
+    vp09[7] = 1;
+    vp09[24..28].copy_from_slice(&[0, 64, 0, 48]);
+    let pics: Vec<(u32, Vec<u8>)> = (0..pictures)
+        .map(|n| {
+            let mut b = vec![b'V'];
+            b.extend(n.to_be_bytes());
+            b.resize(8, 0);
+            (1000, b)
+        })
+        .collect();
+    let stbl = |entry: &[u8], samples: &[(u32, Vec<u8>)], offset: u32, sync: bool| {
+        let mut stts = be32(&[samples.len() as u32]);
+        samples.iter().for_each(|(d, _)| stts.extend(be32(&[1, *d])));
+        let mut stsz = be32(&[0, samples.len() as u32]);
+        samples.iter().for_each(|(_, b)| stsz.extend(be32(&[b.len() as u32])));
+        let mut stbl = [
+            full(b"stsd", &[&be32(&[1])[..], entry].concat()),
+            full(b"stts", &stts),
+            full(b"stsz", &stsz),
+            full(b"stsc", &be32(&[1, 1, samples.len() as u32, 1])),
+            full(b"stco", &be32(&[1, offset])),
+        ]
+        .concat();
+        if sync {
+            let all: Vec<u32> = (1..=samples.len() as u32).collect();
+            let mut stss = be32(&[all.len() as u32]);
+            stss.extend(be32(&all));
+            stbl.extend(full(b"stss", &stss));
+        }
+        stbl
+    };
+    let trak = |id: u32, handler: Option<&[u8; 4]>, total: u32, dims: [u32; 2], stbl: Vec<u8>| {
+        let mut mdhd = vec![0u8; 8];
+        mdhd.extend(be32(&[1000, total, 0x55c4_0000]));
+        let mut mdia = full(b"mdhd", &mdhd);
+        if let Some(h) = handler {
+            let mut hdlr = vec![0u8; 4];
+            hdlr.extend_from_slice(h);
+            hdlr.extend([0u8; 13]);
+            mdia.extend(full(b"hdlr", &hdlr));
+        }
+        mdia.extend(boxed(b"minf", &boxed(b"stbl", &stbl)));
+        let mut tkhd = vec![0u8; 8];
+        tkhd.extend(be32(&[id, 0, total]));
+        tkhd.extend([0u8; 52]);
+        tkhd.extend(be32(&[dims[0] << 16, dims[1] << 16]));
+        boxed(b"trak", &[full(b"tkhd", &tkhd), boxed(b"mdia", &mdia)].concat())
+    };
+    let text_total: u32 = text.iter().map(|s| s.0).sum();
+    let build = |text_at: u32, video_at: u32| {
+        let mut mvhd = vec![0u8; 8];
+        mvhd.extend(be32(&[1000, text_total.max(pictures * 1000)]));
+        mvhd.extend([0u8; 80]);
+        let video = stbl(&boxed(b"vp09", &vp09), &pics, video_at, true);
+        let text = stbl(&tx3g_entry(), text, text_at, false);
+        let moov = [
+            full(b"mvhd", &mvhd),
+            trak(1, None, pictures * 1000, [64, 48], video),
+            trak(2, Some(b"text"), text_total, [0, 0], text),
+        ]
+        .concat();
+        [boxed(b"ftyp", b"isom\0\0\0\0isom"), boxed(b"moov", &moov)].concat()
+    };
+    let text_at = build(0, 0).len() as u32 + 8;
+    let text_bytes: Vec<u8> = text.iter().flat_map(|(_, b)| b.clone()).collect();
+    let head = build(text_at, text_at + text_bytes.len() as u32);
+    let data = [text_bytes, pics.into_iter().flat_map(|(_, b)| b).collect()].concat();
+    [head, boxed(b"mdat", &data)].concat()
+}
+
+/// A cue sample stored ahead of the keyframe a seek lands on is gone back for while its track is
+/// on, not past the reach, and a track that is off moves nothing.
+#[test]
+fn a_seek_goes_back_for_the_cue_up_on_a_track_that_is_on() {
+    const S: u64 = 1_000_000_000;
+    let text = [(2_000, tx3g("")), (3_000, tx3g("Up")), (35_000, tx3g("")), (1_000, tx3g("Last"))];
+    let file = movie_beside_video(&text, 41);
+    let mut reader = Mp4Reader::new(&file).expect("resolves");
+    let tables = reader.tables();
+    let offset = |track: usize, n: usize| {
+        let mut of = tables.samples().iter().filter(|s| usize::from(s.track_index) == track);
+        of.nth(n).expect("the sample").offset
+    };
+    let on = tables.seek_index(&|_| true);
+    let entry = |index: &profluens_core::pipeline::Index, sec: u64| {
+        index.entries.iter().find(|e| e.time_ns == sec * S).copied().expect("an entry")
+    };
+    // 3 s is inside "Up", 1 s inside the gap before it, 30 s past the reach of the gap from 5 s
+    assert_eq!((entry(&on, 3).restart, entry(&on, 3).restart_ns), (offset(1, 1), 2 * S));
+    assert_eq!(entry(&on, 1).restart, offset(1, 0));
+    assert_eq!(entry(&on, 30).restart, offset(0, 30), "{:?}", entry(&on, 30));
+    assert_eq!(entry(&on, 40).restart, offset(1, 3));
+    let off = tables.seek_index(&|_| false);
+    assert!(off.entries.iter().all(|e| e.restart == e.byte), "{:?}", off.entries);
+    // the stream restarted at the entry's byte gates the text track at the cue
+    let r = reader.seek_stream(entry(&on, 3).restart, Some(3 * S), 3 * S);
+    assert_eq!((r.to_byte, r.at_ns), (offset(1, 1), 2 * S));
+    reader.select(1, false);
+    let r = reader.seek_stream(offset(0, 3), Some(3 * S), 3 * S);
+    assert_eq!(r.to_byte, offset(0, 3));
+}
+
 #[test]
 fn tx3g_cues_come_out_as_subrip_with_their_durations() {
     let samples = [

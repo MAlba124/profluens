@@ -238,9 +238,9 @@ fn a_seek_into_a_later_edit_restarts_at_its_sync_sample() {
     let reader = Mp4Reader::new(&with_edits(&[(200, 0), (400, 9 * PICTURE as i32)])).unwrap();
     let tables = reader.tables();
     let first = reader.samples()[0].offset;
-    let r = tables.restart(stamp(5), stamp(5));
+    let r = tables.restart(stamp(5), stamp(5), &|_| true);
     assert_eq!((r.to_byte, r.at_ns), (first, 0));
-    let index = tables.seek_index();
+    let index = tables.seek_index(&|_| true);
     assert_eq!(index.entries.iter().map(|e| (e.time_ns, e.byte)).collect::<Vec<_>>(), [(0, first)]);
     assert_eq!(index.duration.nanos(), Some(600_000_000));
 }

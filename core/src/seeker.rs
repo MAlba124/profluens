@@ -526,6 +526,30 @@ mod tests {
         assert_eq!(targets, [(source, 2_000, MS(2_000)), (demux, 2_000, MS(4_000))]);
     }
 
+    /// The restarts of a published index follow what is linked, so a link or an unlink made
+    /// after it holds planning until the publisher publishes again or saw the change.
+    #[test]
+    fn a_link_after_the_index_holds_planning_until_the_publisher_sees_it() {
+        let mut p = Pipeline::new();
+        let [source, demux, _] = chain(&mut p, &FILE);
+        serve(&p, source, Addressed::Byte, false);
+        let other = p.add(El(&SINK));
+        let id = p.link((demux, SrcPad(1)), (other, SinkPad(0))).expect("links");
+        assert!(!p.counters_of(demux).indexing(), "no index to hold yet");
+        p.publish_index(demux, gops(true));
+        assert_eq!(planned(&p, MS(0), MS(5_000)).0, seek(3_000, 4_000, 5_000));
+        p.unlink(id).expect("unlinks");
+        assert!(p.counters_of(demux).indexing());
+        assert_eq!(planned(&p, MS(0), MS(5_000)).0, SeekPlan::Deferred, "unlinked");
+        p.publish_index(demux, gops(true));
+        assert!(!p.counters_of(demux).indexing());
+        assert_eq!(planned(&p, MS(0), MS(5_000)).0, seek(3_000, 4_000, 5_000), "published");
+        p.link((demux, SrcPad(1)), (other, SinkPad(0))).expect("links");
+        assert!(p.counters_of(demux).indexing(), "linked");
+        p.publish_index(demux, gops(true));
+        assert!(!p.counters_of(demux).indexing());
+    }
+
     #[test]
     fn a_seek_before_the_index_is_held_and_sent_when_it_lands() {
         let mut p = Pipeline::new();

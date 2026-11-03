@@ -698,6 +698,8 @@ impl Group {
                 }
                 return Err(e);
             }
+            // Started with its links as they are, see `Pipeline::relinked`.
+            self.ctxs[i].link_seen();
         }
         self.pair_pulls();
         Ok(())
@@ -970,7 +972,9 @@ impl Group {
         self.ctxs[tail].told(pad, Upstream::default());
         self.ctxs[tail].set_pad_linked(pad, false);
         let off = Event::SrcLinked { pad, on: false, restart: None };
-        self.elements[tail].event(&mut self.ctxs[tail], &off)
+        self.elements[tail].event(&mut self.ctxs[tail], &off)?;
+        self.ctxs[tail].link_seen();
+        Ok(())
     }
 
     /// The tail reads what its links were told. A pad shared by several links reads none.
@@ -1130,6 +1134,7 @@ impl Group {
             if !shared {
                 let on = Event::SrcLinked { pad, on: true, restart };
                 self.elements[tail].event(&mut self.ctxs[tail], &on)?;
+                self.ctxs[tail].link_seen();
             }
         }
         self.fan_out = fans_out(&self.downstream);

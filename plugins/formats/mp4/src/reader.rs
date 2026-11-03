@@ -425,13 +425,26 @@ impl Tables {
     }
 
     /// Where a seek to `point` restarts the file, video restarting at the sync sample at or
-    /// before `video_from`. The byte is the first any track needs.
-    pub fn restart(&self, point: u64, video_from: u64) -> Restart {
+    /// before `video_from`, a caption track `on` at the sample up at `point`. The byte is the
+    /// first any track needs.
+    pub fn restart(&self, point: u64, video_from: u64, on: &dyn Fn(usize) -> bool) -> Restart {
         if let Some(frag) = &self.frag {
             return frag.restart(point, video_from, &self.rules);
         }
         let mut gates = [0u64; MAX_TRACKS];
-        self.gates(Some(point), video_from, 0, &mut gates)
+        self.gates(Some(point), video_from, 0, on, &mut gates)
+    }
+
+    /// `track` is a caption track the restart goes back for.
+    fn caption(&self, track: usize, on: &dyn Fn(usize) -> bool) -> bool {
+        let text = |t: &Track| t.kind() == TrackKind::Other && t.is_text();
+        self.tracks.get(track).is_some_and(text) && on(track)
+    }
+
+    /// A caption sample stamped `pts` is still up at `point`, within the reach.
+    fn caption_up(&self, track: usize, point: u64, pts: i64) -> bool {
+        let up = |t: &Track| point.saturating_sub(t.stamp_ns(pts)) <= CAPTION_REACH_NS;
+        self.tracks.get(track).is_some_and(up)
     }
 
     pub fn is_fragmented(&self) -> bool {
@@ -456,10 +469,11 @@ impl Tables {
 
     /// The time to byte map of the movie. Sync samples of the first
     /// video track, else the first audio track thinned to [`MAX_INDEX_ENTRIES`], or one entry
-    /// per indexed fragment.
-    // Cold path, once per open.
+    /// per indexed fragment. An entry restarts ahead for audio pre-roll and for the sample up
+    /// on a caption track `on`.
+    // Cold path, once per open and link change.
     #[allow(clippy::disallowed_methods)]
-    pub fn seek_index(&self) -> Index {
+    pub fn seek_index(&self, on: &dyn Fn(usize) -> bool) -> Index {
         let longest = self.tracks.iter().map(|t| t.duration_ns).max().unwrap_or(0);
         let ns = match (longest, &self.frag) {
             (0, Some(frag)) => frag.duration_ns,
@@ -497,7 +511,7 @@ impl Tables {
         for s in self.samples.iter().filter(keys).step_by(stride) {
             let time_ns = self.tracks[track].stamp_ns(s.pts);
             if ascends(&entries, time_ns, s.offset) {
-                let r = sweep.restart(time_ns);
+                let r = sweep.restart(time_ns, on);
                 entries.push(IndexEntry {
                     time_ns,
                     byte: s.offset,
@@ -509,12 +523,12 @@ impl Tables {
         Index { complete: !entries.is_empty(), entries, file_len: None, duration, stream, grouped }
     }
 
-    pub fn track_restart(&self, track: usize, point: u64) -> Restart {
+    pub fn track_restart(&self, track: usize, point: u64, on: &dyn Fn(usize) -> bool) -> Restart {
         if let Some(frag) = &self.frag {
             return frag.restart(point, point, &self.rules);
         }
         let mut gates = [0u64; MAX_TRACKS];
-        self.gates(Some(point), point, 0, &mut gates);
+        self.gates(Some(point), point, 0, on, &mut gates);
         let to_byte = gates.get(track).copied().unwrap_or(0);
         let at = self.samples.partition_point(|s| s.offset < to_byte);
         let sample = self.samples[at..].iter().find(|s| s.track() == track);
@@ -524,21 +538,24 @@ impl Tables {
 
     /// The offset each track's samples pass from, into `gates`, behind a source that
     /// restarted at `floor`. Video from the last sync sample at or before `video_from`,
-    /// audio from its pre-roll ahead of `point`, anything else whole. One walk in file order.
+    /// audio from its pre-roll ahead of `point`, a caption track `on` from its sample up at
+    /// `point`, anything else whole. One walk in file order.
     fn gates(
         &self,
         point: Option<u64>,
         video_from: u64,
         floor: u64,
+        on: &dyn Fn(usize) -> bool,
         gates: &mut [u64; MAX_TRACKS],
     ) -> Restart {
         const NONE: (u64, i64) = (u64::MAX, 0);
         let mut picks = [Pick { best: NONE, first: NONE, bound: 0, done: true }; MAX_TRACKS];
         let mut open = 0usize;
-        for (pick, rule) in picks.iter_mut().zip(&self.rules) {
+        for (i, (pick, rule)) in picks.iter_mut().zip(&self.rules).enumerate() {
             let bound_ns = match (rule.kind, point) {
                 (TrackKind::Video, _) => video_from,
                 (TrackKind::Audio, Some(point)) => point.saturating_sub(rule.pre_roll_ns),
+                (TrackKind::Other, Some(point)) if self.caption(i, on) => point,
                 _ => continue,
             };
             (pick.bound, pick.done) = (ticks_at_or_before(bound_ns, rule.timescale), false);
@@ -565,9 +582,15 @@ impl Tables {
             }
         }
         let mut restart = Restart { to_byte: u64::MAX, at_ns: u64::MAX };
-        for ((gate, pick), track) in gates.iter_mut().zip(&picks).zip(&self.tracks) {
-            let gated =
-                !matches!((track.kind(), point), (TrackKind::Other, _) | (TrackKind::Audio, None));
+        for (i, ((gate, pick), track)) in gates.iter_mut().zip(&picks).zip(&self.tracks).enumerate()
+        {
+            let gated = match (track.kind(), point) {
+                (TrackKind::Other, Some(point)) => {
+                    pick.best != NONE && self.caption_up(i, point, pick.best.1)
+                }
+                (TrackKind::Other, None) | (TrackKind::Audio, None) => false,
+                _ => true,
+            };
             let (offset, pts) = match (gated, pick.best != NONE) {
                 (false, _) => (floor, None),
                 (true, true) => (pick.best.0, Some(pick.best.1)),
@@ -599,7 +622,7 @@ struct Sweep<'a> {
 }
 
 impl Sweep<'_> {
-    fn restart(&mut self, point: u64) -> Restart {
+    fn restart(&mut self, point: u64, on: &dyn Fn(usize) -> bool) -> Restart {
         let tables = self.tables;
         let mut restart = Restart { to_byte: u64::MAX, at_ns: u64::MAX };
         for (i, ((rule, track), cursor)) in
@@ -608,6 +631,7 @@ impl Sweep<'_> {
             let bound_ns = match rule.kind {
                 TrackKind::Video => point,
                 TrackKind::Audio => point.saturating_sub(rule.pre_roll_ns),
+                TrackKind::Other if tables.caption(i, on) => point,
                 TrackKind::Other => continue,
             };
             let bound = ticks_at_or_before(bound_ns, rule.timescale);
@@ -624,7 +648,14 @@ impl Sweep<'_> {
                 cursor.best = Some((s.offset, s.pts));
                 cursor.at += 1;
             }
-            if let Some((offset, pts)) = cursor.best.or(cursor.first) {
+            // A caption is up from its sample on, a later one is not
+            let pick = match rule.kind {
+                TrackKind::Other => {
+                    cursor.best.filter(|&(_, pts)| tables.caption_up(i, point, pts))
+                }
+                _ => cursor.best.or(cursor.first),
+            };
+            if let Some((offset, pts)) = pick {
                 restart.to_byte = restart.to_byte.min(offset);
                 restart.at_ns = restart.at_ns.min(track.stamp_ns(pts));
             }
@@ -697,6 +728,10 @@ pub struct Mp4Reader {
 }
 
 const SHUT: u64 = u64::MAX;
+
+/// How long a caption may have been up for a seek to go back for its sample, as mkvdemux's
+/// `CAPTION_REACH`. Chosen, not measured.
+pub const CAPTION_REACH_NS: u64 = 20_000_000_000;
 
 enum Chunk {
     Retained(Memory),
@@ -799,6 +834,11 @@ impl Mp4Reader {
         }
     }
 
+    /// Whether `track` is selected, every track is until deselected.
+    pub fn is_on(&self, track: usize) -> bool {
+        self.off.get(track).is_some_and(|off| !off)
+    }
+
     pub fn select(&mut self, track: usize, on: bool) {
         let Some(off) = self.off.get_mut(track) else {
             return;
@@ -824,7 +864,8 @@ impl Mp4Reader {
         let resume = self.tables.samples.get(self.next).map_or(SHUT, |s| s.offset);
         self.gates.iter_mut().for_each(|gate| *gate = (*gate).max(resume));
         let mut fresh = [0u64; MAX_TRACKS];
-        self.tables.gates(Some(point), point, to_byte, &mut fresh);
+        let off = self.off;
+        self.tables.gates(Some(point), point, to_byte, &|i| !off[i], &mut fresh);
         (self.gates[track], self.off[track]) = (fresh[track], false);
         self.chunks.clear();
         self.buffered = 0;
@@ -855,7 +896,8 @@ impl Mp4Reader {
             }
             return Restart { to_byte, at_ns: point.unwrap_or(video_from) };
         }
-        let restart = self.tables.gates(point, video_from, to_byte, &mut self.gates);
+        let off = self.off;
+        let restart = self.tables.gates(point, video_from, to_byte, &|i| !off[i], &mut self.gates);
         for (gate, off) in self.gates.iter_mut().zip(self.off) {
             *gate = if off { SHUT } else { *gate };
         }

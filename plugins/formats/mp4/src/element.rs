@@ -988,6 +988,30 @@ impl Mp4Demux {
 }
 
 impl Mp4Demux {
+    /// The seek index going back for the caption tracks `on`, kept for the rate teller.
+    fn indexed(
+        &mut self,
+        tables: &crate::reader::Tables,
+        on: &dyn Fn(usize) -> bool,
+    ) -> profluens_core::pipeline::Index {
+        let mut index = tables.seek_index(on);
+        index.stream =
+            index.stream.and_then(|track| self.pad_tracks.get(track as usize)).map(|pt| pt.stream);
+        self.rated = Some(index.clone());
+        index
+    }
+
+    /// Publishes the index again for the tracks selected now.
+    fn republish(&mut self, ctx: &Ctx) {
+        let Some(reader) = self.reader.as_ref() else {
+            return;
+        };
+        let on: Vec<bool> = (0..self.pad_tracks.len()).map(|i| reader.is_on(i)).collect();
+        let tables = reader.tables();
+        let index = self.indexed(&tables, &|i| on.get(i).is_some_and(|on| *on));
+        ctx.publish_index(index);
+    }
+
     fn relink(&mut self, ctx: &Ctx, pad: SrcPad, on: bool, restart: Option<SeekTarget>) {
         let of = |pt: &PadTrack| ctx.stream_pad(pt.stream) == Some(pad);
         let Some(idx) = self.pad_tracks.iter().position(of) else {
@@ -1097,9 +1121,8 @@ impl Element for Mp4Demux {
         if tables.skipped_tracks() > 0 {
             log!(&*ctx, Level::Warn, "tracks_skipped", count = tables.skipped_tracks());
         }
-        let mut index = tables.seek_index();
-        index.stream =
-            index.stream.and_then(|track| self.pad_tracks.get(track as usize)).map(|pt| pt.stream);
+        // No pad is linked at the open, the start publishes again for the caption tracks that are
+        let index = self.indexed(&tables, &|_| false);
         log!(
             &*ctx,
             Level::Info,
@@ -1113,7 +1136,6 @@ impl Element for Mp4Demux {
             0 => log!(&*ctx, Level::Warn, "index_empty", complete = index.complete),
             n => log!(&*ctx, Level::Info, "index", entries = n, complete = index.complete),
         }
-        self.rated = Some(index.clone());
         ctx.publish_index(index);
         self.reader = Some(reader);
         Ok(())
@@ -1138,6 +1160,7 @@ impl Element for Mp4Demux {
                 reader.select(i, pad.is_some_and(|pad| ctx.pad_linked(pad)));
             }
         }
+        self.republish(ctx);
         self.restart(ctx, None)
     }
 
@@ -1198,7 +1221,10 @@ impl Element for Mp4Demux {
                 self.teller.restart();
                 self.restart(ctx, ctx.seek_target())?;
             }
-            Event::SrcLinked { pad, on, restart } => self.relink(ctx, *pad, *on, *restart),
+            Event::SrcLinked { pad, on, restart } => {
+                self.relink(ctx, *pad, *on, *restart);
+                self.republish(ctx);
+            }
             Event::SrcJoined { pad } => self.greet(ctx, *pad),
             _ => {}
         }

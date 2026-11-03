@@ -298,7 +298,7 @@ fn a_seek_index_is_read_off_a_sidx_and_off_an_mfra() {
         assert!(f.time_ns.abs_diff(n as u64 * SECOND + 2 * FRAME) <= 2, "{f:?}");
         assert_eq!(&file[f.offset as usize + 4..f.offset as usize + 8], b"moof");
     }
-    let restart = tables.restart(SECOND + SECOND / 2, SECOND + SECOND / 2);
+    let restart = tables.restart(SECOND + SECOND / 2, SECOND + SECOND / 2, &|_| true);
     assert_eq!(restart.to_byte, fragments[1].offset);
 }
 
@@ -306,21 +306,21 @@ fn a_seek_index_is_read_off_a_sidx_and_off_an_mfra() {
 fn a_fragmented_movie_indexes_its_fragments_or_its_first() {
     let file = fixture("frag_sidx.mp4");
     let tables = Mp4Reader::new(&file).expect("resolves").tables();
-    let index = tables.seek_index();
+    let index = tables.seek_index(&|_| true);
     let named: Vec<(u64, u64)> = tables.fragments().iter().map(|f| (f.time_ns, f.offset)).collect();
     let entries: Vec<(u64, u64)> = index.entries.iter().map(|e| (e.time_ns, e.byte)).collect();
     assert_eq!((entries.len(), entries), (3, named));
     for e in &index.entries {
-        let r = tables.restart(e.time_ns, e.time_ns);
+        let r = tables.restart(e.time_ns, e.time_ns, &|_| true);
         assert_eq!((e.restart, e.restart_ns), (r.to_byte, r.at_ns));
     }
     assert_eq!((index.complete, index.duration), (true, Timestamp(3 * SECOND)));
 
     let file = fixture("frag_av.mp4");
     let bare = Mp4Reader::new(&file).expect("resolves").tables();
-    let first = bare.restart(0, 0).to_byte;
+    let first = bare.restart(0, 0, &|_| true).to_byte;
     assert_eq!(&file[first as usize + 4..first as usize + 8], b"moof");
-    assert_eq!(bare.seek_index().entries, [IndexEntry::key(0, first)]);
+    assert_eq!(bare.seek_index(&|_| true).entries, [IndexEntry::key(0, first)]);
 }
 
 fn seek_and_read(file: &[u8], reader: &mut Mp4Reader, to_byte: u64, point: u64) -> Vec<Out> {
@@ -339,7 +339,7 @@ fn a_seek_restarts_each_track_at_its_own_sample() {
     let size = frag::mfra_size(&file).unwrap() as usize;
     let mut reader = Mp4Reader::indexed(&file, &file[file.len() - size..]).expect("resolves");
     let point = 2 * SECOND + SECOND / 2;
-    let restart = reader.tables().restart(point, point);
+    let restart = reader.tables().restart(point, point, &|_| true);
     let out = seek_and_read(&file, &mut reader, restart.to_byte, point);
     let video: Vec<&Out> = out.iter().filter(|s| s.track == 0).collect();
     let audio: Vec<&Out> = out.iter().filter(|s| s.track == 1).collect();
@@ -363,8 +363,8 @@ fn a_seek_with_no_index_reads_from_the_first_fragment_to_the_same_samples() {
     let mut indexed = Mp4Reader::indexed(&file, &file[file.len() - size..]).expect("resolves");
     let mut bare = Mp4Reader::new(&file).expect("resolves");
     for point in [0, SECOND / 3, SECOND + 1, 2 * SECOND + SECOND / 2, 2 * SECOND + 14 * FRAME] {
-        let by_index = indexed.tables().restart(point, point);
-        let by_scan = bare.tables().restart(point, point);
+        let by_index = indexed.tables().restart(point, point, &|_| true);
+        let by_scan = bare.tables().restart(point, point, &|_| true);
         assert_eq!(&file[by_scan.to_byte as usize + 4..by_scan.to_byte as usize + 8], b"moof");
         let a = seek_and_read(&file, &mut indexed, by_index.to_byte, point);
         let b = seek_and_read(&file, &mut bare, by_scan.to_byte, point);

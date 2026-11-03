@@ -664,6 +664,16 @@ impl Ctx {
         if let Some((counters, _)) = &self.trace {
             counters.index.publish(index);
             counters.set_indexing(false);
+            counters.set_relinked(false);
+            self.resolve_pending();
+        }
+    }
+
+    /// The element saw its links change. Planning on its index goes on, republished or not,
+    /// and a seek held for it is sent.
+    pub(crate) fn link_seen(&self) {
+        if let Some((counters, _)) = &self.trace {
+            counters.set_relinked(false);
             self.resolve_pending();
         }
     }

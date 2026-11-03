@@ -14,7 +14,7 @@ use profluens_core::id::{FormatId, SinkPad, SrcPad};
 use profluens_core::log;
 use profluens_core::log::Level;
 use profluens_core::memory::{Known, Memory, RESERVE_FLOOR, SIZED_TOP};
-use profluens_core::pipeline::Index;
+use profluens_core::pipeline::{Caption, Index};
 use profluens_core::pull::Ask;
 use profluens_core::rate;
 use profluens_core::time::Timestamp;
@@ -1216,6 +1216,7 @@ impl MkvDemux {
         let seek = &mut self.seek;
         seek.due = false;
         let tracks = &self.pad_tracks;
+        let stream = |n: u64| tracks.iter().find(|pt| pt.track_number == n).map(|pt| pt.stream);
         let (entries, complete, key) = match seek.cues.is_empty() {
             false => {
                 let linked = |n: u64| tracks.iter().any(|pt| pt.linked && pt.track_number == n);
@@ -1227,11 +1228,19 @@ impl MkvDemux {
                 (seek.grown.entries.clone(), false, seek.grown.key)
             }
         };
+        let (spans, left_out) = crate::index::captions(&seek.cues, &seek.tracks);
+        let caption = |&(t, time_ns, end_ns, byte): &crate::index::CaptionSpan| {
+            Some(Caption { stream: stream(t)?, time_ns, end_ns, byte })
+        };
+        let mut captions: Vec<Caption> = spans.iter().filter_map(caption).collect();
+        captions.sort_unstable_by_key(|c| c.time_ns);
+        let uncued = left_out.iter().filter_map(|&t| stream(t)).collect();
         let key = key.and_then(|n| tracks.iter().find(|pt| pt.track_number == n));
         let (stream, grouped) =
             (key.map(|pt| pt.stream), key.is_some_and(|pt| pt.kind == Kind::Video));
         let (file_len, duration) = (seek.file_len, seek.duration);
-        let index = Index { entries, file_len, duration, complete, stream, grouped };
+        let index =
+            Index { entries, file_len, duration, complete, stream, grouped, captions, uncued };
         self.rated = Some(index.clone());
         ctx.publish_index(index);
     }

@@ -148,13 +148,15 @@ impl std::fmt::Display for SubParseError {
 impl std::error::Error for SubParseError {}
 
 /// A document behind its end, parsed a chunk at a time and handed out cue by cue under the
-/// pool's backpressure.
+/// pool's backpressure. Kept across a flush and walked again from its start, so a seek parses
+/// no file again.
 struct Document {
     text: String,
     /// Bytes of `text` the parser consumed.
     pos: usize,
     /// Bytes past `pos` offered before and left unconsumed, a record straddling the chunk.
     window: usize,
+    format: Format,
     parser: Box<dyn SubtitleFormat + Send>,
     /// The last step's cues, handed out from `next`.
     cues: Vec<Cue>,
@@ -189,6 +191,13 @@ impl Document {
 
     fn done(&self) -> bool {
         self.next >= self.cues.len() && self.pos >= self.text.len()
+    }
+
+    /// Back to the start, a fresh parser as one keeps a header's state.
+    fn rewind(&mut self) {
+        (self.pos, self.window, self.next, self.emitted) = (0, 0, 0, 0);
+        self.cues.clear();
+        self.parser = self.format.parser();
     }
 }
 
@@ -345,6 +354,7 @@ impl SubParse {
             text,
             pos: 0,
             window: 0,
+            format,
             parser: format.parser(),
             cues: Vec::new(),
             next: 0,
@@ -354,7 +364,8 @@ impl SubParse {
     }
 
     /// Hand out the document's next cues, holding the end while any remain. A full pool or the
-    /// per-pass count yields, the scheduler returns here once the downstream drained.
+    /// per-pass count yields, the scheduler returns here once the downstream drained. Behind a
+    /// seek the cues wholly before the presentation point are passed over.
     fn drain_document(&mut self, ctx: &mut Ctx) {
         let Some(mut doc) = self.doc.take() else { return };
         let mut passed = 0usize;
@@ -364,6 +375,21 @@ impl SubParse {
                     self.warn(ctx, SubParseError::Parse(e));
                     break;
                 }
+                continue;
+            }
+            let (pts, duration) = {
+                let cue = &doc.cues[doc.next];
+                let pts = Timestamp::from_nanos(cue.start_ns);
+                (pts, cue.duration_ns().map_or(Timestamp::NONE, Timestamp::from_nanos))
+            };
+            // A saturated start would go out untimed and show at once or forever.
+            if pts.is_none() {
+                self.dropped += 1;
+                doc.next += 1;
+                continue;
+            }
+            if ctx.before_presentation(pts, duration) {
+                doc.next += 1;
                 continue;
             }
             let out = match ctx.try_alloc_sized(CUE_SLOT) {
@@ -387,13 +413,6 @@ impl SubParse {
             let cue = &doc.cues[doc.next];
             doc.next += 1;
             passed += 1;
-            let pts = Timestamp::from_nanos(cue.start_ns);
-            if pts.is_none() {
-                // A saturated start would go out untimed and show at once or forever.
-                self.dropped += 1;
-                continue;
-            }
-            let duration = cue.duration_ns().map_or(Timestamp::NONE, Timestamp::from_nanos);
             document_ir(cue, &*doc.parser, &mut self.builder);
             self.emit_into(ctx, out, pts, Timestamp::NONE, duration);
             doc.emitted += 1;
@@ -457,6 +476,10 @@ impl Element for SubParse {
         }
         while let Some(buf) = inputs.pop() {
             if self.mode == Mode::Document {
+                // The source reading the file again behind a flush feeds the document held.
+                if self.doc.is_some() {
+                    continue;
+                }
                 if self.text.len() + buf.memory.len() > MAX_FILE {
                     return Err(Error::element_failed(
                         ctx.element(),
@@ -488,7 +511,8 @@ impl Element for SubParse {
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
         match event {
             Event::FormatChange(_) => self.learn_from_sink(ctx),
-            Event::Eos if self.mode == Mode::Document => self.put_out(ctx),
+            Event::Eos if self.mode == Mode::Document && self.doc.is_none() => self.put_out(ctx),
+            Event::Eos if self.mode == Mode::Document => self.drain_document(ctx),
             Event::Eos => log!(
                 &*ctx,
                 Level::Info,
@@ -500,7 +524,9 @@ impl Element for SubParse {
             Event::FlushStart => {
                 log!(&*ctx, Level::Debug, "flush", buffered = self.text.len());
                 self.text.clear();
-                self.doc = None;
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.rewind();
+                }
             }
             // A cue comes out as it goes in, so the track's silence is this pad's.
             Event::Gap { .. } => ctx.push_event(Self::OUT, event.clone()),
@@ -609,6 +635,28 @@ mod tests {
         let buf = h.alloc(SRT.as_bytes());
         h.push(buf).expect("push");
         assert_eq!(h.eos().expect("eos").len(), 2);
+    }
+
+    #[test]
+    fn a_seek_walks_the_document_again_from_the_cue_up_at_the_point() {
+        let mut h = Harness::new(SubParse::new());
+        h.fix_sink_format(SubParse::IN, "bytes", &[]);
+        let buf = h.alloc(SRT.as_bytes());
+        h.push(buf).expect("push");
+        assert_eq!(h.eos().expect("eos").len(), 2);
+        let ms = Timestamp::from_millis;
+        for (point, want) in [(1_500, vec!["first", "second"]), (4_500, vec!["second"])] {
+            h.seek_to(ms(point), None).expect("seek");
+            // the source reads the file again, the bytes are not a second document
+            let again = h.alloc(SRT.as_bytes());
+            h.push(again).expect("push");
+            let out = h.eos().expect("eos");
+            let got: Vec<String> = out.iter().map(plain).collect();
+            assert_eq!(got, want, "at {point} ms");
+            if point == 1_500 {
+                assert_eq!(out[0].pts, ms(1_000), "the cue up at the point keeps its start");
+            }
+        }
     }
 
     #[test]

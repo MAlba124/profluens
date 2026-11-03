@@ -23,3 +23,6 @@ pf-harness = { path = "../../lib/harness" }
 profluens-elements = { path = "../../lib/elements" }
 pf-ogg = { path = "../formats/ogg" }
 pf-mp4 = { path = "../formats/mp4" }
+
+# TODO: add each codec as a feature to enable/disable them at build time to not bloat the compile times and binary size
+# [features]

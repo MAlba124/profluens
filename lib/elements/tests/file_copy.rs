@@ -44,7 +44,7 @@ fn copies_bytes_identically_with_flat_allocation() {
     assert!(report.buffers >= 8, "several batches flowed: {}", report.buffers);
 
     assert!(
-        matches!(p.bus().try_recv(), Some(BusMessage::Eos)),
+        std::iter::from_fn(|| p.bus().try_recv()).any(|m| matches!(m, BusMessage::Eos)),
         "pipeline posted Eos on completion"
     );
 

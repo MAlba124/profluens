@@ -207,6 +207,8 @@ pub struct Control {
     paused: AtomicBool,
     frozen: AtomicU64,
     stopped: AtomicBool,
+    /// A stop said since the last run ended, so one said before a run starts stops that run.
+    stop_asked: AtomicBool,
     finished: AtomicBool,
     base: Arc<AtomicI64>,
     pub(crate) timeline: Timeline,
@@ -300,6 +302,7 @@ impl Control {
             paused: AtomicBool::new(false),
             frozen: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
+            stop_asked: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             base,
             timeline: Timeline::new(),
@@ -502,8 +505,10 @@ impl Control {
         pause
     }
 
-    /// Stop the run without waiting, even on a full log. A held seek is dropped.
+    /// Stop the run without waiting, even on a full log. A held seek is dropped. Said before
+    /// the run starts, it stops that run at its first pass.
     pub fn stop(&self) {
+        self.stop_asked.store(true, Ordering::Release);
         *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.holding.store(false, Ordering::Release);
         if self.append(Command::Stop).is_err() {
@@ -880,8 +885,20 @@ impl Control {
         self.finished.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_stop(&self) {
         self.stopped.store(false, Ordering::Release);
+    }
+
+    /// A run is built, stopped from the start when a stop was asked since the last one ended.
+    pub(crate) fn enter_run(&self) {
+        let asked = self.stop_asked.load(Ordering::Acquire);
+        self.stopped.store(asked, Ordering::Release);
+    }
+
+    /// A run ended, a stop asked during it was for it.
+    pub(crate) fn leave_run(&self) {
+        self.stop_asked.store(false, Ordering::Release);
     }
 
     /// Whether the run is over, by a stop, a failure or its finish.

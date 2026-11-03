@@ -276,6 +276,21 @@ impl IndexEntry {
     }
 }
 
+/// How long a caption may have been up for a restart to go back for its block. Chosen, not
+/// measured.
+pub const CAPTION_REACH: u64 = 20_000_000_000;
+
+/// A caption's span on a stream, by the container's own index of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caption {
+    pub stream: u32,
+    pub time_ns: u64,
+    /// Its duration's end, else its stream's next caption, the stream's last reaches
+    /// [`CAPTION_REACH`].
+    pub end_ns: u64,
+    pub byte: u64,
+}
+
 /// The time to byte map of the element that parses the format.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Index {
@@ -290,14 +305,27 @@ pub struct Index {
     pub stream: Option<u32>,
     /// Keyframes of GOPs, so a skip reaches the GOP being presented and no further.
     pub grouped: bool,
+    /// Every indexed caption of every caption stream, linked or not, ascending by time. A
+    /// stream linked while running restarts by them, see [`restart_for`](Self::restart_for).
+    pub captions: Vec<Caption>,
+    /// Caption streams the container indexes no caption of, one may be up at any time.
+    pub uncued: Vec<u32>,
 }
 
 impl Default for Index {
     // An empty Vec allocates nothing.
     #[allow(clippy::disallowed_methods)]
     fn default() -> Self {
-        let (entries, duration) = (Vec::new(), Timestamp::NONE);
-        Index { entries, file_len: None, duration, complete: false, stream: None, grouped: false }
+        Index {
+            entries: Vec::new(),
+            file_len: None,
+            duration: Timestamp::NONE,
+            complete: false,
+            stream: None,
+            grouped: false,
+            captions: Vec::new(),
+            uncued: Vec::new(),
+        }
     }
 }
 
@@ -342,6 +370,33 @@ impl Index {
             Some(e) => Some((e.byte, Timestamp(e.time_ns))),
             None => self.estimate(target.nanos()?).map(|byte| (byte, target)),
         }
+    }
+
+    /// Where the source restarts to link caption stream `stream` at `at`, the entry at or before
+    /// `at`, or the one below the block of a caption of the stream up at `at` or stored between
+    /// that entry and the next. None without an entry.
+    pub fn restart_for(&self, stream: u32, at: Timestamp) -> Option<(u64, Timestamp)> {
+        let ns = at.nanos()?;
+        let k = self.entries.partition_point(|e| e.time_ns <= ns).saturating_sub(1);
+        let key = self.entries.get(k)?;
+        let until = self.entries.get(k + 1).map_or(u64::MAX, |e| e.time_ns);
+        let reach = ns.saturating_sub(CAPTION_REACH);
+        let mut earliest = (key.time_ns, key.byte);
+        let up = |c: &&Caption| {
+            c.stream == stream && c.time_ns >= reach && c.time_ns < until && c.end_ns > ns
+        };
+        for c in self.captions.iter().filter(up) {
+            let below = self.entries.iter().filter(|e| e.byte <= c.byte).max_by_key(|e| e.byte);
+            if let Some(e) = below.or(self.entries.first()) {
+                earliest = earliest.min((e.time_ns, e.byte));
+            }
+        }
+        if self.uncued.contains(&stream)
+            && let Some(e) = self.floor(reach)
+        {
+            earliest = earliest.min((e.time_ns, e.byte));
+        }
+        Some((earliest.1, Timestamp(earliest.0)))
     }
 
     /// Where the source restarts for `plan`, `None` for a plan that restarts nothing.
@@ -1967,6 +2022,10 @@ impl Pipeline {
         let (mut setups, end) = self.build_run(true)?;
         let control = Arc::clone(&self.control);
         control.topology.serve(true);
+        self.bus_sender.send(BusMessage::StateChanged {
+            old: crate::bus::State::Ready,
+            new: crate::bus::State::Playing,
+        });
         // Unwinding out of here aborts the run and joins the groups, so no thread outlives it.
         let mut guard =
             RunGuard { control: Arc::clone(&control), threads: Vec::new(), armed: true };
@@ -2035,7 +2094,7 @@ impl Pipeline {
     // Run setup, once per run.
     #[allow(clippy::disallowed_methods)]
     fn build_run(&mut self, threaded: bool) -> Result<(Vec<GroupSetup>, RunEnd), Error> {
-        self.control.clear_stop();
+        self.control.enter_run();
         let part = self.part();
         for &(id, i) in self.slots.map().iter().filter(|(id, _)| !has(&part, ElementId(*id))) {
             let (element, element_name) = (ElementId(id), self.rows[i as usize].desc.name);
@@ -3529,6 +3588,7 @@ impl RunEnd {
 
     pub(crate) fn finish(mut self, first_err: Option<Error>) -> (RunReport, Result<(), Error>) {
         self.control.topology.over(&self.bus);
+        self.control.leave_run();
         self.drain_logs();
         if let Some(mut drain) = self.log_thread.take() {
             drain.join();

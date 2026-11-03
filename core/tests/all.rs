@@ -46,6 +46,11 @@ mod sized;
 
 // Test fixtures and assertions allocate freely.
 #[allow(clippy::disallowed_methods)]
+#[path = "halt.rs"]
+mod halt;
+
+// Test fixtures and assertions allocate freely.
+#[allow(clippy::disallowed_methods)]
 #[path = "topology.rs"]
 mod topology;
 

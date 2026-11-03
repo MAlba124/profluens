@@ -474,8 +474,14 @@ impl AviDemux {
         let complete = self.whole && !entries.is_empty();
         let grouped = self.pad_streams.iter().any(|ps| ps.is_video);
         let duration = self.duration_ns.map_or(Timestamp::NONE, Timestamp);
-        self.rated =
-            Index { entries, file_len: self.file_len, duration, complete, stream: None, grouped };
+        self.rated = Index {
+            entries,
+            file_len: self.file_len,
+            duration,
+            complete,
+            grouped,
+            ..Index::default()
+        };
         ctx.publish_index(self.rated.clone());
     }
 

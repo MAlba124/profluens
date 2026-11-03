@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use profluens_core::batch::Inputs;
 use profluens_core::bus::BusMessage;
@@ -148,6 +149,9 @@ pub struct GrowingFileSrc {
 }
 
 const OPEN: u64 = u64::MAX;
+/// How often the source looks again while it waits on its writer, the frontier has no wake
+/// source and a read below the watermark that came back empty is tried again.
+const WRITER_TICK: Duration = Duration::from_millis(10);
 
 impl GrowingFileSrc {
     pub const OUT: SrcPad = SrcPad(0);
@@ -327,7 +331,7 @@ impl Element for GrowingFileSrc {
                 FileError::NotStarted { element: "growingfilesrc" },
             ));
         }
-        let (done_before, seq_before) = (self.done_upto, self.seq);
+        let (done_before, seq_before, was_stalled) = (self.done_upto, self.seq, self.stalled);
 
         if self.end.is_none() {
             if self.shared.is_aborted() {
@@ -457,15 +461,20 @@ impl Element for GrowingFileSrc {
             }
         }
 
-        // Matches the scheduler's idle-pass test, so the retry lands one backstop tick later.
+        // A stall found this pass holds through the next, which clears it when it finds nothing
+        // to do, so the retry goes out on the writer tick after it and not at once.
         let idle_pass =
             self.done_upto == done_before && self.seq == seq_before && self.in_flight == 0;
-        if self.stalled && idle_pass {
+        if was_stalled && idle_pass {
             self.stalled = false;
         }
 
         if self.end.is_none() && finished && self.done_upto >= self.shared.total() {
             self.end = Some(End::Complete);
+        }
+        // nothing in flight and no end, the source waits on its writer, on its own tick
+        if self.end.is_none() && self.in_flight == 0 {
+            ctx.wake_within(WRITER_TICK);
         }
         let Some(end) = self.end else {
             return Ok(Flow::Ok);

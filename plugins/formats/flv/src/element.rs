@@ -468,7 +468,7 @@ impl Live {
                 self.grown.published = self.grown.entries.len();
                 let entries = self.grown.entries.clone();
                 let (file_len, duration) = (self.file_len, self.duration);
-                Index { entries, file_len, duration, complete: false, stream, grouped }
+                Index { entries, file_len, duration, stream, grouped, ..Index::default() }
             }
         };
         ctx.publish_index(index);
@@ -839,8 +839,15 @@ impl Element for FlvDemux {
             let stream = live.key.map(|k| live.tracks[k].stream);
             let grouped = live.tracks.iter().any(|t| t.kind == StreamKind::Video);
             let (file_len, duration) = (live.file_len, live.duration);
-            live.keyframes =
-                Some(Index { entries, file_len, duration, complete: true, stream, grouped });
+            live.keyframes = Some(Index {
+                entries,
+                file_len,
+                duration,
+                complete: true,
+                stream,
+                grouped,
+                ..Index::default()
+            });
         }
         live.publish(ctx);
         Ok(())

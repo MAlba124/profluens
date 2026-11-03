@@ -667,6 +667,7 @@ impl Ctx {
             counters.set_relinked(false);
             self.resolve_pending();
         }
+        self.bus.send(BusMessage::IndexPublished { element: self.element });
     }
 
     /// The element saw its links change. Planning on its index goes on, republished or not,

@@ -99,6 +99,7 @@ impl Grown {
             complete: false,
             stream: self.key.map(|key| key.stream),
             grouped: self.key.is_some_and(|key| key.video),
+            ..Index::default()
         }
     }
 }

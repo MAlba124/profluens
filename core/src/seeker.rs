@@ -352,8 +352,8 @@ mod tests {
             file_len: Some(17_000),
             duration: MS(32_000),
             complete: true,
-            stream: None,
             grouped,
+            ..Index::default()
         }
     }
 

@@ -261,10 +261,10 @@ fn a_stalled_writer_leaves_the_group_parked_not_spinning() {
         "the group spent only {parked_ms} ms parked across a 500 ms stall, spinning?"
     );
     assert!(parks >= 20, "only {parks} parks in a 500 ms stall (expect ~50/group at 10 ms)");
-    assert!(
-        ticks >= 20,
-        "only {ticks} of {parks} parks ended on the backstop tick, the frontier wait has no \
-         wake source, so the tick is what must be advancing it"
+    assert_eq!(
+        ticks, 0,
+        "{ticks} parks ended on the park backstop, the frontier wait has no wake source, so \
+         the source's own tick is what must be advancing it"
     );
 
     append(&path, &data[HALF..]);
@@ -436,7 +436,11 @@ fn an_over_promising_watermark_degrades_to_parked_retries_not_garbage() {
     assert!(
         parked_ms >= 100,
         "only {parked_ms} ms parked over a 250 ms over-promised stall, the empty reads are \
-         looping hot instead of being paced by the park tick"
+         looping hot instead of being paced by the park tick, parks={} ticks={} empty={} late={}",
+        after.parks - before.parks,
+        after.tick_expiries - before.tick_expiries,
+        after.empty_wakes - before.empty_wakes,
+        after.late_wakes - before.late_wakes
     );
 
     append(&path, &data);

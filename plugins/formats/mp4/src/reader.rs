@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use profluens_core::ctx::Disposition;
 use profluens_core::memory::{Demand, IO_DEPTH_BYTES, Known, Memory};
-use profluens_core::pipeline::{Index, IndexEntry};
+pub use profluens_core::pipeline::CAPTION_REACH as CAPTION_REACH_NS;
+use profluens_core::pipeline::{Caption, Index, IndexEntry};
 use profluens_core::time::Timestamp;
 
 use crate::boxes::{self, BoxError, BoxHeader};
@@ -485,6 +486,7 @@ impl Tables {
             return Index { duration, ..Index::default() };
         };
         let (stream, grouped) = (Some(track as u32), self.tracks[track].kind() == TrackKind::Video);
+        let captions = self.captions();
         let mut entries: Vec<IndexEntry> = Vec::new();
         let ascends = |entries: &[IndexEntry], time_ns: u64, byte: u64| {
             entries.last().is_none_or(|last| time_ns > last.time_ns && byte >= last.byte)
@@ -503,7 +505,16 @@ impl Tables {
                     });
                 }
             }
-            return Index { complete: true, entries, file_len: None, duration, stream, grouped };
+            return Index {
+                complete: true,
+                entries,
+                file_len: None,
+                duration,
+                stream,
+                grouped,
+                captions,
+                ..Index::default()
+            };
         }
         let keys = |s: &&Sample| s.track() == track && s.sync;
         let stride = self.samples.iter().filter(keys).count().div_ceil(MAX_INDEX_ENTRIES).max(1);
@@ -520,7 +531,41 @@ impl Tables {
                 });
             }
         }
-        Index { complete: !entries.is_empty(), entries, file_len: None, duration, stream, grouped }
+        Index {
+            complete: !entries.is_empty(),
+            entries,
+            file_len: None,
+            duration,
+            stream,
+            grouped,
+            captions,
+            ..Index::default()
+        }
+    }
+
+    /// Every sample of every text track as a caption up until the track's next, the stream its
+    /// track index, ascending by time.
+    // Cold path, once per open and link change.
+    #[allow(clippy::disallowed_methods)]
+    fn captions(&self) -> Vec<Caption> {
+        let mut captions: Vec<Caption> = Vec::new();
+        for (i, t) in self.tracks.iter().enumerate() {
+            if t.kind() != TrackKind::Other || !t.is_text() {
+                continue;
+            }
+            let own = self.samples.iter().filter(|s| s.track() == i);
+            let first = captions.len();
+            for s in own {
+                let time_ns = t.stamp_ns(s.pts);
+                let end_ns = time_ns.saturating_add(CAPTION_REACH_NS);
+                if let Some(last) = captions.get_mut(first..).and_then(<[Caption]>::last_mut) {
+                    last.end_ns = time_ns.max(last.time_ns);
+                }
+                captions.push(Caption { stream: i as u32, time_ns, end_ns, byte: s.offset });
+            }
+        }
+        captions.sort_unstable_by_key(|c| c.time_ns);
+        captions
     }
 
     pub fn track_restart(&self, track: usize, point: u64, on: &dyn Fn(usize) -> bool) -> Restart {
@@ -728,10 +773,6 @@ pub struct Mp4Reader {
 }
 
 const SHUT: u64 = u64::MAX;
-
-/// How long a caption may have been up for a seek to go back for its sample, as mkvdemux's
-/// `CAPTION_REACH`. Chosen, not measured.
-pub const CAPTION_REACH_NS: u64 = 20_000_000_000;
 
 enum Chunk {
     Retained(Memory),

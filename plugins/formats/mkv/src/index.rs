@@ -4,14 +4,14 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+pub use profluens_core::pipeline::CAPTION_REACH;
 use profluens_core::pipeline::IndexEntry;
 
 use crate::codec::{family_for, is_audio_family, is_video_family, lead_of};
 use crate::reader::{Cue, Track};
 
-/// How long a caption may have been up at an entry for the restart to go back for it. Chosen, not
-/// measured.
-pub const CAPTION_REACH: u64 = 20_000_000_000;
+/// A caption track's cue as `(track, start, end, byte)`.
+pub type CaptionSpan = (u64, u64, u64, u64);
 
 /// The longest pre-roll an audio track may go without beside linked video, its restart then the
 /// video keyframe's own Cluster: AC3, E-AC3, AAC, DTS and FLAC under it, MP3, Vorbis and Opus
@@ -63,31 +63,16 @@ pub fn cue_entries(
             (own, audio_lead(t, tick))
         })
         .collect();
-    let caption = |t: &&Track| {
-        !is_audio_family(family_for(&t.codec_id)) && !is_video_family(family_for(&t.codec_id))
-    };
-    // A cue without a duration, a bitmap composition, is up until its track's next cue.
-    let mut captions: Vec<(u64, u64, u64)> = Vec::new();
-    for t in tracks.iter().filter(on).filter(caption) {
-        let own: Vec<&Cue> = cues.iter().filter(|c| c.track == t.track_number).collect();
-        for (i, c) in own.iter().enumerate() {
-            let end = match c.duration_ns {
-                Some(d) => c.time_ns.saturating_add(d),
-                None => {
-                    own.get(i + 1).map_or(c.time_ns.saturating_add(CAPTION_REACH), |n| n.time_ns)
-                }
-            };
-            captions.push((c.time_ns, end.max(c.time_ns), c.byte));
-        }
-    }
+    let (spans, left_out) = captions(cues, tracks);
+    let mut captions: Vec<(u64, u64, u64)> = spans
+        .iter()
+        .filter(|c| linked(c.0))
+        .map(|&(_, start, end, byte)| (start, end, byte))
+        .collect();
     captions.sort_unstable();
     // A linked caption track the Cues leave out may have a caption up at any key, so every
     // entry goes back the reach for it.
-    let uncued = tracks
-        .iter()
-        .filter(on)
-        .filter(caption)
-        .any(|t| !cues.iter().any(|c| c.track == t.track_number));
+    let uncued = left_out.iter().any(|&t| linked(t));
     let floor =
         |list: &[(u64, u64)], ns: u64| list[..list.partition_point(|p| p.0 <= ns)].last().copied();
     // A caption up at a key, or starting before the next key, restarts at the key below its
@@ -141,6 +126,35 @@ pub fn cue_entries(
             IndexEntry { time_ns: time, byte, restart, restart_ns }
         })
         .collect()
+}
+
+fn is_caption(t: &Track) -> bool {
+    !is_audio_family(family_for(&t.codec_id)) && !is_video_family(family_for(&t.codec_id))
+}
+
+/// Every cue of every caption track as `(track, start, end, byte)` in cue order, and the
+/// caption tracks the Cues leave out. A cue without a duration, a bitmap composition, is up
+/// until its track's next cue.
+// Cold path, once per stream and link change.
+#[allow(clippy::disallowed_methods)]
+pub fn captions(cues: &[Cue], tracks: &[Track]) -> (Vec<CaptionSpan>, Vec<u64>) {
+    let (mut spans, mut left_out) = (Vec::new(), Vec::new());
+    for t in tracks.iter().filter(|t| is_caption(t)) {
+        let own: Vec<&Cue> = cues.iter().filter(|c| c.track == t.track_number).collect();
+        if own.is_empty() {
+            left_out.push(t.track_number);
+        }
+        for (i, c) in own.iter().enumerate() {
+            let end = match c.duration_ns {
+                Some(d) => c.time_ns.saturating_add(d),
+                None => {
+                    own.get(i + 1).map_or(c.time_ns.saturating_add(CAPTION_REACH), |n| n.time_ns)
+                }
+            };
+            spans.push((t.track_number, c.time_ns, end.max(c.time_ns), c.byte));
+        }
+    }
+    (spans, left_out)
 }
 
 pub(crate) fn segment_end(header: &[u8]) -> Option<u64> {

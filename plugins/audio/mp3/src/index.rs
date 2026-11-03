@@ -642,6 +642,7 @@ impl Clock {
             complete,
             stream: head.stream,
             grouped: head.grouped,
+            ..Index::default()
         })
     }
 }

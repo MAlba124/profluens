@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::error::Error;
 use crate::event::TagList;
@@ -75,6 +75,10 @@ pub enum BusMessage {
         element: ElementId,
         ns: u64,
     },
+    /// `element` published its index, a seek planned on it is no longer deferred.
+    IndexPublished {
+        element: ElementId,
+    },
     /// Topology change `change` is in the log.
     Changed {
         change: u32,
@@ -128,7 +132,8 @@ impl BusMessage {
             | BusMessage::ChangeFailed { .. }
             | BusMessage::Buffering { .. }
             | BusMessage::Inserted { .. }
-            | BusMessage::DurationChanged { .. } => MessageClass::Critical,
+            | BusMessage::DurationChanged { .. }
+            | BusMessage::IndexPublished { .. } => MessageClass::Critical,
         }
     }
 }
@@ -146,6 +151,8 @@ pub const DEFAULT_CAPACITY: usize = 1024;
 struct Shared {
     inner: Mutex<Inner>,
     ready: Condvar,
+    /// Rung after a post, for an owner that sleeps elsewhere than in `recv`.
+    bell: OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 struct Inner {
@@ -167,7 +174,10 @@ fn supersedes(old: &BusMessage, new: &BusMessage) -> bool {
         (
             BusMessage::DurationChanged { element: a, .. },
             BusMessage::DurationChanged { element: b, .. },
-        ) => a == b,
+        )
+        | (BusMessage::IndexPublished { element: a }, BusMessage::IndexPublished { element: b }) => {
+            a == b
+        }
         _ => false,
     }
 }
@@ -249,6 +259,9 @@ impl BusSender {
         if waiting {
             self.shared.ready.notify_one();
         }
+        if let Some(ring) = self.shared.bell.get() {
+            ring();
+        }
     }
 }
 
@@ -256,13 +269,29 @@ impl Drop for BusSender {
     fn drop(&mut self) {
         let mut inner = self.shared.inner.lock().unwrap();
         inner.senders -= 1;
-        let last = inner.senders == 0 && inner.waiting > 0;
+        let last = inner.senders == 0;
+        let waiting = last && inner.waiting > 0;
         drop(inner);
-        if last {
+        if waiting {
             self.shared.ready.notify_all();
+        }
+        if last && let Some(ring) = self.shared.bell.get() {
+            ring();
         }
     }
 }
+
+/// The bus already has a bell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BellSet;
+
+impl core::fmt::Display for BellSet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the bus already has a bell")
+    }
+}
+
+impl core::error::Error for BellSet {}
 
 /// The receiving half of the bus. A clone drains the same queue.
 #[derive(Clone)]
@@ -286,6 +315,7 @@ impl Bus {
                 droppable: 0,
             }),
             ready: Condvar::new(),
+            bell: OnceLock::new(),
         });
         let dropped = Arc::new(AtomicU64::new(0));
         (BusSender { shared: shared.clone(), dropped: dropped.clone() }, Bus { shared, dropped })
@@ -293,6 +323,12 @@ impl Bus {
 
     pub fn try_recv(&self) -> Option<BusMessage> {
         self.shared.inner.lock().unwrap().pop()
+    }
+
+    /// Rings `bell` after every post and when the last sender leaves, once per bus. An owner
+    /// that sleeps on a socket or an eventfd wakes by it and reads with `try_recv`.
+    pub fn set_bell(&self, bell: Arc<dyn Fn() + Send + Sync>) -> Result<(), BellSet> {
+        self.shared.bell.set(bell).map_err(|_| BellSet)
     }
 
     /// Block for the oldest message, `None` once every sender is gone and the queue drained.
@@ -535,6 +571,27 @@ mod tests {
             thread::yield_now();
         }
         result
+    }
+
+    #[test]
+    fn the_bell_rings_on_a_post_and_when_the_last_sender_leaves_once_set() {
+        let (tx, bus) = Bus::channel_with_capacity(8);
+        let rings = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let r = Arc::clone(&rings);
+        let bell = Arc::new(move || {
+            r.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(bus.set_bell(bell), Ok(()));
+        assert_eq!(bus.set_bell(Arc::new(|| {})), Err(BellSet), "one bell per bus");
+        let tx2 = tx.clone();
+        tx.send(critical(1));
+        tx2.send(warn(2));
+        assert_eq!(rings.load(Ordering::Relaxed), 2, "once per post, whatever the class");
+        drop(tx);
+        assert_eq!(rings.load(Ordering::Relaxed), 2, "a sender leaving with another left is quiet");
+        drop(tx2);
+        assert_eq!(rings.load(Ordering::Relaxed), 3, "the last one leaving rings");
+        assert_eq!(bus.try_recv().map(|m| m.class()), Some(MessageClass::Critical));
     }
 
     #[test]

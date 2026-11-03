@@ -14,6 +14,7 @@ use profluens_core::error::{Error, GraphError, Scope, TopologyError};
 use profluens_core::event::Event;
 use profluens_core::format::{OfferDesc, Value};
 use profluens_core::id::{ElementId, LinkId, SinkPad, SrcPad};
+use profluens_core::level::Limit;
 use profluens_core::log::{DebugSpec, Level, LogRecord, LogWriter, Loggable, Logs, with_logs};
 use profluens_core::pipeline::Pipeline;
 use profluens_core::sched::{Cut, Outcome, Stepped};
@@ -471,6 +472,20 @@ impl Rig {
             run.pass(ready[rng.below(ready.len() as u64) as usize]).expect("pass");
         }
         (0..run.groups()).all(|g| run.outcome(g) == Some(Outcome::Exit))
+    }
+
+    /// Passes of the groups ready now, the clock standing still, until none is or `passes` ran.
+    /// How many ran.
+    fn run_still(&self, run: &mut Stepped, rng: &mut Rng, passes: u64) -> u64 {
+        for n in 0..passes {
+            run.service();
+            let ready: Vec<usize> = (0..run.groups()).filter(|g| run.ready(*g)).collect();
+            if ready.is_empty() {
+                return n;
+            }
+            run.pass(ready[rng.below(ready.len() as u64) as usize]).expect("pass");
+        }
+        passes
     }
 }
 
@@ -1048,6 +1063,43 @@ fn a_switch_restarts_the_new_stream_at_its_target_and_the_others_play_on() {
         assert_eq!(r.count(demux, What::Flush), 0, "seed {seed}: the demuxer was not flushed");
         assert!(r.of(demux).contains(&What::SrcLinked(new.0, true, Some(position))), "seed {seed}");
         assert_eq!(r.count(vsink, What::Flush), 0, "seed {seed}");
+    }
+}
+
+#[test]
+fn a_restart_runs_while_the_tails_ring_is_full() {
+    // A limit inside the ring's four batches rests the group on the level, one past them stages
+    // a batch at the ring's capacity. The sink holds what is not due, and the clock stands.
+    for (seed, limit) in scaled(20).flat_map(|seed| [(seed, 5), (seed, 50)]) {
+        let (mut r, src, demux) = demuxed();
+        r.p.preroll().expect("preroll");
+        let video = r.p.select(demux, 0).expect("select");
+        let vsink = r.p.add(Node { paced: true, ..r.node(&SINK, Role::Sink) });
+        r.p.set_link_limit(vsink, Limit::time(Timestamp(limit * STEP.0)));
+        r.link(demux.src(video), vsink.sink(IN));
+        let (mut run, mut rng) = (r.step(), Rng(seed));
+        assert!(r.run_still(&mut run, &mut rng, 10_000) < 10_000, "seed {seed}: the ring filled");
+        let group = (0..run.groups()).find(|g| run.elements(*g).contains(&demux)).expect("group");
+        assert!(matches!(run.outcome(group), Some(Outcome::Blocked { .. })), "seed {seed}");
+        let (before, made) = (r.rows(vsink), r.p.counters(demux).buffers_out);
+        let new = r.p.select(demux, 2).expect("select");
+        let bsink = r.add(&SINK, Role::Sink);
+        r.link(demux.src(new), bsink.sink(IN));
+        let targets = [(src, 0, Timestamp::ZERO), (demux, 0, Timestamp::ZERO)];
+        r.p.commit_at(Timestamp::NONE, &targets).expect("commit");
+        assert!(r.run_still(&mut run, &mut rng, 10_000) < 10_000, "seed {seed}: it rests again");
+        let got = r.rows(bsink);
+        assert!(got.len() > 1 && got[0] == 0 && contiguous(&got), "seed {seed} {limit}: {got:?}");
+        assert_eq!(r.rows(vsink), before, "seed {seed}: the video ring was not drained");
+        assert!(
+            got.len() as u64 <= made + 1,
+            "seed {seed}: caught up, the first new video row rests the group, {got:?}"
+        );
+        assert!(matches!(run.outcome(group), Some(Outcome::Blocked { .. })), "seed {seed}");
+        assert!(r.run(&mut run, &mut rng, None), "seed {seed}: the run ends");
+        run.finish().expect("finish");
+        assert_eq!(r.rows(vsink), (0..400).collect::<Vec<_>>(), "seed {seed}");
+        assert_eq!(r.rows(bsink), (0..400).collect::<Vec<_>>(), "seed {seed}");
     }
 }
 

@@ -995,8 +995,15 @@ impl Mp4Demux {
         on: &dyn Fn(usize) -> bool,
     ) -> profluens_core::pipeline::Index {
         let mut index = tables.seek_index(on);
-        index.stream =
-            index.stream.and_then(|track| self.pad_tracks.get(track as usize)).map(|pt| pt.stream);
+        let stream = |track: u32| self.pad_tracks.get(track as usize).map(|pt| pt.stream);
+        index.stream = index.stream.and_then(stream);
+        index.captions.retain_mut(|c| match stream(c.stream) {
+            Some(s) => {
+                c.stream = s;
+                true
+            }
+            None => false,
+        });
         self.rated = Some(index.clone());
         index
     }

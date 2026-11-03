@@ -1,4 +1,4 @@
-use profluens_core::pipeline::{Index, IndexEntry, Reach, SeekMode, SeekPlan};
+use profluens_core::pipeline::{Caption, Index, IndexEntry, Reach, SeekMode, SeekPlan};
 use profluens_core::time::Timestamp;
 
 const MS: fn(u64) -> Timestamp = Timestamp::from_millis;
@@ -537,4 +537,51 @@ fn a_target_before_the_first_keyframe_restarts_at_it() {
     assert_eq!(video(&index, 8_000, 25_000, None), seek(1_000, 10_000, 8_000));
     assert_eq!(index.resolve(Timestamp::NONE), None, "no target, no seek");
     assert_eq!(index.resolve(MS(12_000)), Some((1_000, MS(10_000))), "past it the floor");
+}
+
+fn caption(stream: u32, start_ms: u64, end_ms: u64, byte: u64) -> Caption {
+    Caption { stream, time_ns: MS(start_ms).0, end_ns: MS(end_ms).0, byte }
+}
+
+#[test]
+fn a_link_restarts_at_the_key_before_the_point() {
+    let index = gops();
+    assert_eq!(index.restart_for(7, MS(25_000)), Some((20_000, MS(20_000))));
+    assert_eq!(index.restart_for(7, MS(5_000)), Some((0, MS(0))), "before the second key");
+    assert_eq!(Index::default().restart_for(7, MS(5_000)), None, "no entry");
+}
+
+#[test]
+fn a_link_goes_back_for_the_stream_s_caption_up_at_the_point() {
+    let mut index = gops();
+    index.captions = vec![
+        caption(7, 8_000, 12_000, 8_500),
+        caption(8, 9_000, 40_000, 9_500),
+        caption(7, 19_500, 19_900, 19_600),
+        caption(7, 21_000, 22_000, 19_700),
+        caption(7, 23_000, 24_000, 23_500),
+    ];
+    assert_eq!(index.restart_for(7, MS(11_000)), Some((0, MS(0))), "up from the GOP before");
+    assert_eq!(index.restart_for(7, MS(12_000)), Some((10_000, MS(10_000))), "ended at the point");
+    assert_eq!(
+        index.restart_for(7, MS(25_000)),
+        Some((20_000, MS(20_000))),
+        "the later one is past"
+    );
+    assert_eq!(index.restart_for(8, MS(25_000)), Some((0, MS(0))), "another stream's long one");
+    assert_eq!(
+        index.restart_for(7, MS(20_500)),
+        Some((10_000, MS(10_000))),
+        "stored below the key, starting before the next"
+    );
+    assert_eq!(index.restart_for(9, MS(25_000)), Some((20_000, MS(20_000))), "no caption");
+}
+
+#[test]
+fn a_link_of_an_uncued_stream_goes_back_the_reach() {
+    let mut index = gops();
+    index.uncued = vec![7];
+    assert_eq!(index.restart_for(7, MS(25_000)), Some((0, MS(0))));
+    assert_eq!(index.restart_for(7, MS(35_000)), Some((10_000, MS(10_000))));
+    assert_eq!(index.restart_for(8, MS(35_000)), Some((30_000, MS(30_000))), "a cued stream");
 }

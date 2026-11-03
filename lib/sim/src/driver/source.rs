@@ -132,7 +132,7 @@ impl FakeSource {
         let (entries, file_len) = ((0..keys).map(key).collect(), Some(pictures.count()));
         // Pictures in groups reach the group being presented, as a player's video does.
         let grouped = !pictures.spans();
-        let index = Index { entries, file_len, duration, complete, stream: None, grouped };
+        let index = Index { entries, file_len, duration, complete, grouped, ..Index::default() };
         ctx.publish_index(index);
     }
 

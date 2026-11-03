@@ -30,9 +30,9 @@ use crate::weave::{Full, Weave};
 const INLINE_INPUT_CAP: usize = 8;
 
 pub(crate) const PARK_BACKSTOP: Duration = Duration::from_millis(10);
-/// The group park bound when nothing is scheduled. A growing source paces its empty reads on
-/// it, so it stays at the tick until that path has a timer of its own.
-pub(crate) const GROUP_PARK_BACKSTOP: Duration = PARK_BACKSTOP;
+/// The group park bound when nothing is scheduled, a safety net. Every wait has its signal or
+/// its own timer, `late_wakes` in the scheduler stats counts the ones that had not.
+pub(crate) const GROUP_PARK_BACKSTOP: Duration = Duration::from_secs(1);
 
 pub(crate) fn deliver_event(
     elem: &mut dyn Element,
@@ -295,6 +295,18 @@ enum Phase {
     Ended,
 }
 
+/// A restart handed to a member, which the members run on full rings for until the tail is
+/// back where a ring filled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Restart {
+    Idle,
+    /// Handed at a splice, the head has yet to read behind it. What the tail puts out until
+    /// then it held from before.
+    Handed,
+    /// The head read behind it, the next media the tail feeds a full ring is where it was.
+    Reading,
+}
+
 /// What one pass of a group did, for the driver.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Outcome {
@@ -422,6 +434,7 @@ pub(crate) struct Group {
     cut_pads: Vec<SinkPad>,
     fan_out: bool,
     io_woke: bool,
+    restart: Restart,
     weave: Weave,
 }
 
@@ -684,6 +697,7 @@ impl Group {
             cut_pads,
             fan_out,
             io_woke: false,
+            restart: Restart::Idle,
             weave,
         })
     }
@@ -788,8 +802,12 @@ impl Group {
         if self.leaving.is_some() {
             self.end_dead_inputs();
         }
-        let staged = self.staged_pad();
-        if let Some(pad) = staged.or_else(|| self.resting()) {
+        // A restart is work for the members, a full ring waits until the tail feeds it again.
+        let rest = match self.restart {
+            Restart::Idle => self.staged_pad().or_else(|| self.resting()),
+            Restart::Handed | Restart::Reading => None,
+        };
+        if let Some(pad) = rest {
             self.tell_taken();
             let blocked = Outcome::Blocked { on: BlockedOn::Ring { pad } };
             let kept = self.run_keepers(&mut progressed)?;
@@ -1073,6 +1091,8 @@ impl Group {
                     Some(_) => {}
                 },
                 PadEdit::Restart if fresh => {
+                    self.restart = Restart::Handed;
+                    crate::log!(&*ctx, Level::Debug, "restart_handed", member = i as u64);
                     ctx.aim(self.shared.control.target(id, self.seek_gen));
                     if self.phase != Phase::Running || self.head_done {
                         (self.head_done, self.phase) = (over, Phase::Running);
@@ -1222,6 +1242,7 @@ impl Group {
         (0..self.elements.len()).for_each(|i| self.reset_pull(i));
         let tail = self.elements.len() - 1;
         self.weave.restart();
+        self.restart = Restart::Idle;
         for d in self.downstream.iter_mut() {
             d.level.restart(self.seek_gen);
             d.seen = UNSEEN;
@@ -1397,6 +1418,11 @@ impl Group {
         }
         let leaving = self.leaving.is_some();
         for d in self.downstream.iter_mut() {
+            if d.staged.is_some() && d.limited && d.level.full() {
+                // staged behind a full level, the take that makes room signals the group
+                d.room.raise();
+                continue;
+            }
             let Some(out) = d.staged.take() else { continue };
             if !(leaving && d.data.is_closed()) {
                 send(d, out, bus);
@@ -1625,6 +1651,9 @@ impl Group {
         }
         self.forward_io(i)?;
         self.sync_pull(i, progressed);
+        if i == 0 && nbuf > 0 && self.restart == Restart::Handed {
+            self.restart = Restart::Reading;
+        }
         if i + 1 < self.elements.len() {
             self.hand_off_inline(i, nbuf, nbytes);
         }
@@ -1714,13 +1743,41 @@ impl Group {
                 true => self.ctxs[tail].share_output(pad),
                 false => self.ctxs[tail].take_output(pad),
             };
-            let d = &mut self.downstream[j];
             out.seek_gen = self.seek_gen;
             if self.shared.tracing.load(Ordering::Relaxed) {
                 out.pushed_at = Some(self.shared.trace_ns());
             }
             *progressed = true;
-            match send(d, out, self.ctxs[tail].bus()) {
+            // A codec head or a bare event is no media, only a stamped row says the tail is back
+            // where the ring filled.
+            let newest = out.newest();
+            let d = &mut self.downstream[j];
+            let full = d.staged.is_some() || (d.limited && d.level.full());
+            // A restart runs the tail on a full level, its output waits staged like one a full
+            // ring refused, the level is a bound the ring does not keep.
+            let sent = if d.staged.is_some() {
+                self.stage_behind(j, out)
+            } else if full && self.restart != Restart::Idle {
+                d.room.raise();
+                d.staged = Some(out);
+                Sent::Staged
+            } else {
+                send(d, out, self.ctxs[tail].bus())
+            };
+            // The tail fed media read behind the restart to a full ring, so the group rests on
+            // it from the next pass.
+            let caught_up = newest.is_some() && (full || !matches!(sent, Sent::Pushed));
+            if self.restart == Restart::Reading && caught_up {
+                crate::log!(
+                    &self.ctxs[tail],
+                    Level::Debug,
+                    "restart_done",
+                    pad = pad.0 as u64,
+                    pts = newest
+                );
+                self.restart = Restart::Idle;
+            }
+            match sent {
                 Sent::Pushed | Sent::Staged => {}
                 Sent::Dropped { rows, shell } => {
                     self.counters[tail].record_drops(rows);
@@ -1729,13 +1786,33 @@ impl Group {
                     }
                 }
             }
-            self.counters[tail].record_queue_fill(d.data.len() as u32);
+            self.counters[tail].record_queue_fill(self.downstream[j].data.len() as u32);
         }
         let (unrouted, _) = self.ctxs[tail].total_output();
         if unrouted > 0 {
             self.counters[tail].record_drops(unrouted);
         }
         self.ctxs[tail].clear_outputs();
+    }
+
+    /// Queue `out` behind the batch link `j`'s ring refused, which only a restart runs the tail
+    /// past. A leaky ring loses the rows as it would have.
+    fn stage_behind(&mut self, j: usize, mut out: Batch) -> Sent {
+        let tail = self.elements.len() - 1;
+        let d = &mut self.downstream[j];
+        let rows = out.len() as u64;
+        let leaks = d.leaky == Leaky::DropNewest && rows > 0;
+        if leaks {
+            out.retain_state();
+        }
+        if let Some(staged) = d.staged.as_mut() {
+            staged.append(&mut out);
+        }
+        if leaks {
+            return Sent::Dropped { rows, shell: Some(out) };
+        }
+        self.ctxs[tail].recycle_shell(out);
+        Sent::Staged
     }
 
     fn forward_io(&mut self, i: usize) -> Result<(), Error> {
@@ -4279,6 +4356,95 @@ mod tests {
         assert_eq!(r.group.counters[0].snapshot().buffers_out, made + 1, "and the source ran");
         assert_eq!(settle(&mut r), ring(0));
         assert!(r.group.downstream[0].room.take(), "raised again by the new failed push");
+    }
+
+    #[test]
+    fn a_restart_runs_the_members_behind_a_staged_batch_until_the_tail_feeds_the_ring() {
+        let mut r = rig(vec![Probe { pts_step: MS(10), ..source(100) }], &[], &[0]);
+        assert_eq!(settle(&mut r), ring(0));
+        let made = r.group.counters[0].snapshot().buffers_out;
+        r.group.restart = Restart::Handed;
+        assert_eq!(r.group.pass().unwrap(), Outcome::Progressed, "the member ran on the full ring");
+        assert_eq!(r.group.counters[0].snapshot().buffers_out, made + 1);
+        let staged = r.group.downstream[0].staged.as_ref().expect("the ring is still full");
+        assert_eq!(staged.len(), 2, "the new batch queued behind the refused one");
+        assert_eq!(r.group.restart, Restart::Idle, "feeding the full ring ends the restart");
+        assert_eq!(r.group.pass().unwrap(), ring(0), "and the group rests on it again");
+        assert_eq!(r.group.counters[0].snapshot().buffers_out, made + 1, "no element ran");
+        for _ in 0..4 {
+            assert!(r.down[0].0.try_pop().is_some());
+        }
+        assert_eq!(r.group.pass().unwrap(), Outcome::Progressed);
+        let first = r.down[0].0.try_pop().expect("the staged batch went in");
+        assert_eq!(first.len(), 2, "ahead of what the source made after it");
+        assert_eq!(r.down[0].0.try_pop().map(|b| b.len()), Some(1));
+    }
+
+    #[test]
+    fn what_the_tail_held_from_before_a_restart_does_not_end_it() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let head = Probe { pts_step: MS(10), gate: Some(Arc::clone(&gate)), ..source(100) };
+        let tail = Probe { outs: &[0], ..probe(&FILTER) };
+        let mut r = rig(vec![head, tail], &[], &[0]);
+        for _ in 0..4 {
+            assert!(r.group.downstream[0].data.try_push(timed(&r.pool, 0, 1)).is_ok());
+        }
+        r.group.downstream[0].staged = Some(timed(&r.pool, 1, 1));
+        r.group.restart = Restart::Handed;
+        let mut left = timed(&r.pool, 2, 1);
+        r.group.ctxs[1].output_on(OUT).append(&mut left);
+        assert_eq!(r.group.pass().unwrap(), Outcome::Progressed, "the held row went out");
+        let staged = |r: &Rig| r.group.downstream[0].staged.as_ref().map(Batch::len);
+        assert_eq!(staged(&r), Some(2), "behind the refused batch");
+        assert_eq!(r.group.restart, Restart::Handed, "the head read nothing yet");
+        gate.store(true, Ordering::Release);
+        assert_eq!(r.group.pass().unwrap(), Outcome::Progressed, "the head read, the tail fed");
+        assert_eq!(staged(&r), Some(3));
+        assert_eq!(r.group.restart, Restart::Idle, "media read behind the restart ends it");
+        assert_eq!(r.group.pass().unwrap(), ring(0));
+    }
+
+    #[test]
+    fn a_restart_runs_the_members_on_a_full_level_until_the_tail_feeds_the_link() {
+        let mut r = rig(vec![Probe { pts_step: MS(10), ..source(100) }], &[], &[0]);
+        limit(&mut r, Limit::time(MS(20)));
+        assert_eq!(settle(&mut r), ring(0));
+        assert!(r.group.downstream[0].staged.is_none(), "full by the level, not the ring");
+        let made = r.group.counters[0].snapshot().buffers_out;
+        assert_eq!(made, 3);
+        r.group.restart = Restart::Handed;
+        assert_eq!(r.group.pass().unwrap(), Outcome::Progressed, "the member ran on the full link");
+        assert_eq!(r.group.counters[0].snapshot().buffers_out, made + 1);
+        assert_eq!(r.down[0].0.len(), 3, "its batch waits, the level is a bound");
+        assert_eq!(r.group.downstream[0].staged.as_ref().map(Batch::len), Some(1));
+        assert_eq!(r.group.restart, Restart::Idle, "feeding the full link ends the restart");
+        assert_eq!(r.group.pass().unwrap(), ring(0), "and the group rests on it again");
+        assert_eq!(r.group.counters[0].snapshot().buffers_out, made + 1, "no element ran");
+        let mut taken = 0;
+        assert_eq!(drain(&r, 0, &mut taken), 3);
+        assert_eq!(r.group.pass().unwrap(), Outcome::Progressed);
+        assert!(r.group.downstream[0].staged.is_none(), "the staged batch went in with room");
+    }
+
+    #[test]
+    fn a_restart_behind_a_staged_batch_leaks_the_rows_a_leaky_ring_would_have() {
+        let src = Probe { pts_step: MS(10), ..source(100) };
+        let mut r = rig_with(vec![src], &[], &[0], 64, Leaky::DropNewest);
+        for _ in 0..4 {
+            assert_eq!(r.group.pass().unwrap(), Outcome::Progressed);
+        }
+        assert_eq!(r.down[0].0.len(), 4, "the ring is full");
+        let mut state = Batch::new(BYTES);
+        state.push_event(tags("a"));
+        r.group.downstream[0].staged = Some(state);
+        let drops = r.group.counters[0].snapshot().drops;
+        r.group.restart = Restart::Handed;
+        assert_eq!(r.group.pass().unwrap(), Outcome::Progressed);
+        assert_eq!(r.group.counters[0].snapshot().drops, drops + 1, "the row leaked, and counted");
+        let staged = r.group.downstream[0].staged.as_ref().expect("the state still waits");
+        assert!(staged.is_empty() && staged.has_events(), "only the state queued behind");
+        assert_eq!(r.group.restart, Restart::Idle);
+        assert_eq!(r.group.pass().unwrap(), ring(0));
     }
 
     #[test]

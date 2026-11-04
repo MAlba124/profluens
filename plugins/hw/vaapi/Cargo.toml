@@ -16,10 +16,17 @@ pf-registry = { path = "../../../lib/registry" }
 profluens-video = { path = "../../../lib/video" }
 pf-hdr = { path = "../../video/hdr" }
 
+# Hand-rolled bench of the GPU chain on a real file, no criterion. `main` is the harness.
+[[bench]]
+name = "chain"
+harness = false
+
 [dev-dependencies]
 pf-reactor = { path = "../../../lib/reactor" }
 pf-harness = { path = "../../../lib/harness" }
 pf-mkv = { path = "../../formats/mkv" }
+# The bench opens Matroska and MP4 files through pf-open's demuxer builder.
+pf-open = { path = "../../../lib/open", features = ["pipeline"] }
 # Software decoders for the encode round-trip and VP9 PSNR gates.
 pf-libav = { path = "../../libav" }
 profluens-elements = { path = "../../../lib/elements" }

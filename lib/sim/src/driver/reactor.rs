@@ -1085,7 +1085,7 @@ impl Reactor for SimReactor {
                     self.fly(s, at, result, 0);
                 }
                 // The simulated world has no descriptors.
-                Op::Adopt { .. } => {
+                Op::Adopt { .. } | Op::Ready { .. } => {
                     self.fly(s, now, IoResult::Err(IoError::Unsupported), 0);
                 }
                 Op::Close { handle } => self.close(&mut w, s, handle),

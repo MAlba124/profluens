@@ -73,6 +73,9 @@ impl OsReactor {
                     queue::Op::Accept { fd: Fd::Raw(fd), multi: false }
                 }
                 (Op::Accept { .. }, _) => return Started::Done(IoResult::Err(IoError::WrongKind)),
+                (Op::Ready { .. }, _) => {
+                    queue::Op::Poll { fd: Fd::Raw(fd), events: libc::POLLIN as u32, multi: false }
+                }
                 _ => return Started::Done(IoResult::Err(IoError::Unsupported)),
             };
             return self.push(idx, op);

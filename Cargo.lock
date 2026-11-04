@@ -514,6 +514,7 @@ dependencies = [
  "pf-hdr",
  "pf-libav",
  "pf-mkv",
+ "pf-open",
  "pf-reactor",
  "pf-registry",
  "profluens-core",

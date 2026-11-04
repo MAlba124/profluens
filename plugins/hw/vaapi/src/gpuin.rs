@@ -79,6 +79,10 @@ impl GpuIn {
             return Ok(i.id);
         }
         if self.imports.len() >= IMPORTS_MAX {
+            // a picture in flight may still read one, the destroy waits for it
+            for i in &self.imports {
+                let _ = crate::va::sync_surface(display, i.id);
+            }
             self.imports.clear();
         }
         let (kind, modifier) = self.link.ok_or(K::NoGpuLink)?;

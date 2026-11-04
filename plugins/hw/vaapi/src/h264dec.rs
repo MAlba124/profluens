@@ -28,6 +28,8 @@ use crate::gpuframe::{
     self, F_LAYOUT, F_MODIFIER, FAMILY_VIDEO_GPU, FrameToken, FrameTx, GPU_FRAME_HEADER_LEN,
     GpuFrame, GpuFrameChannel, GpuFrameHeader, LAYOUT_NV12_DMABUF,
 };
+use crate::gpuframe::Handoff;
+use crate::stats::Stats;
 use crate::h264parse::{
     self, MmcoOp, Nal, Pps, PredWeightTable, RefListMod, SliceHeader, SliceType, Sps,
 };
@@ -191,6 +193,7 @@ pub struct VaapiH264Dec {
     emitted: u64,
 
     zerocopy: Option<Arc<GpuFrameChannel>>,
+    stats: Arc<Stats>,
     tx: Option<FrameTx>,
     released: Vec<FrameToken>,
     next_token: FrameToken,
@@ -223,6 +226,11 @@ impl VaapiH264Dec {
     /// Zero-copy mode. Decoded surfaces leave as DMA-BUF [`GpuFrame`]s on `channel`.
     pub fn new_zerocopy(channel: Arc<GpuFrameChannel>) -> Self {
         Self::with_zerocopy(Some(channel))
+    }
+
+    /// The decoder's counters, pictures and waits for the GPU.
+    pub fn stats(&self) -> Arc<Stats> {
+        Arc::clone(&self.stats)
     }
 
     /// Zero-copy pictures leave scaled into `target` by the decode call itself, placed in its box
@@ -270,6 +278,7 @@ impl VaapiH264Dec {
             warned: Warned::default(),
             emitted: 0,
             zerocopy,
+            stats: Arc::default(),
             tx: None,
             released: Vec::new(),
             next_token: 1,
@@ -1262,13 +1271,21 @@ impl VaapiH264Dec {
             None => return Ok(true),
         };
 
+        // a queued handoff exports the picture as it is, the dma-buf's fence orders the consumer
+        let queued = self.zerocopy.as_ref().is_some_and(|c| c.handoff() == Handoff::Queued);
         // a pending command, a seek's flush, cuts the wait short, the decoder runs again after it
-        if !crate::va::wait_surface(dpy, out.export, || ctx.command_pending()) {
-            self.pending = Some(out);
-            ctx.wake_within(crate::enc::POLL_WAKE);
-            return Ok(false);
+        if !queued {
+            let t = crate::stats::mark();
+            let done = crate::va::wait_surface(dpy, out.export, || ctx.command_pending());
+            self.stats.waited(t);
+            if !done {
+                self.pending = Some(out);
+                ctx.wake_within(crate::enc::POLL_WAKE);
+                return Ok(false);
+            }
         }
-        let mut exported = match (self.export)(dpy, out.export) {
+        let export = if queued { ExportedSurface::export_queued } else { self.export };
+        let mut exported = match export(dpy, out.export) {
             Ok(e) => e,
             Err(e) => {
                 // The driver fails this sync now and then under rapid seeks.

@@ -3,7 +3,7 @@
 //! dropped. A PQ or HLG input to nv12 is tone mapped to BT.709 SDR by the driver's HDR10 filter.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::{Buffer, BufferFlags};
@@ -30,7 +30,7 @@ use crate::error::{VaapiErrorKind as K, Warned, failed};
 use crate::ffi;
 use crate::gpuframe::{
     self, DmabufFormat, F_LAYOUT, F_MODIFIER, FAMILY_VIDEO_GPU, FRAMES_OUT, FrameRx, FrameToken,
-    FrameTx, GPU_FRAME_HEADER_LEN, GpuFrame, GpuFrameChannel, GpuFrameHeader,
+    FrameTx, GPU_FRAME_HEADER_LEN, GpuFrame, GpuFrameChannel, GpuFrameHeader, Handoff,
 };
 use crate::probe;
 use crate::va::{Display, ExportedSurface, ReadbackImage, SurfaceFormat, Surfaces, UploadImage};
@@ -116,11 +116,7 @@ const IMPORTS_MAX: usize = FRAMES_OUT;
 const OUT_SURFACES: u32 = 8;
 const CODED_ALIGN: u32 = 16;
 
-#[derive(Debug, Default)]
-pub struct Stats {
-    pub frames: AtomicU64,
-    pub imports: AtomicU64,
-}
+pub use crate::stats::Stats;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InFormat {
@@ -801,7 +797,17 @@ impl VaapiPostProc {
     ) -> Result<(), K> {
         let dpy = self.display.as_ref().ok_or(K::NoDevice)?.raw();
         let g = self.gpu_out.as_mut().ok_or(K::NoDevice)?;
-        let mut e = ExportedSurface::export(dpy, dst).map_err(K::SurfaceExport)?;
+        // a queued handoff exports the picture as it is, the dma-buf's fence orders the consumer,
+        // else the export waits for it
+        let export = match g.channel.handoff() {
+            Handoff::Queued => ExportedSurface::export_queued,
+            Handoff::Done => ExportedSurface::export,
+        };
+        let t = crate::stats::mark();
+        let mut e = export(dpy, dst).map_err(K::SurfaceExport)?;
+        if g.channel.handoff() == Handoff::Done {
+            self.stats.waited(t);
+        }
         if let Some(negotiated) = g.modifier.filter(|&m| m != e.drm_modifier) {
             return Err(K::ModifierChanged { negotiated, exported: e.drm_modifier });
         }

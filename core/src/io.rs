@@ -161,6 +161,11 @@ pub enum Op {
         addr: Option<SocketAddr>,
         segment: u16,
     },
+    /// The fd of `handle` readable, polled for it, nothing read. Completes as `Ok` with the
+    /// events. A dma-buf turns readable once every job writing it is done.
+    Ready {
+        handle: Handle,
+    },
     /// Completes `after` this long on the reactor's own time.
     Timer {
         after: Duration,
@@ -442,6 +447,11 @@ impl<'c> Io<'c> {
 
     pub fn timer(&mut self, after: Duration, user: u64) -> OpId {
         self.push(Op::Timer { after }, None, user)
+    }
+
+    /// Completes once the fd of `handle` is readable, a dma-buf once its writers are done.
+    pub fn ready(&mut self, handle: Handle, user: u64) -> OpId {
+        self.push(Op::Ready { handle }, None, user)
     }
 
     /// Cancel `op`, also turning its completion already in the inbox into `Cancelled`.

@@ -8,13 +8,15 @@ use profluens_core::ctx::Ctx;
 use profluens_core::error::Error;
 use profluens_core::format::{FixedFormat, Value};
 use profluens_core::id::SrcPad;
+use profluens_core::io::{Completion, Handle, IoError, IoResult, OpenMode};
 use profluens_core::time::Timestamp;
 
 use crate::error::{VaapiErrorKind as K, failed};
 use crate::ffi;
+use crate::gpuframe::DmabufFds;
 use crate::va::{
-    self, Buffer as VaBuffer, Config, Context, Display, SurfaceFormat, Surfaces, UploadImage,
-    VaError, VaResult,
+    self, Buffer as VaBuffer, Config, Context, Display, ExportedSurface, SurfaceFormat, Surfaces,
+    UploadImage, VaError, VaResult,
 };
 
 pub(crate) const RAW_FAMILY: &str = "video/raw";
@@ -199,6 +201,21 @@ impl FrameBufs {
 /// How long a picture on the GPU waits for a poll, the encoder asks to run again this soon.
 pub(crate) const POLL_WAKE: std::time::Duration = std::time::Duration::from_millis(1);
 
+/// How long a blocking wait in the driver runs before it looks for a pending command.
+pub(crate) const WAIT_STEP_NS: u64 = 1_000_000;
+
+/// How an encoder waits for the oldest picture in flight.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum How {
+    /// Not at all, a timed wake asked for when it is not done.
+    Poll,
+    /// In the driver, in steps, until it is done or a command pends, for an encoder on its own
+    /// thread. The thread sleeps in the kernel's wait instead of the scheduler's timer.
+    Step,
+    /// In the driver until it is done.
+    Wait,
+}
+
 /// The picture the GPU codes while the encoder returns to its caller, so the next decode is
 /// queued behind it. It holds the coded buffer the bytes land in and the producer's frame it
 /// reads, until the bytes are read.
@@ -208,6 +225,178 @@ pub(crate) struct InFlight {
     pub head: bool,
     pub stamp: Stamp,
     pub _frame: Option<crate::gpuframe::GpuFrame>,
+    /// The picture's number since the session opened, what its fence op is tagged with.
+    pub seq: u64,
+    pub fence: Fence,
+}
+
+/// How a picture in flight is known to be done.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Fence {
+    /// No reactor, or one that refused, the driver is asked on a timer.
+    Polled,
+    /// The reactor polls the fence of the surface it writes, its completion wakes the encoder,
+    /// so the picture asks for no timed wake.
+    Pending,
+    /// The fence signalled, the batch that writes the surface and the coded bytes is done,
+    /// the driver need not be asked.
+    Signalled,
+}
+
+/// Pictures an encoder keeps on the GPU at most, each holds a producer's frame and a coded buffer.
+pub(crate) const DEPTH_MAX: usize = 4;
+
+/// The pictures handed to the GPU and not yet read, oldest first, [`Self::depth`] at most. The
+/// GPU codes them in order while the encoder's thread goes on, so the next picture is queued
+/// behind one still coding and the engine never waits for the CPU.
+pub(crate) struct Flight {
+    ring: VecDeque<InFlight>,
+    depth: usize,
+}
+
+impl Flight {
+    // Cold, construction.
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) fn new(depth: usize) -> Self {
+        Flight { ring: VecDeque::with_capacity(DEPTH_MAX), depth: depth.clamp(1, DEPTH_MAX) }
+    }
+
+    pub(crate) fn set_depth(&mut self, depth: usize) {
+        self.depth = depth.clamp(1, DEPTH_MAX);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
+
+    /// No room for another picture until the oldest is read.
+    pub(crate) fn full(&self) -> bool {
+        self.ring.len() >= self.depth
+    }
+
+    pub(crate) fn push(&mut self, f: InFlight) {
+        self.ring.push_back(f);
+    }
+
+    /// The oldest picture, the one the GPU finishes first.
+    pub(crate) fn front(&self) -> Option<&InFlight> {
+        self.ring.front()
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<InFlight> {
+        self.ring.pop_front()
+    }
+
+    /// Every picture, oldest first, the ring left empty.
+    pub(crate) fn drain(&mut self) -> std::collections::vec_deque::Drain<'_, InFlight> {
+        self.ring.drain(..)
+    }
+
+    /// The fence of picture `seq` signalled, or never will and it polls from here on.
+    pub(crate) fn unfence(&mut self, seq: u64, signalled: bool) {
+        if let Some(f) = self.ring.iter_mut().find(|f| f.seq == seq) {
+            f.fence = if signalled { Fence::Signalled } else { Fence::Polled };
+        }
+    }
+}
+
+/// What a completion's `user` says it is, in its top bits.
+const USER_KIND: u64 = 3 << 62;
+const USER_ADOPT: u64 = 1 << 62;
+const USER_READY: u64 = 2 << 62;
+
+/// The fences of a session's reconstruction surfaces. Each is exported as a dma-buf and adopted
+/// by the reactor once, then a picture's completion is polled on the one it writes, so the
+/// encoder wakes when the GPU is done and not on a timer. Without a reactor, or one that refuses,
+/// the pictures poll as before.
+pub(crate) struct Fences {
+    /// One a reconstruction surface, kept open for the session.
+    fds: Vec<DmabufFds>,
+    /// The reactor's handle of each, none until its adopt completes.
+    handles: Vec<Handle>,
+    /// The reactor refused an op, nothing more is asked of it.
+    off: bool,
+    /// Pictures queued since the element was made, the next picture's number.
+    next_seq: u64,
+}
+
+impl Fences {
+    // Cold, construction.
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) fn new() -> Self {
+        Fences {
+            fds: Vec::with_capacity(REFS_MAX + 1),
+            handles: Vec::with_capacity(REFS_MAX + 1),
+            off: false,
+            next_seq: 0,
+        }
+    }
+
+    /// A session opened on `recon`, the surfaces exported and handed to the reactor. The last
+    /// session's handles are closed first.
+    pub(crate) fn open(&mut self, ctx: &mut Ctx, dpy: ffi::VADisplay, recon: &[ffi::VASurfaceID]) {
+        self.close(ctx);
+        if self.off {
+            return;
+        }
+        for (i, &surface) in recon.iter().enumerate() {
+            let Ok(mut e) = ExportedSurface::export_queued(dpy, surface) else {
+                self.off = true;
+                return self.close(ctx);
+            };
+            let fds = std::mem::take(&mut e.fds);
+            let Some(fd) = fds.fd(0) else {
+                self.off = true;
+                return self.close(ctx);
+            };
+            ctx.io().adopt(fd, OpenMode::Read, USER_ADOPT | i as u64);
+            self.fds.push(fds);
+            self.handles.push(Handle::NONE);
+        }
+    }
+
+    /// The session is gone, the reactor's handles with it.
+    pub(crate) fn close(&mut self, ctx: &mut Ctx) {
+        for h in self.handles.drain(..).filter(|h| !h.is_none()) {
+            ctx.io().close(h, 0);
+        }
+        self.fds.clear();
+    }
+
+    /// A completion of the element. The number of the picture whose fence op ended, if it was
+    /// one, and whether the fence signalled (else the op failed and the picture polls), the
+    /// adopts noted on the way.
+    pub(crate) fn completed(&mut self, c: &Completion) -> Option<(u64, bool)> {
+        let refused = matches!(
+            c.result,
+            IoResult::Err(IoError::NoBackend | IoError::Unsupported | IoError::WrongKind)
+        );
+        self.off |= refused;
+        match c.user & USER_KIND {
+            USER_ADOPT => {
+                let i = (c.user & !USER_KIND) as usize;
+                if let (IoResult::File { handle, .. }, Some(h)) = (c.result, self.handles.get_mut(i)) {
+                    *h = handle;
+                }
+                None
+            }
+            USER_READY => Some((c.user & !USER_KIND, !matches!(c.result, IoResult::Err(_)))),
+            _ => None,
+        }
+    }
+
+    /// A picture queued, writing reconstruction `slot`. Its number, and whether a completion
+    /// comes for it.
+    pub(crate) fn queued(&mut self, ctx: &mut Ctx, slot: usize) -> (u64, Fence) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let handle = self.handles.get(slot).copied().unwrap_or(Handle::NONE);
+        if self.off || handle.is_none() {
+            return (seq, Fence::Polled);
+        }
+        ctx.io().ready(handle, USER_READY | seq);
+        (seq, Fence::Pending)
+    }
 }
 
 /// Timing and flags of one coded frame.
@@ -544,6 +733,16 @@ impl EncEngine {
 
     pub(crate) fn recon_cur(&self) -> ffi::VASurfaceID {
         self.recon[self.cur]
+    }
+
+    /// Which of [`Self::recon_ids`] the picture coded now writes.
+    pub(crate) fn recon_slot(&self) -> usize {
+        self.cur
+    }
+
+    /// The reconstruction surfaces, [`Self::recon_slot`] indexes them.
+    pub(crate) fn recon_ids(&self) -> &[ffi::VASurfaceID] {
+        &self.recon[..self.recon_n]
     }
 
     /// The picture coded last.

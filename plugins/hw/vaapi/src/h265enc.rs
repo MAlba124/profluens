@@ -31,6 +31,7 @@ use crate::gpuframe::{self, GpuFrameChannel, GpuFrameHeader};
 use crate::gpuin::{self, GpuIn, Input};
 use crate::h264parse;
 use crate::probe;
+use crate::stats::Stats;
 use crate::va::{self, Buffer as VaBuffer, Display, SurfaceFormat};
 use profluens_video::color::StreamColor;
 
@@ -94,6 +95,8 @@ pub(crate) static DESC: ElementDesc = ElementDesc {
     inputs: InputPolicy::Single,
     latency: LatencyDesc::NONE,
     make_default: Some(|| Box::new(VaapiH265Enc::new())),
+    // not required, the fences (`enc::Fences`) use a reactor when the pipeline has one and the
+    // pictures poll on a timer when it has none
     io: false,
     couplings: &[Coupling::same(0, 0, enc::F_WIDTH), Coupling::same(0, 0, enc::F_HEIGHT)],
 };
@@ -209,7 +212,7 @@ struct Session {
 pub struct VaapiH265Enc {
     device: Option<PathBuf>,
     // Field order is drop order, what holds the display's handle goes before it.
-    inflight: Option<enc::InFlight>,
+    flight: enc::Flight,
     gpu: Option<GpuIn>,
     session: Option<Session>,
     display: Option<Display>,
@@ -222,6 +225,8 @@ pub struct VaapiH265Enc {
     warned_rc_mode: bool,
 
     low_power: bool,
+    /// The driver's quality level, 1 best to 7 fastest.
+    quality: u32,
     in_fmt: Option<InFormat>,
     /// The input's colour, stated in the VUI, its HDR metadata as SEI.
     color: StreamColor,
@@ -237,6 +242,10 @@ pub struct VaapiH265Enc {
     ahead: Option<(u32, u32)>,
     /// The colour the VUI states in place of the input's, its HDR metadata still the input's.
     pinned: Option<StreamColor>,
+    stats: Arc<Stats>,
+    /// Waits for a picture in the driver, the encoder has its own thread.
+    blocking: bool,
+    fences: enc::Fences,
 }
 
 // SAFETY: an Active element runs on one dedicated thread, the raw VADisplay never crosses threads.
@@ -262,7 +271,10 @@ impl VaapiH265Enc {
     pub fn new() -> Self {
         VaapiH265Enc {
             device: None,
-            inflight: None,
+            flight: enc::Flight::new(1),
+            stats: Arc::default(),
+            blocking: false,
+            fences: enc::Fences::new(),
             gpu: None,
             display: None,
             session: None,
@@ -273,6 +285,7 @@ impl VaapiH265Enc {
             rc_dirty: false,
             warned_rc_mode: false,
             low_power: true,
+            quality: encshell::QUALITY_BALANCED,
             in_fmt: None,
             color: StreamColor::default(),
             hvcc: false,
@@ -341,10 +354,37 @@ impl VaapiH265Enc {
         self
     }
 
+    /// Pictures kept on the GPU at once, 1 to 4. With more than one the next picture is queued
+    /// behind one still coding, so the engine never waits for the CPU between them.
+    pub fn with_depth(mut self, depth: usize) -> Self {
+        self.flight.set_depth(depth);
+        self
+    }
+
+    /// Waits for a picture in the driver, in steps that let a seek's flush through, instead of
+    /// asking for a timed wake. For an encoder on its own thread (Active), never one on its
+    /// producer's (Passive), which would stall the producer.
+    pub fn with_blocking_waits(mut self, on: bool) -> Self {
+        self.blocking = on;
+        self
+    }
+
+    /// The encoder's counters, pictures, polls and waits for the GPU.
+    pub fn stats(&self) -> Arc<Stats> {
+        Arc::clone(&self.stats)
+    }
+
     /// Encodes on VDEnc (EncSliceLP) where the driver has it, on by default. The shader
     /// encoder (EncSlice) loads the render engine past what a 1080p60 stream leaves free.
     pub fn with_low_power(mut self, on: bool) -> Self {
         self.low_power = on;
+        self
+    }
+
+    /// The driver's quality level, 1 best to 7 fastest, VPL's balanced 4 without one. Takes
+    /// effect from the next IDR.
+    pub fn with_quality_level(mut self, level: u32) -> Self {
+        self.quality = level.clamp(1, 7);
         self
     }
 
@@ -400,6 +440,7 @@ impl VaapiH265Enc {
                 height = fmt.height,
                 ten_bit = ten_bit(fmt)
             );
+            self.fences.close(ctx);
             self.session = None;
         }
         let Some(display) = &self.display else {
@@ -525,6 +566,9 @@ impl VaapiH265Enc {
             sei,
             gpb,
         });
+        if let (Some(d), Some(s)) = (&self.display, &self.session) {
+            self.fences.open(ctx, d.raw(), s.engine.recon_ids());
+        }
         if self.bytes_out {
             ctx.announce_format(Self::OUT, "bytes", &[]);
         } else {
@@ -559,17 +603,38 @@ impl VaapiH265Enc {
         self.staged.drain(&mut Self::pad(ctx))
     }
 
-    /// Reads the picture in flight once the GPU is done with it and sends it, waiting for it
-    /// when `wait`. False while it is still being coded, a wake asked for.
-    fn finish(&mut self, ctx: &mut Ctx, wait: bool) -> Result<bool, Error> {
-        let Some(f) = &self.inflight else {
+    /// Reads the oldest picture in flight once the GPU is done with it and sends it, waiting
+    /// for it as `how` says. False while it is still being coded, a wake asked for.
+    fn finish(&mut self, ctx: &mut Ctx, how: enc::How) -> Result<bool, Error> {
+        let Some(f) = self.flight.front() else {
             return Ok(true);
         };
-        if !wait {
-            match f.coded.idle() {
+        let fence = f.fence;
+        if how != enc::How::Wait {
+            let done = match how {
+                // a signalled fence is the answer, the driver is not asked
+                enc::How::Poll if fence == enc::Fence::Signalled => Ok(true),
+                enc::How::Poll => f.coded.idle(),
+                _ => {
+                    let t = crate::stats::mark();
+                    let done = loop {
+                        match f.coded.wait(enc::WAIT_STEP_NS) {
+                            Ok(false) if !ctx.command_pending() => {}
+                            r => break r,
+                        }
+                    };
+                    self.stats.waited(t);
+                    done
+                }
+            };
+            match done {
                 Ok(true) => {}
                 Ok(false) => {
-                    ctx.wake_within(enc::POLL_WAKE);
+                    // a fenced picture's completion wakes the encoder, the rest poll
+                    if fence != enc::Fence::Pending {
+                        self.stats.polled();
+                        ctx.wake_within(enc::POLL_WAKE);
+                    }
                     return Ok(false);
                 }
                 // read by the map below, iHD fails every picture after a coded buffer destroyed
@@ -577,7 +642,7 @@ impl VaapiH265Enc {
                 Err(e) => self.warn(ctx, K::Encode(e)),
             }
         }
-        let Some(f) = self.inflight.take() else {
+        let Some(f) = self.flight.pop() else {
             return Ok(true);
         };
         let b = &mut self.bufs;
@@ -586,7 +651,13 @@ impl VaapiH265Enc {
             b.coded.extend_from_slice(&s.seq_nals);
         }
         // the map waits for the GPU
-        if let Err(e) = f.coded.read_coded(&mut b.coded) {
+        let t = crate::stats::mark();
+        let read = f.coded.read_coded(&mut b.coded);
+        if how == enc::How::Wait {
+            self.stats.waited(t);
+        }
+        self.stats.frame();
+        if let Err(e) = read {
             self.warn(ctx, K::Encode(e));
             return Ok(true);
         }
@@ -603,6 +674,47 @@ impl VaapiH265Enc {
         }
         self.staged.send_or_stage(&mut Self::pad(ctx), &mut self.bufs.coded, f.stamp)?;
         Ok(true)
+    }
+
+    /// Reads every picture the GPU is done with, in order, a wake asked for the first it is not.
+    fn finish_ready(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        while !self.flight.is_empty() && self.finish(ctx, enc::How::Poll)? {}
+        Ok(())
+    }
+
+    /// With no input left, reads what is done. A full ring on an encoder with its own thread
+    /// waits for its oldest picture in the driver, the engine busy with the rest. One with
+    /// room keeps it for the next input, which must not wait behind a picture coding, and
+    /// polls for the pictures in flight.
+    fn finish_idle(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        if self.blocking && self.flight.full() {
+            self.finish(ctx, enc::How::Step)?;
+            return Ok(());
+        }
+        self.finish_ready(ctx)
+    }
+
+    /// How the ring full waits for the oldest picture.
+    fn room(&self) -> enc::How {
+        if self.blocking { enc::How::Step } else { enc::How::Poll }
+    }
+
+    /// Reads every picture in flight, waiting for each.
+    fn finish_all(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        while !self.flight.is_empty() {
+            self.finish(ctx, enc::How::Wait)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the session codes pictures of `fmt` as it is.
+    fn session_fits(&self, fmt: InFormat) -> bool {
+        self.session.as_ref().is_some_and(|s| {
+            s.engine.width == fmt.width
+                && s.engine.height == fmt.height
+                && s.ten == ten_bit(fmt)
+                && s.color == self.color
+        })
     }
 
     /// Hands the picture to the GPU, it goes out on [`Self::finish`]. `frame` is the producer's
@@ -637,7 +749,7 @@ impl VaapiH265Enc {
                 s.gop_pos = 0;
             }
             let is_idr = s.gop_pos == 0;
-            let rc = RcUpdate { dirty: self.rc_dirty, hrd_ms: self.hrd_ms };
+            let rc = RcUpdate { dirty: self.rc_dirty, hrd_ms: self.hrd_ms, quality: self.quality };
             let (qp, kbps, gop) = (self.qp, self.bitrate_kbps, self.gop_len);
             encode_one(display, s, fmt, qp, kbps, gop, is_idr, rc, input, &mut self.bufs)
                 .map(|q| (is_idr, q))
@@ -655,13 +767,15 @@ impl VaapiH265Enc {
         let Some(s) = self.session.as_mut() else {
             return Ok(());
         };
+        let slot = s.engine.recon_slot();
         s.engine.advance_recon();
         s.gop_pos += 1;
         if preview || s.gop_pos >= gop_len {
             s.gop_pos = 0;
         }
+        let (seq, fence) = self.fences.queued(ctx, slot);
         let stamp = Stamp { pts, duration, key: is_idr, preview };
-        self.inflight = Some(enc::InFlight { coded, head, stamp, _frame: frame });
+        self.flight.push(enc::InFlight { coded, head, stamp, _frame: frame, seq, fence });
         Ok(())
     }
 }
@@ -670,6 +784,7 @@ impl VaapiH265Enc {
 struct RcUpdate {
     dirty: bool,
     hrd_ms: u32,
+    quality: u32,
 }
 
 /// Hands one picture to the GPU, its coded buffer and whether the parameter sets go in front.
@@ -705,7 +820,7 @@ fn encode_one(
             let seq = seq_param(engine, fmt, gop_len, bitrate_kbps, s.level_idc, s.ctb_log2);
             bufs.param(display, engine, ffi::VAEncSequenceParameterBufferType, &seq)?;
             // iHD encodes at its fastest target usage (7) without one, VPL's balanced 4 is ours
-            bufs.hold.push(encshell::quality_buffer(display, engine, encshell::QUALITY_BALANCED)?);
+            bufs.hold.push(encshell::quality_buffer(display, engine, rc.quality)?);
         }
         if brc && (is_idr || rc.dirty) {
             encshell::rc_buffers(display, engine, bitrate_kbps, 51, fmt.fps, &mut bufs.hold)?;
@@ -1222,6 +1337,11 @@ impl VaapiH265Enc {
             if self.staged.full() || ctx.command_pending() {
                 return Ok(());
             }
+            // room on the GPU first, the oldest picture read if it is done, else the input
+            // waits for the wake and the caller goes on
+            if self.flight.full() && !self.finish(ctx, self.room())? {
+                return Ok(());
+            }
             let Some(inbuf) = inputs.pop() else { break };
             let Some(h) = GpuFrameHeader::from_bytes(inbuf.memory.data()) else {
                 self.warn(ctx, K::GpuHeader);
@@ -1239,8 +1359,10 @@ impl VaapiH265Enc {
                 self.warn(ctx, K::NoGpuFrame { token: h.token });
                 continue;
             };
-            // the picture before out first, a session rebuilt waits for it
-            self.finish(ctx, true)?;
+            // a session rebuilt reads its pictures first
+            if !self.session_fits(fmt) {
+                self.finish_all(ctx)?;
+            }
             if !self.ensure_session(ctx, fmt) {
                 continue; // warned inside
             }
@@ -1267,8 +1389,7 @@ impl VaapiH265Enc {
                 inbuf.flags.contains(BufferFlags::PREVIEW),
                 inbuf.flags.contains(BufferFlags::INTRA),
             )?;
-            // the GPU codes it while the caller goes on, the next decode queued behind it
-            break;
+            // the GPU codes it while the next picture is prepared, a full ring returns above
         }
         self.drain_pending(ctx)?;
         Ok(())
@@ -1333,14 +1454,19 @@ impl Element for VaapiH265Enc {
         if !self.staged.resume(&mut Self::pad(ctx))? {
             return Ok(Flow::Ok);
         }
-        self.finish(ctx, false)?;
+        while let Some(c) = ctx.io().next_completion() {
+            if let Some((seq, signalled)) = self.fences.completed(&c) {
+                self.flight.unfence(seq, signalled);
+            }
+        }
+        self.finish_ready(ctx)?;
         if !self.ensure_display(ctx) {
             while inputs.pop().is_some() {}
             return Ok(Flow::Ok);
         }
         if self.gpu.is_some() {
             self.process_gpu(ctx, &mut inputs)?;
-            self.finish(ctx, false)?;
+            self.finish_idle(ctx)?;
             return Ok(Flow::Ok);
         }
         if self.in_fmt.is_none()
@@ -1367,8 +1493,8 @@ impl Element for VaapiH265Enc {
                 );
                 continue;
             }
-            // the picture before out first, a session rebuilt or an upload waits for it
-            self.finish(ctx, true)?;
+            // every picture out first, a session rebuilt or the one upload surface waits for them
+            self.finish_all(ctx)?;
             if !self.ensure_session(ctx, fmt) {
                 continue;
             }
@@ -1385,7 +1511,7 @@ impl Element for VaapiH265Enc {
             break;
         }
         self.drain_pending(ctx)?;
-        self.finish(ctx, false)?;
+        self.finish_idle(ctx)?;
         Ok(Flow::Ok)
     }
 
@@ -1441,7 +1567,7 @@ impl Element for VaapiH265Enc {
             }
             Event::FlushStart => {
                 // read and dropped, iHD fails every picture after a coded buffer destroyed unread
-                if let Some(f) = self.inflight.take() {
+                for f in self.flight.drain() {
                     let _ = f.coded.read_coded(&mut self.bufs.coded);
                     self.bufs.coded.clear();
                 }
@@ -1457,7 +1583,7 @@ impl Element for VaapiH265Enc {
                 }
             }
             Event::Eos => {
-                self.finish(ctx, true)?;
+                self.finish_all(ctx)?;
                 let drained = self.staged.finish(&mut Self::pad(ctx))?;
                 let pending = self.staged.len();
                 log!(
@@ -1475,12 +1601,17 @@ impl Element for VaapiH265Enc {
         Ok(())
     }
 
-    fn stop(&mut self, _ctx: &mut Ctx) {
-        self.inflight = None;
+    fn stop(&mut self, ctx: &mut Ctx) {
+        // read and dropped before the session goes, as on a flush
+        for f in self.flight.drain() {
+            let _ = f.coded.read_coded(&mut self.bufs.coded);
+        }
+        self.bufs.coded.clear();
         self.staged.discard();
         if let Some(g) = &mut self.gpu {
             g.stop();
         }
+        self.fences.close(ctx);
         self.session = None;
         self.display = None;
         self.in_fmt = None;

@@ -35,7 +35,9 @@ use crate::gpuframe::{
     self, F_LAYOUT, F_MODIFIER, FAMILY_VIDEO_GPU, FrameToken, FrameTx, GPU_FRAME_HEADER_LEN,
     GpuFrame, GpuFrameChannel, GpuFrameHeader,
 };
+use crate::gpuframe::Handoff;
 use crate::probe;
+use crate::stats::Stats;
 use crate::va::{
     Buffer as VaBuffer, Config, Context, Display, ExportedSurface, ReadbackImage, SurfaceFormat,
     Surfaces, VaError,
@@ -519,6 +521,7 @@ pub struct VaapiVp9Dec {
     emitted: u64,
 
     zerocopy: Option<Arc<GpuFrameChannel>>,
+    stats: Arc<Stats>,
     tx: Option<FrameTx>,
     released: Vec<FrameToken>,
     next_token: FrameToken,
@@ -550,6 +553,11 @@ impl VaapiVp9Dec {
         Self::with_zerocopy(Some(channel))
     }
 
+    /// The decoder's counters, pictures and waits for the GPU.
+    pub fn stats(&self) -> Arc<Stats> {
+        Arc::clone(&self.stats)
+    }
+
     // Cold: once per element. The lists are sized for their bound here.
     #[allow(clippy::disallowed_methods)]
     fn with_zerocopy(zerocopy: Option<Arc<GpuFrameChannel>>) -> Self {
@@ -574,6 +582,7 @@ impl VaapiVp9Dec {
             warned: Warned::default(),
             emitted: 0,
             zerocopy,
+            stats: Arc::default(),
             tx: None,
             released: Vec::with_capacity(16),
             next_token: 1,
@@ -1078,12 +1087,20 @@ impl VaapiVp9Dec {
         let Some(dpy) = self.display.as_ref().map(Display::raw) else {
             return Ok(true);
         };
+        // a queued handoff exports the picture as it is, the dma-buf's fence orders the consumer
+        let queued = self.zerocopy.as_ref().is_some_and(|c| c.handoff() == Handoff::Queued);
         // a pending command, a seek's flush, cuts the wait short, the decoder runs again after it
-        if !crate::va::wait_surface(dpy, out.export, || ctx.command_pending()) {
-            ctx.wake_within(crate::enc::POLL_WAKE);
-            return Ok(false);
+        if !queued {
+            let t = crate::stats::mark();
+            let done = crate::va::wait_surface(dpy, out.export, || ctx.command_pending());
+            self.stats.waited(t);
+            if !done {
+                ctx.wake_within(crate::enc::POLL_WAKE);
+                return Ok(false);
+            }
         }
-        let mut exported = match ExportedSurface::export(dpy, out.export) {
+        let export = if queued { ExportedSurface::export_queued } else { ExportedSurface::export };
+        let mut exported = match export(dpy, out.export) {
             Ok(e) => e,
             Err(e) => {
                 self.warn(ctx, K::Export(e));

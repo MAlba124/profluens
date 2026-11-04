@@ -396,24 +396,70 @@ impl FrameRx {
     }
 }
 
+/// When a producer hands a frame on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handoff {
+    /// Once the GPU wrote it, the producer waited for the picture.
+    Done,
+    /// As soon as the picture is queued. The dma-buf carries the write's fence, so a consumer
+    /// on the same GPU reads behind it and never waits for the CPU. A CPU reader calls
+    /// [`wait_readable`] first.
+    Queued,
+}
+
+/// Waits until every writer of `fds` is done, `poll` on each dma-buf. False on a timeout, an
+/// error as errno. `timeout_ms` below zero waits for good.
+pub fn wait_readable(fds: &DmabufFds, timeout_ms: i32) -> Result<bool, i32> {
+    for &fd in fds.iter() {
+        let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one pollfd of a live fd the frame owns, the call writes only revents.
+        let n = unsafe { libc::poll(&mut p, 1, timeout_ms) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+        }
+        if n == 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Hands [`GpuFrame`]s from a zero-copy decoder to its sink over an SPSC ring.
 /// Nothing is sent back, dropping a frame releases its surface, so a surface is never reused while
 /// held. Ends are taken at `start()` and put back at `stop()`, the only lock. With both back the
 /// ring is dropped.
 pub struct GpuFrameChannel {
     ends: Mutex<(Option<FrameTx>, Option<FrameRx>)>,
+    handoff: Handoff,
 }
 
 impl GpuFrameChannel {
+    /// A channel whose frames are handed on once written, [`Handoff::Done`].
+    pub fn new() -> Arc<Self> {
+        Self::with_handoff(Handoff::Done)
+    }
+
+    /// A channel whose frames are handed on as queued, [`Handoff::Queued`], for a consumer on
+    /// the same GPU.
+    pub fn queued() -> Arc<Self> {
+        Self::with_handoff(Handoff::Queued)
+    }
+
     // Cold, one channel per zero-copy pipeline.
     #[allow(clippy::disallowed_methods)]
-    pub fn new() -> Arc<Self> {
+    pub fn with_handoff(handoff: Handoff) -> Arc<Self> {
         let (frames, taken) = spsc(FRAMES_OUT);
         let tx =
             FrameTx { frames, back: Arc::new(AtomicU64::new(0)), out: 0, tokens: [0; FRAMES_OUT] };
         Arc::new(Self {
             ends: Mutex::new((Some(tx), Some(FrameRx { frames: taken, ahead: None }))),
+            handoff,
         })
+    }
+
+    /// When the producer hands a frame on.
+    pub fn handoff(&self) -> Handoff {
+        self.handoff
     }
 
     fn ends(&self) -> std::sync::MutexGuard<'_, (Option<FrameTx>, Option<FrameRx>)> {

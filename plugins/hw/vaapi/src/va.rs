@@ -607,6 +607,17 @@ impl Buffer {
         }
     }
 
+    /// Waits up to `timeout_ns` for the GPU to be done with the buffer, false on the timeout.
+    /// A driver without it says done, the map then waits.
+    pub fn wait(&self, timeout_ns: u64) -> VaResult<bool> {
+        // SAFETY: self.id is a live buffer on this display.
+        match unsafe { ffi::vaSyncBuffer(self.dpy, self.id, timeout_ns) } {
+            ffi::VA_STATUS_SUCCESS | ffi::VA_STATUS_ERROR_UNIMPLEMENTED => Ok(true),
+            ffi::VA_STATUS_ERROR_TIMEDOUT => Ok(false),
+            status => Err(VaError { status, ctx: "vaSyncBuffer" }),
+        }
+    }
+
     pub fn read_coded(&self, out: &mut Vec<u8>) -> VaResult<()> {
         let mut base: *mut std::ffi::c_void = ptr::null_mut();
         // SAFETY: self.id is a live coded buffer on this display.
@@ -903,14 +914,25 @@ pub struct ExportedSurface {
 }
 
 impl ExportedSurface {
+    /// The surface once the GPU wrote it.
     // `dpy` outlives the call, the element owns it on its single thread.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn export(dpy: ffi::VADisplay, surface: ffi::VASurfaceID) -> VaResult<ExportedSurface> {
         // SAFETY: surface is a live decode target on this display.
         check(unsafe { ffi::vaSyncSurface(dpy, surface) }, "vaSyncSurface(export)")?;
+        Self::export_queued(dpy, surface)
+    }
 
+    /// The surface as it is, the GPU may still write it. The dma-bufs carry the write's fence,
+    /// a job on the same GPU that reads them runs behind it, a CPU reader polls them first.
+    // `dpy` outlives the call, the element owns it on its single thread.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn export_queued(
+        dpy: ffi::VADisplay,
+        surface: ffi::VASurfaceID,
+    ) -> VaResult<ExportedSurface> {
         let mut desc: ffi::VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
-        // SAFETY: desc is a valid out struct, surface is synced, PRIME_2 fills a
+        // SAFETY: desc is a valid out struct, surface is live, PRIME_2 fills a
         // VADRMPRIMESurfaceDescriptor.
         let st = unsafe {
             ffi::vaExportSurfaceHandle(

@@ -622,7 +622,8 @@ impl Reactor for OsReactor {
                 | Op::Send { handle, .. }
                 | Op::SendTo { handle, .. }
                 | Op::RecvMany { handle }
-                | Op::SendMany { handle, .. } => {
+                | Op::SendMany { handle, .. }
+                | Op::Ready { handle } => {
                     if let Some(idx) = self.pend(s, handle) {
                         self.waiting.push_back(idx);
                     }

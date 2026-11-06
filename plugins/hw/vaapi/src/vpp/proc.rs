@@ -4,6 +4,7 @@ use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::ptr;
+use std::sync::OnceLock;
 
 use crate::error::VaapiErrorKind as K;
 use crate::ffi::{
@@ -12,8 +13,8 @@ use crate::ffi::{
     VARectangle,
 };
 use crate::gpuframe::GpuFrame;
-use crate::va::{Display, Surfaces, VaError, VaResult};
-use crate::vpp::format::Kind;
+use crate::va::{Display, ReadbackImage, Surfaces, UploadImage, VaError, VaResult};
+use crate::vpp::format::{Kind, OUTPUTS};
 use crate::vpp::plan::Rect;
 
 fn check(status: ffi::VAStatus, ctx: &'static str) -> VaResult<()> {
@@ -337,6 +338,45 @@ impl Proc {
             "vaCreateBuffer(hdr)",
         )?;
         Ok(ToneMap { dpy: self.dpy, buf, _meta: meta })
+    }
+
+    /// Whether the driver paints `output_background_color` over the whole output surface, out
+    /// of the output region too. VA has no cap for it, a pass into a grey 64x64 surface of each
+    /// output layout tells, once a process. One answer for every display, the elements open
+    /// the probed device only.
+    pub fn paints_background(&self, display: &Display) -> bool {
+        static PAINTS: OnceLock<bool> = OnceLock::new();
+        *PAINTS.get_or_init(|| OUTPUTS.iter().all(|&k| self.paints(display, k).unwrap_or(false)))
+    }
+
+    fn paints(&self, display: &Display, k: Kind) -> VaResult<bool> {
+        const N: u32 = 64;
+        let s = surfaces(display, k, N, N, 2)?;
+        let (src, dst) = (s.ids()[0], s.ids()[1]);
+        let row = N as usize * if k.depth > 8 { 2 } else { 1 };
+        let mut img = UploadImage::acquire_for(display, dst, N, N, k.surface())?;
+        for (plane, rows) in [(0, N), (1, N / 2)] {
+            for r in 0..rows {
+                if let Some(line) = img.row_mut(plane, r, row) {
+                    line.fill(0xeb);
+                }
+            }
+        }
+        img.finish()?;
+        let color = Color::SDR;
+        let place = (0, N / 4, N, N / 2);
+        let out = Out { surface: dst, place, fill: true, color, rotation: 0 };
+        self.run(Src { surface: src, at: (0, 0), size: (N, N), color }, out, None)?;
+        let mut img = ReadbackImage::new(display, k.fourcc, k.bpp, N, N)?;
+        let view = img.read(dst, N, N)?;
+        // the first and last rows lie outside the region, P010 holds a sample's 8 bits high
+        let black = |plane: usize, r: u32, want: u8| {
+            view.row(plane, r, row).is_some_and(|l| match k.depth > 8 {
+                true => l.as_chunks::<2>().0.iter().all(|s| s[1].abs_diff(want) <= 2),
+                false => l.iter().all(|&s| s.abs_diff(want) <= 2),
+            })
+        };
+        Ok(black(0, 0, 16) && black(0, N - 1, 16) && black(1, 0, 128) && black(1, N / 2 - 1, 128))
     }
 
     pub fn run(&self, src: Src, out: Out, tone_map: Option<&ToneMap>) -> VaResult<()> {

@@ -3,7 +3,7 @@
 //! retained input chunks by absolute offset. Fragmented movies walk `moof`/`mdat` instead.
 
 use std::collections::VecDeque;
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref, DerefMut, Range};
 use std::sync::Arc;
 
 use profluens_core::ctx::Disposition;
@@ -363,6 +363,33 @@ fn ticks_at_or_before(ns: u64, timescale: u32) -> i64 {
 }
 
 impl Tables {
+    /// The tracks and the sample index of a head through `moov`, see [`Mp4Reader::bounded`].
+    // Cold path, once per file.
+    #[allow(clippy::disallowed_methods)]
+    pub fn resolve(head: &[u8], mfra: &[u8], limits: Limits) -> Result<Tables, Mp4Error> {
+        let moov = find_moov(head)?.ok_or(Mp4Error::Missing("moov"))?;
+        let movie = resolve_moov(moov.body(head), Some(limits))?;
+        let rules = rules_of(&movie.tracks);
+        let frag = movie.trex.map(|trex| {
+            let mut fragments = Vec::new();
+            let indexed_to = index_head(head, moov.end, &mut fragments);
+            index_mfra(mfra, &movie.tracks, &mut fragments);
+            fragments.sort_unstable();
+            fragments.dedup_by_key(|f| f.offset);
+            let duration_ns = if movie.duration_ns != 0 { movie.duration_ns } else { indexed_to };
+            FragTables { trex, fragments, start: moov.end as u64, duration_ns }
+        });
+        let skipped = movie.skipped;
+        Ok(Tables { tracks: movie.tracks, samples: movie.samples, rules, frag, skipped })
+    }
+
+    /// The tracks of a head through `moov` with no sample folded, for a caller that only
+    /// describes them. A table the fold refuses is not seen here.
+    pub fn tracks_of(head: &[u8]) -> Result<Vec<Track>, Mp4Error> {
+        let moov = find_moov(head)?.ok_or(Mp4Error::Missing("moov"))?;
+        Ok(resolve_moov(moov.body(head), None)?.tracks)
+    }
+
     pub fn tracks(&self) -> &[Track] {
         &self.tracks
     }
@@ -379,6 +406,27 @@ impl Tables {
     /// Octets the sample index has committed, off the heap in its own mapping.
     pub fn index_bytes(&self) -> usize {
         self.samples.committed()
+    }
+
+    /// About all the tables hold, the sample index and the tracks with their buffers by length.
+    pub fn bytes(&self) -> usize {
+        let tracks: usize = self
+            .tracks
+            .iter()
+            .map(|t| {
+                let e = &t.entry;
+                e.codec_head.len() + e.config_record.len() + t.title.len() + t.language_tag.len()
+            })
+            .sum();
+        let frag = self
+            .frag
+            .as_ref()
+            .map_or(0, |f| size_of_val(f.trex.as_slice()) + size_of_val(f.fragments.as_slice()));
+        self.index_bytes()
+            + size_of_val(self.tracks.as_slice())
+            + tracks
+            + size_of_val(self.rules.as_slice())
+            + frag
     }
 
     // Cold path, once per open.
@@ -813,26 +861,18 @@ impl Mp4Reader {
     }
 
     /// As [`Self::indexed`], the sample index held to `limits`.
+    pub fn bounded(head: &[u8], mfra: &[u8], limits: Limits) -> Result<Self, Mp4Error> {
+        Ok(Self::shared(Arc::new(Tables::resolve(head, mfra, limits)?)))
+    }
+
+    /// A reader over tables resolved once and shared, so another run over the file folds
+    /// nothing.
     // Cold path, once at construction.
     #[allow(clippy::disallowed_methods)]
-    pub fn bounded(head: &[u8], mfra: &[u8], limits: Limits) -> Result<Self, Mp4Error> {
-        let moov = find_moov(head)?.ok_or(Mp4Error::Missing("moov"))?;
-        let movie = resolve_moov(moov.body(head), Some(limits))?;
-        let rules = rules_of(&movie.tracks);
-        let frag = movie.trex.map(|trex| {
-            let mut fragments = Vec::new();
-            let indexed_to = index_head(head, moov.end, &mut fragments);
-            index_mfra(mfra, &movie.tracks, &mut fragments);
-            fragments.sort_unstable();
-            fragments.dedup_by_key(|f| f.offset);
-            let duration_ns = if movie.duration_ns != 0 { movie.duration_ns } else { indexed_to };
-            FragTables { trex, fragments, start: moov.end as u64, duration_ns }
-        });
-        let walk = frag.as_ref().map(|_| Walk::new(movie.tracks.len()));
-        let skipped = movie.skipped;
-        let tables = Tables { tracks: movie.tracks, samples: movie.samples, rules, frag, skipped };
+    pub fn shared(tables: Arc<Tables>) -> Self {
+        let walk = tables.frag.as_ref().map(|_| Walk::new(tables.tracks.len()));
         let mut reader = Self {
-            tables: Arc::new(tables),
+            tables,
             next: 0,
             stream_base: 0,
             chunks: VecDeque::new(),
@@ -842,8 +882,9 @@ impl Mp4Reader {
             walk,
         };
         reader.reset_stream();
-        Ok(reader)
+        reader
     }
+
     pub fn tracks(&self) -> &[Track] {
         &self.tables.tracks
     }
@@ -1513,18 +1554,21 @@ fn resolve_moov(moov_body: &[u8], limits: Option<Limits>) -> Result<Movie, Mp4Er
             .ok_or(Mp4Error::TooManySamples { limit })?;
         samples = SampleIndex::reserve(total)?;
         samples.room = Room::of(limits.file_len);
-        for (track_index, stbl) in stbls.iter().enumerate() {
-            if let Some(s) = stbl
-                && !fold_track(track_index as u16, s, &mut samples)?
-            {
+        // The largest run folds last, the merge keeps it in place.
+        let mut order: Vec<usize> = (0..stbls.len()).collect();
+        order.sort_by_key(|&i| stbls[i].as_ref().map_or(0, |s| s.count));
+        let mut runs = Vec::with_capacity(order.len());
+        for track_index in order {
+            let Some(s) = &stbls[track_index] else { continue };
+            let from = samples.len();
+            if !fold_track(track_index as u16, s, &mut samples)? {
                 let track = &mut tracks[track_index];
                 track.edit_refused = Some(EditRefusal::NothingPresented);
             }
+            runs.push(from..samples.len());
         }
+        merge_runs(&mut samples, &runs);
     }
-
-    // Unstable, a stable sort allocates half the index again as scratch.
-    samples.sort_unstable_by_key(|s| (s.offset, s.track_index, s.dts));
 
     // Samples must be disjoint byte ranges. Overlapping ones would emit the same bytes per
     // sample, an output unbounded by the input. Empty samples are exempt.
@@ -1563,6 +1607,80 @@ fn resolve_moov(moov_body: &[u8], limits: Option<Limits>) -> Result<Movie, Mp4Er
         track.duration_ns = duration_ns;
     }
     Ok(Movie { tracks, samples, trex: Some(trex), duration_ns, skipped })
+}
+
+/// Past this many runs the index is sorted whole, the merge scans every run's head per stretch.
+const MERGE_RUNS: usize = 16;
+
+fn order_key(s: &Sample) -> (u64, u16, i64) {
+    (s.offset, s.track_index, s.dts)
+}
+
+/// [`order_key`] of the `n`th sample of a sorted run in one integer, the place in the run for
+/// the DTS, so the merge picks a head without a branch.
+fn packed_key(s: &Sample, n: usize) -> u128 {
+    u128::from(s.offset) << 64 | u128::from(s.track_index) << 48 | n as u128
+}
+
+/// Above every [`packed_key`], a track index is below [`MAX_TRACKS`].
+const DONE: u128 = u128::MAX;
+
+/// `samples` into file order from `runs`, the contiguous per track ranges that cover it in
+/// fold order. A track's run is in order unless its chunk offsets fall back. The runs but the
+/// last go to scratch and merge in front of the last one's unread samples, which never get
+/// overwritten, so the scratch is the size of the others.
+// Cold path, once per movie.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn merge_runs(samples: &mut [Sample], runs: &[Range<usize>]) {
+    if runs.len() > MERGE_RUNS {
+        // Unstable, a stable sort allocates half the index again as scratch.
+        samples.sort_unstable_by_key(order_key);
+        return;
+    }
+    for r in runs {
+        let run = &mut samples[r.clone()];
+        if !run.is_sorted_by_key(order_key) {
+            run.sort_unstable_by_key(order_key);
+        }
+    }
+    let Some((last, rest)) = runs.split_last() else { return };
+    if rest.is_empty() {
+        return;
+    }
+    let scratch = samples[..last.start].to_vec();
+    let (k, tail) = (runs.len(), rest.len());
+    let (mut at, mut start, mut end) = ([0; MERGE_RUNS], [0; MERGE_RUNS], [0; MERGE_RUNS]);
+    // each run's head, cached so a stretch reads only its own run
+    let mut head = [DONE; MERGE_RUNS];
+    for (i, r) in runs.iter().enumerate().filter(|(_, r)| !r.is_empty()) {
+        (at[i], start[i], end[i]) = (r.start, r.start, r.end);
+        head[i] = packed_key(if i == tail { &samples[r.start] } else { &scratch[r.start] }, 0);
+    }
+    let mut w = 0;
+    loop {
+        let m = (0..k).fold(0, |m, i| if head[i] < head[m] { i } else { m });
+        let bound = (0..k).filter(|&i| i != m).fold(DONE, |b, i| b.min(head[i]));
+        if head[m] == DONE || (m == tail && bound == DONE) {
+            // what is left of the last run is in place
+            break;
+        }
+        // the leading run's stretch below every other head, copied forward. The write trails
+        // the last run's next unread sample by the scratch left unread, so never overwrites it.
+        let mut i = at[m];
+        head[m] = loop {
+            samples[w] = if m == tail { samples[i] } else { scratch[i] };
+            (w, i) = (w + 1, i + 1);
+            if i == end[m] {
+                break DONE;
+            }
+            let next = if m == tail { &samples[i] } else { &scratch[i] };
+            let next = packed_key(next, i - start[m]);
+            if next >= bound {
+                break next;
+            }
+        };
+        at[m] = i;
+    }
 }
 
 // Cold path, once per movie.
@@ -2606,5 +2724,93 @@ mod tests {
         let tail = [(10, 8, 17), (12, 9, 18), (14, 10, 19), (16, 11, 20)];
         assert_eq!(got, [&want[..], &tail[..]].concat());
         assert_eq!(out.committed(), 8 * size_of::<Sample>());
+    }
+
+    /// Per track runs of an interleaved file, chunks of 1 to 20 samples dealt to the tracks at
+    /// random, empty samples among them, the chunks of `shuffled` stored out of file order.
+    // Test setup.
+    #[allow(clippy::disallowed_methods)]
+    fn interleaved(
+        tracks: usize,
+        chunks: usize,
+        seed: u64,
+        shuffled: Option<usize>,
+    ) -> Vec<Sample> {
+        let mut x = seed | 1;
+        let mut next = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut per: Vec<Vec<Vec<Sample>>> = vec![Vec::new(); tracks];
+        // a negative first DTS, as an edit that trims the composition lead leaves
+        let (mut offset, mut dts) = (4096u64, vec![-3i64; tracks]);
+        for _ in 0..chunks {
+            let t = next(tracks as u64) as usize;
+            let mut chunk = Vec::new();
+            for _ in 0..1 + next(20) {
+                let size = next(4) as u32 * next(3000) as u32;
+                let s = Sample {
+                    track_index: t as u16,
+                    offset,
+                    size,
+                    dts: dts[t],
+                    pts: dts[t] + 2,
+                    sync: next(10) == 0,
+                    hidden: false,
+                };
+                chunk.push(s);
+                (offset, dts[t]) = (offset + u64::from(size), dts[t] + 1 + next(3) as i64);
+            }
+            per[t].push(chunk);
+        }
+        if let Some(t) = shuffled.filter(|&t| per[t].len() > 2) {
+            let n = per[t].len();
+            per[t].swap(0, n - 1);
+            per[t].swap(1, n / 2);
+        }
+        // largest last, as the fold orders them
+        per.sort_by_key(|c| c.iter().map(Vec::len).sum::<usize>());
+        per.into_iter().flatten().flatten().collect()
+    }
+
+    // Test setup.
+    #[allow(clippy::disallowed_methods)]
+    fn runs_of(samples: &[Sample]) -> Vec<Range<usize>> {
+        let mut runs: Vec<Range<usize>> = Vec::new();
+        for (i, s) in samples.iter().enumerate() {
+            match runs.last_mut() {
+                Some(r) if samples[r.start].track_index == s.track_index => r.end = i + 1,
+                _ => runs.push(i..i + 1),
+            }
+        }
+        runs
+    }
+
+    /// The merge of the per track runs is the order the whole index sort gave, past the merge's
+    /// run count too, and for a track whose chunks fall back in the file.
+    #[test]
+    fn the_merge_of_the_runs_is_the_old_sort() {
+        for (tracks, chunks, shuffled) in [
+            (1, 50, None),
+            (2, 400, None),
+            (3, 2000, None),
+            (3, 2000, Some(1)),
+            (5, 3000, Some(0)),
+            (MERGE_RUNS, 4000, None),
+            (MERGE_RUNS + 3, 4000, Some(2)),
+        ] {
+            for seed in [1, 7, 0x9E37_79B9] {
+                let mut got = interleaved(tracks, chunks, seed, shuffled);
+                let mut want = got.clone();
+                want.sort_unstable_by_key(|s| (s.offset, s.track_index, s.dts));
+                let runs = runs_of(&got);
+                merge_runs(&mut got, &runs);
+                assert!(got == want, "{tracks} tracks, {chunks} chunks, seed {seed}");
+            }
+        }
+        let mut empty: [Sample; 0] = [];
+        merge_runs(&mut empty, &[]);
     }
 }

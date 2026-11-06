@@ -16,6 +16,7 @@ pub mod extras;
 pub mod index;
 pub mod inflate;
 pub mod mux_multi;
+pub mod parsed;
 pub(crate) mod pull;
 pub mod reader;
 pub mod tags;
@@ -40,6 +41,7 @@ pub use extras::{
 pub use index::{CAPTION_REACH, audio_lead, cue_entries, key_track};
 pub use inflate::InflateError;
 pub use mux_multi::MkvMuxN;
+pub use parsed::Parsed;
 pub use reader::{
     Cue, CueIndex, CuedBlock, CuesAt, Frame, MatroskaReader, PTS_NONE, SeekHeadInfo, Track,
     cluster_timestamp, cued_block, cues_demand, parse_cue_tracks, parse_cues, parse_seek_head,

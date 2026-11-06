@@ -8,13 +8,13 @@ pub mod idx1;
 pub mod index;
 pub mod riff;
 
-pub use codec::{EMITS, family_for, offers_for};
+pub use codec::{EMITS, family_for, offers_for, vol_prefix};
 pub use element::AviDemux;
 pub use idx1::{Idx1At, Idx1Body};
 pub use index::AviIndex;
 pub use riff::{
     AviError, AviHeader, Idx1, Idx1Entry, MediaChunk, MoviLocation, MoviWalker, Stream, StreamKind,
-    parse_idx1, probe_header,
+    first_chunk_of, parse_idx1, probe_header,
 };
 
 use pf_registry::{Elements, Registry};

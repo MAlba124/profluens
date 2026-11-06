@@ -10,7 +10,7 @@ pub use aacenc::{LavAacError, LibavAacEnc};
 pub use audio::{LavAudioError, LibavAudioDec};
 pub use video::{
     LavVideoError, LibavFlv1Dec, LibavH264Dec, LibavH265Dec, LibavMpeg2Dec, LibavMpeg4Dec,
-    LibavVp6Dec, LibavVp6aDec, LibavVp6fDec, LibavVp7Dec, LibavVp8Dec, LibavVp9Dec,
+    LibavTheoraDec, LibavVp6Dec, LibavVp6aDec, LibavVp6fDec, LibavVp7Dec, LibavVp8Dec, LibavVp9Dec,
 };
 
 use pf_registry::{Elements, Registry};
@@ -27,6 +27,7 @@ pub static ELEMENTS: Elements = &[
     &video::VP6F_DESC,
     &video::VP6A_DESC,
     &video::VP7_DESC,
+    &video::THEORA_DESC,
     &audio::AAC_DESC,
     &audio::AC3_DESC,
     &audio::MP3_DESC,
@@ -35,6 +36,7 @@ pub static ELEMENTS: Elements = &[
     &audio::MLP_DESC,
     &audio::VORBIS_DESC,
     &audio::ALAC_DESC,
+    &audio::SPEEX_DESC,
     &aacenc::DESC,
 ];
 

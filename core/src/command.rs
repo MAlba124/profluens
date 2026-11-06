@@ -1,4 +1,5 @@
 use std::fmt;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64 as Plain};
 use std::sync::{Arc, TryLockError};
 
@@ -272,6 +273,24 @@ fn relock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// What a queued [`Control::edit_then`] owes: its callback, queued, dropped unrun.
+type Owed<F> = Arc<Mutex<(Option<F>, bool, bool)>>;
+
+/// Held by a queued edit, one dropped unrun answers `Finished` once it is queued.
+struct Unanswered<T, F: FnOnce(Result<T, CommandError>)>(Owed<F>, PhantomData<fn() -> T>);
+
+impl<T, F: FnOnce(Result<T, CommandError>)> Drop for Unanswered<T, F> {
+    fn drop(&mut self) {
+        let mut o = relock(&self.0);
+        o.2 = true;
+        let done = if o.1 { o.0.take() } else { None };
+        drop(o);
+        if let Some(d) = done {
+            d(Err(CommandError::Finished));
+        }
+    }
+}
+
 impl Control {
     // One per pipeline.
     #[allow(clippy::disallowed_methods)]
@@ -522,15 +541,47 @@ impl Control {
     }
 
     /// Run `edit` on the pipeline on the `run()` thread and wait for its result.
-    // One box per edit, off the media path.
+    // One channel per edit, off the media path.
     #[allow(clippy::disallowed_methods)]
     pub fn edit<T: Send + 'static>(
         &self,
         edit: impl FnOnce(&mut Pipeline) -> T + Send + 'static,
     ) -> Result<T, CommandError> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.topology.push_edit(Box::new(move |p| drop(tx.send(edit(p)))))?;
-        rx.recv().map_err(|_| CommandError::Finished)
+        self.edit_then(edit, move |r| drop(tx.send(r)));
+        rx.recv().unwrap_or(Err(CommandError::Finished))
+    }
+
+    /// Queue `edit` for the `run()` thread and return at once. `done` runs exactly once: on the
+    /// run thread with the result, with `Finished` where the run drops it unrun, here with the
+    /// refusal when it cannot be queued.
+    // One box and one cell per edit, off the media path.
+    #[allow(clippy::disallowed_methods)]
+    pub fn edit_then<T: Send + 'static, F>(
+        &self,
+        edit: impl FnOnce(&mut Pipeline) -> T + Send + 'static,
+        done: F,
+    ) where
+        F: FnOnce(Result<T, CommandError>) + Send + 'static,
+    {
+        let owed: Owed<F> = Arc::new(Mutex::new((Some(done), false, false)));
+        let guard = Unanswered(Arc::clone(&owed), PhantomData);
+        let queued = self.topology.push_edit(Box::new(move |p| {
+            let t = edit(p);
+            let done = relock(&guard.0).0.take();
+            if let Some(d) = done {
+                d(Ok(t));
+            }
+        }));
+        // a refused edit was dropped unqueued, one dropped since by an ended run too
+        let mut o = relock(&owed);
+        o.1 = true;
+        let why = queued.err().or(o.2.then_some(CommandError::Finished));
+        let done = why.and_then(|e| o.0.take().map(|d| (d, e)));
+        drop(o);
+        if let Some((d, e)) = done {
+            d(Err(e));
+        }
     }
 
     pub(crate) fn append_with(
@@ -651,14 +702,14 @@ impl Control {
                 }
             }
             Command::Pause => {
-                // Frozen before the flag, so a reader that sees the flag reads this pause's time.
+                // Frozen before the flag for a reader that sees it, none until the run has a clock.
                 let live = crate::time::running_time(now.0, self.base.load(Ordering::Acquire));
-                self.frozen.store(live.0, Ordering::Release);
+                self.frozen.store(w.clock.as_ref().map_or(u64::MAX, |_| live.0), Ordering::Release);
                 self.paused.store(true, Ordering::Release);
             }
             Command::Resume => {
-                // The base before the flag, as for a pause.
-                if self.base.load(Ordering::Acquire) != crate::time::BASE_UNSET {
+                // The base before the flag, as for a pause. With no clock yet the built base stays.
+                if w.clock.is_some() {
                     self.rebase(now, Timestamp(self.frozen.load(Ordering::Acquire)));
                 }
                 self.paused.store(false, Ordering::Release);
@@ -969,6 +1020,38 @@ mod tests {
         got
     }
 
+    /// An edit queued without waiting answers exactly once: its refusal at once before a run
+    /// serves, its result once the run thread takes it, `Finished` when the run ends first.
+    #[test]
+    fn an_edit_then_answers_once_run_or_dropped_with_its_pipeline() {
+        let control = Control::new(Arc::new(AtomicI64::new(0)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let answer = |tx: &std::sync::mpsc::Sender<_>| {
+            let tx = tx.clone();
+            move |r| {
+                let _ = tx.send(r);
+            }
+        };
+        control.edit_then(|_: &mut Pipeline| 1, answer(&tx));
+        assert_eq!(rx.try_recv(), Ok(Err(CommandError::NotRunning)), "no run serves edits");
+        let serving = Arc::clone(&control);
+        std::thread::spawn(move || serving.topology.serve(true)).join().unwrap();
+        control.edit_then(|_: &mut Pipeline| 2, answer(&tx));
+        assert!(rx.try_recv().is_err(), "queued, not answered");
+        let edit = control.topology.take_edit();
+        assert!(edit.is_some());
+        if let Some(e) = edit {
+            e(&mut Pipeline::new());
+        }
+        assert_eq!(rx.try_recv(), Ok(Ok(2)), "answered by the run thread");
+        control.edit_then(|_: &mut Pipeline| 3, answer(&tx));
+        control.topology.serve(false);
+        assert_eq!(rx.try_recv(), Ok(Err(CommandError::Finished)), "the run ended first");
+        assert!(rx.try_recv().is_err(), "each answered once");
+        // the blocking edit is the same path
+        assert_eq!(control.edit(|_: &mut Pipeline| 4), Err(CommandError::NotRunning));
+    }
+
     #[test]
     fn commands_come_back_in_append_order_with_their_payload() {
         let (control, cursors, _) = running(1);
@@ -1132,6 +1215,29 @@ mod tests {
         clock.advance(MS(20));
         assert_eq!(control.append(Command::Resume), Ok(2));
         assert_eq!(base.load(Ordering::Acquire), 25_000_000);
+    }
+
+    // A resume between the run's base and its clock once shifted the base by the 2^63 a
+    // clockless pause froze, and every join after it started near i64::MAX.
+    #[test]
+    fn a_resume_while_the_run_starts_leaves_the_base_on_the_runs_clock() {
+        let base = Arc::new(AtomicI64::new(crate::time::BASE_UNSET));
+        let control = Control::new(Arc::clone(&base));
+        assert_eq!(control.append(Command::Pause), Ok(0));
+        let clock = MockClock::starting_at(MS(5));
+        base.store(crate::time::base_from_clock(clock.now()), Ordering::Release);
+        assert!(control.running(clock.now()).is_none(), "no run time frozen yet");
+        assert_eq!(control.append(Command::Resume), Ok(1));
+        assert_eq!(base.load(Ordering::Acquire), 5_000_000, "the base as the run built it");
+
+        let stations = vec![Arc::new(Station::new())];
+        let (cursors, _) = control.begin_run(Arc::new(clock.clone()), stations, &[true], false);
+        assert!(!control.is_paused(), "the resume holds for the run");
+        assert!(drain(&control, &cursors[0]).is_empty());
+        assert_eq!(base.load(Ordering::Acquire), 5_000_000);
+        assert_eq!(control.running(clock.now()), MS(0));
+        clock.advance(MS(20));
+        assert_eq!(control.running(clock.now()), MS(20));
     }
 
     #[test]

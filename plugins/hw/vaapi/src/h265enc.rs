@@ -314,6 +314,14 @@ impl VaapiH265Enc {
         self
     }
 
+    /// Frames of a `video/gpu` input pass at most this often, the rest are dropped.
+    pub fn with_max_fps(mut self, num: u32, den: u32) -> Self {
+        if let Some(g) = &mut self.gpu {
+            g.max_fps = (num, den.max(1));
+        }
+        self
+    }
+
     /// Constant-QP quantizer (0..51). The `qp` prop overrides.
     pub fn with_qp(mut self, qp: u8) -> Self {
         self.qp = qp.min(51);
@@ -538,6 +546,7 @@ impl VaapiH265Enc {
         );
         let lp = entrypoint == ffi::VAEntrypointEncSliceLP;
         log!(&*ctx, Level::Info, "entrypoint", low_power = lp, gpb = gpb, refs = refs);
+        self.stats.made(engine.surfaces_made(), 0);
         let (kbps, qp, gop) = (self.bitrate_kbps, self.qp, self.gop_len);
         log!(
             &*ctx,
@@ -645,34 +654,46 @@ impl VaapiH265Enc {
         let Some(f) = self.flight.pop() else {
             return Ok(true);
         };
-        let b = &mut self.bufs;
-        b.coded.clear();
-        if let (true, Some(s)) = (f.head, &self.session) {
-            b.coded.extend_from_slice(&s.seq_nals);
-        }
         // the map waits for the GPU
         let t = crate::stats::mark();
-        let read = f.coded.read_coded(&mut b.coded);
+        let map = f.coded.map_coded();
         if how == enc::How::Wait {
             self.stats.waited(t);
         }
         self.stats.frame();
-        if let Err(e) = read {
-            self.warn(ctx, K::Encode(e));
+        let Ok(map) = map.map_err(|e| self.warn(ctx, K::Encode(e))) else {
+            // its buffer goes, the session makes another
             return Ok(true);
-        }
-        if let (true, Some(sei)) = (f.stamp.key, self.session.as_ref().and_then(|s| s.sei.as_ref()))
-        {
-            insert_before_slices(&mut b.coded, sei);
-        }
-        log!(&*ctx, Level::Trace, "encoded", bytes = b.coded.len(), key = f.stamp.key);
+        };
+        let head: &[u8] = match (f.head, &self.session) {
+            (true, Some(s)) => &s.seq_nals,
+            _ => &[],
+        };
+        let sei = self.session.as_ref().and_then(|s| s.sei.as_deref()).filter(|_| f.stamp.key);
+        log!(&*ctx, Level::Trace, "encoded", bytes = head.len() + map.len(), key = f.stamp.key);
         self.frames += 1;
-        if self.hvcc {
-            b.conv.clear();
-            annexb_to_hvcc(&b.coded, &mut b.conv);
-            std::mem::swap(&mut b.coded, &mut b.conv);
+        if self.hvcc || sei.is_some() {
+            let b = &mut self.bufs;
+            b.coded.clear();
+            b.coded.extend_from_slice(head);
+            map.append_to(&mut b.coded);
+            if let Some(sei) = sei {
+                insert_before_slices(&mut b.coded, sei);
+            }
+            if self.hvcc {
+                b.conv.clear();
+                annexb_to_hvcc(&b.coded, &mut b.conv);
+                std::mem::swap(&mut b.coded, &mut b.conv);
+            }
+            self.staged.send_or_stage(&mut Self::pad(ctx), &mut b.coded, f.stamp)?;
+        } else {
+            self.staged.send_coded(&mut Self::pad(ctx), &[head], &map, f.stamp)?;
         }
-        self.staged.send_or_stage(&mut Self::pad(ctx), &mut self.bufs.coded, f.stamp)?;
+        match (map.unmap(), &mut self.session) {
+            (Ok(()), Some(s)) => s.engine.put_coded(f.coded),
+            (Ok(()), None) => {}
+            (Err(e), _) => self.warn(ctx, K::Encode(e)),
+        }
         Ok(true)
     }
 
@@ -751,8 +772,13 @@ impl VaapiH265Enc {
             let is_idr = s.gop_pos == 0;
             let rc = RcUpdate { dirty: self.rc_dirty, hrd_ms: self.hrd_ms, quality: self.quality };
             let (qp, kbps, gop) = (self.qp, self.bitrate_kbps, self.gop_len);
-            encode_one(display, s, fmt, qp, kbps, gop, is_idr, rc, input, &mut self.bufs)
-                .map(|q| (is_idr, q))
+            let made = s.engine.coded_made();
+            let surfaces = s.engine.surfaces_made();
+            let r = encode_one(display, s, fmt, qp, kbps, gop, is_idr, rc, input, &mut self.bufs);
+            let made = u64::from(s.engine.coded_made() - made);
+            self.stats.coded_bufs.fetch_add(made, std::sync::atomic::Ordering::Relaxed);
+            self.stats.made(s.engine.surfaces_made() - surfaces, 0);
+            r.map(|q| (is_idr, q))
         };
         let (is_idr, (coded, head)) = match result {
             Ok(v) => v,
@@ -802,17 +828,12 @@ fn encode_one(
     bufs: &mut FrameBufs,
 ) -> va::VaResult<(VaBuffer, bool)> {
     let surface = match input {
-        Input::Raw(data) => {
-            s.engine.upload(display, data, fmt.pixfmt)?;
-            None
-        }
-        Input::Surface(surface) => Some(surface),
+        Input::Raw(data) => s.engine.upload(display, data, fmt.pixfmt)?,
+        Input::Surface(surface) => surface,
     };
     let poc = s.gop_pos as i32; // POC == frames since the IDR (8.3.1)
     let brc = bitrate_kbps > 0;
-    let ctxva = s.engine.context();
-    let coded =
-        VaBuffer::new_empty(display, ctxva, ffi::VAEncCodedBufferType, s.engine.coded_buf_size())?;
+    let coded = s.engine.take_coded(display)?;
 
     let built = (|| {
         let engine = &s.engine;
@@ -848,7 +869,11 @@ fn encode_one(
     })();
     let queued = built.and_then(|()| bufs.queue(&s.engine, surface));
     bufs.hold.clear();
-    queued?;
+    if let Err(e) = queued {
+        // read out and kept, not destroyed unread, the next picture writes it over
+        enc::discard_coded(Some(&mut s.engine), coded);
+        return Err(e);
+    }
     Ok((coded, is_idr && s.packed_mask & ffi::VA_ENC_PACKED_HEADER_SEQUENCE == 0))
 }
 
@@ -1359,6 +1384,14 @@ impl VaapiH265Enc {
                 self.warn(ctx, K::NoGpuFrame { token: h.token });
                 continue;
             };
+            // the rate gate, a key the source or a seek asks for passes
+            let must = inbuf.flags.contains(BufferFlags::PREVIEW)
+                || inbuf.flags.contains(BufferFlags::INTRA);
+            if !self.gpu.as_mut().is_some_and(|g| g.keep(inbuf.pts, must)) {
+                drop(frame);
+                ctx.count_drop();
+                continue;
+            }
             // a session rebuilt reads its pictures first
             if !self.session_fits(fmt) {
                 self.finish_all(ctx)?;
@@ -1366,9 +1399,11 @@ impl VaapiH265Enc {
             if !self.ensure_session(ctx, fmt) {
                 continue; // warned inside
             }
+            // the driver pads a surface past the session's alignment (720 rows come as 736),
+            // a frame at least the session's coded size encodes, the picture is the session's
             let coded =
                 self.session.as_ref().map_or((0, 0), |s| (s.engine.coded_w, s.engine.coded_h));
-            if (frame.coded_w, frame.coded_h) != coded {
+            if frame.coded_w < coded.0 || frame.coded_h < coded.1 {
                 self.warn(
                     ctx,
                     K::CodedSize { coded: (frame.coded_w, frame.coded_h), session: coded },
@@ -1566,10 +1601,8 @@ impl Element for VaapiH265Enc {
                 }
             }
             Event::FlushStart => {
-                // read and dropped, iHD fails every picture after a coded buffer destroyed unread
                 for f in self.flight.drain() {
-                    let _ = f.coded.read_coded(&mut self.bufs.coded);
-                    self.bufs.coded.clear();
+                    enc::discard_coded(self.session.as_mut().map(|s| &mut s.engine), f.coded);
                 }
                 self.cadence.reset();
                 log!(&*ctx, Level::Debug, "flush", pending = self.staged.len());
@@ -1604,9 +1637,8 @@ impl Element for VaapiH265Enc {
     fn stop(&mut self, ctx: &mut Ctx) {
         // read and dropped before the session goes, as on a flush
         for f in self.flight.drain() {
-            let _ = f.coded.read_coded(&mut self.bufs.coded);
+            enc::discard_coded(None, f.coded);
         }
-        self.bufs.coded.clear();
         self.staged.discard();
         if let Some(g) = &mut self.gpu {
             g.stop();

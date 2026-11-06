@@ -693,6 +693,30 @@ impl MoviWalker {
     }
 }
 
+/// The data of the first chunk of stream `stream_index` in `movi`, the bytes behind the list's
+/// `movi` four-CC, cut where the slice ends. `rec ` lists are entered, other chunks stepped over.
+pub fn first_chunk_of(movi: &[u8], stream_index: usize) -> Option<&[u8]> {
+    let mut at = 0;
+    loop {
+        let w = movi.get(at..at + 8)?;
+        let id = [w[0], w[1], w[2], w[3]];
+        let size = u32::from_le_bytes([w[4], w[5], w[6], w[7]]) as usize;
+        if &id == b"LIST" {
+            let kind = movi.get(at + 8..at + 12)?;
+            at += if kind == b"rec " || kind == b"movi" { 12 } else { 8 + padded(size) };
+            continue;
+        }
+        if id[0].is_ascii_digit()
+            && id[1].is_ascii_digit()
+            && usize::from(id[0] - b'0') * 10 + usize::from(id[1] - b'0') == stream_index
+        {
+            let data = movi.get(at + 8..)?;
+            return Some(&data[..data.len().min(size)]);
+        }
+        at = at.checked_add(8 + padded(size))?;
+    }
+}
+
 fn find_next_chunk_id(window: &[u8]) -> Option<usize> {
     window.windows(4).position(plausible_chunk_id)
 }
@@ -713,6 +737,22 @@ mod odml_tests {
         if body.len() & 1 == 1 {
             out.push(0);
         }
+    }
+
+    #[test]
+    fn the_first_chunk_of_a_stream_is_found_behind_lists_and_cut_at_the_slice() {
+        let mut b = Vec::new();
+        chunk(&mut b, b"JUNK", &[0; 6]);
+        chunk(&mut b, b"01wb", b"audio");
+        b.extend_from_slice(b"LIST   rec ");
+        chunk(&mut b, b"01wb", b"more");
+        chunk(&mut b, b"00dc", b"picture");
+        assert_eq!(first_chunk_of(&b, 0), Some(&b"picture"[..]));
+        assert_eq!(first_chunk_of(&b, 1), Some(&b"audio"[..]));
+        assert_eq!(first_chunk_of(&b, 2), None);
+        let cut = &b[..b.len() - 5];
+        assert_eq!(first_chunk_of(cut, 0), Some(&b"pic"[..]), "cut where the slice ends");
+        assert_eq!(first_chunk_of(&b[..b.len() - 13], 0), None, "its header past the slice");
     }
 
     #[test]

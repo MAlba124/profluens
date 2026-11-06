@@ -1,4 +1,4 @@
-//! Codec identification headers on an Ogg bos page, Opus, Vorbis and Speex.
+//! Codec identification headers on an Ogg bos page, Opus, Vorbis, Speex and Theora.
 
 /// The Opus identification header (RFC 7845 section 5.1), as much of it as a container needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +94,74 @@ pub fn parse_speex_head(packet: &[u8]) -> Option<SpeexHead> {
     let sample_rate = u32::try_from(le32(SPEEX_RATE_AT)).ok().filter(|&r| r > 0)?;
     let channels = u8::try_from(le32(SPEEX_CHANNELS_AT)).ok().filter(|&c| c > 0)?;
     Some(SpeexHead { sample_rate, channels })
+}
+
+const SPEEX_FRAME_SIZE_AT: usize = 56;
+
+const SPEEX_FRAMES_PER_PACKET_AT: usize = 64;
+
+/// The samples in each packet of the Speex stream whose identification header is `packet`,
+/// `frames_per_packet` frames of `frame_size` (Speex manual section 7.3, Table 7.1).
+pub fn speex_packet_samples(packet: &[u8]) -> Option<u32> {
+    parse_speex_head(packet)?;
+    let le32 = |at: usize| {
+        let b = &packet[at..at + 4];
+        u32::try_from(i32::from_le_bytes([b[0], b[1], b[2], b[3]])).ok()
+    };
+    let samples = le32(SPEEX_FRAME_SIZE_AT)?.checked_mul(le32(SPEEX_FRAMES_PER_PACKET_AT)?)?;
+    (samples > 0).then_some(samples)
+}
+
+/// The Theora identification header (Theora I spec section 6.2), as much of it as a container
+/// needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TheoraIdent {
+    /// The picture region, the visible part of the coded frame.
+    pub width: u32,
+    pub height: u32,
+    /// Frames `fps_num` over `fps_den` seconds, neither zero.
+    pub fps_num: u32,
+    pub fps_den: u32,
+    /// KFGSHIFT, the bits of a granule position counting frames since the last keyframe.
+    pub shift: u8,
+    /// 1 where a granule counts from frame 0 (bitstream versions before 3.2.1), 0 where it
+    /// counts frames through its own (Theora I section A.2.3).
+    pub lag: u64,
+}
+
+const THEORA_IDENT_LEN: usize = 42;
+
+/// Parse a Theora identification header packet (Theora I spec section 6.2, Figure 6.2).
+pub fn parse_theora_ident(packet: &[u8]) -> Option<TheoraIdent> {
+    let p = packet.strip_prefix(b"\x80theora").filter(|_| packet.len() >= THEORA_IDENT_LEN)?;
+    // A major version other than 3 or a later minor is a stream this spec does not read.
+    if p[0] != 3 || p[1] > 2 {
+        return None;
+    }
+    let be24 = |at: usize| u32::from_be_bytes([0, p[at], p[at + 1], p[at + 2]]);
+    let be32 = |at: usize| u32::from_be_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]]);
+    let id = TheoraIdent {
+        width: be24(7),
+        height: be24(10),
+        fps_num: be32(15),
+        fps_den: be32(19),
+        shift: (p[33] & 0x03) << 3 | p[34] >> 5,
+        lag: u64::from((p[1], p[2]) < (2, 1)),
+    };
+    (id.width > 0 && id.height > 0 && id.fps_num > 0 && id.fps_den > 0).then_some(id)
+}
+
+/// The frames through the one a Theora granule names, the keyframe's number plus the frames since
+/// it plus `lag` (Theora I section A.2.3).
+pub fn theora_frames(granule: u64, shift: u8, lag: u64) -> u64 {
+    let since = granule & ((1u64 << shift) - 1);
+    (granule >> shift).saturating_add(since).saturating_add(lag)
+}
+
+/// The frames before the keyframe a Theora granule's frame decodes from, `None` for a granule
+/// naming no frame, a header page's 0 at version 3.2.1.
+pub fn theora_keyframe(granule: u64, shift: u8, lag: u64) -> Option<u64> {
+    (granule >> shift).saturating_add(lag).checked_sub(1)
 }
 
 /// Every family a stream goes out as, skeleton streams are skipped.
@@ -358,6 +426,19 @@ mod tests {
     }
 
     #[test]
+    fn a_speex_packet_holds_frames_per_packet_frames() {
+        let mut head = speex_head(16_000, 1, 0);
+        assert_eq!(speex_packet_samples(&head), Some(320));
+        head[SPEEX_FRAMES_PER_PACKET_AT] = 3;
+        assert_eq!(speex_packet_samples(&head), Some(960));
+        for bad in [0i32, -1] {
+            head[SPEEX_FRAME_SIZE_AT..SPEEX_FRAME_SIZE_AT + 4].copy_from_slice(&bad.to_le_bytes());
+            assert_eq!(speex_packet_samples(&head), None, "frame size {bad}");
+        }
+        assert_eq!(speex_packet_samples(b"OpusHead\x01\x02"), None);
+    }
+
+    #[test]
     fn rejects_bad_speex_head() {
         assert!(parse_speex_head(&speex_head(0, 1, 0)).is_none()); // zero rate
         assert!(parse_speex_head(&speex_head(16_000, 0, 0)).is_none()); // zero channels
@@ -372,6 +453,54 @@ mod tests {
         for n in 0..full.len() {
             assert!(parse_speex_head(&full[..n]).is_none(), "truncated to {n} must not parse");
         }
+    }
+
+    /// 160x120 coded as 160x128 at 15/1, KFGSHIFT 6, as libtheora 1.1 writes it.
+    fn theora_ident(minor: u8, rev: u8) -> Vec<u8> {
+        let mut h = b"\x80theora".to_vec();
+        h.extend_from_slice(&[3, minor, rev, 0, 10, 0, 8, 0, 0, 160, 0, 0, 120, 0, 0]);
+        h.extend_from_slice(&15u32.to_be_bytes());
+        h.extend_from_slice(&1u32.to_be_bytes());
+        h.extend_from_slice(&[0, 0, 1, 0, 0, 1, 0, 0, 0, 0]);
+        // QUAL 48 and the top two bits of KFGSHIFT, then its low three
+        h.extend_from_slice(&[48 << 2, 6 << 5]);
+        h
+    }
+
+    #[test]
+    fn parses_theora_ident() {
+        let id = parse_theora_ident(&theora_ident(2, 1)).expect("valid ident");
+        let want =
+            TheoraIdent { width: 160, height: 120, fps_num: 15, fps_den: 1, shift: 6, lag: 0 };
+        assert_eq!(id, want);
+        assert_eq!(parse_theora_ident(&theora_ident(2, 0)).map(|i| i.lag), Some(1));
+        assert_eq!(parse_theora_ident(&theora_ident(1, 9)).map(|i| i.lag), Some(1));
+        assert!(parse_theora_ident(&theora_ident(3, 0)).is_none(), "a later minor version");
+        let full = theora_ident(2, 1);
+        for n in 0..full.len() {
+            assert!(parse_theora_ident(&full[..n]).is_none(), "truncated to {n} must not parse");
+        }
+        for at in [22, 26] {
+            let mut zero = full.clone();
+            zero[at..at + 4].fill(0);
+            assert!(parse_theora_ident(&zero).is_none(), "a zero frame rate term at {at}");
+        }
+    }
+
+    #[test]
+    fn a_theora_granule_names_its_frame_and_its_keyframe() {
+        // the keyframe at count 13 and the 11 frames behind it, through count 24
+        assert_eq!(theora_frames(13 << 6 | 11, 6, 0), 24);
+        assert_eq!(theora_keyframe(13 << 6 | 11, 6, 0), Some(12), "12 frames before it");
+        assert_eq!(theora_frames(25 << 6, 6, 0), 25, "a keyframe's own page");
+        assert_eq!(theora_keyframe(25 << 6, 6, 0), Some(24));
+        // a 3.2.0 granule counts from frame 0, keyframe index 12 is the 13th frame
+        assert_eq!(theora_frames(12 << 6 | 11, 6, 1), 24);
+        assert_eq!(theora_keyframe(12 << 6 | 11, 6, 1), Some(12));
+        assert_eq!(theora_keyframe(0, 6, 0), None, "a header page");
+        assert_eq!(theora_keyframe(0, 6, 1), Some(0), "the first frame of a 3.2.0 stream");
+        assert_eq!(theora_frames(7, 0, 0), 7, "no shift, every frame a keyframe");
+        assert_eq!(theora_frames(u64::MAX, 0, 1), u64::MAX, "saturates");
     }
 
     #[test]

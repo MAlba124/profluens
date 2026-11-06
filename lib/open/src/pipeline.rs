@@ -10,7 +10,7 @@ use pf_avi::AviDemux;
 use pf_bare::BareSrc;
 use pf_flv::FlvDemux;
 use pf_mkv::MkvDemux;
-use pf_mp4::Mp4Demux;
+use pf_mp4::{Limits, Mp4Demux, Mp4Reader};
 use pf_ogg::OggDemux;
 use profluens_core::error::Error;
 use profluens_core::id::{ElementId, SinkPad, SrcPad};
@@ -23,7 +23,10 @@ use crate::{Index, Kind, Opened, TrackDesc, TrackKind};
 /// coded 4K frame of 10 MB stalls the default 8 MB.
 pub const DEMUX_BYTES: u64 = 64 << 20;
 const POOL_SLOT: usize = 128 << 10;
-const POOL_SLOTS: u32 = 64;
+/// Buffers out at once. A sink holding a window of small frames read ahead, 20 ms audio for a
+/// few seconds, took all of 64 and left the demuxer none for its next read, the bytes bound
+/// the memory.
+const POOL_SLOTS: u32 = 1024;
 
 /// What [`demuxer`] refuses.
 #[derive(Clone, Debug)]
@@ -69,8 +72,9 @@ impl Out {
 
 /// `filesrc ! demuxer` for `o`, or the `baresrc` that reads a bare file itself for a decoder (see
 /// [`BareSrc::for_decoder`]), the element the tracks come out of. The demuxer starts from the
-/// head, the Cues, the idx1 index and the duration the open read, so it reads none of them. A
-/// `held` Matroska demuxer reads nothing until the seek that follows its start.
+/// head, the Cues, the idx1 index, the MP4 tables and the duration the open read, so it reads
+/// and folds none of them, a Matroska one parses no head. A `held` Matroska demuxer reads nothing
+/// until the seek that follows its start.
 pub fn demuxer(
     p: &mut Pipeline,
     file: File,
@@ -83,23 +87,32 @@ pub fn demuxer(
             return Ok(p.add(BareSrc::new(file, (**h).clone(), o.len).for_decoder()));
         }
         (Kind::Mkv, index) => {
+            let d = match index {
+                Index::Mkv(parsed) => MkvDemux::with_parsed(Arc::clone(parsed)),
+                _ => MkvDemux::with_shared_head(Arc::clone(&o.head)),
+            };
             // tags come from the open, attachments and chapters have no user
-            let mut d = MkvDemux::with_shared_head(Arc::clone(&o.head)).without_extras();
-            if let Index::Mkv { cues, at, .. } = index
-                && !cues.is_empty()
-            {
-                d = d.with_shared_cues(Arc::clone(cues), *at);
-            }
+            let mut d = d.without_extras();
             if held {
                 d = d.with_held_start();
             }
             (p.add(d), MkvDemux::IN)
         }
-        (Kind::Mp4, _) => (p.add(Mp4Demux::new(o.head.to_vec())), Mp4Demux::IN),
+        (Kind::Mp4, Index::Mp4(tables)) => {
+            (p.add(Mp4Demux::resolved(Mp4Reader::shared(Arc::clone(tables)))), Mp4Demux::IN)
+        }
+        (Kind::Mp4, _) => {
+            let limits = Limits { file_len: Some(o.len), ..Limits::default() };
+            (p.add(Mp4Demux::new(o.head.to_vec()).limits(limits)), Mp4Demux::IN)
+        }
         (Kind::Avi, index) => {
             let mut d = AviDemux::new(o.head.to_vec()).with_len(Some(o.len));
             if let Index::Avi(ix) = index {
                 d = d.with_index(Arc::clone(ix));
+            }
+            // the VOL the open read past the header, the demuxer sends it ahead of each start
+            for t in o.tracks.iter().filter(|t| t.family == "mpeg4/asp") {
+                d = d.with_codec_head(t.stream as usize, o.codec_head(t).to_vec());
             }
             (p.add(d), AviDemux::IN)
         }

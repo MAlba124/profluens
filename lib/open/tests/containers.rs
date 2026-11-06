@@ -40,6 +40,14 @@ fn a_faststart_mp4_head_is_the_window_cut_at_the_mdat() {
     assert!(a.delay_ns > 0, "the edit's priming");
     assert_eq!((o.language(a), o.duration_ns), ("und", 1_000 * MS));
     assert!(matches!(o.meta, Meta::Moov(_)));
+    let Index::Mp4(tables) = &o.index else { panic!("{:?}", o.index) };
+    assert_eq!(tables.tracks().len(), 2);
+    assert!(!tables.samples().is_empty() && tables.bytes() > tables.index_bytes());
+    // tracks only, no sample folded
+    let (tracks, _) = open_with(&b, Want::TRACKS, Caps::default());
+    let tracks = tracks.unwrap();
+    assert!(matches!(tracks.index, Index::None), "{:?}", tracks.index);
+    assert_eq!((tracks.tracks, tracks.arena), (o.tracks.clone(), o.arena.clone()));
     // a window short of the moov reads the rest past it
     let (small, log) = open_with(&b, Want::ALL, Caps { window: 100, ..Caps::default() });
     let small = small.unwrap();
@@ -104,13 +112,20 @@ fn an_avi_reads_its_idx1_once() {
     let mut want = Vec::new();
     let idx1 = reads(&mut Idx1At::new(movi.movi_end, b.len() as u64), &b, &mut want).unwrap();
     assert!(idx1.is_some());
+    // the XviD VOL, in the first key chunk only, is the video track's head
+    let vol = o.codec_head(v);
+    let first = pf_avi::first_chunk_of(&b[movi.movi_data_start as usize..], 0).unwrap();
+    assert_eq!(Some(vol), pf_avi::vol_prefix(first));
+    assert!(vol.starts_with(&[0, 0, 1, 0xB0]), "{vol:x?}");
     let caps = Caps { window: 4096, ..Caps::default() };
     let (o2, log) = open_with(&b, Want { index: false, meta: true }, caps);
-    assert_eq!(o2.unwrap().tracks, o.tracks);
-    assert!(log.len() <= fhs_avi(&b).len() + 1, "{log:?}");
+    assert_eq!(o2.unwrap().tracks, o.tracks, "the VOL read past the head too");
+    let vol_read = log.iter().filter(|n| n.at == movi.movi_data_start).count();
+    assert_eq!(vol_read, 1, "one read at movi for the VOL, {log:?}");
+    assert!(log.len() <= fhs_avi(&b).len() + 2, "{log:?}");
     let (_, log) = open_with(&b, Want::ALL, caps);
     assert!(
-        log.len() <= fhs_avi(&b).len() + 1 + want.len(),
+        log.len() <= fhs_avi(&b).len() + 2 + want.len(),
         "the idx1 the demuxer read moves here, {log:?}"
     );
 }

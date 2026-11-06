@@ -1,5 +1,8 @@
 //! Stream duration from the last page's granule position (RFC 3533 section 6, RFC 7845 section 4).
 
+use crate::ident::{
+    TheoraIdent, parse_speex_head, parse_theora_ident, theora_frames, theora_keyframe,
+};
 use crate::page::{CAPTURE_PATTERN, GRANULE_NONE, PageHeader};
 
 /// Opus granule positions count 48 kHz samples whatever the input rate (RFC 7845 section 4).
@@ -82,6 +85,8 @@ pub enum GranuleClock {
         pre_skip: u16,
     },
     Rate(u32),
+    /// Theora frames, a granule naming the end of its frame (Theora I section A.2.3).
+    Theora(TheoraIdent),
 }
 
 impl GranuleClock {
@@ -90,6 +95,7 @@ impl GranuleClock {
         match self {
             GranuleClock::Opus { pre_skip } => Some(opus_duration_ns(granule, pre_skip)),
             GranuleClock::Rate(rate) => vorbis_duration_ns(granule, rate),
+            GranuleClock::Theora(t) => Some(frames_ns(theora_frames(granule, t.shift, t.lag), t)),
         }
     }
 
@@ -98,9 +104,25 @@ impl GranuleClock {
     pub fn stamp(self, granule: u64) -> Option<u64> {
         match self {
             GranuleClock::Opus { .. } => Some(opus_duration_ns(granule, 0)),
-            GranuleClock::Rate(rate) => vorbis_duration_ns(granule, rate),
+            GranuleClock::Rate(_) | GranuleClock::Theora(_) => self.ns(granule),
         }
     }
+
+    /// Where the keyframe the frame at `granule` decodes from starts, nanoseconds, `None` for a
+    /// clock of no keyframes.
+    pub fn keyframe_ns(self, granule: u64) -> Option<u64> {
+        match self {
+            GranuleClock::Theora(t) => {
+                theora_keyframe(granule, t.shift, t.lag).map(|before| frames_ns(before, t))
+            }
+            GranuleClock::Opus { .. } | GranuleClock::Rate(_) => None,
+        }
+    }
+}
+
+fn frames_ns(frames: u64, t: TheoraIdent) -> u64 {
+    let ns = u128::from(frames) * NANOS_PER_SEC * u128::from(t.fps_den) / u128::from(t.fps_num);
+    ns.min(u64::MAX as u128) as u64
 }
 
 /// The clock of the stream whose identification packet is `bos`, `None` for another mapping.
@@ -110,6 +132,13 @@ pub fn granule_clock(bos: &[u8]) -> Option<GranuleClock> {
     }
     if let Some(id) = crate::ident::parse_vorbis_ident(bos) {
         return Some(GranuleClock::Rate(id.sample_rate));
+    }
+    // Speex granules count samples at the header's rate, its encoder lookahead not among them.
+    if let Some(id) = parse_speex_head(bos) {
+        return Some(GranuleClock::Rate(id.sample_rate));
+    }
+    if let Some(id) = parse_theora_ident(bos) {
+        return Some(GranuleClock::Theora(id));
     }
     flac_streaminfo(bos).map(|(rate, _)| GranuleClock::Rate(rate))
 }
@@ -360,5 +389,68 @@ mod tests {
         let mut tail = page(0, 48_000 * 10, 0x0A, 8, b"aud");
         tail.extend_from_slice(&page(flags::EOS, 90_000 * 60, 0x0B, 8, b"vid"));
         assert_eq!(stream_duration_ns(&opus_head(0), &tail, 0x0A), Some(10_000_000_000));
+    }
+
+    fn speex_head(rate: i32) -> Vec<u8> {
+        let mut h = crate::ident::SPEEX_MAGIC.to_vec();
+        h.extend_from_slice(&[0u8; 20]);
+        for field in [1, 80, rate, 1, 4, 1, 27_800, 320, 0, 1, 0, 0, 0] {
+            h.extend_from_slice(&i32::to_le_bytes(field));
+        }
+        h
+    }
+
+    /// Version 3.2.`rev`, frames `num` over `den` a second, KFGSHIFT `shift`.
+    fn theora(rev: u8, num: u32, den: u32, shift: u8) -> Vec<u8> {
+        let mut h = b"\x80theora".to_vec();
+        h.extend_from_slice(&[3, 2, rev, 0, 10, 0, 8, 0, 0, 160, 0, 0, 120, 0, 0]);
+        h.extend_from_slice(&num.to_be_bytes());
+        h.extend_from_slice(&den.to_be_bytes());
+        h.extend_from_slice(&[0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 48 << 2 | shift >> 3, shift << 5]);
+        h
+    }
+
+    #[test]
+    fn a_speex_granule_counts_samples_at_the_header_rate() {
+        const SERIAL: u32 = 0x5EE5;
+        let clock = granule_clock(&speex_head(16_000)).expect("Speex");
+        assert_eq!(clock, GranuleClock::Rate(16_000));
+        // ogg_speex.spx's last page, 143 samples of wideband lookahead short of 2 s
+        assert_eq!(clock.ns(31_857), Some(1_991_062_500));
+        assert_eq!(clock.stamp(31_857), clock.ns(31_857));
+        for target in [0, 991_062_500, 1_000_000_000, 1_999_999_999] {
+            let granule = target * 16_000 / 1_000_000_000;
+            assert!(clock.ns(granule) <= Some(target), "{target}");
+            assert!(clock.ns(granule + 1) > Some(target), "{target}");
+        }
+        let tail = page(flags::EOS, 31_857, SERIAL, 3, b"spx");
+        assert_eq!(stream_duration_ns(&speex_head(16_000), &tail, SERIAL), Some(1_991_062_500));
+        assert_eq!(clock.keyframe_ns(31_857), None, "audio has no keyframes");
+    }
+
+    #[test]
+    fn a_theora_granule_ends_its_frame_at_the_frame_rate() {
+        const SERIAL: u32 = 0x7EE0;
+        let clock = granule_clock(&theora(1, 15, 1, 6)).expect("Theora");
+        // ogg_theora_speex.ogv's pages, the first keyframe alone then the 11 frames behind it
+        assert_eq!(clock.ns(1 << 6), Some(66_666_666));
+        assert_eq!(clock.ns(1 << 6 | 11), Some(800_000_000));
+        assert_eq!(clock.keyframe_ns(1 << 6 | 11), Some(0));
+        // past a second keyframe, 13 frames through it and 11 behind
+        assert_eq!(clock.ns(13 << 6 | 11), Some(1_600_000_000));
+        assert_eq!(clock.keyframe_ns(13 << 6 | 11), Some(800_000_000));
+        assert_eq!(clock.keyframe_ns(13 << 6), Some(800_000_000), "a keyframe page");
+        assert_eq!(clock.stamp(13 << 6 | 11), clock.ns(13 << 6 | 11));
+        assert_eq!((clock.ns(0), clock.keyframe_ns(0)), (Some(0), None), "a header page");
+        let tail = page(flags::EOS, 25 << 6 | 5, SERIAL, 9, b"vid");
+        assert_eq!(stream_duration_ns(&theora(1, 15, 1, 6), &tail, SERIAL), Some(2_000_000_000));
+        // before 3.2.1 a granule names the frame's index, one short of the count through it
+        let old = granule_clock(&theora(0, 15, 1, 6)).expect("3.2.0");
+        assert_eq!(old.ns(12 << 6 | 11), Some(1_600_000_000));
+        assert_eq!(old.keyframe_ns(12 << 6 | 11), Some(800_000_000));
+        assert_eq!((old.ns(0), old.keyframe_ns(0)), (Some(66_666_666), Some(0)));
+        let ntsc = granule_clock(&theora(1, 30_000, 1_001, 5)).expect("NTSC");
+        assert_eq!(ntsc.ns(30 << 5), Some(1_001_000_000));
+        assert_eq!(ntsc.ns(u64::MAX), Some(u64::MAX), "saturates");
     }
 }

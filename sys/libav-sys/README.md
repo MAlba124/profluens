@@ -1,6 +1,6 @@
 # libav-sys
 
-Static FFI to a subset of FFmpeg's libavcodec and libavutil, twenty decoders and the
+Static FFI to a subset of FFmpeg's libavcodec and libavutil, twenty-two decoders and the
 native AAC encoder behind a flat C shim that pf owns. FFmpeg is the git submodule `ffmpeg/`, `build.rs` compiles the
 files of those decoders out of it. `pf-libav` is the only user.
 
@@ -9,7 +9,8 @@ files of those decoders out of it. `pf-libav` is the only user.
 - Release **9.0.2**, tag `n9.0.2`, commit `946fcce07b6dcd0331c8cc609192aeff5e1924f8`,
   the submodule `ffmpeg/` from `https://git.ffmpeg.org/ffmpeg.git`, unpatched.
 - Decoders `h264`, `hevc`, `vp8`, `vp9`, `mpeg2video`, `mpeg4` (with the `h263` it selects), `aac`, `ac3`, `eac3`, `mp3float`,
-  `dca`, `truehd`, `mlp`, `vorbis`, `alac`, `flv`, `vp6`, `vp6f`, `vp6a`, `vp7`, parsers `h264`, `hevc`, `vp8`, `vp9`, `mpegvideo`, `aac`, `ac3`,
+  `dca`, `truehd`, `mlp`, `vorbis`, `alac`, `flv`, `vp6`, `vp6f`, `vp6a`, `vp7`, `theora`
+  (with the `vp3` it selects), `speex`, parsers `h264`, `hevc`, `vp8`, `vp9`, `mpegvideo`, `aac`, `ac3`,
   `mpegaudio`, `dca`, `mlp`, the `vp9_superframe_split` bsf the
   vp9 decoder selects, and the encoder `aac` (AAC-LC, FFmpeg's own).
 - MPEG-1 video and MPEG audio layers I and II need no decoder of their own. `mpeg2video` reads
@@ -59,7 +60,7 @@ configure --cc=clang --target-os=linux --arch=x86_64 --enable-pic \
   --disable-avdevice --disable-avformat --disable-avfilter --disable-swscale \
   --disable-swresample --disable-network --disable-iconv --disable-debug \
   --disable-symver --disable-pixelutils \
-  --enable-decoder=h264,hevc,vp8,vp9,aac,ac3,eac3,mp3float,dca,truehd,mlp,mpeg2video,mpeg4,vorbis,alac,flv,vp6,vp6f,vp6a,vp7 \
+  --enable-decoder=h264,hevc,vp8,vp9,aac,ac3,eac3,mp3float,dca,truehd,mlp,mpeg2video,mpeg4,vorbis,alac,flv,vp6,vp6f,vp6a,vp7,theora,speex \
   --enable-parser=h264,hevc,vp8,vp9,aac,ac3,mpegaudio,dca,mlp,mpegvideo \
   --enable-encoder=aac
 ```

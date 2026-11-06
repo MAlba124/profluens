@@ -25,8 +25,9 @@ pub use duration::{
 };
 pub use element::{DEFAULT_SERIAL, DemuxError, OggDemux, OggMux};
 pub use ident::{
-    EMITS, Mapping, OpusHead, SPEEX_MAGIC, SpeexHead, VorbisIdent, flac_frame_samples,
-    opus_packet_samples, parse_opus_head, parse_speex_head, parse_vorbis_ident,
+    EMITS, Mapping, OpusHead, SPEEX_MAGIC, SpeexHead, TheoraIdent, VorbisIdent, flac_frame_samples,
+    opus_packet_samples, parse_opus_head, parse_speex_head, parse_theora_ident, parse_vorbis_ident,
+    speex_packet_samples,
 };
 pub use mux_multi::{MuxError, OggMuxN};
 

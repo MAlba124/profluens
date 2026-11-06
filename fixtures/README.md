@@ -29,6 +29,8 @@ FFMPEG=/path/to/ffmpeg cargo xtask fixtures   # FFPROBE likewise, else the ffpro
 | `mp4_h264_nofaststart.mp4`  | **negative** — moov *after* mdat                   |
 | `ogg_flac.oga`              | FLAC-in-Ogg                                         |
 | `ogg_vorbis.ogg`            | Vorbis-in-Ogg                                       |
+| `ogg_speex.spx`             | Speex-in-Ogg, 16 kHz wideband, 2 s                  |
+| `ogg_theora_speex.ogv`      | Theora 160x120 at 15 fps + Speex in Ogg, 2 s        |
 | `audio.mp3`                 | MP3, 44.1 kHz stereo CBR                            |
 | `audio.flac`                | FLAC (native)                                       |
 | `audio.wav`                 | WAV, s16le PCM                                      |

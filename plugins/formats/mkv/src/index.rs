@@ -32,15 +32,29 @@ pub fn audio_lead(track: &Track, tick: u64) -> u64 {
     lead.pre_roll.saturating_add(lead.packet).saturating_add(tick)
 }
 
-// Cold path, once per stream and link change.
-#[allow(clippy::disallowed_methods)]
 pub fn cue_entries(
     cues: &[Cue],
     tracks: &[Track],
     linked: &dyn Fn(u64) -> bool,
     tick: u64,
 ) -> Vec<IndexEntry> {
+    let (spans, left_out) = captions(cues, tracks);
     let key = key_track(cues, tracks);
+    cue_entries_of(cues, tracks, (&spans, &left_out), key, linked, tick)
+}
+
+/// [`cue_entries`] from the [`captions`] and the [`key_track`] of `cues`, which the linked
+/// tracks leave as they are.
+// Cold path, once per linked set.
+#[allow(clippy::disallowed_methods)]
+pub fn cue_entries_of(
+    cues: &[Cue],
+    tracks: &[Track],
+    (spans, left_out): (&[CaptionSpan], &[u64]),
+    key: Option<u64>,
+    linked: &dyn Fn(u64) -> bool,
+    tick: u64,
+) -> Vec<IndexEntry> {
     let mut keys: Vec<(u64, u64)> = cues
         .iter()
         .filter(|c| key.is_none_or(|k| c.track == k))
@@ -63,7 +77,6 @@ pub fn cue_entries(
             (own, audio_lead(t, tick))
         })
         .collect();
-    let (spans, left_out) = captions(cues, tracks);
     let mut captions: Vec<(u64, u64, u64)> = spans
         .iter()
         .filter(|c| linked(c.0))
@@ -155,6 +168,41 @@ pub fn captions(cues: &[Cue], tracks: &[Track]) -> (Vec<CaptionSpan>, Vec<u64>) 
         }
     }
     (spans, left_out)
+}
+
+/// A caption cue as `(track, start, end)`.
+pub(crate) type CueEnd = (u64, u64, Option<u64>);
+
+/// Every cue of every caption track by track then start, ending at its CueDuration, else at its
+/// track's next cue. A track's last cue without a duration has no end.
+// Cold path, once per Cues read.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn cue_ends(cues: &[Cue], tracks: &[Track]) -> Vec<CueEnd> {
+    let captions: Vec<u64> =
+        tracks.iter().filter(|t| is_caption(t)).map(|t| t.track_number).collect();
+    let mut ends: Vec<CueEnd> = cues
+        .iter()
+        .filter(|c| captions.contains(&c.track))
+        .map(|c| (c.track, c.time_ns, c.duration_ns.map(|d| c.time_ns.saturating_add(d))))
+        .collect();
+    ends.sort_unstable_by_key(|&(track, start, _)| (track, start));
+    ends.dedup_by_key(|&mut (track, start, _)| (track, start));
+    for i in 1..ends.len() {
+        let (track, start, _) = ends[i];
+        let prev = &mut ends[i - 1];
+        if prev.0 == track && prev.2.is_none() {
+            prev.2 = Some(start);
+        }
+    }
+    ends
+}
+
+/// The end of the caption cue of `track` at exactly `pts`. A block the Cues do not name has
+/// none, its next cue may not be its next block.
+pub(crate) fn cue_end(ends: &[CueEnd], track: u64, pts: u64) -> Option<u64> {
+    let at = ends.partition_point(|&(t, start, _)| (t, start) < (track, pts));
+    let &(t, start, end) = ends.get(at)?;
+    end.filter(|&end| t == track && start == pts && end > pts)
 }
 
 pub(crate) fn segment_end(header: &[u8]) -> Option<u64> {
@@ -382,6 +430,25 @@ mod tests {
         assert_eq!(at(4), (3_000, 40), "8 s, still up");
         assert_eq!(at(5), (5_000, 80), "10 s, the one from 9 replaced it, under the key at 8");
         assert_eq!(at(7), (5_000, 80), "14 s, the last one is up for the reach");
+    }
+
+    #[test]
+    fn a_caption_block_ends_at_its_tracks_next_cue_the_last_without_one() {
+        let (mut cues, mut tracks) = film(false);
+        tracks.push(track(3, "S_HDMV/PGS"));
+        tracks.push(track(4, "S_TEXT/UTF8"));
+        cues.push(cue(3, 55 * S / 10, 3_400, None));
+        cues.push(cue(3, 9 * S, 5_600, None));
+        cues.push(cue(4, 6 * S, 4_000, Some(S / 2)));
+        cues.push(cue(4, 7 * S, 4_500, None));
+        cues.sort_by_key(|c| c.time_ns);
+        let ends = cue_ends(&cues, &tracks);
+        assert_eq!(cue_end(&ends, 3, 55 * S / 10), Some(9 * S), "up until the next composition");
+        assert_eq!(cue_end(&ends, 3, 9 * S), None, "the last one");
+        assert_eq!(cue_end(&ends, 4, 6 * S), Some(65 * S / 10), "its CueDuration");
+        assert_eq!(cue_end(&ends, 4, 7 * S), None, "another track's cue is not its end");
+        assert_eq!(cue_end(&ends, 3, 6 * S), None, "a block the Cues do not name");
+        assert_eq!(cue_end(&ends, 1, 2 * S), None, "video is no caption");
     }
 
     /// A remux stores a bitmap block ahead of its time, so a caption starting between a key and

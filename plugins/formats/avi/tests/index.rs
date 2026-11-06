@@ -382,7 +382,10 @@ fn the_fixture_pulled_puts_out_what_it_puts_out_pushed() {
     let (pulled, index) = play(TINY, &data[..64 << 10], len, false);
     let (pushed, estimate) = play(TINY, &data[..64 << 10], len, true);
     assert_eq!(pulled.len(), 2);
-    assert_eq!(pulled[0].len(), 75, "every picture");
+    let header = profluens_core::buffer::BufferFlags::HEADER.0;
+    let head = pulled[0][0].as_ref().map(|r| r.1 & header != 0);
+    assert_eq!(head, Some(true), "the VOL ahead of the pictures");
+    assert_eq!(pulled[0].len(), 76, "every picture behind it");
     assert_eq!(pulled[1].len(), 87, "every audio frame");
     assert_eq!(pulled, pushed);
     assert!(estimate.entries.is_empty() && !estimate.complete);

@@ -7,7 +7,9 @@
 use std::sync::{Arc, Mutex};
 
 use pf_mkv::ebml;
-use pf_mkv::{MatroskaWriter, MkvDemux, TrackConfig, parse_cues, parse_seek_head};
+use pf_mkv::{
+    MatroskaWriter, MkvDemux, TrackConfig, parse_cue_tracks, parse_cues, parse_seek_head,
+};
 use profluens_core::batch::Inputs;
 use profluens_core::clock::{Clock, MockClock};
 use profluens_core::ctx::{Ctx, StreamKind};
@@ -18,7 +20,7 @@ use profluens_core::error::Error;
 use profluens_core::event::Event;
 use profluens_core::format::OfferDesc;
 use profluens_core::id::{ElementId, SinkPad, SrcPad};
-use profluens_core::log::DebugSpec;
+use profluens_core::log::{DebugSpec, Level, LogRecord, LogWriter};
 use profluens_core::pipeline::Pipeline;
 use profluens_core::sched::{Outcome, Stepped};
 use profluens_core::time::Timestamp;
@@ -181,10 +183,44 @@ struct Rig {
     flushes: Arc<Mutex<Vec<u64>>>,
 }
 
+/// Every track's cues of `stream`, as an open hands them to the demuxer.
+fn every_cue(stream: &[u8]) -> Vec<pf_mkv::Cue> {
+    let info = parse_seek_head(&header_of(stream)).expect("a SeekHead");
+    let at = (info.segment_data_start + info.cues_pos.expect("it names the Cues")) as usize;
+    parse_cue_tracks(&stream[at..], info.segment_data_start, info.timestamp_scale)
+}
+
+/// The events a run logged.
+#[derive(Default)]
+struct Events(Mutex<Vec<&'static str>>);
+
+impl Events {
+    fn count(&self, event: &str) -> usize {
+        self.0.lock().unwrap().iter().filter(|e| **e == event).count()
+    }
+}
+
+impl LogWriter for Events {
+    fn record(&self, rec: &LogRecord) {
+        self.0.lock().unwrap().push(rec.event);
+    }
+
+    fn line(&self, _level: Level, _msg: std::fmt::Arguments<'_>) {}
+}
+
 impl Rig {
     fn new(stream: &[u8]) -> Rig {
+        Rig::with(stream, MkvDemux::new(header_of(stream)), None)
+    }
+
+    fn with(stream: &[u8], demux: MkvDemux, events: Option<Arc<Events>>) -> Rig {
         let clock = MockClock::starting_at(Timestamp::from_secs(1));
-        let mut p = Pipeline::with(DebugSpec::default(), false, Arc::new(clock.clone()));
+        let mut p = Pipeline::with(DebugSpec::parse("debug"), false, Arc::new(clock.clone()));
+        if let Some(events) = events {
+            p.set_log_writer(events);
+        } else {
+            p.set_debug(DebugSpec::default());
+        }
         p.set_pool(4096, 32);
         p.set_select_all(false);
         let flushes = Arc::new(Mutex::new(Vec::new()));
@@ -194,7 +230,7 @@ impl Rig {
             stamp: Timestamp::NONE,
             flushes: Arc::clone(&flushes),
         };
-        let (src, demux) = (p.add(feed), p.add(MkvDemux::new(header_of(stream))));
+        let (src, demux) = (p.add(feed), p.add(demux));
         p.link(src.src(SrcPad(0)), demux.sink(MkvDemux::IN)).expect("feed -> demux");
         assert!(p.preroll().expect("preroll").srcs.is_empty(), "describing tracks adds no pad");
         Rig { p, clock, src, demux, flushes }
@@ -328,7 +364,7 @@ fn a_switch_keeps_the_captions_of_a_text_track_whose_last_lies_ahead_of_the_cue(
     let mut run = r.p.step(Arc::new(r.clock.clone())).expect("step");
     let played = Arc::clone(&first);
     assert!(!r.run(&mut run, || { stamps(&played).last().is_some_and(|ms| *ms >= 1_000) }));
-    assert_eq!(stamps(&text), [100], "the caption ahead of the switch");
+    assert!(stamps(&text).is_empty(), "the caption ahead of the switch waits for its end");
     let position = *stamps(&first).last().expect("played") * 1_000_000;
     let line = position - 21_333_334 - 1_000_000;
     let &(at, byte) =
@@ -368,4 +404,45 @@ fn a_switch_puts_out_a_caption_read_again_once() {
     assert!(r.run(&mut run, || false), "the run ends");
     run.finish().expect("finish");
     assert_eq!(stamps(&text), [800, 1_900], "once each");
+}
+
+/// The seek index of the Cues is computed once a set of linked tracks. A seek computes none, a
+/// link that changes the set computes it once, and one back to a set seen lately none. The
+/// captions are not computed again for any of them. What preroll logs is not handed to the
+/// writer, so the counts start at the start.
+#[test]
+fn the_cued_entries_are_computed_once_a_linked_set() {
+    let stream = movie_with_text(&[100, 1_900, 2_200]);
+    let cues = cues_of(&stream);
+    let events = Arc::new(Events::default());
+    let demux = MkvDemux::new(header_of(&stream)).with_cues(every_cue(&stream), None);
+    let mut r = Rig::with(&stream, demux, Some(Arc::clone(&events)));
+    let ((_, _video), (_, first), (text, _)) = (r.play(0), r.play(1), r.play(3));
+    let mut run = r.p.step(Arc::new(r.clock.clone())).expect("step");
+    let past = |ms: u64| {
+        let played = Arc::clone(&first);
+        move || stamps(&played).last().is_some_and(|at| *at >= ms)
+    };
+    assert!(!r.run(&mut run, past(600)));
+    let position = *stamps(&first).last().expect("played") * 1_000_000;
+    let &(at, byte) = cues.iter().rev().find(|(time, _)| *time <= position / 2).expect("a cue");
+    r.p.commit_at(Timestamp(at), &[(r.src, byte, Timestamp(at))]).expect("seek");
+    assert!(!r.run(&mut run, past(1_000)));
+    assert_eq!(*r.flushes.lock().unwrap(), [byte], "the seek went back");
+    assert_eq!(events.count("entries"), 1, "the set at start, none for the seek");
+    let entries = |r: &Rig| r.p.index(r.demux).expect("an index").entries.clone();
+    let all = entries(&r);
+    r.p.remove(text, Leave::Cut).expect("remove");
+    r.p.commit().expect("commit");
+    assert!(!r.run(&mut run, past(1_400)));
+    assert_eq!(events.count("entries"), 2, "the set without the captions");
+    assert_ne!(entries(&r), all, "the set without the captions is published");
+    let (_, _again) = r.play(3);
+    r.p.commit().expect("commit");
+    assert!(r.run(&mut run, || false), "the run ends");
+    run.finish().expect("finish");
+    assert_eq!(events.count("relink"), 2, "the captions unlinked and linked again");
+    assert_eq!(events.count("entries"), 2, "the set at start is kept");
+    assert_eq!(entries(&r), all, "the kept set is published again");
+    assert_eq!(events.count("captions"), 0, "the captions once at preroll");
 }

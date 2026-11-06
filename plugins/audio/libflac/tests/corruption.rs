@@ -6,7 +6,8 @@
 mod support;
 
 use pf_harness::Harness;
-use pf_libflac::{DecodeError, FlacDec, FlacDecoder, FlacEnc, FlacEncoder, OggFlacDeframe};
+use pf_libflac::{DecodeError, FlacDec, FlacDecoder, FlacEnc, FlacEncoder};
+use pf_libflac::{OggFlacDec, OggFlacDeframe};
 use pf_libflac::{SampleFormat, StreamDecoder};
 use pf_sim::corrupt::harness::drive;
 use pf_sim::corrupt::{
@@ -483,13 +484,19 @@ fn flacdec_element_survives_corruption() {
     corpus_gate(&gate, &bounded);
 }
 
-#[test]
-fn oggflacdeframe_element_survives_corruption() {
+/// A native stream behind the 9 byte Ogg mapping prefix, as one first packet.
+fn mapped() -> Vec<u8> {
     let native = stream(2, SampleFormat::S16, 192, 700, true);
     let mut mapped = vec![0x7F];
     mapped.extend_from_slice(b"FLAC");
     mapped.extend_from_slice(&[1, 0, 0, 2]);
     mapped.extend_from_slice(&native);
+    mapped
+}
+
+#[test]
+fn oggflacdeframe_element_survives_corruption() {
+    let mapped = mapped();
     let gate = Corpus {
         name: "oggflacdeframe_element",
         inputs: &[Input {
@@ -507,6 +514,39 @@ fn oggflacdeframe_element_survives_corruption() {
         let driven = drive(&mut h, bytes, chunking, None);
         assert!(driven.out_bytes <= bytes.len(), "{} out of {}", driven.out_bytes, bytes.len());
     });
+    corpus_gate(&gate, &bounded);
+}
+
+#[test]
+fn oggflacdec_element_survives_corruption() {
+    let mapped = mapped();
+    let gate = Corpus {
+        name: "oggflacdec_element",
+        inputs: &[Input {
+            name: "mapped_stereo_s16",
+            bytes: &mapped,
+            fields: &[0, 1, 5, 7, 9, 13],
+        }],
+        tokens: TOKENS,
+        iters: iterations(400),
+        sweep: 48,
+        tolerate: &[],
+    };
+    let bounded =
+        heap_bounded(DECODER_HEAP + MAX_FRAME_SAMPLES * 4 + 4 * MIB, 16, |bytes, chunking| {
+            for flush in [None, Some(1 + bytes.len() % 3)] {
+                let mut h = Harness::new(OggFlacDec::new());
+                let span = Timestamp::from_millis(400);
+                let driven = pointed::drive_bytes(&mut h, bytes, chunking, flush, span);
+                let limit = (bytes.len() / MIN_FRAME_BYTES + 1) * MAX_FRAME_SAMPLES * 4;
+                assert!(
+                    driven.out_bytes <= limit,
+                    "{} PCM bytes from {}",
+                    driven.out_bytes,
+                    bytes.len()
+                );
+            }
+        });
     corpus_gate(&gate, &bounded);
 }
 

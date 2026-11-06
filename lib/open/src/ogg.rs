@@ -1,6 +1,6 @@
 use pf_ogg::{
-    Mapping, OggReader, parse_comment_body, parse_opus_head, parse_speex_head, parse_vorbis_ident,
-    stream_duration_ns,
+    Mapping, OggReader, parse_comment_body, parse_opus_head, parse_speex_head, parse_theora_ident,
+    parse_vorbis_ident, stream_duration_ns,
 };
 use profluens_core::event::TagSink;
 use profluens_core::scratch::Arena;
@@ -74,7 +74,12 @@ fn form(mapping: Mapping, ident: &[u8], t: &mut TrackDesc) -> bool {
             t.channels = u16::from(c >> 1 & 7) + 1;
             t.depth = ((c & 1) << 4 | e >> 4) + 1;
         }
-        Mapping::Theora => t.kind = TrackKind::Video,
+        Mapping::Theora => {
+            let Some(h) = parse_theora_ident(ident) else { return false };
+            t.kind = TrackKind::Video;
+            (t.width, t.height) = (h.width, h.height);
+            t.frame_ns = 1_000_000_000 * u64::from(h.fps_den) / u64::from(h.fps_num);
+        }
         Mapping::Skeleton | Mapping::Unknown => t.kind = TrackKind::Other,
     }
     true

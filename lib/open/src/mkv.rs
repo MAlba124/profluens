@@ -2,8 +2,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use pf_mkv::ebml::{id, read_element_header};
-use pf_mkv::reader::MatroskaReader;
-use pf_mkv::{Track, is_audio_family, is_video_family, track_family};
+use pf_mkv::{DemuxError, Parsed, Track, is_audio_family, is_video_family, track_family};
 
 use crate::{Desc, OpenError, SkipWhy, TrackDesc, TrackKind, id_of, ratio};
 
@@ -12,9 +11,18 @@ const MAX_TOP: usize = 4096;
 /// An element head at most, a 4 octet id and an 8 octet size.
 const EL_HEAD: usize = 12;
 
-/// The head's length and the first Cluster when `window` holds every element before it, the
-/// head [`pf_probe::head::MkvHeadAt`] reads then, no more than `max` long.
-pub(crate) fn head_in(window: &[u8], max: u64) -> Option<usize> {
+/// Where the head walk passed the Tags and the Attachments, for a head cut before them whose
+/// SeekHead names neither.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Passed {
+    pub(crate) tags: Option<u64>,
+    pub(crate) attachments: Option<u64>,
+}
+
+/// The head [`pf_probe::head::MkvHeadAt`] reads when `window` holds every element before the
+/// first Cluster, no more than `max` long. Its length, the first Cluster and what the walk passed,
+/// the head ending before the Attachments once Tracks is read.
+pub(crate) fn head_in(window: &[u8], max: u64) -> Option<(usize, u64, Passed)> {
     let ebml = read_element_header(window, 0).ok()?;
     if ebml.id != id::EBML {
         return None;
@@ -25,11 +33,21 @@ pub(crate) fn head_in(window: &[u8], max: u64) -> Option<usize> {
         return None;
     }
     let mut at = seg.data_start;
+    let (mut tracks, mut cut, mut passed) = (false, None, Passed::default());
     for _ in 0..MAX_TOP {
         let h = read_element_header(window, at).ok()?;
         if h.id == id::CLUSTER {
-            return (at as u64 <= max).then_some(at);
+            let len = cut.unwrap_or(at);
+            return (len as u64 <= max).then_some((len, at as u64, passed));
         }
+        if h.id == id::ATTACHMENTS {
+            passed.attachments = passed.attachments.or(Some(at as u64));
+            cut = cut.or(tracks.then_some(at));
+        }
+        if h.id == id::TAGS {
+            passed.tags = passed.tags.or(Some(at as u64));
+        }
+        tracks |= h.id == id::TRACKS;
         let end = h.data_end().ok()??;
         if end > window.len() || end <= at {
             return None;
@@ -58,18 +76,17 @@ pub(crate) fn doc_type(head: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Where the Cues and the Tags of `head` lie, absolute, by its SeekHead and its own elements.
-pub(crate) fn places(head: &[u8]) -> (Option<u64>, Option<u64>, Option<u64>) {
-    let cues = pf_mkv::parse_seek_head(head)
-        .and_then(|sh| sh.cues_pos?.checked_add(sh.segment_data_start));
-    let ix = pf_mkv::tags::index_segment(head);
-    (cues, ix.as_ref().and_then(|ix| ix.tags), ix.and_then(|ix| ix.attachments))
+/// Where the Cues, the Tags and the Attachments lie, absolute, by the head's SeekHead and its own
+/// elements.
+pub(crate) fn places(p: &Parsed) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let ix = p.index;
+    (p.cues_pos(), ix.and_then(|ix| ix.tags), ix.and_then(|ix| ix.attachments))
 }
 
 /// The Cues at the start of `b`, the held bytes from where the SeekHead puts them, as
 /// `pf_mkv::CuesAt` reads them. None when `b` holds less than that read and is not the end of the
 /// file.
-pub(crate) fn cues_in(b: &[u8], eof: bool, max: u64, head: &[u8]) -> Option<Vec<pf_mkv::Cue>> {
+pub(crate) fn cues_in(b: &[u8], eof: bool, max: u64, p: &Parsed) -> Option<Vec<pf_mkv::Cue>> {
     let hd = &b[..b.len().min(EL_HEAD)];
     if hd.len() < EL_HEAD && !eof {
         return None;
@@ -83,7 +100,7 @@ pub(crate) fn cues_in(b: &[u8], eof: bool, max: u64, head: &[u8]) -> Option<Vec<
     if b.len() < len && !eof {
         return None;
     }
-    let sh = pf_mkv::parse_seek_head(head)?;
+    let sh = p.seek_head?;
     let body = &b[..len.min(b.len())];
     Some(pf_mkv::parse_cue_tracks(body, sh.segment_data_start, sh.timestamp_scale))
 }
@@ -138,15 +155,18 @@ fn track(t: &Track, d: &mut Desc) {
     d.push(out);
 }
 
+/// The head parsed once for every run's demuxer.
+pub(crate) fn parse(head: &[u8]) -> Result<Parsed, OpenError> {
+    Parsed::of(head).map_err(|e| match e {
+        DemuxError::TracksIncomplete => OpenError::NoStreams,
+        _ => OpenError::Malformed { at: 0 },
+    })
+}
+
 /// The tracks and the duration of the head, the TrackUID of each track described.
-pub(crate) fn describe(head: &[u8], d: &mut Desc) -> Result<(u64, Vec<u64>), OpenError> {
-    let mut r = MatroskaReader::new();
-    r.push(head).map_err(|_| OpenError::Malformed { at: 0 })?;
-    if !r.tracks_ready() {
-        return Err(OpenError::NoStreams);
-    }
-    let mut uids = Vec::with_capacity(r.tracks().len());
-    for t in r.tracks() {
+pub(crate) fn describe(p: &Parsed, d: &mut Desc) -> Result<(u64, Vec<u64>), OpenError> {
+    let mut uids = Vec::with_capacity(p.tracks.len());
+    for t in &p.tracks {
         let n = d.tracks.len();
         track(t, d);
         if d.tracks.len() > n {
@@ -156,5 +176,5 @@ pub(crate) fn describe(head: &[u8], d: &mut Desc) -> Result<(u64, Vec<u64>), Ope
     if d.tracks.is_empty() {
         return Err(OpenError::NoStreams);
     }
-    Ok((r.duration_ns().unwrap_or(0), uids))
+    Ok((p.duration_ns.unwrap_or(0), uids))
 }

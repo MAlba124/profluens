@@ -15,8 +15,8 @@ use crate::error::{VaapiErrorKind as K, failed};
 use crate::ffi;
 use crate::gpuframe::DmabufFds;
 use crate::va::{
-    self, Buffer as VaBuffer, Config, Context, Display, ExportedSurface, SurfaceFormat, Surfaces,
-    UploadImage, VaError, VaResult,
+    self, Buffer as VaBuffer, CodedMap, Config, Context, Display, ExportedSurface, SurfaceFormat,
+    Surfaces, UploadImage, VaError, VaResult,
 };
 
 pub(crate) const RAW_FAMILY: &str = "video/raw";
@@ -169,30 +169,25 @@ impl FrameBufs {
         Ok(())
     }
 
-    /// Submits the held buffers on `input`, the engine's upload surface for `None`, then drops
-    /// them since VA consumed them.
+    /// Submits the held buffers on `input`, then drops them since VA consumed them.
     pub(crate) fn submit(
         &mut self,
         display: &Display,
         engine: &EncEngine,
-        input: Option<ffi::VASurfaceID>,
+        input: ffi::VASurfaceID,
     ) -> VaResult<()> {
         self.ids.clear();
         self.ids.extend(self.hold.iter().map(VaBuffer::id));
-        let r = engine.submit_from(display, &self.ids, input.unwrap_or(engine.input));
+        let r = engine.submit_from(display, &self.ids, input);
         self.hold.clear();
         r
     }
 
     /// [`Self::submit`] without the wait, the picture then [`InFlight`].
-    pub(crate) fn queue(
-        &mut self,
-        engine: &EncEngine,
-        input: Option<ffi::VASurfaceID>,
-    ) -> VaResult<()> {
+    pub(crate) fn queue(&mut self, engine: &EncEngine, input: ffi::VASurfaceID) -> VaResult<()> {
         self.ids.clear();
         self.ids.extend(self.hold.iter().map(VaBuffer::id));
-        let r = engine.queue(&self.ids, input.unwrap_or(engine.input));
+        let r = engine.queue(&self.ids, input);
         self.hold.clear();
         r
     }
@@ -414,22 +409,24 @@ pub(crate) struct OutFrame {
     pub stamp: Stamp,
 }
 
-/// Copies `bytes` into a pool buffer and pushes it on `pad`. `false` when the pool is dry.
+/// Pushes `len` bytes on `pad`, `fill` writes them straight into a pool buffer. `false` when the
+/// pool is dry, `fill` then not called.
 pub(crate) fn send(
     ctx: &mut Ctx,
     pad: SrcPad,
     name: &'static str,
-    bytes: &[u8],
+    len: usize,
+    fill: &dyn Fn(&mut [u8]),
     st: Stamp,
 ) -> Result<bool, Error> {
     let Some(mut buf) = ctx.try_alloc() else {
         return Ok(false);
     };
-    let (len, capacity) = (bytes.len(), buf.memory.capacity());
+    let capacity = buf.memory.capacity();
     if capacity < len {
         return Err(failed(ctx, name, K::PacketSlot { len, capacity }));
     }
-    buf.memory.as_mut_full()[..len].copy_from_slice(bytes);
+    fill(&mut buf.memory.as_mut_full()[..len]);
     buf.memory.set_len(len);
     (buf.pts, buf.duration) = (st.pts, st.duration);
     buf.flags = if st.key { BufferFlags::KEYFRAME } else { BufferFlags::DELTA };
@@ -442,8 +439,9 @@ pub(crate) fn send(
 
 /// Where staged frames go, an element's src pad or a fake pool in tests.
 pub(crate) trait Outlet {
-    /// Pushes one frame, `false` when no slot is free. A dry pool wakes the element on a return.
-    fn send(&mut self, bytes: &[u8], st: Stamp) -> Result<bool, Error>;
+    /// Pushes one frame of `len` bytes `fill` writes, `false` when no slot is free. A dry pool
+    /// wakes the element on a return.
+    fn send(&mut self, len: usize, fill: &dyn Fn(&mut [u8]), st: Stamp) -> Result<bool, Error>;
     /// Keeps the end of the stream back for this pass.
     fn hold_end(&mut self);
 }
@@ -456,8 +454,8 @@ pub(crate) struct PadOut<'a> {
 }
 
 impl Outlet for PadOut<'_> {
-    fn send(&mut self, bytes: &[u8], st: Stamp) -> Result<bool, Error> {
-        send(self.ctx, self.pad, self.name, bytes, st)
+    fn send(&mut self, len: usize, fill: &dyn Fn(&mut [u8]), st: Stamp) -> Result<bool, Error> {
+        send(self.ctx, self.pad, self.name, len, fill, st)
     }
 
     fn hold_end(&mut self) {
@@ -518,7 +516,8 @@ impl Staged {
         coded: &mut Vec<u8>,
         stamp: Stamp,
     ) -> Result<(), Error> {
-        if self.frames.is_empty() && out.send(coded, stamp)? {
+        let fill = |d: &mut [u8]| d.copy_from_slice(coded);
+        if self.frames.is_empty() && out.send(coded.len(), &fill, stamp)? {
             return Ok(());
         }
         let next = self.spare.pop().unwrap_or_default();
@@ -526,10 +525,42 @@ impl Staged {
         Ok(())
     }
 
+    /// Sends the coded picture in `map` behind `head` straight from the driver's buffer into a
+    /// slot when nothing waits and one is free, else into staged storage. One copy either way.
+    pub(crate) fn send_coded(
+        &mut self,
+        out: &mut impl Outlet,
+        head: &[&[u8]],
+        map: &CodedMap<'_>,
+        stamp: Stamp,
+    ) -> Result<(), Error> {
+        let len = head.iter().map(|h| h.len()).sum::<usize>() + map.len();
+        let fill = |d: &mut [u8]| {
+            let mut rest = d;
+            for h in head {
+                let Some((to, after)) = rest.split_at_mut_checked(h.len()) else { return };
+                to.copy_from_slice(h);
+                rest = after;
+            }
+            map.copy_to(rest);
+        };
+        if self.frames.is_empty() && out.send(len, &fill, stamp)? {
+            return Ok(());
+        }
+        let mut bytes = self.spare.pop().unwrap_or_default();
+        bytes.clear();
+        bytes.reserve(len);
+        head.iter().for_each(|h| bytes.extend_from_slice(h));
+        map.append_to(&mut bytes);
+        self.push(bytes, stamp);
+        Ok(())
+    }
+
     /// Sends staged frames in order, `false` when the pool ran dry first.
     pub(crate) fn drain(&mut self, out: &mut impl Outlet) -> Result<bool, Error> {
         while let Some(front) = self.frames.front() {
-            if !out.send(&front.bytes, front.stamp)? {
+            let fill = |d: &mut [u8]| d.copy_from_slice(&front.bytes);
+            if !out.send(front.bytes.len(), &fill, front.stamp)? {
                 return Ok(false);
             }
             if let Some(f) = self.frames.pop_front() {
@@ -641,10 +672,17 @@ impl IntraCadence {
 
 /// Field order is drop order, the teardown order libva wants.
 pub(crate) struct EncEngine {
+    /// Coded buffers read and free for the next picture, one a picture in flight at most. A
+    /// buffer made and destroyed each picture is a driver allocation each picture.
+    coded: Vec<VaBuffer>,
+    /// Coded buffers made since the session opened.
+    coded_made: u32,
     context: Context,
     _surfaces: Surfaces,
+    /// The upload surface, made by the first raw picture. A zero-copy session codes from its
+    /// producer's surfaces and never makes it.
+    input: Option<Surfaces>,
     _config: Config,
-    input: ffi::VASurfaceID,
     /// A ring, `recon[cur]` takes the picture coded, the `recon_n - 1` before it are references.
     recon: [ffi::VASurfaceID; REFS_MAX + 1],
     recon_n: usize,
@@ -653,8 +691,8 @@ pub(crate) struct EncEngine {
     pub coded_h: u32,
     pub width: u32,
     pub height: u32,
-    /// Of the input surface format, which sizes the coded buffer.
-    bits_per_pixel: u32,
+    /// Of the input surface, which also sizes the coded buffer.
+    format: SurfaceFormat,
 }
 
 impl EncEngine {
@@ -672,7 +710,8 @@ impl EncEngine {
         Self::new_packed(display, profile, entrypoint, rc_mode, format, width, height, align, 0, 1)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    // Cold, session setup.
+    #[allow(clippy::too_many_arguments, clippy::disallowed_methods)]
     pub(crate) fn new_packed(
         display: &Display,
         profile: ffi::VAProfile,
@@ -696,17 +735,17 @@ impl EncEngine {
             rc_mode,
             packed,
         )?;
-        let surfaces = Surfaces::new(display, format, coded_w, coded_h, 1 + recon_n as u32)?;
+        let surfaces = Surfaces::new(display, format, coded_w, coded_h, recon_n as u32)?;
         let context = Context::new(display, &config, coded_w as i32, coded_h as i32, &surfaces)?;
-        let ids = surfaces.ids();
         let mut recon = [ffi::VA_INVALID_SURFACE; REFS_MAX + 1];
-        recon[..recon_n].copy_from_slice(&ids[1..=recon_n]);
-        let input = ids[0];
+        recon[..recon_n].copy_from_slice(surfaces.ids());
         Ok(EncEngine {
+            coded: Vec::with_capacity(DEPTH_MAX),
+            coded_made: 0,
             context,
             _surfaces: surfaces,
+            input: None,
             _config: config,
-            input,
             recon,
             recon_n,
             cur: 0,
@@ -714,7 +753,7 @@ impl EncEngine {
             coded_h,
             width,
             height,
-            bits_per_pixel: format.bits_per_pixel,
+            format,
         })
     }
 
@@ -727,8 +766,26 @@ impl EncEngine {
         &self.context
     }
 
-    pub(crate) fn input(&self) -> ffi::VASurfaceID {
-        self.input
+    /// The upload surface, None until a raw picture made it.
+    pub(crate) fn input(&self) -> Option<ffi::VASurfaceID> {
+        self.input.as_ref().map(|s| s.ids()[0])
+    }
+
+    /// Surfaces the session made, its references and the upload surface once made.
+    pub(crate) fn surfaces_made(&self) -> u32 {
+        (self.recon_n + usize::from(self.input.is_some())) as u32
+    }
+
+    // Allocates once a session, at its first raw picture.
+    #[allow(clippy::disallowed_methods)]
+    fn upload_surface(&mut self, display: &Display) -> VaResult<ffi::VASurfaceID> {
+        if let Some(id) = self.input() {
+            return Ok(id);
+        }
+        let s = Surfaces::new(display, self.format, self.coded_w, self.coded_h, 1)?;
+        let id = s.ids()[0];
+        self.input = Some(s);
+        Ok(id)
     }
 
     pub(crate) fn recon_cur(&self) -> ffi::VASurfaceID {
@@ -765,17 +822,24 @@ impl EncEngine {
         self.cur = (self.cur + 1) % self.recon_n;
     }
 
-    /// Edges are replicated into the alignment padding so padded blocks predict cheaply.
-    pub(crate) fn upload(&self, display: &Display, data: &[u8], fmt: RawPixFmt) -> VaResult<()> {
+    /// The picture in `data` on the upload surface, which it returns. Edges are replicated into
+    /// the alignment padding so padded blocks predict cheaply.
+    pub(crate) fn upload(
+        &mut self,
+        display: &Display,
+        data: &[u8],
+        fmt: RawPixFmt,
+    ) -> VaResult<ffi::VASurfaceID> {
+        let input = self.upload_surface(display)?;
         if fmt == RawPixFmt::P010 {
-            return self.upload_p010(display, data);
+            return self.upload_p010(display, data, input).map(|()| input);
         }
         let (w, h) = (self.width as usize, self.height as usize);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let (pad_w, pad_h) = (self.coded_w as usize, self.coded_h as usize);
         let (pad_cw, pad_ch) = (pad_w / 2, pad_h / 2);
 
-        let mut img = UploadImage::acquire(display, self.input, self.coded_w, self.coded_h)?;
+        let mut img = UploadImage::acquire(display, input, self.coded_w, self.coded_h)?;
 
         for row in 0..pad_h {
             let src_row = row.min(h - 1);
@@ -817,17 +881,17 @@ impl EncEngine {
             }
         }
 
-        img.finish()
+        img.finish().map(|()| input)
     }
 
-    fn upload_p010(&self, display: &Display, data: &[u8]) -> VaResult<()> {
+    fn upload_p010(&self, display: &Display, data: &[u8], input: ffi::VASurfaceID) -> VaResult<()> {
         let (w, h) = (self.width as usize, self.height as usize);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let (pad_w, pad_h) = (self.coded_w as usize, self.coded_h as usize);
         let (pad_cw, pad_ch) = (pad_w / 2, pad_h / 2);
         let mut img = UploadImage::acquire_for(
             display,
-            self.input,
+            input,
             self.coded_w,
             self.coded_h,
             SurfaceFormat::P010,
@@ -876,8 +940,54 @@ impl EncEngine {
 
     /// Raw size plus 4 KiB, output beyond the raw input means something is badly wrong.
     pub(crate) fn coded_buf_size(&self) -> u32 {
-        self.coded_w * self.coded_h * self.bits_per_pixel / 8 + 4096
+        self.coded_w * self.coded_h * self.format.bits_per_pixel / 8 + 4096
     }
+
+    /// A coded buffer for the next picture, a free one or a new one. The size is the session's,
+    /// a new picture size is a new session.
+    pub(crate) fn take_coded(&mut self, display: &Display) -> VaResult<VaBuffer> {
+        if let Some(b) = self.coded.pop() {
+            return Ok(b);
+        }
+        let ty = ffi::VAEncCodedBufferType;
+        let b = VaBuffer::new_empty(display, &self.context, ty, self.coded_buf_size())?;
+        self.coded_made += 1;
+        Ok(b)
+    }
+
+    /// `b` free again, its picture read and unmapped or never handed to the GPU. Only a buffer
+    /// [`Self::take_coded`] gave out comes back, the encoders read every picture before a new
+    /// session.
+    pub(crate) fn put_coded(&mut self, b: VaBuffer) {
+        #[cfg(test)]
+        if FRESH_CODED.get() {
+            return;
+        }
+        if self.coded.len() < DEPTH_MAX {
+            self.coded.push(b);
+        }
+    }
+
+    pub(crate) fn coded_made(&self) -> u32 {
+        self.coded_made
+    }
+}
+
+/// A picture in flight read and dropped, a flush or a stop, its buffer back to `engine`. iHD
+/// fails every picture after a coded buffer destroyed unread. A failed submit goes through
+/// here too, the map waits out whatever the driver queued before it failed.
+pub(crate) fn discard_coded(engine: Option<&mut EncEngine>, b: VaBuffer) {
+    let read = b.map_coded().and_then(CodedMap::unmap);
+    if let (Ok(()), Some(e)) = (read, engine) {
+        e.put_coded(b);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every picture through a new coded buffer, the path before the reuse, for a test to
+    /// compare against. The harness drives an element on the test's thread.
+    pub(crate) static FRESH_CODED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -956,7 +1066,12 @@ mod tests {
     }
 
     impl Outlet for FakePool {
-        fn send(&mut self, _bytes: &[u8], st: Stamp) -> Result<bool, Error> {
+        fn send(
+            &mut self,
+            _len: usize,
+            _fill: &dyn Fn(&mut [u8]),
+            st: Stamp,
+        ) -> Result<bool, Error> {
             if self.free == 0 {
                 return Ok(false);
             }

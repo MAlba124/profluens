@@ -45,6 +45,8 @@ static SINK_DESC: ElementDesc = ElementDesc {
 #[derive(Default)]
 struct Capture {
     buffers: Vec<(usize, i64)>,
+    /// HEADER buffers, how many media buffers came before each and its bytes.
+    heads: Vec<(usize, Vec<u8>)>,
     total_bytes: u64,
     flushed_at: Option<usize>,
 }
@@ -66,6 +68,11 @@ impl Element for CaptureSink {
         let mut taken = 0;
         let mut cap = self.cap.lock().unwrap();
         while let Some(buf) = inputs.pop() {
+            if buf.flags.contains(profluens_core::buffer::BufferFlags::HEADER) {
+                let before = cap.buffers.len();
+                cap.heads.push((before, buf.memory.data().to_vec()));
+                continue;
+            }
             let len = buf.memory.data().len();
             cap.total_bytes += len as u64;
             cap.buffers.push((len, buf.pts.nanos().map(|n| n as i64).unwrap_or(-1)));
@@ -145,6 +152,32 @@ fn after_a_seek_the_chunks_are_stamped_on_from_the_seeks_time() {
         let first = behind(cap).expect("a chunk behind the seek");
         assert!((first - to.0 as i64).abs() <= 40_000_000, "pad {pad} resumed at {first} ns");
     }
+    // the VOL again ahead of the first video chunk behind the seek
+    let v = caps[0].lock().unwrap();
+    let at = v.flushed_at.unwrap();
+    assert!(v.heads.iter().any(|(before, _)| *before == at), "{:?} at {at}", v.heads);
+}
+
+/// XviD keeps the VOL in the first key chunk only, the demuxer sends it as a HEADER buffer ahead
+/// of the video at each start, so a decoder opened behind a seek has its extradata.
+#[test]
+fn the_vol_goes_ahead_of_the_video_at_each_start() {
+    let header = header_prefix(TINY);
+    let movi = riff::probe_header(&header).unwrap().1.unwrap();
+    let first = riff::first_chunk_of(&header[movi.movi_data_start as usize..], 0).unwrap();
+    let vol = pf_avi::vol_prefix(first).unwrap();
+    assert!(vol.starts_with(&[0, 0, 1, 0xB0]) && vol.len() < first.len(), "{vol:x?}");
+    let caps = run_demux();
+    let v = caps[0].lock().unwrap();
+    assert_eq!(v.heads, [(0, vol.to_vec())], "the VOL once, ahead of the first chunk");
+    let a = caps[1].lock().unwrap();
+    assert!(a.heads.is_empty(), "audio carries no head");
+    // a demuxer whose header stops at movi learns it from the chunk itself, or is given it
+    let cut = header[..movi.movi_data_start as usize].to_vec();
+    let d = AviDemux::new(cut.clone());
+    drop(d);
+    let given = AviDemux::new(cut).with_codec_head(0, vol.to_vec());
+    drop(given);
 }
 
 #[test]

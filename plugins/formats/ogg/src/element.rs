@@ -22,7 +22,9 @@ use profluens_core::time::Timestamp;
 use crate::duration::{
     GranuleClock, OGG_TAIL_FIRST, OGG_TAIL_LEN, OPUS_GRANULE_RATE, granule_clock, last_granule,
 };
-use crate::ident::{Mapping, flac_frame_samples, opus_packet_samples};
+use crate::ident::{
+    Mapping, flac_frame_samples, opus_packet_samples, speex_packet_samples, theora_frames,
+};
 use crate::page::GRANULE_NONE;
 use crate::reader::{OggReader, Packet};
 use crate::seek::{Bisect, Landing, Step};
@@ -36,6 +38,8 @@ const DEFAULT_GRANULE: u64 = 0;
 pub const DEFAULT_SERIAL: u32 = 0x5C_09_67_67; // "\x5C" + "Ogg"-ish, just a constant
 
 static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
+/// A video decoder takes its family alone, the audio ones take bytes too.
+static THEORA_OFFERS: [OfferDesc; 2] = [OfferDesc::any("theora"), OfferDesc::any("bytes")];
 
 static DEMUX_SINKS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &OFFERS }];
 static DEMUX_SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: &OFFERS }];
@@ -76,7 +80,9 @@ const WINDOW: u32 = 256 * 1024;
 const WINDOW_DEPTH: u32 = 2;
 const WINDOW_FIRST: u32 = 16 << 10;
 const WINDOW_TIME: u64 = 250_000_000;
-const PACED_MIN: u32 = 4 << 10;
+/// A page of the largest size. Under about 2 Mbit/s a quarter second is less, read in reads that
+/// small a disk shared with other readers seeks for each.
+const PACED_MIN: u32 = 64 << 10;
 
 fn paced_window(bits_per_second: u64) -> u32 {
     let bytes = u128::from(bits_per_second) * u128::from(WINDOW_TIME) / 8_000_000_000;
@@ -97,6 +103,12 @@ enum Tail {
 }
 
 /// A packet parked on the byte budget. At most one exists, the reader holds the rest.
+/// Whether `packet` opens with a FLAC frame sync code, a metadata block header byte never
+/// does. A mapping header's count read wrong would otherwise keep every frame as a header.
+fn flac_frame(packet: &[u8]) -> bool {
+    packet.len() >= 2 && packet[0] == 0xFF && packet[1] & 0xFC == 0xF8
+}
+
 struct Carry {
     data: Vec<u8>,
     track: usize,
@@ -104,23 +116,81 @@ struct Carry {
     pts: Timestamp,
 }
 
+/// The most header bytes a track keeps for a later link. Cover art in a FLAC PICTURE block or
+/// a comment header runs to a few MB, a mapping header count read wrong would keep the media.
+const KEPT_MAX: usize = 4 << 20;
+
 struct Track {
     serial: Option<u32>,
     stream: u32,
     pad: Option<SrcPad>,
     stamp: Timestamp,
     heads: u32,
+    /// A FLAC mapping, its header count ends early at the first frame.
+    flac: bool,
     run: Run,
+    /// The header packets put out so far, back to back, for a decoder linked mid-run.
+    kept: Vec<u8>,
+    kept_ends: Vec<usize>,
+    /// The headers ran past `KEPT_MAX`, none are kept and a later link gets none.
+    kept_over: bool,
+    /// A link made mid-run is owed `kept` ahead of the track's next packet.
+    greet: bool,
 }
 
-/// The clock of a track whose packet lengths the demuxer reads, Opus and FLAC. A stamp anchors
-/// it, the packets after go out at the anchor plus the samples between. Each page's granule
-/// keeps it on time, a packet lost to a bad page costs no drift.
+impl Track {
+    // Cold, once per stream.
+    #[allow(clippy::disallowed_methods)]
+    fn new(serial: Option<u32>, stream: u32, pad: Option<SrcPad>) -> Self {
+        Track {
+            serial,
+            stream,
+            pad,
+            stamp: Timestamp::NONE,
+            heads: 0,
+            flac: false,
+            run: Run::default(),
+            kept: Vec::new(),
+            kept_ends: Vec::new(),
+            kept_over: false,
+            greet: false,
+        }
+    }
+
+    fn keep_head(&mut self, head: bool, data: &[u8]) {
+        if !head || self.kept_over {
+            return;
+        }
+        if self.kept.len() + data.len() > KEPT_MAX {
+            self.kept_over = true;
+            drop(std::mem::take(&mut self.kept));
+            drop(std::mem::take(&mut self.kept_ends));
+            return;
+        }
+        self.kept.extend_from_slice(data);
+        self.kept_ends.push(self.kept.len());
+    }
+
+    /// Sends the kept header packets on `pad`, unstamped and flagged as they first went out.
+    fn send_kept(&self, ctx: &mut Ctx, pad: SrcPad) {
+        let mut from = 0;
+        for &end in &self.kept_ends {
+            OggDemux::emit_exact(ctx, pad, &self.kept[from..end], Timestamp::NONE, true);
+            from = end;
+        }
+    }
+}
+
+/// The clock of a track whose packet lengths the demuxer reads, Opus, FLAC, Speex and Theora. A
+/// stamp anchors it, the packets after go out at the anchor plus the samples between. Each page's
+/// granule keeps it on time, a packet lost to a bad page costs no drift.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Run {
-    /// Samples a second, 0 for a mapping whose packet lengths are not read here.
+    /// Ticks, samples or Theora frames, `rate` over `den` seconds. 0 for a mapping whose packet
+    /// lengths are not read here.
     rate: u32,
-    flac: bool,
+    den: u32,
+    lengths: Lengths,
     anchor: Timestamp,
     /// Samples since the anchor.
     samples: u64,
@@ -128,20 +198,63 @@ struct Run {
     base: Option<u64>,
 }
 
+/// How a packet's length in ticks is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lengths {
+    Opus,
+    Flac,
+    /// The same samples every packet, Speex.
+    Fixed(u32),
+    /// A frame a packet. A granule is the keyframe's count shifted left by `shift` plus the
+    /// frames since, `lag` short of a count through its own frame (Theora I section A.2.3).
+    Theora {
+        shift: u8,
+        lag: u64,
+    },
+}
+
 impl Default for Run {
     fn default() -> Self {
-        Run { rate: 0, flac: false, anchor: Timestamp::NONE, samples: 0, base: None }
+        Run {
+            rate: 0,
+            den: 1,
+            lengths: Lengths::Opus,
+            anchor: Timestamp::NONE,
+            samples: 0,
+            base: None,
+        }
     }
 }
 
 impl Run {
     fn identify(&mut self, ident: &[u8]) {
-        (self.rate, self.flac) = match (Mapping::identify(ident), granule_clock(ident)) {
-            (Mapping::Opus, _) => (OPUS_GRANULE_RATE, false),
-            (Mapping::Flac, Some(GranuleClock::Rate(rate))) => (rate, true),
-            _ => (0, false),
+        (self.rate, self.den, self.lengths) = match (Mapping::identify(ident), granule_clock(ident))
+        {
+            (Mapping::Opus, _) => (OPUS_GRANULE_RATE, 1, Lengths::Opus),
+            (Mapping::Flac, Some(GranuleClock::Rate(rate))) => (rate, 1, Lengths::Flac),
+            (Mapping::Speex, Some(GranuleClock::Rate(rate))) => match speex_packet_samples(ident) {
+                Some(n) => (rate, 1, Lengths::Fixed(n)),
+                None => (0, 1, Lengths::Opus),
+            },
+            (_, Some(GranuleClock::Theora(t))) => {
+                (t.fps_num, t.fps_den, Lengths::Theora { shift: t.shift, lag: t.lag })
+            }
+            _ => (0, 1, Lengths::Opus),
         };
         self.stop();
+    }
+
+    fn ns(&self, ticks: u64) -> u64 {
+        let ns = u128::from(ticks) * 1_000_000_000 * u128::from(self.den) / u128::from(self.rate);
+        u64::try_from(ns).unwrap_or(u64::MAX)
+    }
+
+    /// The ticks through the packet a page granule ends on.
+    fn linear(&self, granule: u64) -> u64 {
+        match self.lengths {
+            Lengths::Theora { shift, lag } => theora_frames(granule, shift, lag),
+            _ => granule,
+        }
     }
 
     /// Until the next stamp the packets go out unstamped.
@@ -150,10 +263,12 @@ impl Run {
     }
 
     fn length(&self, data: &[u8]) -> Option<u32> {
-        match (self.rate, self.flac) {
+        match (self.rate, self.lengths) {
             (0, _) => None,
-            (_, true) => flac_frame_samples(data),
-            (_, false) => opus_packet_samples(data),
+            (_, Lengths::Flac) => flac_frame_samples(data),
+            (_, Lengths::Opus) => opus_packet_samples(data),
+            (_, Lengths::Fixed(n)) => Some(n),
+            (_, Lengths::Theora { .. }) => Some(1),
         }
     }
 
@@ -162,7 +277,8 @@ impl Run {
     }
 
     /// The granule where `packet` starts, the end of its page less the samples from it on
-    /// there, `after` the packets queued behind it.
+    /// there, `after` the packets queued behind it. A start before 0, a Speex encoder's
+    /// lookahead, is taken as 0.
     fn start<'a>(
         &self,
         packet: &Packet,
@@ -174,14 +290,13 @@ impl Run {
             end = after.find(|p| p.serial == packet.serial)?;
             samples += u64::from(self.length(&end.data)?);
         }
-        (end.granule != GRANULE_NONE).then_some(end.granule)?.checked_sub(samples)
+        (end.granule != GRANULE_NONE).then(|| self.linear(end.granule).saturating_sub(samples))
     }
 
     /// Anchors the clock at the sample of `granule`, its container stamp, ahead of the stream
     /// time by an Opus pre-skip as a demuxer stamps.
     fn anchor_at(&mut self, granule: u64) {
-        let ns = u128::from(granule) * 1_000_000_000 / u128::from(self.rate);
-        self.anchor = Timestamp(u64::try_from(ns).unwrap_or(u64::MAX));
+        self.anchor = Timestamp(self.ns(granule));
         (self.samples, self.base) = (0, Some(granule));
     }
 
@@ -197,14 +312,14 @@ impl Run {
         let Some(anchor) = self.anchor.nanos() else {
             return stamp;
         };
-        let ns = u128::from(self.samples) * 1_000_000_000 / u128::from(self.rate);
-        let pts = Timestamp(anchor.saturating_add(u64::try_from(ns).unwrap_or(u64::MAX)));
+        let pts = Timestamp(anchor.saturating_add(self.ns(self.samples)));
         let Some(n) = self.length(data) else {
             self.stop();
             return pts;
         };
         self.samples += u64::from(n);
         if last && granule != GRANULE_NONE {
+            let granule = self.linear(granule);
             match self.base {
                 None => self.base = granule.checked_sub(self.samples),
                 Some(base) => self.samples = granule.checked_sub(base).unwrap_or(self.samples),
@@ -244,6 +359,8 @@ pub struct OggDemux {
     tail_want: u32,
     /// The duration the caller knows, published without a tail read.
     known: Option<u64>,
+    /// The duration published, the stream time at the file's end a seek interpolates to.
+    ends: Option<u64>,
     ident: Option<Vec<u8>>,
     published: bool,
     feed: Feed,
@@ -271,14 +388,7 @@ impl Default for OggDemux {
         Self {
             reader: OggReader::default(),
             key: None,
-            tracks: vec![Track {
-                serial: None,
-                stream: 0,
-                pad: Some(Self::OUT),
-                stamp: Timestamp::NONE,
-                heads: 0,
-                run: Run::default(),
-            }],
+            tracks: vec![Track::new(None, 0, Some(Self::OUT))],
             head: None,
             streams: false,
             pending: None,
@@ -289,6 +399,7 @@ impl Default for OggDemux {
             tail_at: Tail::Absent,
             tail_want: OGG_TAIL_FIRST as u32,
             known: None,
+            ends: None,
             ident: None,
             published: false,
             feed: Feed::new(WINDOW_FIRST, WINDOW_DEPTH),
@@ -417,17 +528,10 @@ impl OggDemux {
                 duration: Timestamp::NONE,
                 sparse: kind.sparse(),
                 name: format!("src_{:08x}", s.serial).into(),
-                offers: &OFFERS,
+                offers: if s.mapping == Mapping::Theora { &THEORA_OFFERS } else { &OFFERS },
             });
             self.key.get_or_insert(s.serial);
-            self.tracks.push(Track {
-                serial: Some(s.serial),
-                stream,
-                pad: None,
-                stamp: Timestamp::NONE,
-                heads: 0,
-                run: Run::default(),
-            });
+            self.tracks.push(Track::new(Some(s.serial), stream, None));
         }
         log!(&*ctx, Level::Info, "opened", streams = self.tracks.len());
         match self.tracks.is_empty() {
@@ -460,6 +564,7 @@ impl OggDemux {
             return;
         }
         let duration = self.known.or_else(|| crate::stream_duration_ns(bos, &self.tail, serial));
+        self.ends = duration;
         let tail = self.tail.len();
         self.tail = Vec::new();
         match duration {
@@ -533,20 +638,23 @@ impl OggDemux {
         let mapping = Mapping::identify(data);
         if mapping != Mapping::Unknown {
             track.heads = mapping.header_packets(data);
+            track.flac = mapping == Mapping::Flac;
             track.run.identify(data);
+            // the stream sends its headers again itself
+            track.greet = false;
+            track.kept.clear();
+            track.kept_ends.clear();
+            track.kept_over = false;
+        }
+        if track.flac && track.heads > 0 && flac_frame(data) {
+            track.heads = 0;
         }
         let head = track.heads > 0;
         track.heads = track.heads.saturating_sub(1);
         head
     }
 
-    fn place(
-        &mut self,
-        ctx: &mut Ctx,
-        serial: u32,
-        bos: bool,
-        data: &[u8],
-    ) -> Option<(usize, SrcPad)> {
+    fn place(&mut self, ctx: &mut Ctx, serial: u32, bos: bool, data: &[u8]) -> Option<usize> {
         let at = self.route(serial);
         if at.is_none() && bos && Mapping::identify(data) != Mapping::Skeleton {
             log!(&*ctx, Level::Warn, "link_dropped", serial = serial, at = self.taken);
@@ -563,8 +671,74 @@ impl OggDemux {
                 self.learnt.get_or_insert((serial, clock));
             }
         }
-        let at = at?;
-        Some((at, self.tracks[at].pad?))
+        at
+    }
+
+    /// The pad of track `at`, owed headers sent first. An unlinked track reads its headers and
+    /// keeps its clock for a later link.
+    fn out_pad(&mut self, ctx: &mut Ctx, at: usize, head: bool, data: &[u8]) -> Option<SrcPad> {
+        let t = &mut self.tracks[at];
+        let Some(pad) = t.pad else {
+            t.keep_head(head, data);
+            return None;
+        };
+        if std::mem::take(&mut t.greet) {
+            t.send_kept(ctx, pad);
+        }
+        Some(pad)
+    }
+
+    /// The track src pad `pad` carries.
+    fn track_on(&self, ctx: &Ctx, pad: SrcPad) -> Option<usize> {
+        self.tracks.iter().position(|t| t.pad == Some(pad) || ctx.stream_pad(t.stream) == Some(pad))
+    }
+
+    /// A link on `pad` made or cut mid-run. A new one gets the headers before what follows.
+    fn relink(&mut self, ctx: &Ctx, pad: SrcPad, on: bool) {
+        let Some(at) = self.track_on(ctx, pad) else {
+            return;
+        };
+        let t = &mut self.tracks[at];
+        let kept = t.kept_ends.len();
+        log!(ctx, Level::Debug, "relink", serial = t.serial.unwrap_or(0), on = on, heads = kept);
+        if on && t.kept_over {
+            log!(ctx, Level::Warn, "headers_over", serial = t.serial.unwrap_or(0), max = KEPT_MAX);
+        }
+        // the cut of a pad the track already moved off changes nothing
+        if on || t.pad == Some(pad) {
+            t.greet = on;
+            if self.streams {
+                t.pad = on.then_some(pad);
+            }
+        }
+    }
+
+    /// A link that joins `pad` beside the ones it feeds gets the headers at once, the others
+    /// are not sent them again. One owed them already gets them with the others.
+    fn join(&mut self, ctx: &mut Ctx, pad: SrcPad) {
+        let Some(at) = self.track_on(ctx, pad) else {
+            return;
+        };
+        let t = &self.tracks[at];
+        if t.kept_over {
+            log!(
+                &*ctx,
+                Level::Warn,
+                "headers_over",
+                serial = t.serial.unwrap_or(0),
+                max = KEPT_MAX
+            );
+        }
+        log!(
+            &*ctx,
+            Level::Debug,
+            "joined",
+            serial = t.serial.unwrap_or(0),
+            heads = t.kept_ends.len()
+        );
+        if !t.greet {
+            t.send_kept(ctx, pad);
+        }
     }
 
     /// The reader's first resync and drop at warn, later ones at trace.
@@ -585,10 +759,12 @@ impl OggDemux {
         self.note_reader(ctx);
         // A parked packet precedes everything queued behind it.
         if let Some(c) = self.pending.take() {
-            let pad = self.tracks[c.track].pad.unwrap_or(Self::OUT);
-            if !Self::emit_packet(ctx, pad, &c.data, c.pts, c.head) {
-                self.pending = Some(c);
-                return false; // budget still spent
+            if let Some(pad) = self.out_pad(ctx, c.track, c.head, &c.data) {
+                if !Self::emit_packet(ctx, pad, &c.data, c.pts, c.head) {
+                    self.pending = Some(c);
+                    return false; // budget still spent
+                }
+                self.tracks[c.track].keep_head(c.head, &c.data);
             }
             self.reader.recycle(c.data);
         }
@@ -598,17 +774,22 @@ impl OggDemux {
             self.note(packet.serial, packet.granule, packet.data.len());
             self.tell_rate(ctx);
             let skipped = self.skips(packet.serial, packet.granule);
-            let Some((at, pad)) = placed.filter(|_| !skipped) else {
+            let Some(at) = placed.filter(|_| !skipped) else {
                 self.keep(skipped, packet.data);
                 continue;
             };
-            self.lead_out(ctx, packet.serial, pad);
             let head = self.head(at, &packet.data);
             let pts = self.pts(at, &packet, head);
+            let Some(pad) = self.out_pad(ctx, at, head, &packet.data) else {
+                self.reader.recycle(packet.data);
+                continue;
+            };
+            self.lead_out(ctx, packet.serial, pad);
             if !Self::emit_packet(ctx, pad, &packet.data, pts, head) {
                 self.pending = Some(Carry { data: packet.data, track: at, head, pts });
                 return false;
             }
+            self.tracks[at].keep_head(head, &packet.data);
             self.reader.recycle(packet.data);
             budget -= 1;
             if budget == 0 {
@@ -651,23 +832,27 @@ impl OggDemux {
 
     fn flush(&mut self, ctx: &mut Ctx) {
         if let Some(c) = self.pending.take() {
-            let pad = self.tracks[c.track].pad.unwrap_or(Self::OUT);
-            Self::emit_exact(ctx, pad, &c.data, c.pts, c.head);
+            if let Some(pad) = self.out_pad(ctx, c.track, c.head, &c.data) {
+                Self::emit_exact(ctx, pad, &c.data, c.pts, c.head);
+                self.tracks[c.track].keep_head(c.head, &c.data);
+            }
             self.reader.recycle(c.data);
         }
         while let Some(packet) = self.reader.next_packet() {
             let placed = self.place(ctx, packet.serial, packet.bos, &packet.data);
             let skipped = self.skips(packet.serial, packet.granule);
-            match placed.filter(|_| !skipped) {
-                Some((at, pad)) => {
-                    self.lead_out(ctx, packet.serial, pad);
-                    let head = self.head(at, &packet.data);
-                    let pts = self.pts(at, &packet, head);
-                    Self::emit_exact(ctx, pad, &packet.data, pts, head);
-                    self.reader.recycle(packet.data);
-                }
-                None => self.keep(skipped, packet.data),
+            let Some(at) = placed.filter(|_| !skipped) else {
+                self.keep(skipped, packet.data);
+                continue;
+            };
+            let head = self.head(at, &packet.data);
+            let pts = self.pts(at, &packet, head);
+            if let Some(pad) = self.out_pad(ctx, at, head, &packet.data) {
+                self.lead_out(ctx, packet.serial, pad);
+                Self::emit_exact(ctx, pad, &packet.data, pts, head);
+                self.tracks[at].keep_head(head, &packet.data);
             }
+            self.reader.recycle(packet.data);
         }
         self.note_reader(ctx);
         self.publish_kept(ctx);
@@ -720,9 +905,9 @@ impl OggDemux {
         let target = ctx.presentation_point().unwrap_or(from.at).nanos()?;
         let preroll = match clock {
             GranuleClock::Opus { .. } => OPUS_PREROLL_NS,
-            GranuleClock::Rate(_) => 0,
+            GranuleClock::Rate(_) | GranuleClock::Theora(_) => 0,
         };
-        Some(Bisect::new(key, clock, target.saturating_sub(preroll), len))
+        Some(Bisect::new(key, clock, target.saturating_sub(preroll), len).ending(self.ends))
     }
 
     fn ask_probe(&mut self, ctx: &mut Ctx) {
@@ -761,17 +946,25 @@ impl OggDemux {
 
     fn land(&mut self, landing: Option<Landing>, from: SeekTarget) {
         self.bisect = None;
-        match landing {
-            Some(l) => {
-                self.feed.restart(l.at);
-                self.skip = Some(l.granule);
-                let stamp = self.learnt.and_then(|(_, clock)| clock.stamp(l.granule));
-                self.stamp_all(Timestamp(stamp.unwrap_or(l.ns)));
-            }
-            None => {
-                self.feed.restart(from.to_byte);
-                self.stamp_all(from.at);
-            }
+        let Some(l) = landing else {
+            self.feed.restart(from.to_byte);
+            self.stamp_all(from.at);
+            return;
+        };
+        self.feed.restart(l.at);
+        let head = l == Landing::HEAD;
+        self.skip = (!head).then_some(l.granule);
+        let (key, clock) = self.learnt.unzip();
+        let stamp = Timestamp(clock.and_then(|c| c.stamp(l.granule)).unwrap_or(l.ns));
+        // The landing page's time is the key stream's alone. A track whose packet lengths are
+        // read anchors on its own page granule, the others take the landing's, 0 at the head.
+        for t in &mut self.tracks {
+            t.stamp = match (t.run.rate, head) {
+                (0, true) => Timestamp::ZERO,
+                (0, false) => stamp,
+                (_, false) if t.serial == key => stamp,
+                _ => Timestamp::NONE,
+            };
         }
     }
 
@@ -923,7 +1116,7 @@ impl Element for OggDemux {
         self.reader = OggReader::new();
         self.unlock();
         for t in &mut self.tracks {
-            (t.stamp, t.heads) = (Timestamp::NONE, 0);
+            (t.stamp, t.heads, t.greet) = (Timestamp::NONE, 0, false);
             t.run.stop();
             if self.streams {
                 t.pad = ctx.stream_pad(t.stream).filter(|pad| ctx.pad_linked(*pad));
@@ -946,7 +1139,8 @@ impl Element for OggDemux {
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
         match event {
             // Drop everything pre-seek, the reader resyncs to the next page (RFC 3533 section 6).
-            // The locked serial is kept so a grouped file does not switch streams mid-playback.
+            // The locked serial is kept so a grouped file does not switch streams mid-playback, and
+            // a link still owed the headers gets them ahead of the first packet behind the seek.
             Event::FlushStart => {
                 log!(&*ctx, Level::Debug, "flush", seek = ctx.seek_target().is_some());
                 self.reader.reset();
@@ -975,6 +1169,8 @@ impl Element for OggDemux {
                     dropped = dropped
                 );
             }
+            Event::SrcLinked { pad, on, .. } => self.relink(ctx, *pad, *on),
+            Event::SrcJoined { pad } => self.join(ctx, *pad),
             _ => {}
         }
         Ok(())
@@ -1125,6 +1321,35 @@ impl Element for OggMux {
 mod tests {
     use super::*;
 
+    #[test]
+    fn headers_past_the_cap_are_dropped_and_a_later_link_gets_none() {
+        let mut t = Track::new(None, 0, None);
+        let block = vec![0u8; 1 << 20];
+        for _ in 0..4 {
+            t.keep_head(true, &block);
+        }
+        assert_eq!((t.kept_ends.len(), t.kept.len()), (4, KEPT_MAX));
+        t.keep_head(false, &block);
+        assert_eq!(t.kept_ends.len(), 4, "media is not kept");
+        t.keep_head(true, &[0]);
+        assert!(t.kept_over && t.kept.is_empty() && t.kept_ends.is_empty());
+        t.keep_head(true, &[0]);
+        assert!(t.kept.is_empty(), "nothing kept once over");
+    }
+
+    /// A mapping header naming 65535 header packets, the frames after STREAMINFO are media.
+    #[test]
+    fn a_flac_header_count_read_wrong_ends_at_the_first_frame() {
+        let mut d = OggDemux::new();
+        let mut mapping = [0u8; 17 + 34];
+        mapping[..17].copy_from_slice(b"\x7fFLAC\x01\x00\xff\xfffLaC\x80\x00\x00\x22");
+        assert!(d.head(0, &mapping), "the mapping packet");
+        assert!(d.head(0, &[0x84, 0, 0, 4, 0, 0, 0, 0]), "a metadata block");
+        assert!(!d.head(0, &[0xff, 0xf8, 0x69, 0x08]), "a frame");
+        assert!(!d.head(0, &[0x84, 0, 0, 4, 0, 0, 0, 0]), "nothing after the first frame");
+        assert!(flac_frame(&[0xff, 0xf9]) && !flac_frame(&[0xff, 0xfc]) && !flac_frame(&[0x84]));
+    }
+
     /// A 20 ms CELT packet, config 31, one frame.
     const PACKET: [u8; 2] = [31 << 3, 0];
     const MS20: u64 = 20_000_000;
@@ -1164,6 +1389,86 @@ mod tests {
         // ends on a page whose granule is a later packet's end
         r.stamp(Timestamp::NONE, &PACKET, GRANULE_NONE, false);
         assert_eq!(r.stamp(Timestamp::NONE, &PACKET, 2880, true), Timestamp(2 * MS20));
+    }
+
+    /// 25/2 frames a second, KFGSHIFT 6, version 3.2.1.
+    #[allow(clippy::disallowed_methods)]
+    fn theora() -> Run {
+        let mut ident = b"\x80theora\x03\x02\x01\0\x0a\0\x08\0\0\xa0\0\0\x78\0\0".to_vec();
+        ident.extend_from_slice(&[0, 0, 0, 25, 0, 0, 0, 2, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0]);
+        ident.extend_from_slice(&[0, 6 << 5]);
+        let mut r = Run::default();
+        r.identify(&ident);
+        r
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn theora_frames_are_timed_by_the_frame_rate_and_a_granule_names_a_frame() {
+        const FRAME: u64 = 80_000_000;
+        let mut r = theora();
+        assert_eq!((r.rate, r.den), (25, 2));
+        // a keyframe at count 1 and the 3 frames behind it, through count 4
+        assert_eq!(r.linear(1 << 6 | 3), 4);
+        assert_eq!(r.linear(2 << 6 | 3), 5, "past a second keyframe");
+        // a 3.2.0 granule names the frame's index, one short of the count through it
+        let old = Run { lengths: Lengths::Theora { shift: 6, lag: 1 }, ..r };
+        assert_eq!(old.linear(2 << 6 | 3), 6);
+        let page = [b"f".to_vec(), b"f".to_vec(), b"f".to_vec()];
+        let packet = |i: usize, granule: u64| Packet {
+            data: page[i].clone(),
+            granule,
+            last: i == 2,
+            serial: 1,
+            bos: false,
+            eos: false,
+        };
+        // frames 4 to 6 on a page ending at count 7, two past the keyframe at count 5
+        let (first, rest) =
+            (packet(0, GRANULE_NONE), [packet(1, GRANULE_NONE), packet(2, 5 << 6 | 2)]);
+        assert_eq!(r.start(&first, rest.iter()), Some(4));
+        r.anchor_at(4);
+        assert_eq!(r.stamp(Timestamp::NONE, b"f", GRANULE_NONE, false), Timestamp(4 * FRAME));
+        // a zero byte packet repeats a frame and takes its slot
+        assert_eq!(r.stamp(Timestamp::NONE, b"", GRANULE_NONE, false), Timestamp(5 * FRAME));
+        assert_eq!(r.stamp(Timestamp::NONE, b"f", 5 << 6 | 2, true), Timestamp(6 * FRAME));
+        // frame 7 lost, the granule of the page frame 8 ends puts the clock back
+        r.stamp(Timestamp::NONE, b"f", 5 << 6 | 4, true);
+        assert_eq!(r.stamp(Timestamp::NONE, b"f", 10 << 6, true), Timestamp(9 * FRAME));
+    }
+
+    /// A Speex page of 50 packets of 320 samples at 16 kHz, its granule 143 short of their sum
+    /// as libspeex writes the first, the encoder's lookahead.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn speex_packets_are_counted_back_from_their_page_granule() {
+        let mut ident = b"Speex   ".to_vec();
+        ident.resize(28, 0);
+        for f in [1i32, 80, 16_000, 1, 4, 1, 27_800, 320, 0, 1, 0, 0, 0] {
+            ident.extend_from_slice(&f.to_le_bytes());
+        }
+        let mut r = Run::default();
+        r.identify(&ident);
+        assert_eq!((r.rate, r.lengths), (16_000, Lengths::Fixed(320)));
+        let packet = |last: bool, granule: u64| Packet {
+            data: b"s".to_vec(),
+            granule,
+            last,
+            serial: 1,
+            bos: false,
+            eos: false,
+        };
+        let page: Vec<Packet> = (0..50).map(|i| packet(i == 49, 15_857)).collect();
+        assert_eq!(r.start(&page[0], page[1..].iter()), Some(0), "a start before 0 is 0");
+        assert_eq!(r.start(&page[1], page[2..].iter()), Some(177));
+        r.anchor_at(0);
+        for (i, p) in page.iter().enumerate() {
+            let pts = r.stamp(Timestamp::NONE, &p.data, p.granule, p.last);
+            assert_eq!(pts, Timestamp(i as u64 * MS20), "packet {i}");
+        }
+        // the page granule puts the next page on its own time, 15857 samples in
+        let next = r.stamp(Timestamp::NONE, b"s", 31_857, false);
+        assert_eq!(next, Timestamp(15_857 * 1_000_000_000 / 16_000));
     }
 
     #[test]

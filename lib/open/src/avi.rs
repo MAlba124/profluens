@@ -1,6 +1,46 @@
-use pf_avi::{AviError, MoviLocation, StreamKind, family_for, probe_header};
+use pf_avi::{
+    AviError, MoviLocation, StreamKind, family_for, first_chunk_of, probe_header, vol_prefix,
+};
 
 use crate::{Desc, OpenError, SkipWhy, TrackDesc, TrackKind, id_of};
+
+/// Bytes read past `movi` for the VOL of an MPEG-4 stream whose `strf` carries none, the
+/// first video chunk's start lies within them in a file XviD or ffmpeg wrote.
+pub(crate) const VOL_WINDOW: u64 = 64 << 10;
+
+/// Whether a described MPEG-4 Part 2 track has no VOL in its head, XviD files keep it in the
+/// first key chunk only.
+pub(crate) fn wants_vol(d: &Desc) -> bool {
+    d.tracks.iter().any(|t| t.family == "mpeg4/asp" && vol_prefix(head_of(d, t)).is_none())
+}
+
+fn head_of<'a>(d: &'a Desc, t: &TrackDesc) -> &'a [u8] {
+    d.arena.get(t.head.range()).unwrap_or_default()
+}
+
+/// The VOL of each such track from `movi`, the bytes behind the list's four-CC, as its head.
+/// Whether every one was found or ruled out, a chunk cut by the slice's end decides nothing.
+pub(crate) fn vol_from_movi(movi: &[u8], d: &mut Desc) -> bool {
+    let mut settled = true;
+    for i in 0..d.tracks.len() {
+        let t = &d.tracks[i];
+        if t.family != "mpeg4/asp" || vol_prefix(head_of(d, t)).is_some() {
+            continue;
+        }
+        let Some(chunk) = first_chunk_of(movi, t.stream as usize) else {
+            settled = false;
+            continue;
+        };
+        match vol_prefix(chunk) {
+            Some(vol) => {
+                let head = d.put(vol);
+                d.tracks[i].head = head;
+            }
+            None => settled = false,
+        }
+    }
+    settled
+}
 
 /// The head's length through the `movi` four-CC when `window` holds it, the head
 /// [`pf_probe::head::AviHeadAt`] reads then.

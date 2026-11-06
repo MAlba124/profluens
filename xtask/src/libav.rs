@@ -25,7 +25,7 @@ const COMMON: &[&str] = &[
     "--disable-debug",
     "--disable-symver",
     "--disable-pixelutils",
-    "--enable-decoder=h264,hevc,vp8,vp9,aac,ac3,eac3,mp3float,dca,truehd,mlp,mpeg2video,mpeg4,vorbis,alac,flv,vp6,vp6f,vp6a,vp7",
+    "--enable-decoder=h264,hevc,vp8,vp9,aac,ac3,eac3,mp3float,dca,truehd,mlp,mpeg2video,mpeg4,vorbis,alac,flv,vp6,vp6f,vp6a,vp7,theora,speex",
     "--enable-parser=h264,hevc,vp8,vp9,aac,ac3,mpegaudio,dca,mlp,mpegvideo",
     "--enable-encoder=aac",
 ];

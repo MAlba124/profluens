@@ -1061,8 +1061,13 @@ impl Element for Mp4Demux {
     fn preroll(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         let reader = match self.reader.take() {
             Some(reader) => reader,
-            None => Mp4Reader::bounded(&self.head, &[], self.limits)
-                .map_err(|e| Error::element_failed(ctx.element(), e))?,
+            None => {
+                let r = Mp4Reader::bounded(&self.head, &[], self.limits)
+                    .map_err(|e| Error::element_failed(ctx.element(), e))?;
+                // the tables hold all the run needs, a big moov stays only once
+                drop(std::mem::take(&mut self.head));
+                r
+            }
         };
         for (i, track) in reader.tracks().iter().enumerate() {
             let (family, codec_head, reframer) = Self::track_wiring(track, self.passthrough)

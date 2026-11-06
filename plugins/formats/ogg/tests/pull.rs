@@ -10,9 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use pf_ogg::seek::{Bisect, Landing, Step};
 use pf_ogg::{
     GRANULE_NONE, GranuleClock, Mapping, OGG_TAIL_FIRST, OGG_TAIL_LEN, OggDemux, Packet,
     PageHeader, demux_all, flac_frame_samples, granule_clock, opus_packet_samples,
+    speex_packet_samples,
 };
 use pf_sim::driver::reactor::{Faults, World};
 use pf_sim::time::MS;
@@ -543,13 +545,14 @@ fn last_on_page(data: &[u8], key: u32, granule: u64) -> Option<Vec<u8>> {
     from.into_iter().rfind(|p| p.serial == key && p.granule == granule).map(|p| p.data)
 }
 
-fn landed(data: &[u8], serial: Option<u32>, target: u64) -> Vec<Ev> {
+/// What the key stream puts out behind a seek pulled to `target`, from the page ending by it on.
+/// A landing on a header page reads the file from its start, the headers flagged again.
+fn landed(data: &[u8], target: u64) -> Vec<Ev> {
     let packets = demux_all(data);
     let key = packets[0].serial;
     let clock = granule_clock(&packets[0].data).expect("a clock");
     let preroll = if matches!(clock, GranuleClock::Opus { .. }) { 80_000_000 } else { 0 };
     let ns = |g: u64| clock.ns(g).unwrap();
-    let stamp = |g: u64| clock.stamp(g).unwrap();
     let page = packets
         .iter()
         .filter(|p| {
@@ -560,47 +563,79 @@ fn landed(data: &[u8], serial: Option<u32>, target: u64) -> Vec<Ev> {
         .map(|p| p.granule)
         .max()
         .expect("a page ends by the target");
-    let serial = serial.unwrap_or(key);
-    let from: Vec<&Packet> = packets
-        .iter()
-        .filter(|p| p.serial == serial && (p.serial != key || p.granule > page))
-        .collect();
-    let stamps = match serial == key {
-        true => stamps(&from, &packets[0].data, page, stamp(page)),
-        false => (0..from.len()).map(|i| (i == 0).then_some(stamp(page))).collect(),
-    };
+    if page == 0 {
+        return from_head(&packets, key);
+    }
+    let from: Vec<&Packet> =
+        packets.iter().filter(|p| p.serial == key && p.granule > page).collect();
+    let stamps = stamps(&from, &packets[0].data, page, clock.stamp(page).unwrap());
     let mut evs: Vec<Ev> = from
         .iter()
         .zip(stamps)
         .map(|(p, pts)| Ev::Buf { pts, flags: 0, bytes: p.data.clone() })
         .collect();
     let vorbis = Mapping::identify(&packets[0].data) == Mapping::Vorbis;
-    if let Some(lead) =
-        last_on_page(data, key, page).filter(|_| vorbis && serial == key && !evs.is_empty())
-    {
+    if let Some(lead) = last_on_page(data, key, page).filter(|_| vorbis && !evs.is_empty()) {
         evs.insert(0, Ev::Buf { pts: None, flags: 0, bytes: lead });
     }
     evs
+}
+
+/// The stream of `serial` read from byte 0 behind a seek, its headers flagged and unstamped, its
+/// media stamped from where its first page's granule puts it, or the first at 0 where its packet
+/// lengths are not read.
+fn from_head(packets: &[Packet], serial: u32) -> Vec<Ev> {
+    let mine: Vec<&Packet> = packets.iter().filter(|p| p.serial == serial).collect();
+    let ident = &mine[0].data;
+    let (head, media) = mine.split_at(Mapping::identify(ident).header_packets(ident) as usize);
+    let stamps = match first_start(media, ident) {
+        Some(start) => {
+            stamps(media, ident, start, granule_clock(ident).unwrap().stamp(start).unwrap())
+        }
+        None => (0..media.len()).map(|i| (i == 0).then_some(0)).collect(),
+    };
+    let heads = head.iter().map(|p| Ev::Buf {
+        pts: None,
+        flags: BufferFlags::HEADER.0,
+        bytes: p.data.clone(),
+    });
+    let media =
+        media.iter().zip(stamps).map(|(p, pts)| Ev::Buf { pts, flags: 0, bytes: p.data.clone() });
+    heads.chain(media).collect()
+}
+
+/// The samples of `packet` where the demuxer reads them, Opus, FLAC and Speex.
+fn length(ident: &[u8], packet: &[u8]) -> Option<u32> {
+    match Mapping::identify(ident) {
+        Mapping::Opus => opus_packet_samples(packet),
+        Mapping::Flac => flac_frame_samples(packet),
+        Mapping::Speex => speex_packet_samples(ident),
+        _ => None,
+    }
+}
+
+/// The granule `packets[0]` starts at, its page's granule less the samples to it, 0 at the least.
+fn first_start(packets: &[&Packet], ident: &[u8]) -> Option<u64> {
+    let to_end = packets.iter().position(|p| p.last)?;
+    let samples: Option<u64> =
+        packets[..=to_end].iter().map(|p| length(ident, &p.data).map(u64::from)).sum();
+    Some(packets[to_end].granule.saturating_sub(samples?))
 }
 
 /// The stamps of a stream's packets from a landing on the page ending at `page` stamped `at`, the
 /// first at `at`, each after it later by the samples between, a page's granule ending its packets.
 /// Only the first stamped for a mapping whose packet lengths the demuxer does not read.
 fn stamps(packets: &[&Packet], ident: &[u8], page: u64, at: u64) -> Vec<Option<u64>> {
-    let (rate, flac) = match (Mapping::identify(ident), granule_clock(ident)) {
-        (Mapping::Opus, _) => (48_000u128, false),
-        (Mapping::Flac, Some(GranuleClock::Rate(rate))) => (u128::from(rate), true),
+    let rate = match (Mapping::identify(ident), granule_clock(ident)) {
+        (Mapping::Opus, _) => 48_000u128,
+        (Mapping::Flac | Mapping::Speex, Some(GranuleClock::Rate(rate))) => u128::from(rate),
         _ => return (0..packets.len()).map(|i| (i == 0).then_some(at)).collect(),
     };
     let mut start = page;
     let mut out = Vec::with_capacity(packets.len());
     for p in packets {
         out.push(Some(at + (u128::from(start - page) * 1_000_000_000 / rate) as u64));
-        let len = match flac {
-            true => flac_frame_samples(&p.data),
-            false => opus_packet_samples(&p.data),
-        };
-        start += u64::from(len.expect("a packet length"));
+        start += u64::from(length(ident, &p.data).expect("a packet length"));
         if p.last && p.granule != GRANULE_NONE {
             start = p.granule;
         }
@@ -615,7 +650,7 @@ fn a_seek_part_way_through_restarts_a_push_at_its_byte_and_lands_a_pull_on_its_p
         let len = data.len() as u64;
         for at in [Timestamp(1_500_000_000), Timestamp(55_000_000), Timestamp(3_210_000_000)] {
             let seek = Some(Seek { after: 8, to_byte: len / 2, at });
-            let want = landed(&data, None, at.0);
+            let want = landed(&data, at.0);
             for seed in 0..4 {
                 let what = format!("{} at {at:?} seed {seed}", path.display());
                 let push = demux(path, Opts { stepped: Some(seed), seek, ..PUSH });
@@ -760,6 +795,10 @@ fn by_serial(data: &[u8]) -> Vec<(u32, Vec<Vec<u8>>)> {
     out
 }
 
+fn pts_of(evs: &[Ev]) -> Vec<Option<u64>> {
+    evs.iter().filter_map(|e| if let Ev::Buf { pts, .. } = e { Some(*pts) } else { None }).collect()
+}
+
 fn bytes_of(evs: &[Ev]) -> Vec<Vec<u8>> {
     evs.iter()
         .filter_map(|e| if let Ev::Buf { bytes, .. } = e { Some(bytes.clone()) } else { None })
@@ -808,10 +847,11 @@ fn behind_a_seek_every_pad_restarts_with_its_time() {
         let len = data.len() as u64;
         let at = Timestamp(2_000_000_000);
         let seek = Some(Seek { after: 8, to_byte: len / 2, at });
-        let first = landed(&data, None, at.0);
-        let Some(Ev::Buf { pts: Some(page), .. }) = first.first().cloned() else {
-            panic!("a landing")
-        };
+        let first = landed(&data, at.0);
+        let packets = demux_all(&data);
+        let serial = by_serial(&data)[1].0;
+        let mine: Vec<&Packet> = packets.iter().filter(|p| p.serial == serial).collect();
+        let ident = &mine[0].data;
         for seed in 0..4 {
             let what = format!("{} seed {seed}", path.display());
             let push = demux(path, Opts { stepped: Some(seed), seek, streams: true, ..PUSH });
@@ -832,14 +872,14 @@ fn behind_a_seek_every_pad_restarts_with_its_time() {
             let (first_pad, other) = (&pull.pads[0].1, &pull.pads[1].1);
             assert_same(&first, behind_flush(first_pad), &format!("{what} first"));
             let b = behind_flush(other);
-            assert!(
-                matches!(b.first(), Some(Ev::Buf { pts: Some(t), .. }) if *t == page),
-                "{what} other: {:?}",
-                b.first()
-            );
-            let all = bytes_of(&landed(&data, Some(by_serial(&data)[1].0), 0));
             let tail = bytes_of(b);
+            let all: Vec<Vec<u8>> = mine.iter().map(|p| p.data.clone()).collect();
             assert!(all.ends_with(&tail), "{what} other: its packets from the landing on");
+            // stamped from its own page granule, not the key stream's landing
+            let from = &mine[mine.len() - tail.len()..];
+            let start = first_start(from, ident).expect("a page end");
+            let at = granule_clock(ident).unwrap().stamp(start).unwrap();
+            assert_eq!(pts_of(b), stamps(from, ident, start, at), "{what} other");
             assert_eq!(pull.index, push.index, "{what}: the index");
         }
     }
@@ -872,9 +912,18 @@ fn a_first_tail_of_no_page_is_asked_again_whole() {
     }
 }
 
+/// Five seconds of 192 kHz stereo FLAC noise, about 4 Mbit/s, a quarter second of it over
+/// the window's floor.
+fn dense_flac() -> Option<PathBuf> {
+    let noise = "anoisesrc=d=5:a=0.5:r=192000:seed=5";
+    ffmpeg("dense.oga", noise, &["-ac", "2", "-c:a", "flac", "-sample_fmt", "s32"])
+}
+
+/// Told the rate, a window holds a quarter second of it, at least 64 KiB.
 #[test]
 fn told_the_rate_a_window_holds_a_quarter_second_of_it() {
-    for path in fixtures() {
+    for path in fixtures().iter().cloned().chain(dense_flac()) {
+        let path = &path;
         let what = path.display();
         let data = Arc::new(std::fs::read(path).unwrap());
         let len = data.len() as u64;
@@ -904,7 +953,7 @@ fn told_the_rate_a_window_holds_a_quarter_second_of_it() {
             continue;
         }
         let paced = (u128::from(len) * 250_000_000 / u128::from(duration)) as u64;
-        let paced = paced.clamp(4096, 256 * 1024);
+        let paced = paced.clamp(64 << 10, 256 * 1024);
         let log = log.lock().unwrap();
         let windows: Vec<u64> = log
             .taken
@@ -914,7 +963,9 @@ fn told_the_rate_a_window_holds_a_quarter_second_of_it() {
             .map(|(_, l)| u64::from(*l))
             .collect();
         assert_eq!(windows.first(), Some(&(16u64 << 10).min(len)), "{what}: {windows:?}");
-        let steady = windows[windows.len().saturating_sub(4)..windows.len() - 1].to_vec();
+        // past the first windows, the last short at the file's end
+        let told: Vec<u64> = windows.iter().copied().skip_while(|w| *w == 16 << 10).collect();
+        let steady = &told[..told.len().saturating_sub(1)];
         assert!(
             !steady.is_empty() && steady.iter().all(|w| *w >= paced / 2 && *w <= paced * 2),
             "{what}: {steady:?} for {paced}"
@@ -969,4 +1020,255 @@ fn from_the_start_every_media_packet_is_stamped_from_the_granules() {
             assert_eq!(got, want, "{what} pulled {}", opts.pull);
         }
     }
+}
+
+/// A file of the generated corpus, `None` and a note where `cargo xtask fixtures` has not run.
+fn corpus(name: &str) -> Option<PathBuf> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../fixtures/out").join(name);
+    if !path.exists() {
+        eprintln!("pull: {name} not generated, skipped");
+    }
+    path.exists().then_some(path)
+}
+
+const SPEEX: (&str, u64) = ("ogg_speex.spx", 1_991_062_500);
+const THEORA: (&str, u64) = ("ogg_theora_speex.ogv", 2_000_000_000);
+
+/// Speex is timed in samples less its encoder's lookahead, Theora in frames, both from the last
+/// page of the first stream.
+#[test]
+fn speex_and_theora_files_are_timed_from_their_last_granule() {
+    for (name, ns) in [SPEEX, THEORA] {
+        let Some(path) = corpus(name) else { continue };
+        let data = std::fs::read(&path).unwrap();
+        let first = demux_all(&data).swap_remove(0);
+        let duration = pf_ogg::stream_duration_ns(&first.data, &tail_of(&data), first.serial);
+        assert_eq!(duration, Some(ns), "{name}");
+        let pulled = demux(&path, PULL).index.and_then(|i| i.duration.nanos());
+        assert_eq!(pulled, Some(ns), "{name}: published");
+    }
+}
+
+/// A pulled seek to the middle bisects by the granules. Speex lands on the page ending by the
+/// target, its next packet within one of it and each after 20 ms on. Theora lands ahead of the
+/// keyframe the target's frame decodes from, every frame stamped from it.
+#[test]
+fn a_speex_or_theora_seek_pulled_lands_by_its_granules() {
+    const TARGET: u64 = 1_000_000_000;
+    const SPEEX_PACKET: u64 = 20_000_000;
+    for (name, _) in [SPEEX, THEORA] {
+        let Some(path) = corpus(name) else { continue };
+        let data = std::fs::read(&path).unwrap();
+        let packets = demux_all(&data);
+        let (key, ident) = (packets[0].serial, &packets[0].data);
+        let clock = granule_clock(ident).expect("a clock");
+        let theora = Mapping::identify(ident) == Mapping::Theora;
+        let ns = |g: u64| clock.ns(g).expect("a time");
+        let ends = |by: u64, below: u64| {
+            packets
+                .iter()
+                .filter(|p| p.serial == key && p.granule < below && ns(p.granule) <= by)
+                .map(|p| p.granule)
+                .max()
+        };
+        let page = ends(TARGET, u64::MAX).expect("a page ends by the target");
+        let page = match clock.keyframe_ns(page) {
+            Some(key) => ends(key, page).expect("a page ends by the keyframe"),
+            None => page,
+        };
+        let from: Vec<&Packet> =
+            packets.iter().filter(|p| p.serial == key && p.granule > page).collect();
+        let at = clock.stamp(page).expect("a stamp");
+        let pts = match theora {
+            true => (0..from.len()).map(|i| Some(at + i as u64 * 1_000_000_000 / 15)).collect(),
+            false => stamps(&from, ident, page, at),
+        };
+        let want: Vec<Ev> = from
+            .iter()
+            .zip(pts)
+            .map(|(p, pts)| Ev::Buf { pts, flags: 0, bytes: p.data.clone() })
+            .collect();
+        match theora {
+            // the fixture's keyframes are 12 frames apart at 15 a second
+            true => {
+                assert_eq!(at, 800_000_000, "{name}");
+                assert_eq!(from[0].data[0] & 0xC0, 0, "{name}: an intra frame first");
+            }
+            false => assert!(at <= TARGET && TARGET - at < SPEEX_PACKET, "{name}: {at}"),
+        }
+        let len = data.len() as u64;
+        for seed in 0..4 {
+            let what = format!("{name} seed {seed}");
+            let seek = Some(Seek { after: 1, to_byte: len / 2, at: Timestamp(TARGET) });
+            let pull = demux(&path, Opts { stepped: Some(seed), seek, ..PULL });
+            assert!(pull.evs.contains(&Ev::Flush), "{what}: sought before the end");
+            assert_same(&want, behind_flush(&pull.evs), &what);
+        }
+    }
+}
+
+/// Behind a seek every pad of a Theora file with Speex starts on its own time. Before the second
+/// group of pictures the file is read again from byte 0, every stream's headers flagged, never a
+/// Speex comment put out as audio. Past it the Speex pad is counted back from its own page
+/// granule, not stamped with the Theora landing's time.
+#[test]
+fn behind_a_seek_a_theora_files_speex_pad_is_on_its_own_time() {
+    let Some(path) = corpus(THEORA.0) else { return };
+    let data = std::fs::read(&path).unwrap();
+    let packets = demux_all(&data);
+    let serials = by_serial(&data);
+    let speex: Vec<&Packet> = packets.iter().filter(|p| p.serial == serials[1].0).collect();
+    let ident = &speex[0].data;
+    assert_eq!(Mapping::identify(ident), Mapping::Speex);
+    let len = data.len() as u64;
+    for (target, keyframe) in [(0, 0), (500_000_000, 0), (1_000_000_000, 12)] {
+        for seed in 0..3 {
+            let what = format!("target {target} seed {seed}");
+            let seek = Some(Seek { after: 4, to_byte: len / 2, at: Timestamp(target) });
+            let pull = demux(&path, Opts { stepped: Some(seed), seek, streams: true, ..PULL });
+            assert!(pull.pads[0].1.contains(&Ev::Flush), "{what}: sought before the end");
+            let (video, audio) = (behind_flush(&pull.pads[0].1), behind_flush(&pull.pads[1].1));
+            let header =
+                |e: &Ev| matches!(e, Ev::Buf { flags, .. } if flags & BufferFlags::HEADER.0 != 0);
+            let comment = |e: &Ev| matches!(e, Ev::Buf { bytes, .. } if bytes.len() == 55 && bytes[0] == 0x0d);
+            assert!(!audio.iter().any(|e| comment(e) && !header(e)), "{what}: a comment as audio");
+            let heads = video.iter().take_while(|e| header(e)).count();
+            assert_eq!(heads, if keyframe == 0 { 3 } else { 0 }, "{what}: the Theora headers");
+            let pts = pts_of(&video[heads..]);
+            let Some(Ev::Buf { bytes, .. }) = video.get(heads) else { panic!("{what}: no frame") };
+            assert_eq!(bytes[0] & 0xC0, 0, "{what}: an intra frame first");
+            for (i, t) in pts.iter().enumerate() {
+                assert_eq!(
+                    *t,
+                    Some((keyframe + i as u64) * 1_000_000_000 / 15),
+                    "{what}: frame {i}"
+                );
+            }
+            if keyframe == 0 {
+                assert_same(&from_head(&packets, serials[1].0), audio, &what);
+                continue;
+            }
+            assert!(!audio.iter().any(header), "{what}: no Speex header past the headers");
+            let from = &speex[speex.len() - audio.len()..];
+            assert_eq!(bytes_of(audio), from.iter().map(|p| p.data.clone()).collect::<Vec<_>>());
+            let start = first_start(from, ident).expect("a page end");
+            let got = pts_of(audio);
+            assert!(
+                got[0].is_some_and(|t| t < 20_000_000),
+                "{what}: {:?}, not the landing's",
+                got[0]
+            );
+            assert_eq!(got, stamps(from, ident, start, start * 1_000_000_000 / 16_000), "{what}");
+            assert_eq!(got[1].zip(got[0]).map(|(b, a)| b - a), Some(20_000_000), "{what}");
+        }
+    }
+}
+
+/// An audio file seeks by its granules, a target before its first page of audio ends reads it
+/// again from byte 0 with its headers flagged.
+#[test]
+fn an_audio_seek_before_the_first_page_ends_reads_the_headers_again() {
+    for name in ["ogg_vorbis.ogg", "ogg_flac.oga", SPEEX.0] {
+        let Some(path) = corpus(name) else { continue };
+        let data = std::fs::read(&path).unwrap();
+        let len = data.len() as u64;
+        let packets = demux_all(&data);
+        let clock = granule_clock(&packets[0].data).expect("a clock");
+        let first = packets.iter().map(|p| p.granule).filter(|g| *g > 0 && *g != GRANULE_NONE);
+        let first = clock.ns(first.min().expect("a page of audio")).unwrap();
+        for target in [0, 500_000_000, 1_000_000_000, 1_500_000_000] {
+            let want = landed(&data, target);
+            let head = matches!(want.first(), Some(Ev::Buf { flags, .. }) if *flags != 0);
+            assert_eq!(head, target < first, "{name} {target}: from byte 0");
+            for seed in 0..3 {
+                let what = format!("{name} target {target} seed {seed}");
+                let seek = Some(Seek { after: 2, to_byte: len / 2, at: Timestamp(target) });
+                let pull = demux(&path, Opts { stepped: Some(seed), seek, ..PULL });
+                assert!(pull.evs.contains(&Ev::Flush), "{what}: sought before the end");
+                assert_same(&want, behind_flush(&pull.evs), &what);
+            }
+        }
+    }
+}
+
+/// The key stream's timed pages, their first byte and granule, walked from byte 0.
+fn timed_pages(data: &[u8], key: u32) -> Vec<(u64, u64)> {
+    let (mut at, mut out) = (0, Vec::new());
+    while let Ok(page) = PageHeader::parse(&data[at..]) {
+        if page.serial() == key && page.granule_position() != GRANULE_NONE {
+            out.push((at as u64, page.granule_position()));
+        }
+        at += page.len();
+    }
+    out
+}
+
+/// Where a seek to `target` lands read page by page, the rule [`Bisect`] keeps.
+fn brute(pages: &[(u64, u64)], clock: GranuleClock, target: u64) -> Option<Landing> {
+    let ns = |g: u64| clock.ns(g).expect("a time");
+    let mut found = pages.iter().rev().find(|(_, g)| ns(*g) <= target).copied()?;
+    if let Some(key) = clock.keyframe_ns(found.1) {
+        let before = pages.iter().rev().find(|(at, g)| *at < found.0 && ns(*g) <= key);
+        found = before.copied().unwrap_or(found);
+    }
+    Some(match found {
+        (_, 0) => Landing::HEAD,
+        (at, granule) => Landing { at, granule, ns: ns(granule) },
+    })
+}
+
+/// The most probes a seek to each tenth of the file takes, the file's end time known or not,
+/// every landing checked against the pages read in order.
+fn most_probes(path: &Path, known: bool) -> u32 {
+    let data = std::fs::read(path).unwrap();
+    let packets = demux_all(&data);
+    let (key, clock) = (packets[0].serial, granule_clock(&packets[0].data).expect("a clock"));
+    let pages = timed_pages(&data, key);
+    let end = clock.ns(pages.last().expect("a page").1).unwrap();
+    let mut most = 0;
+    for tenth in 0..=10 {
+        let target = end / 10 * tenth;
+        let mut b = Bisect::new(key, clock, target, data.len() as u64).ending(known.then_some(end));
+        let mut probes = 0;
+        let got = loop {
+            match b.step() {
+                Step::Land(l) => break l,
+                Step::Probe { at, len } => {
+                    probes += 1;
+                    b.served(at, &data[at as usize..(at + u64::from(len)) as usize]);
+                }
+            }
+        };
+        assert_eq!(got, brute(&pages, clock, target), "{path:?} target {target}");
+        most = most.max(probes);
+    }
+    most
+}
+
+/// A seek interpolates on the granules against the bytes. Every file takes no more probes than
+/// plain bisection did, counted 2026-11-06, and ten minutes of Opus one or two with its end time
+/// known, plain bisection 3 to 13.
+#[test]
+fn a_seek_lands_in_fewer_probes_than_a_bisection() {
+    let before = [("ogg_vorbis.ogg", 1), ("ogg_flac.oga", 6), (SPEEX.0, 1), (THEORA.0, 5)];
+    let corpus = before.into_iter().filter_map(|(name, most)| corpus(name).zip(Some(most)));
+    let before = [("128kbps.opus", 4), ("noise.opus", 6), ("noise.oga", 11), ("noise.ogg", 6)];
+    let made = fixtures().iter().filter_map(|path| {
+        let name = path.file_name()?.to_str()?;
+        before.iter().find(|(end, _)| name.ends_with(end)).map(|(_, most)| (path.clone(), *most))
+    });
+    for (path, before) in corpus.chain(made) {
+        for known in [false, true] {
+            let most = most_probes(&path, known);
+            assert!(most <= before, "{path:?} end known {known}: {most} probes");
+        }
+    }
+    // ten minutes of Opus at 24 kbit/s, 1.5 MB
+    let noise = "anoisesrc=d=600:a=0.3:r=48000:seed=4";
+    let Some(long) = ffmpeg("long.opus", noise, &["-ac", "1", "-c:a", "libopus", "-b:a", "24k"])
+    else {
+        return;
+    };
+    assert!(most_probes(&long, true) <= 2, "the end known");
+    assert!(most_probes(&long, false) <= 4, "the end unknown");
 }

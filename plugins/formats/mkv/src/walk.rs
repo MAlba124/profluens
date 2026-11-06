@@ -182,6 +182,15 @@ impl<H: AsRef<[u8]>> MetaOwned<H> {
     pub fn into_head(self) -> H {
         self.head
     }
+
+    /// The Tags and the Attachments at `tags` and `attachments` where the head names neither,
+    /// a head cut before them whose SeekHead leaves them out.
+    pub fn with_places(mut self, tags: Option<u64>, attachments: Option<u64>) -> Self {
+        if let Some((t, a)) = &mut self.walk.index {
+            (*t, *a) = (t.or(tags), a.or(attachments));
+        }
+        self
+    }
 }
 
 impl<H: AsRef<[u8]>> Fetch for MetaOwned<H> {

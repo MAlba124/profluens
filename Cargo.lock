@@ -290,6 +290,7 @@ dependencies = [
 name = "pf-mkv"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "pf-harness",
  "pf-hdr",
  "pf-libav",

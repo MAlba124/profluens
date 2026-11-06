@@ -368,11 +368,7 @@ impl VaapiH265Dec {
         // VA decodes the format range extensions profiles as Main 12
         let rext = sps.rext || depth > 10;
         let (refs, reorder) = (sps.ref_frames(), sps.reorder_frames());
-        // Exported surfaces stay out of the free pool until released, this covers them and the
-        // release-drain latency.
-        const PRESENTATION_SLACK: u32 = 6;
-        let extra = if self.zerocopy.is_some() { PRESENTATION_SLACK } else { 0 };
-        let count = crate::va::decode_surface_count(refs, reorder, extra);
+        let count = crate::va::decode_surface_count(refs, reorder, self.zerocopy.is_some());
         if depth > 10 && self.zerocopy.is_none() {
             self.fail(ctx, unsupported(sps));
             return false;
@@ -382,7 +378,7 @@ impl VaapiH265Dec {
         let asked = self.shrink.or((depth > 10).then_some(twelve));
         let shrink = match asked.filter(|_| self.zerocopy.is_some()) {
             Some((t, fixed)) => match decproc::plan(width, height, depth.min(10), t, fixed) {
-                Some(p) => Some(p),
+                Some(p) => decproc::needed(p, width, height, (crop_x, crop_y), format),
                 None => {
                     self.fail(ctx, K::ProcSize { width, height });
                     return false;
@@ -473,6 +469,8 @@ impl VaapiH265Dec {
             let (w, h) = (t.plan.width, t.plan.height);
             log!(&*ctx, Level::Info, "shrink", width = w, height = h, layout = t.kind().name);
         }
+        let made = if twins.is_some() { count } else { 0 };
+        self.stats.made(count + made, made);
         let free = VecDeque::from(surfaces.ids().to_vec());
         self.va = Some(VaState {
             _config: config,

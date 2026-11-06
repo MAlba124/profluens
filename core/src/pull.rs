@@ -167,7 +167,24 @@ impl Feed {
             && self.end.is_none_or(|end| self.asked < end)
             && ctx.asks_left(pad) > 0
         {
-            let Some(buf) = ctx.try_alloc() else { return };
+            let Some(buf) = ctx.try_alloc() else {
+                // the pool refused a window, the first and every 64th time with its state
+                static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 64 == 0 {
+                    let st = ctx.pool_stats();
+                    crate::log!(
+                        &*ctx,
+                        crate::log::Level::Debug,
+                        "window_refused",
+                        out = st.outstanding,
+                        max_slots = st.max_slots,
+                        bytes_out = st.bytes_out,
+                        budget = st.bytes_budget,
+                    );
+                }
+                return;
+            };
             let room = self.end.map_or(u64::MAX, |end| end - self.asked);
             let len = (self.window as u64).min(buf.memory.capacity() as u64).min(room) as u32;
             if ctx.ask(pad, Ask { offset: self.asked, len, tag: self.asked, buf }).is_err() {

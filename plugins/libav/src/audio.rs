@@ -1,4 +1,5 @@
-//! libavcodec audio decoders (AAC, AC-3/E-AC-3, MP3, DTS, TrueHD/MLP, Vorbis, ALAC) as elements.
+//! libavcodec audio decoders (AAC, AC-3/E-AC-3, MP3, DTS, TrueHD/MLP, Vorbis, ALAC, Speex) as
+//! elements.
 //! Compressed audio in, interleaved `audio/raw` out in libavutil's native channel order.
 //! Float to s16 matches `ffmpeg -f s16le` (libswresample audioconvert.c).
 
@@ -84,6 +85,9 @@ static VORBIS_SINKS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &VORBIS_SIN
 static ALAC_SINK: [OfferDesc; 2] =
     [OfferDesc { family: "alac", fields: &DELAY_FIELDS }, OfferDesc::any("bytes")];
 static ALAC_SINKS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &ALAC_SINK }];
+static SPEEX_SINK: [OfferDesc; 2] =
+    [OfferDesc { family: "speex", fields: &DELAY_FIELDS }, OfferDesc::any("bytes")];
+static SPEEX_SINKS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &SPEEX_SINK }];
 
 const fn desc(
     name: &'static str,
@@ -130,6 +134,9 @@ pub(crate) static VORBIS_DESC: ElementDesc =
 #[allow(clippy::disallowed_methods)]
 pub(crate) static ALAC_DESC: ElementDesc =
     desc("libavalacdec", &ALAC_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::alac()));
+#[allow(clippy::disallowed_methods)]
+pub(crate) static SPEEX_DESC: ElementDesc =
+    desc("libavspeexdec", &SPEEX_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::speex()));
 
 const FRAMES_PER_BATCH: u32 = 2;
 
@@ -142,6 +149,14 @@ const MIN_OUT_PER_SEC: u32 = 50;
 
 /// Empty comment header laced between the other two (Vorbis I 5.2.1). libavcodec skips it.
 const VORBIS_COMMENT: [u8; 16] = *b"\x03vorbis\0\0\0\0\0\0\0\0\x01";
+
+/// The Speex identification header, `Speex` and three spaces up front (Speex manual 7.3, Table
+/// 7.1). libavcodec reads it as extradata.
+const SPEEX_HEAD: usize = 80;
+const SPEEX_MAGIC: &[u8; 8] = b"Speex   ";
+const SPEEX_EXTRA_AT: usize = 68;
+/// Extra headers past the comment a Speex stream may claim, as pf-ogg caps them.
+const SPEEX_EXTRA_MAX: u32 = 16;
 
 /// Why a libav audio decoder dropped something.
 #[derive(Debug, PartialEq, Eq)]
@@ -180,6 +195,8 @@ enum Framing {
     VorbisRaw,
     AlacHead,
     AlacRaw,
+    SpeexHead,
+    SpeexRaw,
 }
 
 impl Framing {
@@ -188,13 +205,25 @@ impl Framing {
             lav::Codec::Aac => Framing::AacHead,
             lav::Codec::Vorbis => Framing::VorbisHead,
             lav::Codec::Alac => Framing::AlacHead,
+            lav::Codec::Speex => Framing::SpeexHead,
             _ => Framing::Parse,
         }
     }
 
-    fn vorbis(self) -> bool {
-        matches!(self, Framing::VorbisHead | Framing::VorbisRaw)
+    /// Headers ride in band ahead of the packets and go unstamped.
+    fn in_band_heads(self) -> bool {
+        matches!(
+            self,
+            Framing::VorbisHead | Framing::VorbisRaw | Framing::SpeexHead | Framing::SpeexRaw
+        )
     }
+}
+
+/// The Speex identification header the decoder opened with and the header packets behind it
+/// still to drop, the comment and any extra headers.
+struct SpeexHeads {
+    ident: [u8; SPEEX_HEAD],
+    skip: u32,
 }
 
 struct VorbisHeads {
@@ -241,6 +270,7 @@ pub struct LibavAudioDec {
     coded: Option<u64>,
     input: ByteIn,
     vorbis: VorbisHeads,
+    speex: SpeexHeads,
 }
 
 impl LibavAudioDec {
@@ -285,6 +315,7 @@ impl LibavAudioDec {
             coded: None,
             input: ByteIn::new(SINK_PAD),
             vorbis: VorbisHeads { ident: Vec::new(), laced: Vec::new() },
+            speex: SpeexHeads { ident: [0; SPEEX_HEAD], skip: 0 },
         }
     }
 
@@ -358,6 +389,10 @@ impl LibavAudioDec {
         Self::with(&ALAC_DESC, lav::Codec::Alac, Framing::AlacHead)
     }
 
+    pub fn speex() -> Self {
+        Self::with(&SPEEX_DESC, lav::Codec::Speex, Framing::SpeexHead)
+    }
+
     fn tagged(&self) -> bool {
         matches!(self.codec, lav::Codec::Mp3 | lav::Codec::Aac)
     }
@@ -392,6 +427,7 @@ impl LibavAudioDec {
         self.coded = None;
         self.vorbis.ident.clear();
         self.vorbis.laced.clear();
+        self.speex.skip = 0;
     }
 
     /// Count a frame or packet not put out, `true` for the first few, which are logged.
@@ -534,6 +570,47 @@ impl LibavAudioDec {
                 Self::warn(ctx, LavAudioError::Open(e));
             }
         }
+    }
+
+    /// `true` for a Speex packet to decode. Ogg Speex has no magic on its comment and extra
+    /// headers, so the count the identification header states drops them.
+    fn speex_audio(&mut self, ctx: &mut Ctx, data: &[u8]) -> bool {
+        if let Some(ident) = data.get(..SPEEX_HEAD).filter(|d| d.starts_with(SPEEX_MAGIC)) {
+            let extra = u32::from_le_bytes(
+                ident[SPEEX_EXTRA_AT..SPEEX_EXTRA_AT + 4].try_into().unwrap_or_default(),
+            );
+            self.speex.skip = 1 + extra.min(SPEEX_EXTRA_MAX);
+            if self.framing == Framing::SpeexRaw && ident == self.speex.ident.as_slice() {
+                return false;
+            }
+            match Decoder::open(lav::Codec::Speex, ident, None, false) {
+                Ok(d) => {
+                    log!(&*ctx, Level::Info, "decoder_open", codec = "speex", extra = extra);
+                    self.decoder = Some(d);
+                    self.framing = Framing::SpeexRaw;
+                    self.speex.ident.copy_from_slice(ident);
+                    self.errors = 0;
+                }
+                Err(e) => {
+                    log!(&*ctx, Level::Warn, "open_failed", codec = "speex", err = e.code());
+                    self.decoder = None;
+                    self.framing = Framing::SpeexHead;
+                    Self::warn(ctx, LavAudioError::Open(e));
+                }
+            }
+            return false;
+        }
+        if self.speex.skip > 0 {
+            self.speex.skip -= 1;
+            return false;
+        }
+        if self.framing == Framing::SpeexRaw {
+            return !data.is_empty();
+        }
+        if self.drop_counted() {
+            log!(&*ctx, Level::Warn, "frame_drop", reason = "no_headers", bytes = data.len());
+        }
+        false
     }
 
     fn is_head(&self, data: &[u8]) -> bool {
@@ -979,7 +1056,7 @@ impl LibavAudioDec {
                 return Ok(Flow::Ok);
             };
             let data = inbuf.memory.data();
-            if !self.framing.vorbis() {
+            if !self.framing.in_band_heads() {
                 self.rebase.input(inbuf.pts);
             }
             self.scan(ctx, data);
@@ -1039,6 +1116,17 @@ impl LibavAudioDec {
                 }
                 Framing::VorbisHead | Framing::VorbisRaw => {
                     if !self.vorbis_audio(ctx, data) {
+                        continue;
+                    }
+                    self.rebase.input(inbuf.pts);
+                    self.decode_unit(ctx, data);
+                    if !self.after_packet(ctx, &mut emitted) {
+                        ctx.hold_end();
+                        return Ok(Flow::Ok);
+                    }
+                }
+                Framing::SpeexHead | Framing::SpeexRaw => {
+                    if !self.speex_audio(ctx, data) {
                         continue;
                     }
                     self.rebase.input(inbuf.pts);

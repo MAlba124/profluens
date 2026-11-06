@@ -220,6 +220,8 @@ fn t(max_width: u32, max_height: u32, depth: u8) -> Target {
 #[test]
 fn h265_shrunk_in_the_decoder_is_the_vpps_picture() {
     check("h265_shrunk", Dec::Nal(Codec::H265), "HEVCMain", IPB, t(160, 120, 8), t(160, 120, 8), 0);
+    // the decoded size, no twin, the decode surface leaves itself
+    check("h265_same", Dec::Nal(Codec::H265), "HEVCMain", IPB, t(320, 240, 8), t(320, 240, 8), 0);
 }
 
 #[test]
@@ -238,6 +240,15 @@ fn main10_shrunk_in_the_decoder_stays_ten_bit() {
         t(64, 64, 10),
         0,
     );
+    check(
+        "main10_same",
+        Dec::Nal(Codec::H265),
+        "HEVCMain10",
+        PQ,
+        t(128, 128, 10),
+        t(128, 128, 10),
+        0,
+    );
 }
 
 /// A 10 bit SDR source to 8 bits, the decoder's scaler converts.
@@ -251,6 +262,7 @@ fn h264_shrunk_in_the_decoder_is_the_vpps_picture() {
     let ipb = include_bytes!("fixtures/ipb_320x240.h264");
     check("h264_shrunk", Dec::Nal(Codec::H264), "H264High", ipb, t(160, 120, 8), t(160, 120, 8), 0);
     check("h264_bars", Dec::Nal(Codec::H264), "H264High", ipb, t(160, 160, 8), t(160, 160, 8), 20);
+    check("h264_same", Dec::Nal(Codec::H264), "H264High", ipb, t(320, 240, 8), t(320, 240, 8), 0);
 }
 
 /// PQ to SDR as a transcode runs it, shrunk at 10 bits by the decoder then tone mapped, is the
@@ -358,6 +370,7 @@ fn vp9_shrunk_in_the_decoder_is_the_vpps_picture() {
     let hidden = include_bytes!("fixtures/alloc_352x288.ivf");
     let p2 = include_bytes!("fixtures/p2_160x96.ivf");
     check("vp9_shrunk", Dec::Vp9, "VP9Profile0", features, t(256, 144, 8), t(256, 144, 8), 0);
+    check("vp9_same", Dec::Vp9, "VP9Profile0", features, t(512, 288, 8), t(512, 288, 8), 0);
     check("vp9_bars", Dec::Vp9, "VP9Profile0", features, t(256, 176, 8), t(256, 176, 8), 16);
     check("vp9_hidden", Dec::Vp9, "VP9Profile0", hidden, t(176, 144, 8), t(176, 144, 8), 0);
     check("vp9_p2_shrunk", Dec::Vp9, "VP9Profile2", p2, t(80, 48, 10), t(80, 48, 10), 0);

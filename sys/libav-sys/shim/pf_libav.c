@@ -88,6 +88,8 @@ static enum AVCodecID codec_id(int codec)
     case PF_LAV_VP6F: return AV_CODEC_ID_VP6F;
     case PF_LAV_VP6A: return AV_CODEC_ID_VP6A;
     case PF_LAV_VP7: return AV_CODEC_ID_VP7;
+    case PF_LAV_THEORA: return AV_CODEC_ID_THEORA;
+    case PF_LAV_SPEEX: return AV_CODEC_ID_SPEEX;
     default: return AV_CODEC_ID_NONE;
     }
 }

@@ -124,7 +124,6 @@ use header::NUM_REF_FRAMES;
 /// A unit of more frames, as SVT-AV1's hierarchical alt-refs after a key frame, waits
 /// for as many free surfaces as it decodes frames.
 const UNIT_RESERVE: usize = 2;
-const PRESENTATION_SLACK: u32 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Slot {
@@ -377,9 +376,9 @@ impl VaapiAv1Dec {
             return false;
         };
         let per_frame = 1 + u32::from(grain);
-        let extra = if self.zerocopy.is_some() { PRESENTATION_SLACK } else { 0 };
         let refs = NUM_REF_FRAMES as u32 * per_frame;
-        let count = crate::va::decode_surface_count(refs, UNIT_RESERVE as u32 * per_frame, extra);
+        let reserve = UNIT_RESERVE as u32 * per_frame;
+        let count = crate::va::decode_surface_count(refs, reserve, self.zerocopy.is_some());
         log!(&*ctx, Level::Info, "surfaces", count = count, width = coded_w, height = coded_h);
         log!(
             &*ctx,

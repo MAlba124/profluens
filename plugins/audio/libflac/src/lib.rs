@@ -21,15 +21,16 @@ pub use error::FlacError;
 pub use flacdec::FlacDec;
 #[cfg(feature = "encoder")]
 pub use flacenc::FlacEnc;
-pub use oggflac::OggFlacDeframe;
+pub use oggflac::{OggFlacDec, OggFlacDeframe};
 pub use pf_tags::flacmeta::FlacTags;
 
 use pf_registry::{Elements, Registry};
 
 #[cfg(feature = "encoder")]
-pub static ELEMENTS: Elements = &[&flacenc::DESC, &flacdec::DESC, &oggflac::DESC];
+pub static ELEMENTS: Elements =
+    &[&flacenc::DESC, &flacdec::DESC, &oggflac::DESC, &oggflac::DEC_DESC];
 #[cfg(not(feature = "encoder"))]
-pub static ELEMENTS: Elements = &[&flacdec::DESC, &oggflac::DESC];
+pub static ELEMENTS: Elements = &[&flacdec::DESC, &oggflac::DESC, &oggflac::DEC_DESC];
 
 pub fn register(registry: &mut Registry) {
     registry.register_all(ELEMENTS);

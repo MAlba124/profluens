@@ -36,6 +36,8 @@ enum {
     PF_LAV_VP6F = 18,
     PF_LAV_VP6A = 19,
     PF_LAV_VP7 = 20,
+    PF_LAV_THEORA = 21,
+    PF_LAV_SPEEX = 22,
 };
 
 /* Picture layouts the vocabulary names. YUV is three planes of any depth and

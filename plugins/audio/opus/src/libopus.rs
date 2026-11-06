@@ -71,6 +71,11 @@ impl LibopusEncoder {
         Ok(me)
     }
 
+    /// A new bitrate, bit/s, the next frame codes at it.
+    pub fn set_bitrate(&mut self, bps: u32) -> Result<(), CodecError> {
+        self.ctl_set(sys::OPUS_SET_BITRATE_REQUEST, i32::try_from(bps).unwrap_or(i32::MAX))
+    }
+
     fn ctl_set(&mut self, request: c_int, value: i32) -> Result<(), CodecError> {
         // SAFETY: every `SET_*` request takes exactly one `i32` vararg.
         let code = unsafe { sys::opus_encoder_ctl(self.st, request, value) };

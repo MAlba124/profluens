@@ -152,9 +152,12 @@ static SINK_DESC: ElementDesc = ElementDesc {
     couplings: &[],
 };
 
+/// Bytes, pts, keyframe, delta and duration.
+type Buf = (Vec<u8>, Option<u64>, bool, bool, Option<u64>);
+
 #[derive(Default, Debug)]
 struct Recorded {
-    bufs: Vec<(Vec<u8>, Option<u64>, bool, bool)>,
+    bufs: Vec<Buf>,
     flushes: Vec<usize>,
 }
 
@@ -179,6 +182,7 @@ impl Element for RecSink {
                 buf.pts.nanos(),
                 buf.flags.contains(BufferFlags::KEYFRAME),
                 buf.flags.contains(BufferFlags::DELTA),
+                buf.duration.nanos(),
             ));
         }
         // Release-store after the push, so a source that sees the count knows the buffers are in
@@ -282,7 +286,7 @@ fn seek_to_keyframe_cluster_resyncs_and_regates() {
     let rec = run_seek(stream, 64, trigger, seek_byte as usize);
 
     let ptss: Vec<Option<u64>> = rec.bufs.iter().map(|b| b.1).collect();
-    let post: Vec<&(Vec<u8>, Option<u64>, bool, bool)> =
+    let post: Vec<&Buf> =
         rec.bufs.iter().filter(|b| b.1 == Some(80_000_000) || b.1 == Some(120_000_000)).collect();
     assert_eq!(post.len(), 2, "the two post-seek clusters' frames arrive");
     assert_eq!(post[0].0, vec![4, 4, 4, 4], "80 ms frame bit-exact");
@@ -312,8 +316,7 @@ fn seek_gate_drops_leading_delta_until_keyframe() {
 
     let rec = run_seek(stream, 48, trigger, second);
 
-    let post: Vec<&(Vec<u8>, Option<u64>, bool, bool)> =
-        rec.bufs.iter().filter(|b| b.1 == Some(40_040_000_000)).collect();
+    let post: Vec<&Buf> = rec.bufs.iter().filter(|b| b.1 == Some(40_040_000_000)).collect();
     assert_eq!(post.len(), 1, "the post-seek keyframe is emitted");
     assert_eq!(post[0].0, vec![3, 3], "keyframe frame bit-exact");
     assert!(post[0].2 && !post[0].3, "it is KEYFRAME");
@@ -338,8 +341,7 @@ fn seek_into_midblock_recovers_and_gates() {
 
     let rec = run_seek(stream, 32, trigger, seek_byte);
 
-    let post: Vec<&(Vec<u8>, Option<u64>, bool, bool)> =
-        rec.bufs.iter().filter(|b| b.1 == Some(80_000_000)).collect();
+    let post: Vec<&Buf> = rec.bufs.iter().filter(|b| b.1 == Some(80_000_000)).collect();
     assert_eq!(post.len(), 1, "recovered exactly the 80 ms keyframe frame");
     assert_eq!(post[0].0, vec![8, 8, 8, 8], "80 ms frame bit-exact after mid-block recovery");
     assert!(post[0].2 && !post[0].3, "first post-seek frame is KEYFRAME");
@@ -415,6 +417,19 @@ fn run_tracks(
     seek_byte: u64,
     jump: impl FnOnce(ElementId) -> Jump,
 ) -> Vec<Vec<u64>> {
+    let behind = |rec: &Recorded| {
+        let frames = rec.bufs[rec.flushes[0]..].iter().filter(|b| b.0 != AAC_HEAD);
+        frames.map(|b| b.1.expect("a stamped frame") / 1_000_000).collect::<Vec<u64>>()
+    };
+    run_recorded(stream, seek_byte, jump).iter().map(behind).collect()
+}
+
+/// Each pad's record, one seek and one flush in each.
+fn run_recorded(
+    stream: Vec<u8>,
+    seek_byte: u64,
+    jump: impl FnOnce(ElementId) -> Jump,
+) -> Vec<Recorded> {
     let header = header_prefix(&stream);
     let mut p = Pipeline::new();
     let seek = p.control();
@@ -443,13 +458,42 @@ fn run_tracks(
         recs.push(rec);
     }
     p.run().expect("run");
-    let behind = |rec: &Arc<Mutex<Recorded>>| {
-        let rec = rec.lock().unwrap();
+    let take = |rec: Arc<Mutex<Recorded>>| {
+        let rec = Arc::try_unwrap(rec).unwrap().into_inner().unwrap();
         assert_eq!(rec.flushes.len(), 1, "one seek, one flush");
-        let frames = rec.bufs[rec.flushes[0]..].iter().filter(|b| b.0 != AAC_HEAD);
-        frames.map(|b| b.1.expect("a stamped frame") / 1_000_000).collect::<Vec<u64>>()
+        rec
     };
-    recs.iter().map(behind).collect()
+    recs.into_iter().map(take).collect()
+}
+
+/// A seek's run up to its target ends the bitmap captions it reads by their next, though the
+/// pictures between run past the wait, and one up at the target goes without a duration once
+/// they are a second past it. An uncued track, a pushed run reads no Cues.
+#[test]
+fn a_seeks_run_to_its_target_ends_the_captions_it_passes() {
+    let pgs = TrackConfig::audio(2, "S_HDMV/PGS", Vec::new(), 0.0, 0, 0);
+    let mut w = MatroskaWriter::new(vec![TrackConfig::vp8(1, 320, 240), pgs]);
+    w.enable_cues();
+    let mut stream = Vec::new();
+    w.write_header(&mut stream).unwrap();
+    for ms in (0..4_000u64).step_by(40) {
+        w.write_frame(&mut stream, 1, ms * 1_000_000, &[1, (ms / 40) as u8], ms % 1_000 == 0)
+            .unwrap();
+        for at in [100u64, 1_100, 2_300, 3_700].into_iter().filter(|at| at / 40 == ms / 40) {
+            w.write_frame(&mut stream, 2, at * 1_000_000, &[0x16, (at / 100) as u8], true).unwrap();
+        }
+    }
+    w.finalize(&mut stream);
+    let cues = seek_index(&stream);
+    let early = *cues.iter().find(|c| c.0 == 1_000_000_000).expect("the key at 1 s");
+    let jump = |_| Jump::One { to_time: MS(2_600), at: Timestamp(early.0) };
+    let recs = run_recorded(stream, early.1, jump);
+    let rec = &recs[1];
+    let ends: Vec<(u64, Option<u64>)> = rec.bufs[rec.flushes[0]..]
+        .iter()
+        .map(|b| (b.1.expect("stamped") / 1_000_000, b.4.map(|d| d / 1_000_000)))
+        .collect();
+    assert_eq!(ends, [(1_100, Some(1_200)), (2_300, None), (3_700, None)]);
 }
 
 fn every(step: usize, from: u64) -> Vec<u64> {

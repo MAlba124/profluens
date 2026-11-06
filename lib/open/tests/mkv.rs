@@ -28,9 +28,9 @@ fn fhs_hls(bytes: &[u8]) -> Vec<Need> {
 }
 
 fn cues(o: &Opened) -> (u64, Vec<(u64, u64)>, Option<u64>) {
-    let Index::Mkv { first_cluster, cues, at } = &o.index else { panic!("{:?}", o.index) };
-    let video = cues.iter().filter(|c| c.track == 1).map(|c| (c.time_ns, c.byte)).collect();
-    (*first_cluster, video, *at)
+    let Index::Mkv(p) = &o.index else { panic!("{:?}", o.index) };
+    let video = p.cues.iter().filter(|c| c.track == 1).map(|c| (c.time_ns, c.byte)).collect();
+    (p.first_cluster, video, p.cued_at)
 }
 
 /// A file the window holds whole is one read, the tracks, the Cues and the meta all from it.
@@ -106,7 +106,7 @@ fn the_cues_and_tags_at_the_end_are_one_read() {
     assert!(log.len() <= fhs_hls(&f.bytes).len());
     let (o, log) = open_with(&f.bytes, Want::TRACKS, Caps::default());
     assert_eq!(log.len(), 1, "the tracks alone are the window");
-    assert!(matches!(o.unwrap().index, Index::Mkv { at: None, .. }));
+    assert!(matches!(o.unwrap().index, Index::Mkv(p) if p.cued_at.is_none()));
 }
 
 /// Cues past the tail cap are read by their own machine, its head then its body.
@@ -200,9 +200,9 @@ fn a_head_past_the_cap_is_refused_before_it_is_read() {
     assert!(matches!(o, Err(OpenError::MkvHead(MkvHeadError::TooMany { .. }))), "{o:?}");
 }
 
-/// The HLS cap ends a head that crosses it once Tracks is read, the tunnel's holds it.
+/// Attachments behind Tracks end the head under any cap, the first Cluster found behind them.
 #[test]
-fn the_head_cap_is_the_callers() {
+fn attachments_end_the_head_under_any_cap() {
     let f = mkv_file(2);
     let cut = f.clusters[0] as usize;
     let size: u64 = 9 << 20;
@@ -213,11 +213,72 @@ fn the_head_cap_is_the_callers() {
     file.extend_from_slice(&att);
     file.resize(rest_at as usize, 0);
     file.extend_from_slice(&f.bytes[cut..]);
-    let hls = Caps { max_head: 8 << 20, ..Caps::default() };
-    let o = open_with(&file, Want::TRACKS, hls).0.unwrap();
-    assert_eq!((o.head.len(), cues(&o).0), (cut, rest_at), "cut before the Attachments");
-    let o = open_with(&file, Want::TRACKS, Caps::default()).0.unwrap();
-    assert_eq!((o.head.len() as u64, cues(&o).0), (rest_at, rest_at), "the Attachments held");
+    for caps in [Caps { max_head: 8 << 20, ..Caps::default() }, Caps::default()] {
+        let o = open_with(&file, Want::TRACKS, caps).0.unwrap();
+        assert_eq!((o.head.len(), cues(&o).0), (cut, rest_at), "{caps:?}");
+    }
+}
+
+/// An Attachments element of a cover of `cover` bytes and a font of `font`.
+fn attachments(cover: usize, font: usize) -> Vec<u8> {
+    let file = |name: &str, mime: &str, uid: u64, len: usize| {
+        let mut b = el(&[0x46, 0x6E], name.as_bytes());
+        b.extend(el(&[0x46, 0x60], mime.as_bytes()));
+        b.extend(el(&[0x46, 0x5C], &vec![7; len]));
+        b.extend(uel(&[0x46, 0xAE], uid));
+        el(&[0x61, 0xA7], &b)
+    };
+    let mut body = file("font.ttf", "application/x-truetype-font", 1, font);
+    body.extend(file("cover.jpg", "image/jpeg", 2, cover));
+    el(&[0x19, 0x41, 0xA4, 0x69], &body)
+}
+
+/// A cover beside a font before the first Cluster, held by the window or past it. The head ends
+/// before them and the cover is read where the walk passed it, the SeekHead names neither.
+#[test]
+fn attachments_in_front_are_read_past_the_head() {
+    for (cover, font) in [(2 << 10, 8 << 10), (1 << 20, 4 << 20)] {
+        let f = mkv_file(2);
+        let cut = f.clusters[0] as usize;
+        let att = attachments(cover, font);
+        let mut file = f.bytes[..cut].to_vec();
+        file.extend_from_slice(&att);
+        file.extend_from_slice(&f.bytes[cut..]);
+        let (o, log) = open_with(&file, Want::ALL, Caps::default());
+        let o = o.unwrap();
+        assert_eq!(o.head.len(), cut, "the head ends at the Attachments, {cover}");
+        assert_eq!(cues(&o).0, (cut + att.len()) as u64, "the Cluster behind them");
+        let Meta::Mkv(m) = &o.meta else { panic!("{:?}", o.meta) };
+        assert!(m.error.is_none(), "{:?}", m.error);
+        assert_eq!(m.pictures.len(), 1, "the cover, not the font");
+        assert_eq!(m.pictures[0].data.len(), cover);
+        let past_window = file.len() > Caps::default().window;
+        let font_read = log.iter().any(|n| n.len >= font);
+        assert!(!(past_window && font_read), "the font is never read, {log:?}");
+        let window = Caps::default().window as u64;
+        let again = log[1..].iter().any(|n| n.at < window);
+        assert!(!again, "what the window holds past the head is not read again, {log:?}");
+    }
+}
+
+/// Tags behind the Attachments in front that the SeekHead leaves out, as the head held them
+/// whole before it ended at the Attachments.
+#[test]
+fn tags_behind_attachments_the_seek_head_leaves_out_are_read() {
+    let f = mkv_file(2);
+    let cut = f.clusters[0] as usize;
+    let mut file = f.bytes[..cut].to_vec();
+    file.extend(attachments(2 << 10, 8 << 10));
+    file.extend(tags_el(&[(102, "BPS", "96000")]));
+    file.extend_from_slice(&f.bytes[cut..]);
+    // the window holding the head walk, then the element heads read past a small one
+    for caps in [Caps::default(), Caps { window: 4096, ..Caps::default() }] {
+        let o = open_with(&file, Want::ALL, caps).0.unwrap();
+        let Meta::Mkv(m) = &o.meta else { panic!("{:?}", o.meta) };
+        assert_eq!(m.pictures.len(), 1, "the cover, {caps:?}");
+        assert!(!m.tags.is_empty(), "the Tags behind the Attachments, {caps:?}");
+        assert_eq!(o.tracks[1].bitrate, 96_000, "{caps:?}");
+    }
 }
 
 /// Fonts attached past the head cap behind Tracks. The head stops before the Attachments, the

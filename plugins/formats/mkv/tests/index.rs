@@ -410,7 +410,8 @@ fn shared_cues_and_head_are_published_as_handed_over() {
     let keys: Vec<IndexEntry> =
         clusters(&file).iter().map(|&(byte, time)| IndexEntry::key(time, byte)).collect();
     assert_eq!((&index.entries, index.complete), (&keys, true));
-    assert_eq!((Arc::strong_count(&cues), Arc::strong_count(&head)), (2, 2), "held, not copied");
+    let held = (Arc::strong_count(&cues), Arc::strong_count(&head));
+    assert_eq!(held, (2, 1), "the Cues held, not copied, the head let go once parsed");
     p.run().expect("run");
     assert_eq!(p.index(demux).expect("published").entries, keys);
 }
@@ -481,12 +482,8 @@ fn a_seek_before_the_cues_are_in_lands_on_the_estimate_and_the_next_exactly() {
     run.join().expect("the run thread").expect("the run ends");
 }
 
-/// The frames past the read window of a track no pad takes are walked past unread. PCM's
-/// 64 KB blocks beside a small video, with the video alone only the 16 KB window that finds
-/// each block's head is read of it, every picture still out, past the start's lead of 512 KB.
-/// With the PCM linked it is all read.
-#[test]
-fn an_unlinked_tracks_large_frames_are_not_read() {
+/// PCM blocks of `pcm` bytes every `every` ms beside a small video, 2 s of it.
+fn pcm_beside_video(pcm: usize, every: u64) -> Vec<u8> {
     let tracks = vec![
         TrackConfig::vp8(1, 320, 240),
         TrackConfig::audio(2, "A_PCM/INT/LIT", Vec::new(), 48_000.0, 2, 16),
@@ -496,43 +493,60 @@ fn an_unlinked_tracks_large_frames_are_not_read() {
     w.set_duration_ns(2_000 * MS);
     let mut out = Vec::new();
     w.write_header(&mut out).unwrap();
-    let pcm = vec![7u8; 64 << 10];
+    let pcm = vec![7u8; pcm];
     for t in (0..2_000).step_by(20) {
         if t % 40 == 0 {
             w.write_frame(&mut out, 1, t * MS, &[1, (t / 40) as u8], t % 1_000 == 0).unwrap();
         }
-        w.write_frame(&mut out, 2, t * MS, &pcm, true).unwrap();
+        if t % every == 0 {
+            w.write_frame(&mut out, 2, t * MS, &pcm, true).unwrap();
+        }
     }
     w.finalize(&mut out);
-    let file = sized(out);
-    let run = |link: &dyn Fn(usize) -> bool| {
-        let served = Arc::new(AtomicU64::new(0));
-        let end = Arc::new(AtomicBool::new(true));
-        let pulled = Pulled {
-            held_at: u64::MAX,
-            held: Vec::new(),
-            release: Arc::new(AtomicBool::new(true)),
-            end: Arc::clone(&end),
-            served: Some(Arc::clone(&served)),
-            asks: None,
-        };
-        let mut p = pf_reactor::pipeline();
-        let src = p.add(MemSrc { data: file.clone(), chunk: 0, pos: 0, pull: Some(pulled) });
-        let (_, seen) = build(&mut p, src, MkvDemux::new(header(&file)), link);
-        p.run().expect("run");
-        let pictures = seen[0].lock().unwrap().rows.iter().filter(|r| r.is_some()).count();
-        (served.load(Ordering::Relaxed), pictures)
+    sized(out)
+}
+
+/// The bytes served and the pictures out of a pulled run of `file`.
+fn served_and_pictures(file: &[u8], link: &dyn Fn(usize) -> bool) -> (u64, usize) {
+    let served = Arc::new(AtomicU64::new(0));
+    let pulled = Pulled {
+        held_at: u64::MAX,
+        held: Vec::new(),
+        release: Arc::new(AtomicBool::new(true)),
+        end: Arc::new(AtomicBool::new(true)),
+        served: Some(Arc::clone(&served)),
+        asks: None,
     };
-    let (video_only, pictures) = run(&|n| n == 0);
+    let mut p = pf_reactor::pipeline();
+    let src = p.add(MemSrc { data: file.to_vec(), chunk: 0, pos: 0, pull: Some(pulled) });
+    let (_, seen) = build(&mut p, src, MkvDemux::new(header(file)), link);
+    p.run().expect("run");
+    let pictures = seen[0].lock().unwrap().rows.iter().filter(|r| r.is_some()).count();
+    (served.load(Ordering::Relaxed), pictures)
+}
+
+/// PCM's 64 KB blocks beside a small video are read through with the video alone, a disk reads
+/// them in less time than it seeks past each, every picture still out.
+#[test]
+fn an_unlinked_tracks_frames_under_the_gap_are_read_through() {
+    let file = pcm_beside_video(64 << 10, 20);
+    let (video_only, pictures) = served_and_pictures(&file, &|n| n == 0);
     assert_eq!(pictures, 50, "every picture");
-    let lead = 512 << 10;
-    assert!(
-        video_only < file.len() as u64 * 3 / 10 + lead,
-        "{video_only} of {} bytes read",
-        file.len()
-    );
-    let (both, _) = run(&|_| true);
-    assert!(both >= file.len() as u64 * 9 / 10, "{both} of {} bytes read", file.len());
+    let len = file.len() as u64;
+    assert!(video_only >= len * 9 / 10, "{video_only} of {len} bytes read");
+    let (both, _) = served_and_pictures(&file, &|_| true);
+    assert!(both >= len * 9 / 10, "{both} of {len} bytes read");
+}
+
+/// A 12 MiB block of a track no pad takes is longer than the windows asked ahead reach by more
+/// than the gap read through, so the walk jumps past the rest of it.
+#[test]
+fn an_unlinked_tracks_frames_past_the_gap_are_not_read() {
+    let file = pcm_beside_video(12 << 20, 1_000);
+    let (video_only, pictures) = served_and_pictures(&file, &|n| n == 0);
+    assert_eq!(pictures, 50, "every picture");
+    let len = file.len() as u64;
+    assert!(video_only < len * 6 / 10, "{video_only} of {len} bytes read");
 }
 
 /// A seek's first read holds its Cluster's head and the keyframe, one ask the size of the

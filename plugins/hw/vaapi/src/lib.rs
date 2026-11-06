@@ -30,6 +30,8 @@ mod vp9quant;
 pub mod vpp;
 
 #[cfg(test)]
+mod coded_reuse;
+#[cfg(test)]
 mod enc_eos;
 #[cfg(test)]
 mod export_failure;

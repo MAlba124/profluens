@@ -133,3 +133,47 @@ fn a_chained_link_is_not_a_track() {
     let o = open(&f);
     assert_eq!(o.tracks.iter().map(|t| t.stream).collect::<Vec<_>>(), [1]);
 }
+
+/// A Theora stream states its picture size and frame rate (Theora I section 6.2), a head that
+/// does not parse is skipped.
+#[test]
+fn a_theora_track_has_its_picture_size_and_frame_duration() {
+    let mut ident = b"\x80theora\x03\x02\x01\0\x0a\0\x08\0\0\xa0\0\0\x78\0\0".to_vec();
+    ident.extend_from_slice(&30_000u32.to_be_bytes());
+    ident.extend_from_slice(&1_001u32.to_be_bytes());
+    ident.extend_from_slice(&[0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 6 << 5]);
+    let file = |ident: &[u8]| {
+        let mut w = pf_ogg::OggWriter::new(3);
+        let mut f = Vec::new();
+        for (p, g) in [(ident, 0), (b"\x81theora", 0), (b"\x82theora", 0), (b"\x30", 1 << 6)] {
+            w.write_packet(&mut f, p, g).unwrap();
+            w.flush(&mut f);
+        }
+        w.finish(&mut f);
+        f
+    };
+    let o = open(&file(&ident));
+    let t = &o.tracks[0];
+    assert_eq!((t.kind, t.family, t.width, t.height), (TrackKind::Video, "theora", 160, 120));
+    assert_eq!(t.frame_ns, 33_366_666, "30000/1001");
+    assert_eq!((t.duration_ns, o.duration_ns), (33_366_666, 33_366_666), "one frame, the last");
+    ident[26..30].fill(0);
+    let (o, _) = open_with(&file(&ident), Want::ALL, Caps::default());
+    assert!(o.is_err_and(|e| matches!(e, OpenError::NoStreams)), "a zero frame rate");
+}
+
+/// Speex and Theora are timed by their last granule, the longest stream the file's duration.
+#[test]
+fn speex_and_theora_fixtures_are_timed() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/out");
+    let want = [("ogg_speex.spx", 1_991_062_500), ("ogg_theora_speex.ogv", 2_000_000_000)];
+    for (name, ns) in want {
+        let Ok(f) = std::fs::read(root.join(name)) else {
+            eprintln!("{name} not generated, skipped");
+            continue;
+        };
+        let o = open(&f);
+        assert_eq!(o.duration_ns, ns, "{name}");
+        assert!(o.tracks.iter().all(|t| t.duration_ns > 0), "{name}: {:?}", o.tracks);
+    }
+}

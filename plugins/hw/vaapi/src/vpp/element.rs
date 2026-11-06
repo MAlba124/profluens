@@ -484,6 +484,13 @@ impl VaapiPostProc {
         let input = f.kind();
         let (sw, sh) = ((f.width + 1) & !1, (f.height + 1) & !1);
         let out = (p.width, p.height, p.out);
+        // iHD keeps the tone map's state on the context, a plain pass after it comes out
+        // shifted, so a source gone SDR on a session that mapped gets a new one
+        let maps = self.maps_tones(p.out);
+        if self.session.as_ref().is_some_and(|s| s.tone.is_some() && !maps) {
+            log!(ctx, Level::Debug, "tone_off", width = f.width, height = f.height);
+            self.session = None;
+        }
         if let Some(s) = &mut self.session {
             if s.key == f {
                 return Ok(());
@@ -533,17 +540,15 @@ impl VaapiPostProc {
             None => ((p.width, p.height), 1),
         };
         let dst = surfaces(d, p.out, coded.0, coded.1, count).map_err(K::SessionSetup)?;
-        let read = match gpu_out {
-            Some(_) => {
-                // bars are black, the alignment rows are cropped and left as allocated, a CPU
-                // fill of every surface costs a start tens of ms
-                if p.bars() {
-                    for &s in dst.ids() {
-                        black(d, s, p.out, coded)?;
-                    }
-                }
-                None
+        // every pass paints the bars and alignment rows with the background colour, the CPU
+        // fills them once where the driver paints none
+        if p.bars() && !proc.paints_background(d) {
+            for &s in dst.ids() {
+                black(d, s, p.out, coded)?;
             }
+        }
+        let read = match gpu_out {
+            Some(_) => None,
             None => Some(
                 ReadbackImage::new(d, p.out.fourcc, p.out.bpp, p.width, p.height)
                     .map_err(K::SessionSetup)?,

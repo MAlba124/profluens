@@ -38,14 +38,14 @@ enum Stage {
 /// What a Matroska open carries between its reads.
 #[derive(Default)]
 struct MkvPart {
-    first_cluster: u64,
     /// The TrackUID of each described track, in their order.
     uids: Vec<u64>,
     /// Where the SeekHead puts the Cues, when they are wanted.
     cues_at: Option<u64>,
-    cues: Vec<pf_mkv::Cue>,
-    /// Where the Cues were read, None for none.
-    cued: Option<u64>,
+    /// The head parsed, the Cues joining it once read.
+    parsed: pf_mkv::Parsed,
+    /// The Tags and the Attachments by the head, its SeekHead or the head walk past a cut.
+    passed: mkv::Passed,
 }
 
 /// Opens a file of `len` bytes of any container pf reads, its tracks, the head its demuxer
@@ -72,6 +72,8 @@ pub struct OpenAt {
     meta: Meta,
     mkv: MkvPart,
     ogg: Option<ogg::Scan>,
+    /// Where an AVI's `movi` lies, for the reads behind its head.
+    movi: Option<pf_avi::MoviLocation>,
 }
 
 impl OpenAt {
@@ -93,6 +95,7 @@ impl OpenAt {
             meta: Meta::None,
             mkv: MkvPart::default(),
             ogg: None,
+            movi: None,
         }
     }
 
@@ -208,12 +211,13 @@ impl OpenAt {
         let max = usize::try_from(self.caps.max_head).unwrap_or(usize::MAX);
         match self.kind {
             Kind::Mkv => match mkv::head_in(&self.window, self.caps.max_head) {
-                Some(n) => {
+                Some((n, first_cluster, passed)) => {
                     let head = Arc::from(&self.window[..n]);
-                    self.mkv_described(head, n as u64)
+                    self.mkv_described(head, first_cluster, passed)
                 }
                 None => {
-                    let m = MkvHeadAt::with_window(self.caps.max_head, take(&mut self.window));
+                    // kept past the head, which ends before Attachments the meta walk reads
+                    let m = MkvHeadAt::with_window(self.caps.max_head, self.window.clone());
                     self.stage = Stage::MkvHead(m);
                     Ok(None)
                 }
@@ -261,12 +265,17 @@ impl OpenAt {
                 scan.push(&self.window[from..], &mut self.desc, self.want.meta);
                 self.ogg_more()
             }
+            (Kind::Avi, _) => {
+                self.avi_vol();
+                self.avi_tail()
+            }
             _ => self.flv_done(),
         }
     }
 
     fn mkv_head(&mut self, h: MkvHead) -> Result<Option<Need>, OpenError> {
-        self.mkv_described(Arc::from(h.head), h.first_cluster)
+        let passed = mkv::Passed { tags: h.tags, attachments: h.attachments };
+        self.mkv_described(Arc::from(h.head), h.first_cluster, passed)
     }
 
     /// The tracks of `head`, then one read of the Cues and Tags near the end when nothing holds
@@ -275,16 +284,19 @@ impl OpenAt {
         &mut self,
         head: Arc<[u8]>,
         first_cluster: u64,
+        walked: mkv::Passed,
     ) -> Result<Option<Need>, OpenError> {
-        let (duration, uids) = mkv::describe(&head, &mut self.desc)?;
-        let (cues, tags, attachments) = mkv::places(&head);
+        let mut parsed = pf_mkv::Parsed { first_cluster, ..mkv::parse(&head)? };
+        if let Some(ix) = parsed.index.as_mut() {
+            ix.tags = ix.tags.or(walked.tags);
+            ix.attachments = ix.attachments.or(walked.attachments);
+        }
+        let (duration, uids) = mkv::describe(&parsed, &mut self.desc)?;
+        let (cues, tags, attachments) = mkv::places(&parsed);
         let (len, want) = (self.len, self.want);
-        self.mkv = MkvPart {
-            first_cluster,
-            uids,
-            cues_at: cues.filter(|_| want.index),
-            ..MkvPart::default()
-        };
+        let cues_at = cues.filter(|_| want.index);
+        let passed = mkv::Passed { tags, attachments };
+        self.mkv = MkvPart { uids, cues_at, parsed, passed };
         (self.duration, self.head) = (duration, head);
         let held = (self.window.len() as u64).max(self.head.len() as u64);
         let meta = [tags, attachments].map(|p| p.filter(|_| want.meta));
@@ -299,7 +311,8 @@ impl OpenAt {
     fn mkv_cues(&mut self) -> Result<Option<Need>, OpenError> {
         let Some(at) = self.mkv.cues_at else { return self.mkv_meta() };
         let max = self.caps.max_cues;
-        let held = self.held_from(at).and_then(|(b, eof)| mkv::cues_in(b, eof, max, &self.head));
+        let parsed = &self.mkv.parsed;
+        let held = self.held_from(at).and_then(|(b, eof)| mkv::cues_in(b, eof, max, parsed));
         match held {
             Some(cues) => {
                 let at = (!cues.is_empty()).then_some(at);
@@ -317,7 +330,7 @@ impl OpenAt {
         cues: Vec<pf_mkv::Cue>,
         at: Option<u64>,
     ) -> Result<Option<Need>, OpenError> {
-        (self.mkv.cues, self.mkv.cued) = (cues, at);
+        (self.mkv.parsed.cues, self.mkv.parsed.cued_at) = (Arc::from(cues), at);
         self.mkv_meta()
     }
 
@@ -326,7 +339,8 @@ impl OpenAt {
             return self.mkv_done();
         }
         let (tags, pictures) = (self.caps.max_tags, self.caps.max_picture);
-        let m = MetaOwned::new(Arc::clone(&self.head), tags, pictures);
+        let m = MetaOwned::new(Arc::clone(&self.head), tags, pictures)
+            .with_places(self.mkv.passed.tags, self.mkv.passed.attachments);
         self.stage = Stage::Meta(Box::new(m));
         Ok(None)
     }
@@ -345,9 +359,7 @@ impl OpenAt {
     }
 
     fn mkv_done(&mut self) -> Result<Option<Need>, OpenError> {
-        let cues = Arc::from(take(&mut self.mkv.cues));
-        let (first_cluster, at) = (self.mkv.first_cluster, self.mkv.cued);
-        self.index = Index::Mkv { first_cluster, cues, at };
+        self.index = Index::Mkv(Arc::new(take(&mut self.mkv.parsed)));
         self.done()
     }
 
@@ -355,7 +367,8 @@ impl OpenAt {
         if head.len() as u64 > self.caps.max_head {
             return Err(OpenError::TooLarge);
         }
-        self.duration = mp4::describe(&head, &mut self.desc)?;
+        (self.duration, self.index) =
+            mp4::describe(&head, self.len, self.want.index, &mut self.desc)?;
         if self.want.meta
             && let pf_mp4::MoovExtent::InPrefix { offset, len } =
                 pf_mp4::locate_moov(&head, head.len() as u64)
@@ -368,8 +381,36 @@ impl OpenAt {
 
     fn avi(&mut self, head: Arc<[u8]>) -> Result<Option<Need>, OpenError> {
         let (duration, movi) = avi::describe(&head, &mut self.desc)?;
-        (self.duration, self.head) = (duration, head);
-        match movi.filter(|_| self.want.index) {
+        (self.duration, self.head, self.movi) = (duration, head, movi);
+        // the VOL of an MPEG-4 stream from the bytes held past movi, else one read of them
+        if let Some(m) = movi
+            && avi::wants_vol(&self.desc)
+            && !self.avi_vol()
+        {
+            let to = m.movi_data_start.saturating_add(avi::VOL_WINDOW).min(self.len);
+            if to > self.window.len() as u64 {
+                if self.window.len() < self.head.len() {
+                    self.window = self.head.to_vec();
+                }
+                return Ok(self.grow(to as usize));
+            }
+        }
+        self.avi_tail()
+    }
+
+    /// The VOL of an MPEG-4 track from the window past `movi`, whether the tracks are settled.
+    fn avi_vol(&mut self) -> bool {
+        let Some(m) = self.movi else { return true };
+        let at = usize::try_from(m.movi_data_start).unwrap_or(usize::MAX);
+        match self.window.get(at..) {
+            Some(movi) if !movi.is_empty() => avi::vol_from_movi(movi, &mut self.desc),
+            _ => false,
+        }
+    }
+
+    /// The idx1 read when wanted, else the open is done.
+    fn avi_tail(&mut self) -> Result<Option<Need>, OpenError> {
+        match self.movi.filter(|_| self.want.index) {
             Some(movi) => {
                 self.stage = Stage::Idx1(Idx1At::new(movi.movi_end, self.len));
                 Ok(None)

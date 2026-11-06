@@ -340,10 +340,18 @@ impl Drop for Config {
 
 pub const DECODE_SLACK: u32 = 4;
 
+/// Pictures a zero-copy decoder has out downstream at once. The deepest consumer is an
+/// encoder, `enc::DEPTH_MAX` pictures in flight and the next queued behind them,
+/// vaapipostproc lets its input go once queued. The link ring to the consumer holds pictures
+/// too, so a full ring behind a busy encoder parks the decoder until a picture comes back, it
+/// never drops one, and the encoder needs nothing of the decoder's to let one go.
+pub const PRESENTATION_SLACK: u32 = crate::enc::DEPTH_MAX as u32 + 1;
+
 /// Every holder must fit at once. A pool that runs dry makes the exhaustion path emit below the
 /// reorder budget and a later smaller-POC B-frame shows after a newer one.
-pub fn decode_surface_count(refs: u32, reorder: u32, presentation: u32) -> u32 {
-    refs.clamp(1, 16) + reorder.clamp(1, 16) + DECODE_SLACK + presentation
+pub fn decode_surface_count(refs: u32, reorder: u32, zerocopy: bool) -> u32 {
+    let out = if zerocopy { PRESENTATION_SLACK } else { 0 };
+    refs.clamp(1, 16) + reorder.clamp(1, 16) + DECODE_SLACK + out
 }
 
 pub struct Surfaces {
@@ -618,36 +626,21 @@ impl Buffer {
         }
     }
 
-    pub fn read_coded(&self, out: &mut Vec<u8>) -> VaResult<()> {
+    /// The coded picture mapped in place, the map waits for the GPU. A broken picture is an
+    /// error and leaves the buffer unmapped.
+    pub fn map_coded(&self) -> VaResult<CodedMap<'_>> {
         let mut base: *mut std::ffi::c_void = ptr::null_mut();
         // SAFETY: self.id is a live coded buffer on this display.
         check(unsafe { ffi::vaMapBuffer(self.dpy, self.id, &mut base) }, "vaMapBuffer(coded)")?;
-        // Bounded walk, 64 segments means the driver handed us a cycle.
-        let mut seg = base as *const ffi::VACodedBufferSegment;
-        let mut hops = 0;
-        let mut status = 0;
-        while !seg.is_null() && hops < 64 {
-            // SAFETY: seg and buf point into the mapped coded buffer for the map's lifetime.
-            unsafe {
-                let s = &*seg;
-                status |= s.status;
-                if !s.buf.is_null() && s.size > 0 {
-                    out.extend_from_slice(std::slice::from_raw_parts(
-                        s.buf as *const u8,
-                        s.size as usize,
-                    ));
-                }
-                seg = s.next as *const ffi::VACodedBufferSegment;
-            }
-            hops += 1;
-        }
-        // SAFETY: mapped above, unmap exactly once.
-        check(unsafe { ffi::vaUnmapBuffer(self.dpy, self.id) }, "vaUnmapBuffer(coded)")?;
+        let mut map = CodedMap { buf: self, first: base as *const _, len: 0 };
+        let (len, status) = map.walk().fold((0, 0), |(l, s), (b, st)| (l + b.len(), s | st));
+        map.len = len;
         // A truncated or broken picture is no picture.
         if status & ffi::VA_CODED_BUF_STATUS_BROKEN != 0 {
+            map.unmap()?;
             return Err(VaError { status: -1, ctx: "coded buffer status" });
         }
-        Ok(())
+        Ok(map)
     }
 
     pub fn id(&self) -> ffi::VABufferID {
@@ -660,6 +653,85 @@ impl Drop for Buffer {
         // SAFETY: id is a live buffer, destroyed once, dpy outlives it.
         unsafe {
             ffi::vaDestroyBuffer(self.dpy, self.id);
+        }
+    }
+}
+
+/// Segments a coded picture has at most, a longer chain is a cycle the driver handed us.
+const SEGMENTS_MAX: usize = 64;
+
+/// A mapped coded buffer, its segments read where the driver wrote them. Unmapped on drop, or
+/// by [`Self::unmap`] for its status.
+pub struct CodedMap<'a> {
+    buf: &'a Buffer,
+    first: *const ffi::VACodedBufferSegment,
+    len: usize,
+}
+
+impl CodedMap<'_> {
+    /// Bytes of every segment.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn walk(&self) -> impl Iterator<Item = (&[u8], u32)> + '_ {
+        let (mut seg, mut hops) = (self.first, 0);
+        std::iter::from_fn(move || {
+            if seg.is_null() || hops >= SEGMENTS_MAX {
+                return None;
+            }
+            hops += 1;
+            // SAFETY: seg and its buf point into the buffer, mapped while self lives.
+            let s = unsafe { &*seg };
+            seg = s.next as *const ffi::VACodedBufferSegment;
+            let bytes = if s.buf.is_null() || s.size == 0 {
+                &[][..]
+            } else {
+                // SAFETY: as above, the driver wrote `size` bytes at `buf`.
+                unsafe { std::slice::from_raw_parts(s.buf as *const u8, s.size as usize) }
+            };
+            Some((bytes, s.status))
+        })
+    }
+
+    /// The segments in order.
+    pub fn segments(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        self.walk().map(|(bytes, _)| bytes)
+    }
+
+    /// Copies the picture into `dst`, [`Self::len`] bytes. A short `dst` stops at the first
+    /// segment that does not fit.
+    pub fn copy_to(&self, dst: &mut [u8]) {
+        let mut at = 0;
+        for s in self.segments() {
+            let Some(d) = dst.get_mut(at..at + s.len()) else { return };
+            d.copy_from_slice(s);
+            at += s.len();
+        }
+    }
+
+    pub fn append_to(&self, out: &mut Vec<u8>) {
+        self.segments().for_each(|s| out.extend_from_slice(s));
+    }
+
+    /// The buffer takes the next picture once this is `Ok`.
+    pub fn unmap(self) -> VaResult<()> {
+        let (dpy, id) = (self.buf.dpy, self.buf.id);
+        std::mem::forget(self);
+        // SAFETY: mapped by map_coded, the forget above keeps drop from unmapping it again.
+        check(unsafe { ffi::vaUnmapBuffer(dpy, id) }, "vaUnmapBuffer(coded)")
+    }
+}
+
+impl Drop for CodedMap<'_> {
+    fn drop(&mut self) {
+        // SAFETY: mapped by map_coded, unmapped once, here or by unmap.
+        unsafe {
+            ffi::vaUnmapBuffer(self.buf.dpy, self.buf.id);
         }
     }
 }
@@ -1148,14 +1220,14 @@ mod tests {
 
     #[test]
     fn the_surface_count_holds_every_holder_at_once() {
-        assert_eq!(decode_surface_count(4, 2, 0), 10);
-        assert_eq!(decode_surface_count(4, 2, 6), 16);
-        assert_eq!(decode_surface_count(1, 0, 0), 1 + 1 + DECODE_SLACK);
-        assert_eq!(decode_surface_count(0, 0, 0), decode_surface_count(1, 1, 0));
-        assert_eq!(decode_surface_count(40, 40, 0), 32 + DECODE_SLACK);
+        assert_eq!(decode_surface_count(4, 2, false), 10);
+        assert_eq!(decode_surface_count(4, 2, true), 10 + PRESENTATION_SLACK);
+        assert_eq!(decode_surface_count(1, 0, false), 1 + 1 + DECODE_SLACK);
+        assert_eq!(decode_surface_count(0, 0, false), decode_surface_count(1, 1, false));
+        assert_eq!(decode_surface_count(40, 40, false), 32 + DECODE_SLACK);
         for refs in 1..=16u32 {
             for reorder in 1..=16u32 {
-                assert!(decode_surface_count(refs, reorder, 0) >= refs + reorder + 2);
+                assert!(decode_surface_count(refs, reorder, false) >= refs + reorder + 2);
             }
         }
     }

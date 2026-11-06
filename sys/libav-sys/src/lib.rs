@@ -34,6 +34,8 @@ pub const PF_LAV_VP6: c_int = 17;
 pub const PF_LAV_VP6F: c_int = 18;
 pub const PF_LAV_VP6A: c_int = 19;
 pub const PF_LAV_VP7: c_int = 20;
+pub const PF_LAV_THEORA: c_int = 21;
+pub const PF_LAV_SPEEX: c_int = 22;
 
 pub const PF_LAV_PIX_NONE: i32 = 0;
 pub const PF_LAV_PIX_I420: i32 = 1;
@@ -225,6 +227,33 @@ mod tests {
         let rc = unsafe { pf_lav_open(&mut d, 99, std::ptr::null(), 0, std::ptr::null(), 0) };
         assert_eq!(rc, PF_LAV_ERR_NO_CODEC);
         assert!(d.is_null());
+    }
+
+    /// Both read their stream headers from extradata and refuse to open without them.
+    #[test]
+    fn theora_and_speex_are_built_and_open_on_their_headers() {
+        for codec in [PF_LAV_THEORA, PF_LAV_SPEEX] {
+            let mut d = std::ptr::null_mut();
+            // SAFETY: an out pointer and no extradata or slots.
+            let rc =
+                unsafe { pf_lav_open(&mut d, codec, std::ptr::null(), 0, std::ptr::null(), 0) };
+            assert!(rc < 0 && rc != PF_LAV_ERR_NO_CODEC, "codec {codec}, {rc}");
+            assert!(d.is_null());
+        }
+        // Speex manual Table 7.1, wideband mono at 16 kHz, 320 samples a frame.
+        let mut head = [0u8; 80];
+        head[..8].copy_from_slice(b"Speex   ");
+        for (at, v) in [(32, 80), (36, 16_000), (40, 1), (44, 4), (48, 1), (56, 320), (64, 1)] {
+            head[at..at + 4].copy_from_slice(&i32::to_le_bytes(v));
+        }
+        let mut d = std::ptr::null_mut();
+        // SAFETY: an out pointer, the header outlives the call, closed below.
+        let rc = unsafe {
+            pf_lav_open(&mut d, PF_LAV_SPEEX, head.as_ptr(), head.len(), std::ptr::null(), 0)
+        };
+        assert_eq!(rc, PF_LAV_OK);
+        // SAFETY: opened above, closed once.
+        unsafe { pf_lav_close(d) };
     }
 
     #[test]

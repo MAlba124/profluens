@@ -2956,6 +2956,11 @@ impl Pipeline {
         planned
     }
 
+    /// Whether a run is up to change, a commit before the first run is refused.
+    pub fn has_run(&self) -> bool {
+        self.live_run.is_some() && !self.control.is_stopped()
+    }
+
     /// Whether a committed change has not spliced yet, so a commit would be refused.
     pub fn changing(&mut self) -> bool {
         self.settle();

@@ -36,6 +36,8 @@ pub enum Codec {
     Vp6a,
     Vp7,
     Vorbis,
+    Theora,
+    Speex,
 }
 
 impl Codec {
@@ -61,6 +63,8 @@ impl Codec {
             Codec::Vp6a => "vp6a",
             Codec::Vp7 => "vp7",
             Codec::Vorbis => "vorbis",
+            Codec::Theora => "theora",
+            Codec::Speex => "speex",
         }
     }
 
@@ -85,6 +89,8 @@ impl Codec {
             Codec::Vp6a => ffi::PF_LAV_VP6A,
             Codec::Vp7 => ffi::PF_LAV_VP7,
             Codec::Vorbis => ffi::PF_LAV_VORBIS,
+            Codec::Theora => ffi::PF_LAV_THEORA,
+            Codec::Speex => ffi::PF_LAV_SPEEX,
         }
     }
 }

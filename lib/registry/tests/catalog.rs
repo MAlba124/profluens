@@ -36,7 +36,7 @@ static DEMUXERS: [(Elements, &[&str]); 8] = [
 ];
 
 /// What a demuxer emits that pf does not decode to raw media, and why.
-static UNDECODED: [(&str, &str); 16] = [
+static UNDECODED: [(&str, &str); 13] = [
     ("subtitle/srt", "text cues"),
     ("subtitle/ass", "text cues"),
     ("subtitle/vtt", "text cues"),
@@ -46,13 +46,10 @@ static UNDECODED: [(&str, &str); 16] = [
     ("subtitle/dvb", "dvbsubdec puts out subtitle/bitmap"),
     ("h264/avcc", "a remux framing, its pad offers h264/annexb too"),
     ("h265/hvcc", "a remux framing, its pad offers h265/annexb too"),
-    ("flac/ogg", "oggflacdeframe then flacdec, linked on bytes"),
     ("vfw", "a VFW fourcc pf does not map"),
     ("pcm", "PCM of a depth audio/raw does not name"),
     ("encrypted", "refused, no keys"),
     ("compressed", "refused, a ContentCompAlgo pf does not undo"),
-    ("speex", "no decoder"),
-    ("theora", "no decoder"),
 ];
 
 fn emitted() -> Vec<&'static str> {
@@ -97,6 +94,7 @@ fn decoders_by_family() {
     let cases = [
         ("opus", "opusdec"),
         ("flac", "flacdec"),
+        ("flac/ogg", "oggflacdec"),
         ("aac", "libavaacdec"),
         ("ac3", "libavac3dec"),
         ("eac3", "libavac3dec"),
@@ -105,18 +103,23 @@ fn decoders_by_family() {
         ("dts", "libavdtsdec"),
         ("truehd", "libavtruehddec"),
         ("alac", "libavalacdec"),
+        ("speex", "libavspeexdec"),
         ("av1", "av1dec"),
         ("h264/annexb", "libavh264dec"),
         ("h265/annexb", "libavh265dec"),
         ("vp9", "libavvp9dec"),
         ("mpeg1", "libavmpeg2dec"),
         ("vp6f", "libavvp6fdec"),
+        ("theora", "libavtheoradec"),
     ];
     for (family, name) in cases {
         assert_eq!(decoder_for(&SETS, family).map(|d| d.name), Some(name), "{family}");
     }
     assert_eq!(raw_of(&SETS, "opus"), Some(Raw::Audio));
+    assert_eq!(raw_of(&SETS, "flac/ogg"), Some(Raw::Audio));
     assert_eq!(raw_of(&SETS, "vp9"), Some(Raw::Video));
+    assert_eq!(raw_of(&SETS, "speex"), Some(Raw::Audio));
+    assert_eq!(raw_of(&SETS, "theora"), Some(Raw::Video));
     assert!(decoder_for(&SETS, "bytes").is_none());
     assert!(decoder_for(&SETS, "audio/raw").is_none());
 }

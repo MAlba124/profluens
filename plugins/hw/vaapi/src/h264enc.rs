@@ -291,6 +291,14 @@ impl VaapiH264Enc {
         self
     }
 
+    /// Frames of a `video/gpu` input pass at most this often, the rest are dropped.
+    pub fn with_max_fps(mut self, num: u32, den: u32) -> Self {
+        if let Some(g) = &mut self.gpu {
+            g.max_fps = (num, den.max(1));
+        }
+        self
+    }
+
     /// Constant-QP quantizer (0..51, 7.4.2.2). The `qp` prop overrides.
     pub fn with_qp(mut self, qp: u8) -> Self {
         self.qp = qp.min(51);
@@ -499,6 +507,7 @@ impl VaapiH264Enc {
         let pps_nal = write_pps(self.qp);
         log!(&*ctx, Level::Info, "session", width = w, height = h, level = level, low_power = lp);
         log!(&*ctx, Level::Info, "references", refs = refs, sps_refs = sps_refs);
+        self.stats.made(engine.surfaces_made(), 0);
         let cqp = self.bitrate_kbps == 0;
         let (kbps, qp, gop) = (self.bitrate_kbps, self.qp, self.gop_len);
         log!(
@@ -608,32 +617,40 @@ impl VaapiH264Enc {
         let Some(f) = self.flight.pop() else {
             return Ok(true);
         };
-        let b = &mut self.bufs;
-        b.coded.clear();
-        if let (true, Some(s)) = (f.head, &self.session) {
-            b.coded.extend_from_slice(&s.sps_nal);
-            b.coded.extend_from_slice(&s.pps_nal);
-        }
         // the map waits for the GPU
         let t = crate::stats::mark();
-        let read = f.coded.read_coded(&mut b.coded);
+        let map = f.coded.map_coded();
         if how == enc::How::Wait {
             self.stats.waited(t);
         }
         self.stats.frame();
-        if let Err(e) = read {
-            self.warn(ctx, K::Encode(e));
+        let Ok(map) = map.map_err(|e| self.warn(ctx, K::Encode(e))) else {
+            // its buffer goes, the session makes another
             return Ok(true);
-        }
-        if self.avcc {
-            b.conv.clear();
-            annexb_to_avcc(&b.coded, &mut b.conv);
-            std::mem::swap(&mut b.coded, &mut b.conv);
-        }
-        let len = self.bufs.coded.len() as u64;
+        };
+        let head: [&[u8]; 2] = match (f.head, &self.session) {
+            (true, Some(s)) => [&s.sps_nal, &s.pps_nal],
+            _ => [&[], &[]],
+        };
+        let len = (head[0].len() + head[1].len() + map.len()) as u64;
         log!(&*ctx, Level::Trace, "encoded", bytes = len, key = f.stamp.key as u64);
         self.frames += 1;
-        self.staged.send_or_stage(&mut Self::pad(ctx), &mut self.bufs.coded, f.stamp)?;
+        if self.avcc {
+            let b = &mut self.bufs;
+            b.coded.clear();
+            head.iter().for_each(|h| b.coded.extend_from_slice(h));
+            map.append_to(&mut b.coded);
+            b.conv.clear();
+            annexb_to_avcc(&b.coded, &mut b.conv);
+            self.staged.send_or_stage(&mut Self::pad(ctx), &mut b.conv, f.stamp)?;
+        } else {
+            self.staged.send_coded(&mut Self::pad(ctx), &head, &map, f.stamp)?;
+        }
+        match (map.unmap(), &mut self.session) {
+            (Ok(()), Some(s)) => s.engine.put_coded(f.coded),
+            (Ok(()), None) => {}
+            (Err(e), _) => self.warn(ctx, K::Encode(e)),
+        }
         Ok(true)
     }
 
@@ -726,7 +743,9 @@ impl VaapiH264Enc {
                 s.frame_num = 0;
             }
             let cfg = RcUpdate { dirty: self.rc_dirty, hrd_ms: self.hrd_ms, quality: self.quality };
-            encode_one(
+            let made = s.engine.coded_made();
+            let surfaces = s.engine.surfaces_made();
+            let r = encode_one(
                 display,
                 s,
                 fmt,
@@ -737,8 +756,11 @@ impl VaapiH264Enc {
                 cfg,
                 input,
                 &mut self.bufs,
-            )
-            .map(|q| (is_idr, q))
+            );
+            let made = u64::from(s.engine.coded_made() - made);
+            self.stats.coded_bufs.fetch_add(made, std::sync::atomic::Ordering::Relaxed);
+            self.stats.made(s.engine.surfaces_made() - surfaces, 0);
+            r.map(|q| (is_idr, q))
         };
         let (is_idr, (coded, head)) = match result {
             Ok(v) => v,
@@ -803,6 +825,14 @@ impl VaapiH264Enc {
                 self.warn(ctx, K::NoGpuFrame { token: h.token });
                 continue;
             };
+            // the rate gate, a key the source or a seek asks for passes
+            let must = inbuf.flags.contains(BufferFlags::PREVIEW)
+                || inbuf.flags.contains(BufferFlags::INTRA);
+            if !self.gpu.as_mut().is_some_and(|g| g.keep(inbuf.pts, must)) {
+                drop(frame);
+                ctx.count_drop();
+                continue;
+            }
             // a session rebuilt reads its pictures first
             if !self.session_fits(fmt) {
                 self.finish_all(ctx)?;
@@ -810,9 +840,11 @@ impl VaapiH264Enc {
             if !self.ensure_session(ctx, fmt) {
                 continue; // warned inside
             }
+            // the driver pads a surface past the session's alignment (720 rows come as 736),
+            // a frame at least the session's coded size encodes, the picture is the session's
             let coded =
                 self.session.as_ref().map_or((0, 0), |s| (s.engine.coded_w, s.engine.coded_h));
-            if (frame.coded_w, frame.coded_h) != coded {
+            if frame.coded_w < coded.0 || frame.coded_h < coded.1 {
                 self.warn(
                     ctx,
                     K::CodedSize { coded: (frame.coded_w, frame.coded_h), session: coded },
@@ -862,15 +894,10 @@ fn encode_one(
     bufs: &mut FrameBufs,
 ) -> va::VaResult<(VaBuffer, bool)> {
     let surface = match input {
-        Input::Raw(data) => {
-            s.engine.upload(display, data, fmt.pixfmt)?;
-            None
-        }
-        Input::Surface(surface) => Some(surface),
+        Input::Raw(data) => s.engine.upload(display, data, fmt.pixfmt)?,
+        Input::Surface(surface) => surface,
     };
-    let ctxva = s.engine.context();
-    let coded =
-        VaBuffer::new_empty(display, ctxva, ffi::VAEncCodedBufferType, s.engine.coded_buf_size())?;
+    let coded = s.engine.take_coded(display)?;
 
     let built = (|| {
         let engine = &s.engine;
@@ -911,7 +938,11 @@ fn encode_one(
     })();
     let queued = built.and_then(|()| bufs.queue(&s.engine, surface));
     bufs.hold.clear();
-    queued?;
+    if let Err(e) = queued {
+        // read out and kept, not destroyed unread, the next picture writes it over
+        enc::discard_coded(Some(&mut s.engine), coded);
+        return Err(e);
+    }
 
     // Without packed headers the coded buffer holds only the slice, SPS/PPS go in front on IDR.
     let packed_seq = s.packed_mask
@@ -1422,10 +1453,8 @@ impl Element for VaapiH264Enc {
                 }
             }
             Event::FlushStart => {
-                // read and dropped, iHD fails every picture after a coded buffer destroyed unread
                 for f in self.flight.drain() {
-                    let _ = f.coded.read_coded(&mut self.bufs.coded);
-                    self.bufs.coded.clear();
+                    enc::discard_coded(self.session.as_mut().map(|s| &mut s.engine), f.coded);
                 }
                 self.cadence.reset();
                 self.key_prev = None;
@@ -1462,9 +1491,8 @@ impl Element for VaapiH264Enc {
     fn stop(&mut self, ctx: &mut Ctx) {
         // read and dropped before the session goes, as on a flush
         for f in self.flight.drain() {
-            let _ = f.coded.read_coded(&mut self.bufs.coded);
+            enc::discard_coded(None, f.coded);
         }
-        self.bufs.coded.clear();
         self.staged.discard();
         if let Some(g) = &mut self.gpu {
             g.stop();
@@ -1764,5 +1792,201 @@ mod tests {
         assert!(warned.is_empty(), "{test} warned {warned:?}");
         assert_eq!(out.len(), 6, "{test} every picture after the flush");
         assert!(out[0].flags.contains(BufferFlags::KEYFRAME), "{test} the run opens on a key");
+    }
+
+    #[repr(C)]
+    struct Timespec {
+        sec: i64,
+        nsec: i64,
+    }
+
+    unsafe extern "C" {
+        fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+    }
+
+    /// CPU time of every thread of the process, ns, the driver's included.
+    fn cpu_ns() -> u64 {
+        const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+        let mut ts = Timespec { sec: 0, nsec: 0 };
+        // SAFETY: ts is a valid out struct for the call.
+        let r = unsafe { clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+        assert_eq!(r, 0, "clock_gettime");
+        ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
+    }
+
+    /// A bare context on a pool of `slots` slots of `slot` bytes, the element driven by hand.
+    fn bare_ctx(slot: usize, slots: u32) -> (Ctx, profluens_core::bus::Bus) {
+        use profluens_core::memory::{Pool, PoolConfig};
+        let pool = Pool::with_config(PoolConfig::heap(slot, slots));
+        let (bus_tx, bus) = profluens_core::bus::Bus::channel();
+        let ids = (profluens_core::id::ElementId(0), profluens_core::id::FormatId(0));
+        let mut ctx = Ctx::new(pool, bus_tx, ids.0, ids.1, 1);
+        ctx.configure_pads(1, 1);
+        (ctx, bus)
+    }
+
+    type Out = profluens_core::buffer::Buffer;
+
+    /// Codes `input` and reads it, the pictures out.
+    fn code(el: &mut VaapiH264Enc, ctx: &mut Ctx, input: Input<'_>, i: u64) -> Vec<Out> {
+        let pts = Timestamp::from_nanos(i * 33_333_333);
+        let none = Timestamp::NONE;
+        el.encode_frame(ctx, input, None, pts, none, false, false).expect("coded");
+        el.finish_all(ctx).expect("read");
+        let mut batch = ctx.take_output(VaapiH264Enc::OUT);
+        std::iter::from_fn(|| batch.pop_front()).collect()
+    }
+
+    /// A picture the driver refuses leaves its coded buffer to the next, and a flush with a
+    /// picture in flight reads it and hands the buffer back, so the session makes no other
+    /// and codes on.
+    #[test]
+    fn a_refused_picture_and_a_flush_keep_the_coded_buffer() {
+        let test = "a_refused_picture_and_a_flush_keep_the_coded_buffer";
+        let Some(caps) = crate::probe() else {
+            return eprintln!("skip {test}: no VA-API device");
+        };
+        if !caps.supports_encode("h264/annexb") {
+            return eprintln!("skip {test}: no H.264 encode entrypoint");
+        }
+        let (w, h) = (320u32, 240u32);
+        let fmt = InFormat { width: w, height: h, pixfmt: RawPixFmt::Nv12, fps: (30, 1) };
+        let (mut ctx, bus) = bare_ctx(256 * 1024, 16);
+        let mut el = VaapiH264Enc::new();
+        assert!(el.ensure_display(&mut ctx), "{test} display");
+        el.in_fmt = Some(fmt);
+        assert!(el.ensure_session(&mut ctx, fmt), "{test} session");
+        let made = |el: &VaapiH264Enc| el.session.as_ref().map(|s| s.engine.coded_made());
+        let (frame, bad) = (noise(w, h, 1), Input::Surface(ffi::VA_INVALID_SURFACE));
+        assert_eq!(code(&mut el, &mut ctx, Input::Raw(&frame), 0).len(), 1, "{test} first");
+        assert_eq!(made(&el), Some(1), "{test} one buffer");
+
+        assert!(code(&mut el, &mut ctx, bad, 1).is_empty(), "{test} a refused picture is none");
+        let warned =
+            std::iter::from_fn(|| bus.try_recv()).any(|m| matches!(m, BusMessage::Warning { .. }));
+        assert!(warned, "{test} the refusal is a warning");
+        let out = code(&mut el, &mut ctx, Input::Raw(&frame), 2);
+        assert_eq!((out.len(), made(&el)), (1, Some(1)), "{test} the next picture, same buffer");
+
+        let pts = Timestamp::from_nanos(3 * 33_333_333);
+        let none = Timestamp::NONE;
+        el.encode_frame(&mut ctx, Input::Raw(&frame), None, pts, none, false, false).expect("3");
+        assert!(!el.flight.is_empty(), "{test} a picture in flight at the flush");
+        el.event(&mut ctx, &Event::FlushStart).expect("the flush");
+        assert!(el.flight.is_empty() && ctx.take_output(VaapiH264Enc::OUT).is_empty());
+        for i in 4..10 {
+            let out = code(&mut el, &mut ctx, Input::Raw(&noise(w, h, i)), i);
+            assert_eq!(out.len(), 1, "{test} picture {i} after the flush");
+            let idr = h264parse::split_nals(out[0].memory.data())
+                .iter()
+                .any(|n| n.unit_type == h264parse::NAL_SLICE_IDR);
+            assert_eq!(idr, i == 4, "{test} the run after the flush opens on a key");
+        }
+        assert_eq!(made(&el), Some(1), "{test} one buffer through it all");
+        el.stop(&mut ctx);
+    }
+
+    /// A session coding from its producer's surfaces makes no upload surface of its own, the
+    /// first raw picture makes it.
+    #[test]
+    fn the_upload_surface_waits_for_a_raw_picture() {
+        let test = "the_upload_surface_waits_for_a_raw_picture";
+        let Some(caps) = crate::probe() else {
+            return eprintln!("skip {test}: no VA-API device");
+        };
+        if !caps.supports_encode("h264/annexb") {
+            return eprintln!("skip {test}: no H.264 encode entrypoint");
+        }
+        let (w, h) = (320u32, 240u32);
+        let fmt = InFormat { width: w, height: h, pixfmt: RawPixFmt::Nv12, fps: (30, 1) };
+        let (mut ctx, _bus) = bare_ctx(256 * 1024, 16);
+        let mut el = VaapiH264Enc::new();
+        let stats = el.stats();
+        assert!(el.ensure_display(&mut ctx), "{test} display");
+        el.in_fmt = Some(fmt);
+        assert!(el.ensure_session(&mut ctx, fmt), "{test} session");
+        let refs = el.session.as_ref().map(|s| s.engine.recon_ids().len() as u64);
+        let input = |el: &VaapiH264Enc| el.session.as_ref().and_then(|s| s.engine.input());
+        let producer = el.display.as_ref().map(|d| va::Surfaces::new_nv12(d, w, h, 1));
+        let producer = producer.expect("display").expect("a producer's surface");
+        for i in 0..3 {
+            let out = code(&mut el, &mut ctx, Input::Surface(producer.ids()[0]), i);
+            assert_eq!(out.len(), 1, "{test} picture {i} from the producer's surface");
+        }
+        assert_eq!(input(&el), None, "{test} no upload surface");
+        assert_eq!(Some(stats.snapshot().surfaces), refs, "{test} the references alone");
+        assert_eq!(code(&mut el, &mut ctx, Input::Raw(&noise(w, h, 3)), 3).len(), 1);
+        assert!(input(&el).is_some(), "{test} the raw picture made it");
+        assert_eq!(Some(stats.snapshot().surfaces), refs.map(|r| r + 1), "{test} and one more");
+        assert_eq!(code(&mut el, &mut ctx, Input::Raw(&noise(w, h, 4)), 4).len(), 1);
+        assert_eq!(Some(stats.snapshot().surfaces), refs.map(|r| r + 1), "{test} made once");
+        drop(producer);
+        el.stop(&mut ctx);
+    }
+
+    /// A noisy picture, so an intra picture codes to a realistic size.
+    fn noise(w: u32, h: u32, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..(w * h * 3 / 2) as usize)
+            .map(|p| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ((p as u64 % 1920) / 8 + (x & 31) + 16) as u8
+            })
+            .collect()
+    }
+
+    /// Per picture CPU and wall time of the encoder at 1080p, every picture coded from the
+    /// engine's input surface uploaded once, so the time is the encoder's own and no upload's.
+    /// All intra (`gop` 1) and a 60 picture GOP, best of five runs of 300.
+    /// `cargo test -p pf-vaapi --lib --release -- --ignored --nocapture --test-threads=1
+    /// time_1080p_encode`
+    #[test]
+    #[ignore]
+    fn time_1080p_encode() {
+        let test = "time_1080p_encode";
+        let Some(caps) = crate::probe() else {
+            return eprintln!("skip {test}: no VA-API device");
+        };
+        if !caps.supports_encode("h264/annexb") {
+            return eprintln!("skip {test}: no H.264 encode entrypoint");
+        }
+        const FRAMES: u64 = 300;
+        let (w, h) = (1920u32, 1080u32);
+        let fmt = InFormat { width: w, height: h, pixfmt: RawPixFmt::Nv12, fps: (30, 1) };
+        let frame = noise(w, h, 7);
+        for gop in [1u32, 60] {
+            let (mut best_cpu, mut best_wall, mut bytes) = (u64::MAX, u64::MAX, 0usize);
+            for run in 0..5 {
+                let (mut ctx, _bus) = bare_ctx(4 << 20, 16);
+                let mut el = VaapiH264Enc::new().with_gop(gop);
+                assert!(el.ensure_display(&mut ctx), "{test} display");
+                el.in_fmt = Some(fmt);
+                assert!(el.ensure_session(&mut ctx, fmt), "{test} session");
+                let pic = |el: &mut VaapiH264Enc, ctx: &mut Ctx, input: Input<'_>, i: u64| {
+                    code(el, ctx, input, i).iter().map(|b| b.memory.len()).sum::<usize>()
+                };
+                pic(&mut el, &mut ctx, Input::Raw(&frame), 0);
+                let surface = el.session.as_ref().and_then(|s| s.engine.input()).expect("input");
+                let (mut cpu, mut wall) = (0u64, 0u64);
+                bytes = 0;
+                for i in 1..=FRAMES {
+                    let (c0, t0) = (cpu_ns(), std::time::Instant::now());
+                    bytes += pic(&mut el, &mut ctx, Input::Surface(surface), i);
+                    cpu += cpu_ns() - c0;
+                    wall += t0.elapsed().as_nanos() as u64;
+                }
+                el.stop(&mut ctx);
+                let (c, t) = (cpu / FRAMES, wall / FRAMES);
+                eprintln!("{test} gop {gop} run {run}, cpu {c} ns/picture, wall {t} ns/picture");
+                (best_cpu, best_wall) = (best_cpu.min(c), best_wall.min(t));
+            }
+            let mean = bytes as u64 / FRAMES;
+            eprintln!(
+                "{test} gop {gop} best, cpu {best_cpu} ns/picture, wall {best_wall} ns/picture, \
+                 {mean} bytes/picture"
+            );
+        }
     }
 }

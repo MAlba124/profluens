@@ -1,6 +1,6 @@
-//! libavcodec's H.264, H.265, VP8, VP9, MPEG-1/2, MPEG-4 Part 2, Sorenson Spark, VP6 and VP7
-//! decoders in the shared [`VideoDec`] shell. VP6 in FLV (`vp6f`, `vp6a`) leads each frame with
-//! the byte that crops its 16-pixel grid, libavcodec takes the first as extradata. An MPEG-4
+//! libavcodec's H.264, H.265, VP8, VP9, MPEG-1/2, MPEG-4 Part 2, Sorenson Spark, VP6, VP7 and
+//! Theora decoders in the shared [`VideoDec`] shell. VP6 in FLV (`vp6f`, `vp6a`) leads each frame
+//! with the byte that crops its 16-pixel grid, libavcodec takes the first as extradata. An MPEG-4
 //! Part 2 configuration unit (a demuxer's DSI or CodecPrivate) is extradata too, see
 //! [`config_unit`]. The decoder opens at the first unit, never in [`Codec::new`], which builds
 //! throwaway instances.
@@ -56,6 +56,9 @@ static VP6A_SINK: [OfferDesc; 1] = [OfferDesc { family: "vp6a", fields: &decoder
 static VP6A_SINKS: [PadDesc; 1] = decoder::sink_pad(&VP6A_SINK);
 static VP7_SINK: [OfferDesc; 1] = [OfferDesc { family: "vp7", fields: &decoder::COLOR_FIELDS }];
 static VP7_SINKS: [PadDesc; 1] = decoder::sink_pad(&VP7_SINK);
+static THEORA_SINK: [OfferDesc; 1] =
+    [OfferDesc { family: "theora", fields: &decoder::COLOR_FIELDS }];
+static THEORA_SINKS: [PadDesc; 1] = decoder::sink_pad(&THEORA_SINK);
 
 // One-time construction.
 #[allow(clippy::disallowed_methods)]
@@ -91,6 +94,9 @@ pub(crate) static VP6A_DESC: ElementDesc =
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VP7_DESC: ElementDesc =
     decoder::desc("libavvp7dec", &VP7_SINKS, &SRCS, || Box::new(LibavVp7Dec::new()));
+#[allow(clippy::disallowed_methods)]
+pub(crate) static THEORA_DESC: ElementDesc =
+    decoder::desc("libavtheoradec", &THEORA_SINKS, &SRCS, || Box::new(LibavTheoraDec::new()));
 
 pub const H264: u8 = 0;
 pub const H265: u8 = 1;
@@ -103,6 +109,7 @@ pub const VP6: u8 = 7;
 pub const VP6F: u8 = 8;
 pub const VP6A: u8 = 9;
 pub const VP7: u8 = 10;
+pub const THEORA: u8 = 11;
 
 const fn codec_of(kind: u8) -> lav::Codec {
     match kind {
@@ -116,6 +123,7 @@ const fn codec_of(kind: u8) -> lav::Codec {
         VP6F => lav::Codec::Vp6f,
         VP6A => lav::Codec::Vp6a,
         VP7 => lav::Codec::Vp7,
+        THEORA => lav::Codec::Theora,
         _ => lav::Codec::Vp9,
     }
 }
@@ -131,6 +139,7 @@ pub type LibavVp6Dec = VideoDec<LavVideo<VP6>>;
 pub type LibavVp6fDec = VideoDec<LavVideo<VP6F>>;
 pub type LibavVp6aDec = VideoDec<LavVideo<VP6A>>;
 pub type LibavVp7Dec = VideoDec<LavVideo<VP7>>;
+pub type LibavTheoraDec = VideoDec<LavVideo<THEORA>>;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum LavVideoError {
@@ -192,6 +201,22 @@ pub struct LavVideo<const KIND: u8> {
     /// The stamps of units sent and not yet given to a picture, smallest first, see
     /// [`decode_order`].
     stamps: BinaryHeap<Reverse<i64>>,
+    /// Theora's identification header, held until its setup header comes.
+    ident: Vec<u8>,
+    laced: Vec<u8>,
+    refs: Refs,
+}
+
+/// Whether a Theora inter frame has its reference pictures. vp3.c decodes one with none against
+/// a golden frame it never writes (vp3_decode_frame, "first frame not a keyframe"), where the
+/// H.264, H.265, VP8 and VP9 decoders refuse it or hold its picture back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refs {
+    Held,
+    /// Opened or flushed, inter frames drop until an intra frame.
+    Wanted,
+    /// As `Wanted`, the first drop logged.
+    Dropping,
 }
 
 /// Families whose units mostly come stamped in decode order, from AVI and FLV, which know no
@@ -345,6 +370,63 @@ impl<const KIND: u8> LavVideo<KIND> {
         self.failed += 1;
         self.failed <= WARNINGS
     }
+
+    /// `true` for a Theora unit to decode. The setup header opens the decoder with the three
+    /// headers laced, a header again as a demuxer sends it after a seek changes nothing.
+    fn theora_unit(&mut self, unit: &[u8], out: &mut Out<'_>) -> bool {
+        match unit {
+            [] => true,
+            // A header has the top bit of its first byte set, a frame clear (Theora I 6.1).
+            [t, ..] if t & 0x80 == 0 => {
+                let open = !self.config.is_empty();
+                if !open && self.count_failed() {
+                    log!(out.ctx(), Level::Warn, "frame_drop", reason = "no_headers");
+                }
+                open && self.theora_refs(t & 0x40 != 0, out)
+            }
+            [0x80, b't', b'h', b'e', b'o', b'r', b'a', ..] => {
+                self.ident.clear();
+                self.ident.extend_from_slice(unit);
+                false
+            }
+            [0x82, b't', b'h', b'e', b'o', b'r', b'a', ..] if !self.ident.is_empty() => {
+                let mut laced = std::mem::take(&mut self.laced);
+                xiph_lace(&mut laced, &self.ident, unit);
+                if laced != self.config {
+                    self.refs = Refs::Wanted;
+                }
+                self.configure(&laced, out);
+                self.laced = laced;
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// `false` for an inter frame that has no reference pictures to decode from (Theora I 7.1,
+    /// FTYPE).
+    fn theora_refs(&mut self, inter: bool, out: &mut Out<'_>) -> bool {
+        if !inter {
+            self.refs = Refs::Held;
+            return true;
+        }
+        if self.refs == Refs::Wanted {
+            log!(out.ctx(), Level::Debug, "frame_drop", reason = "no_keyframe");
+            self.refs = Refs::Dropping;
+        }
+        self.refs == Refs::Held
+    }
+}
+
+/// The extradata libavcodec splits into Xiph headers (xiph.c avpriv_split_xiph_headers). The
+/// comment header goes empty, theora_decode_init skips it.
+fn xiph_lace(out: &mut Vec<u8>, ident: &[u8], setup: &[u8]) {
+    out.clear();
+    out.push(2);
+    out.extend(std::iter::repeat_n(0xFF, ident.len() / 255));
+    out.extend_from_slice(&[(ident.len() % 255) as u8, 0]);
+    out.extend_from_slice(ident);
+    out.extend_from_slice(setup);
 }
 
 fn check_short(supply: &Supply, out: &mut Out<'_>) {
@@ -470,6 +552,7 @@ impl<const KIND: u8> Codec for LavVideo<KIND> {
         VP6F => &VP6F_DESC,
         VP6A => &VP6A_DESC,
         VP7 => &VP7_DESC,
+        THEORA => &THEORA_DESC,
         _ => &VP9_DESC,
     };
 
@@ -487,6 +570,9 @@ impl<const KIND: u8> Codec for LavVideo<KIND> {
             failed: 0,
             lost: 0,
             stamps: BinaryHeap::with_capacity(STAMPS + 1),
+            ident: Vec::new(),
+            laced: Vec::new(),
+            refs: Refs::Wanted,
         }
     }
 
@@ -503,9 +589,13 @@ impl<const KIND: u8> Codec for LavVideo<KIND> {
         }
         self.open_failed = false;
         self.stamps.clear();
+        self.refs = Refs::Wanted;
     }
 
     fn decode(&mut self, unit: &[u8], pts: Timestamp, duration: Timestamp, out: &mut Out<'_>) {
+        if KIND == THEORA && !self.theora_unit(unit, out) {
+            return;
+        }
         let (extradata, unit) = match KIND {
             VP6F | VP6A => unit.split_at(unit.len().min(1)),
             _ => (&[][..], unit),
@@ -651,6 +741,19 @@ mod tests {
         assert!(!codes_picture(MPEG4, &vol));
         let vop = [0, 0, 1, 0xB0, 0xF5, 0, 0, 1, 0xB6, 0x10];
         assert!(codes_picture(MPEG4, &vop));
+    }
+
+    /// Lengths in 255s and the rest, the last header's left to the end (xiph.c).
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn theora_headers_lace_as_libavcodec_splits_them() {
+        let mut out = Vec::new();
+        xiph_lace(&mut out, &[0x80; 42], &[0x82; 9]);
+        assert_eq!(out[..4], [2, 42, 0, 0x80]);
+        assert_eq!(out.len(), 3 + 42 + 9);
+        xiph_lace(&mut out, &[0x80; 300], &[0x82; 1]);
+        assert_eq!(out[..4], [2, 0xFF, 45, 0]);
+        assert_eq!(out.len(), 4 + 300 + 1);
     }
 
     #[test]

@@ -98,7 +98,9 @@ impl Element for MemSrc {
 }
 
 type Frames = Vec<(u64, Vec<u8>)>;
-type Got = Arc<Mutex<Frames>>;
+/// Each buffer's pts, duration and bytes.
+type Timed = Vec<(u64, Option<u64>, Vec<u8>)>;
+type Got = Arc<Mutex<Timed>>;
 
 struct Rec(Got);
 
@@ -109,7 +111,8 @@ impl Element for Rec {
 
     fn process(&mut self, _ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
         while let Some(buf) = inputs.pop() {
-            self.0.lock().unwrap().push((buf.pts.0, buf.memory.data().to_vec()));
+            let at = (buf.pts.0, buf.duration.nanos(), buf.memory.data().to_vec());
+            self.0.lock().unwrap().push(at);
         }
         Ok(Flow::Ok)
     }
@@ -147,6 +150,12 @@ fn run(file: &[u8], pull: bool, tracks: &[u64]) -> (Vec<Frames>, u64) {
 }
 
 fn run_with(file: &[u8], pull: bool, tracks: &[u64], slots: Option<u32>) -> (Vec<Frames>, u64) {
+    let (got, served) = run_timed(file, pull, tracks, slots);
+    let untimed = |t: Timed| t.into_iter().map(|(pts, _, bytes)| (pts, bytes)).collect();
+    (got.into_iter().map(untimed).collect(), served)
+}
+
+fn run_timed(file: &[u8], pull: bool, tracks: &[u64], slots: Option<u32>) -> (Vec<Timed>, u64) {
     let mut p = pf_reactor::pipeline();
     if let Some(n) = slots {
         p.set_pool(4096, n);
@@ -238,4 +247,76 @@ fn more_captions_than_buffers_all_come_out() {
     let (cued, _) = run_with(&file, true, &[2], Some(16));
     assert_eq!(pushed[0].len(), 125);
     assert_eq!(cued[0], pushed[0]);
+}
+
+/// A video, a PGS and a text track, a caption on each every `every` ms, their blocks without a
+/// BlockDuration.
+fn captioned(every: u64, cues: bool) -> Vec<u8> {
+    let pgs = TrackConfig::audio(2, "S_HDMV/PGS", Vec::new(), 0.0, 0, 0);
+    let text = TrackConfig::audio(3, "S_TEXT/UTF8", Vec::new(), 0.0, 0, 0);
+    let mut w = MatroskaWriter::new(vec![TrackConfig::vp8(1, 320, 240), pgs, text]);
+    if cues {
+        w.enable_cues();
+    }
+    w.set_duration_ns(10_000 * MS);
+    let mut out = Vec::new();
+    w.write_header(&mut out).unwrap();
+    let picture = vec![7u8; 2_000];
+    for t in (0..10_000u64).step_by(40) {
+        w.write_frame(&mut out, 1, t * MS, &picture, t % 1_000 == 0).unwrap();
+        if t % every == 0 {
+            w.write_frame(&mut out, 2, t * MS, &[0x16, (t / every) as u8], true).unwrap();
+            w.write_frame(&mut out, 3, t * MS, format!("caption {}", t / every).as_bytes(), true)
+                .unwrap();
+        }
+    }
+    w.finalize(&mut out);
+    out
+}
+
+/// Each caption's start and duration in ms.
+fn spans(got: &Timed) -> Vec<(u64, Option<u64>)> {
+    got.iter().map(|(pts, dur, _)| (pts / MS, dur.map(|d| d / MS))).collect()
+}
+
+/// Every caption of a track `every` ms apart over 10 s ends at the next, the last at none.
+fn each_until_the_next(every: u64) -> Vec<(u64, Option<u64>)> {
+    let starts: Vec<u64> = (0..10_000).step_by(every as usize).collect();
+    let last = starts.len() - 1;
+    starts.iter().enumerate().map(|(i, &t)| (t, (i < last).then_some(every))).collect()
+}
+
+#[test]
+fn a_caption_without_a_block_duration_ends_at_its_tracks_next_by_the_cues() {
+    let file = captioned(1_600, true);
+    let want = each_until_the_next(1_600);
+    for (tracks, how) in [(&[2u64, 3][..], "read at the cues"), (&[1, 2, 3][..], "walked")] {
+        let (got, _) = run_timed(&file, true, tracks, None);
+        let (pgs, text) = (&got[got.len() - 2], &got[got.len() - 1]);
+        assert_eq!(spans(pgs), want, "bitmap {how}");
+        assert_eq!(spans(text), want, "text {how}");
+    }
+}
+
+#[test]
+fn an_uncued_caption_ends_at_its_next_block_read_within_the_wait() {
+    let file = captioned(800, false);
+    let want = each_until_the_next(800);
+    for pull in [false, true] {
+        let (got, _) = run_timed(&file, pull, &[1, 2, 3], None);
+        assert_eq!(got[0].len(), 250, "every picture, pulled {pull}");
+        assert_eq!(spans(&got[1]), want, "bitmap, pulled {pull}");
+        assert_eq!(spans(&got[2]), want, "text, pulled {pull}");
+    }
+}
+
+#[test]
+fn an_uncued_caption_whose_next_block_lies_past_the_wait_goes_without_a_duration() {
+    let file = captioned(1_600, false);
+    let (got, _) = run_timed(&file, true, &[1, 2, 3], None);
+    let starts: Vec<u64> = (0..10_000).step_by(1_600).collect();
+    let none: Vec<(u64, Option<u64>)> = starts.iter().map(|&t| (t, None)).collect();
+    assert_eq!(spans(&got[1]), none, "the pictures ran a second past each");
+    let (alone, _) = run_timed(&file, true, &[2, 3], None);
+    assert_eq!(spans(&alone[0]), each_until_the_next(1_600), "nothing else read, it waits");
 }

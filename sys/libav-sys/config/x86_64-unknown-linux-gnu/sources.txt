@@ -242,6 +242,7 @@ libavcodec/itut35.c
 libavcodec/jfdctfst.c
 libavcodec/jfdctint.c
 libavcodec/jni.c
+libavcodec/jpegquanttables.c
 libavcodec/jrevdct.c
 libavcodec/kbdwin.c
 libavcodec/lpc.c
@@ -298,6 +299,7 @@ libavcodec/rl.c
 libavcodec/sbrdsp.c
 libavcodec/simple_idct.c
 libavcodec/sinewin.c
+libavcodec/speexdec.c
 libavcodec/startcode.c
 libavcodec/synth_filter.c
 libavcodec/threadprogress.c
@@ -312,6 +314,7 @@ libavcodec/vorbis_data.c
 libavcodec/vorbis_parser.c
 libavcodec/vorbisdec.c
 libavcodec/vorbisdsp.c
+libavcodec/vp3.c
 libavcodec/vp3dsp.c
 libavcodec/vp56.c
 libavcodec/vp56data.c

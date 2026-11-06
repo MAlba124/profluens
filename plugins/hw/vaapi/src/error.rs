@@ -507,7 +507,7 @@ impl fmt::Display for VaapiErrorKind {
             }
             K::CodedSize { coded, session } => write!(
                 f,
-                "frame coded {}x{} for a session of {}x{}, dropped",
+                "frame coded {}x{} under the session's {}x{}, dropped",
                 coded.0, coded.1, session.0, session.1
             ),
         }

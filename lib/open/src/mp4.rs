@@ -1,6 +1,8 @@
-use pf_mp4::{Mp4Reader, Reframer, TrackKind as Mp4Kind};
+use std::sync::Arc;
 
-use crate::{Brand, Desc, OpenError, TrackDesc, TrackKind};
+use pf_mp4::{Limits, Reframer, Tables, Track, TrackKind as Mp4Kind};
+
+use crate::{Brand, Desc, Index, OpenError, TrackDesc, TrackKind};
 
 /// RFC 7845 section 4.6 asks Opus for 80 ms of decoding ahead of a seek target, the Opus in
 /// ISOBMFF mapping states the same roll.
@@ -14,11 +16,27 @@ fn ns(ticks: i64, timescale: u32) -> u64 {
         as u64
 }
 
-/// The tracks of the head through `moov` and the longest track's duration.
-pub(crate) fn describe(head: &[u8], d: &mut Desc) -> Result<u64, OpenError> {
-    let r = Mp4Reader::new(head).map_err(OpenError::Mp4)?;
+/// The tracks of the head through `moov`, the longest track's duration, and with `index` the
+/// sample tables folded once for every run's demuxer, held to a file of `len` bytes.
+pub(crate) fn describe(
+    head: &[u8],
+    len: u64,
+    index: bool,
+    d: &mut Desc,
+) -> Result<(u64, Index), OpenError> {
+    if !index {
+        let tracks = Tables::tracks_of(head).map_err(OpenError::Mp4)?;
+        return Ok((tracks_into(&tracks, d)?, Index::None));
+    }
+    // the file's length bounds the index a small hostile table can declare
+    let limits = Limits { file_len: Some(len), ..Limits::default() };
+    let tables = Arc::new(Tables::resolve(head, &[], limits).map_err(OpenError::Mp4)?);
+    Ok((tracks_into(tables.tracks(), d)?, Index::Mp4(tables)))
+}
+
+fn tracks_into(tracks: &[Track], d: &mut Desc) -> Result<u64, OpenError> {
     let mut duration = 0;
-    for t in r.tracks() {
+    for t in tracks {
         let family = t.family();
         let kind = match t.kind() {
             Mp4Kind::Video => TrackKind::Video,

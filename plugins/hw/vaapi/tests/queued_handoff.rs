@@ -54,6 +54,8 @@ struct Out {
     vpp_waits: u64,
     enc_waits: u64,
     enc_polls: u64,
+    /// Coded buffers the encoder made, one a picture it keeps in flight, reused after.
+    enc_coded_bufs: u64,
 }
 
 fn encode(s: Shape) -> Out {
@@ -113,6 +115,7 @@ fn encode(s: Shape) -> Out {
         vpp_waits,
         enc_waits: enc.waits,
         enc_polls: enc.polls,
+        enc_coded_bufs: enc.coded_bufs,
     }
 }
 
@@ -131,6 +134,7 @@ fn check(test: &str, vpp: bool) {
     }
     let base = encode(Shape { handoff: Handoff::Done, depth: 1, inline: false, vpp, reactor: false });
     assert_eq!(base.frames.len(), units().len(), "{test} every picture");
+    assert_eq!(base.enc_coded_bufs, 1, "{test} one picture in flight, one coded buffer");
     assert!(base.dec_waits > 0, "{test} the decoder waits for each picture it hands on");
     if vpp {
         assert!(base.vpp_waits > 0, "{test} vaapipostproc waits for each picture it hands on");
@@ -143,6 +147,11 @@ fn check(test: &str, vpp: bool) {
             assert_eq!((out.dec_waits, out.vpp_waits), (0, 0), "{test} nobody waited, depth {depth}");
             // the ring is read without waiting, only the end drains it waiting for each picture
             assert!(out.enc_waits <= depth as u64, "{test} the encoder waited {} times", out.enc_waits);
+            let made = out.enc_coded_bufs;
+            assert!(
+                (1..=depth as u64).contains(&made),
+                "{test} {made} coded buffers at depth {depth}"
+            );
         }
     }
 }

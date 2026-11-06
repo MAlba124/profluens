@@ -81,6 +81,12 @@ STREAMINFO it now sees at the head of the reconstructed native stream (spec: For
 dynamic caps). Milestone pipeline: `filesrc ! oggdemux ! oggflacdeframe ! flacdec !
 pipewireaudiosink`.
 
+`oggflacdec` is the same strip inside `flacdec`, one element taking `flac/ogg` and putting
+out `audio/raw`. The registry lookup (`pf_registry::decoder_for`) answers one element per
+family, so `flac/ogg` resolves to it. `oggflacdeframe` stays for byte pipelines.
+A seek to the start has the demuxer read again from byte 0 and send the headers again,
+`oggflacdec` drops them, from the mapping packet up to the first frame.
+
 ## Decisions / interpretation
 
 - **Header packet count is advisory, not load-bearing.** Because metadata blocks and

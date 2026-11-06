@@ -338,6 +338,81 @@ pub fn downmix_to_stereo(
     Some(out_len)
 }
 
+/// The gain that keeps a full scale input of every channel of `layout` within full scale
+/// after the fold, one over the larger side's coefficient sum, 1 when nothing folds or the
+/// layout does not name `in_channels` positions.
+pub fn downmix_clip_gain(layout: u64, in_channels: usize) -> f32 {
+    if layout == 0 || layout.count_ones() as usize != in_channels {
+        return 1.0;
+    }
+    let (mut lo, mut ro) = (0f32, 0f32);
+    for p in positions(layout) {
+        let (l, r) = stereo_feed(p);
+        (lo, ro) = (lo + l, ro + r);
+    }
+    let peak = lo.max(ro);
+    if peak > 1.0 { 1.0 / peak } else { 1.0 }
+}
+
+/// [`downmix_layout_to_stereo`] with every coefficient scaled by `gain` before the fold
+/// clamps, so [`downmix_clip_gain`] keeps a full scale input within full scale. The layout
+/// must name `in_channels` positions.
+pub fn downmix_layout_to_stereo_scaled(
+    fmt: SampleFormat,
+    layout: u64,
+    in_channels: usize,
+    input: &[u8],
+    output: &mut [u8],
+    gain: f32,
+) -> Option<usize> {
+    if layout == 0 || layout.count_ones() as usize != in_channels || in_channels > 64 {
+        return None;
+    }
+    let bps = fmt.bytes();
+    let in_stride = bps * in_channels;
+    if in_stride == 0 || !input.len().is_multiple_of(in_stride) {
+        return None;
+    }
+    let frames = input.len() / in_stride;
+    let out_len = frames * bps * 2;
+    if output.len() < out_len {
+        return None;
+    }
+    let (mut lo, mut ro) = ([0f32; 64], [0f32; 64]);
+    for (c, p) in positions(layout).enumerate() {
+        let (l, r) = stereo_feed(p);
+        (lo[c], ro[c]) = (l * gain, r * gain);
+    }
+    let (lo, ro) = (&lo[..in_channels], &ro[..in_channels]);
+    let output = &mut output[..out_len];
+    match fmt {
+        SampleFormat::U8 => fold_by_feed::<1>(fmt, lo, ro, input, output),
+        SampleFormat::S16 => fold_by_feed::<2>(fmt, lo, ro, input, output),
+        SampleFormat::S24 => fold_by_feed::<3>(fmt, lo, ro, input, output),
+        SampleFormat::S32 | SampleFormat::F32 => fold_by_feed::<4>(fmt, lo, ro, input, output),
+    }
+    Some(out_len)
+}
+
+/// Folds interleaved stereo PCM to mono, the mean of both sides, clamped at full scale.
+pub fn fold_stereo_to_mono(fmt: SampleFormat, input: &[u8], output: &mut [u8]) -> Option<usize> {
+    let bps = fmt.bytes();
+    let stride = bps * 2;
+    if stride == 0 || !input.len().is_multiple_of(stride) {
+        return None;
+    }
+    let out_len = input.len() / 2;
+    if output.len() < out_len {
+        return None;
+    }
+    let out = &mut output[..out_len];
+    for (s, d) in input.chunks_exact(stride).zip(out.chunks_exact_mut(bps)) {
+        let v = (downmix_get(fmt, &s[..bps]) + downmix_get(fmt, &s[bps..])) * 0.5;
+        downmix_put(fmt, v, d);
+    }
+    Some(out_len)
+}
+
 #[inline(always)]
 fn downmix_get(fmt: SampleFormat, b: &[u8]) -> f32 {
     if fmt.is_float() { decode_f32(b) } else { decode_i32_scale32(fmt, b) as f32 / 2_147_483_648.0 }
@@ -1110,5 +1185,52 @@ mod tests {
         downmix_to_stereo(SampleFormat::S16, 7, &input, &mut out).unwrap();
         assert_eq!(i16::from_le_bytes([out[0], out[1]]), 111);
         assert_eq!(i16::from_le_bytes([out[2], out[3]]), 222);
+    }
+
+    #[test]
+    fn the_clip_gain_holds_a_full_scale_fold_within_full_scale() {
+        use crate::layout::*;
+        let five_one = FL | FR | FC | LFE | BL | BR;
+        let g = downmix_clip_gain(five_one, 6);
+        assert!((g - 1.0 / (1.0 + 2.0 * M3DB)).abs() < 1e-6, "{g}");
+        let seven_one = FL | FR | FC | LFE | BL | BR | SL | SR;
+        let g7 = downmix_clip_gain(seven_one, 8);
+        assert!((g7 - 1.0 / (1.0 + 3.0 * M3DB)).abs() < 1e-6, "{g7}");
+        assert_eq!(downmix_clip_gain(FL | FR, 2), 1.0);
+        assert_eq!(downmix_clip_gain(0, 6), 1.0, "no layout, no gain");
+        // full scale on every channel clamps unscaled and lands at full scale scaled
+        let loud: Vec<u8> = (0..6).flat_map(|_| (-32768i16).to_le_bytes()).collect();
+        let mut out = vec![0u8; 4];
+        downmix_layout_to_stereo(SampleFormat::S16, five_one, 6, &loud, &mut out).unwrap();
+        assert_eq!(i16::from_le_bytes([out[0], out[1]]), -32768);
+        let mut out = vec![0u8; 4];
+        downmix_layout_to_stereo_scaled(SampleFormat::S16, five_one, 6, &loud, &mut out, g)
+            .unwrap();
+        let (l, r) = (i16::from_le_bytes([out[0], out[1]]), i16::from_le_bytes([out[2], out[3]]));
+        assert!((-32768..=-32700).contains(&l) && l == r, "{l} {r}");
+        // the fronts alone come out at the gain
+        let front: Vec<u8> =
+            [32767i16, 0, 0, 0, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut out = vec![0u8; 4];
+        downmix_layout_to_stereo_scaled(SampleFormat::S16, five_one, 6, &front, &mut out, g)
+            .unwrap();
+        let l = i16::from_le_bytes([out[0], out[1]]);
+        assert!((l - (32767.0 * g) as i16).abs() <= 1, "{l}");
+        assert_eq!(i16::from_le_bytes([out[2], out[3]]), 0);
+    }
+
+    #[test]
+    fn a_stereo_fold_to_mono_is_the_mean_of_both_sides() {
+        let frames: Vec<u8> = [(32767i16, -32768i16), (10000, 20000), (-32768, -32768)]
+            .iter()
+            .flat_map(|(l, r)| [l.to_le_bytes(), r.to_le_bytes()].concat())
+            .collect();
+        let mut out = vec![0u8; 6];
+        assert_eq!(fold_stereo_to_mono(SampleFormat::S16, &frames, &mut out), Some(6));
+        let got: Vec<i16> = out.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)).collect();
+        assert!(got[0].abs() <= 1, "{got:?}");
+        assert!((got[1] - 15000).abs() <= 1, "{got:?}");
+        assert_eq!(got[2], -32768);
+        assert_eq!(fold_stereo_to_mono(SampleFormat::S16, &frames[..3], &mut out), None);
     }
 }

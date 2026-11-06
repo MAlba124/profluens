@@ -81,6 +81,9 @@ struct PadStream {
     warned_undecodable: bool,
     /// Bytes the framer skipped between frames.
     junk: u64,
+    /// The stream's configuration sent as a HEADER buffer at each start, an MPEG-4 VOL, else
+    /// empty.
+    head: Vec<u8>,
 }
 
 impl PadStream {
@@ -103,6 +106,8 @@ struct Carry {
 /// Demultiplexes an AVI (RIFF) byte stream into one src pad per stream.
 pub struct AviDemux {
     header: Vec<u8>,
+    /// Codec heads given for streams by index, ahead of what the header holds.
+    heads: Vec<(usize, Vec<u8>)>,
     pad_streams: Vec<PadStream>,
     movi_data_start: u64,
     skipped: u64,
@@ -139,6 +144,7 @@ impl AviDemux {
     pub fn new(header: Vec<u8>) -> Self {
         Self {
             header,
+            heads: Vec::new(),
             pad_streams: Vec::new(),
             movi_data_start: 0,
             skipped: 0,
@@ -168,6 +174,16 @@ impl AviDemux {
     /// Tells the demuxer the source's length, `None` where it is unknown.
     pub fn with_len(mut self, len: Option<u64>) -> Self {
         self.file_len = len;
+        self
+    }
+
+    /// The codec head of stream `stream_index`, what an opener read past the header, an MPEG-4
+    /// VOL from the first key chunk. Sent as a HEADER buffer at each start of the stream.
+    pub fn with_codec_head(mut self, stream_index: usize, head: Vec<u8>) -> Self {
+        self.heads.retain(|(i, _)| *i != stream_index);
+        if !head.is_empty() {
+            self.heads.push((stream_index, head));
+        }
         self
     }
 
@@ -260,7 +276,7 @@ impl AviDemux {
         &mut self,
         ctx: &mut Ctx,
         chunk: &MediaChunk,
-    ) -> Option<(SrcPad, Option<u64>, BufferFlags)> {
+    ) -> Option<(SrcPad, Option<u64>, BufferFlags, bool)> {
         let Some(idx) =
             self.pad_streams.iter().position(|ps| ps.stream_index == chunk.stream_index)
         else {
@@ -275,7 +291,14 @@ impl AviDemux {
         if held {
             return None;
         }
-        if !ps.started {
+        if ps.head.is_empty()
+            && ps.family == codec::FAMILY_MPEG4_ASP
+            && let Some(vol) = codec::vol_prefix(&chunk.data)
+        {
+            ps.head.extend_from_slice(vol);
+        }
+        let fresh = !ps.started;
+        if fresh {
             ps.started = true;
             let (pad, family) = (ps.pad, ps.family);
             Self::announce(ctx, pad, family, &self.pad_streams[idx].stream);
@@ -297,7 +320,36 @@ impl AviDemux {
         } else {
             BufferFlags::empty()
         };
-        Some((ps.pad, pts, flags))
+        Some((ps.pad, pts, flags, fresh))
+    }
+
+    /// The stream's head on `pad` ahead of its first chunk of the run, stamped with it.
+    fn greet(&self, ctx: &mut Ctx, pad: SrcPad, pts_ns: Option<u64>) {
+        let Some(ps) = self.pad_streams.iter().find(|ps| ps.pad == pad) else { return };
+        if !ps.head.is_empty() {
+            Self::emit_exact(ctx, pad, pts_ns, BufferFlags::HEADER, &ps.head, 0);
+        }
+    }
+
+    /// The configuration of `stream` sent ahead of its chunks, the head given for it, else the
+    /// MPEG-4 VOL of its `strf` or of its first chunk when the header bytes reach it. Empty for
+    /// other families, their units carry what they need.
+    // Cold path, once per stream at preroll.
+    #[allow(clippy::disallowed_methods)]
+    fn head_of(&self, stream: &Stream, family: &str, movi_data_start: u64) -> Vec<u8> {
+        if let Some((_, h)) = self.heads.iter().find(|(i, _)| *i == stream.index) {
+            return h.clone();
+        }
+        if family != codec::FAMILY_MPEG4_ASP {
+            return Vec::new();
+        }
+        let in_movi = usize::try_from(movi_data_start)
+            .ok()
+            .and_then(|at| self.header.get(at..))
+            .and_then(|movi| riff::first_chunk_of(movi, stream.index));
+        codec::vol_prefix(stream.codec_head())
+            .or_else(|| in_movi.and_then(codec::vol_prefix))
+            .map_or_else(Vec::new, <[u8]>::to_vec)
     }
 
     /// The walker's and framers' first resync at warn, later ones at trace.
@@ -321,9 +373,12 @@ impl AviDemux {
             return false;
         }
         while let Some(chunk) = self.next_unit() {
-            let Some((pad, pts, flags)) = self.route(ctx, &chunk) else {
+            let Some((pad, pts, flags, fresh)) = self.route(ctx, &chunk) else {
                 continue;
             };
+            if fresh {
+                self.greet(ctx, pad, pts);
+            }
             let off = Self::emit_bounded(ctx, pad, pts, flags, &chunk.data, 0);
             if off < chunk.data.len() {
                 self.pending.push_back(Carry { pad, pts_ns: pts, flags, bytes: chunk.data, off });
@@ -341,9 +396,12 @@ impl AviDemux {
             Self::emit_exact(ctx, c.pad, c.pts_ns, c.flags, &c.bytes, c.off);
         }
         while let Some(chunk) = self.next_unit() {
-            let Some((pad, pts, flags)) = self.route(ctx, &chunk) else {
+            let Some((pad, pts, flags, fresh)) = self.route(ctx, &chunk) else {
                 continue;
             };
+            if fresh {
+                self.greet(ctx, pad, pts);
+            }
             Self::emit_exact(ctx, pad, pts, flags, &chunk.data, 0);
         }
     }
@@ -632,6 +690,7 @@ impl Element for AviDemux {
             let name = format!("src_stream{}", stream.index);
             let pad = ctx.add_src_pad(&name, codec::offers_for(stream));
             log_stream(ctx, stream, family);
+            let head = self.head_of(stream, family, movi.movi_data_start);
             self.pad_streams.push(PadStream {
                 stream_index: stream.index,
                 pad,
@@ -645,6 +704,7 @@ impl Element for AviDemux {
                 warned_undecodable: false,
                 junk: 0,
                 stream: stream.clone(),
+                head,
             });
         }
         if self.pad_streams.is_empty() {

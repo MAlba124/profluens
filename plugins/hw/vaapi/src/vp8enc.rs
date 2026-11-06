@@ -302,12 +302,11 @@ impl VaapiVp8Enc {
             };
             let is_kf = s.gop_pos == 0;
             let rc = RcUpdate { dirty: self.rc_dirty, hrd_ms: self.hrd_ms };
-            self.bufs.coded.clear();
             let (q, kbps, gop) = (self.qindex, self.bitrate_kbps, self.gop_len);
             encode_one(display, s, fmt, q, kbps, gop, is_kf, rc, data, &mut self.bufs)
-                .map(|()| is_kf)
+                .map(|coded| (is_kf, coded))
         };
-        let is_kf = match result {
+        let (is_kf, coded) = match result {
             Ok(v) => v,
             Err(e) => {
                 self.warn(ctx, K::Encode(e));
@@ -315,7 +314,15 @@ impl VaapiVp8Enc {
             }
         };
         self.rc_dirty = false; // the RC/HRD update rode this frame's submission
-        log!(&*ctx, Level::Trace, "encoded", bytes = self.bufs.coded.len(), key = is_kf);
+        let map = match coded.map_coded() {
+            Ok(m) => m,
+            // its buffer goes, the session makes another
+            Err(e) => {
+                self.warn(ctx, K::Encode(e));
+                return Ok(());
+            }
+        };
+        log!(&*ctx, Level::Trace, "encoded", bytes = map.len(), key = is_kf);
         self.frames += 1;
 
         let gop_len = self.gop_len.clamp(1, 1024);
@@ -328,7 +335,12 @@ impl VaapiVp8Enc {
             s.gop_pos = 0;
         }
         let stamp = Stamp { pts, duration, key: is_kf, preview: false };
-        self.staged.send_or_stage(&mut Self::pad(ctx), &mut self.bufs.coded, stamp)
+        self.staged.send_coded(&mut Self::pad(ctx), &[], &map, stamp)?;
+        match map.unmap() {
+            Ok(()) => s.engine.put_coded(coded),
+            Err(e) => self.warn(ctx, K::Encode(e)),
+        }
+        Ok(())
     }
 }
 
@@ -338,7 +350,8 @@ struct RcUpdate {
     hrd_ms: u32,
 }
 
-/// The driver writes all VP8 headers, the coded buffer is the whole frame.
+/// Codes one picture and waits for it, its coded buffer to read. The driver writes all VP8
+/// headers, the coded buffer is the whole frame.
 #[allow(clippy::too_many_arguments)]
 fn encode_one(
     display: &Display,
@@ -351,19 +364,21 @@ fn encode_one(
     rc: RcUpdate,
     data: &[u8],
     bufs: &mut FrameBufs,
-) -> va::VaResult<()> {
-    s.engine.upload(display, data, fmt.pixfmt)?;
+) -> va::VaResult<VaBuffer> {
+    let input = s.engine.upload(display, data, fmt.pixfmt)?;
 
+    let coded = s.engine.take_coded(display)?;
     let engine = &s.engine;
-    let ctxva = engine.context();
-    let coded =
-        VaBuffer::new_empty(display, ctxva, ffi::VAEncCodedBufferType, engine.coded_buf_size())?;
     let built =
         params(display, engine, fmt, qindex, bitrate_kbps, gop_len, is_kf, rc, &coded, bufs);
-    let submitted = built.and_then(|()| bufs.submit(display, engine, None));
+    let submitted = built.and_then(|()| bufs.submit(display, engine, input));
     bufs.hold.clear();
-    submitted?;
-    coded.read_coded(&mut bufs.coded)
+    if let Err(e) = submitted {
+        // read out and kept, not destroyed unread, the next picture writes it over
+        enc::discard_coded(Some(&mut s.engine), coded);
+        return Err(e);
+    }
+    Ok(coded)
 }
 
 #[allow(clippy::too_many_arguments)]

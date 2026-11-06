@@ -115,6 +115,35 @@ fn a_seek_to_the_first_packet_cuts_the_pre_skip_again() {
     );
 }
 
+/// A seek to the start has `oggdemux` read again from byte 0, the head comes again ahead of the
+/// first packet. Its pre-skip is cut once, not on top of the one the stamp places.
+#[test]
+fn a_seek_to_the_start_with_the_head_again_cuts_the_pre_skip_once() {
+    let mut owned = vec![opus_head(2, PRE_SKIP as u16)];
+    owned.extend(packets(2, 12));
+    let pieces: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+    let stamp = |piece: usize, buffer: &mut Buffer| {
+        if let Some(packet) = piece.checked_sub(1) {
+            buffer.pts = grid(PACKET * packet as u64, 48_000);
+        }
+    };
+    let stream = Stream { pieces: &pieces, rate: 48_000, stride: 4, stamp: &stamp, first: 0 };
+    let full = stream.full(&new);
+    let mut h = new();
+    drop(stream.feed(&mut h, 0..6));
+    h.seek(0, Timestamp::ZERO).expect("seek");
+    let mut out = stream.feed(&mut h, 0..pieces.len());
+    out.extend(stream.finish(&mut h));
+    assert_eq!(out[0].pts, Timestamp::ZERO);
+    let again: Vec<u8> = out.into_iter().flat_map(|pcm| pcm.bytes).collect();
+    assert!(
+        again == full,
+        "the same samples as from the start, {} for {}",
+        again.len(),
+        full.len()
+    );
+}
+
 #[test]
 fn a_declared_delay_that_repeats_the_pre_skip_is_taken_off_once() {
     use profluens_core::format::ValueDesc;

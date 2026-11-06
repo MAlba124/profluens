@@ -142,7 +142,6 @@ pub struct VaEnc<C: Codec> {
     in_fmt: Option<InFormat>,
     hold: Vec<VaBuffer>,
     ids: Vec<ffi::VABufferID>,
-    coded: Vec<u8>,
     staged: Staged,
     disabled: bool,
     warned: Warned,
@@ -175,7 +174,6 @@ impl<C: Codec> VaEnc<C> {
             in_fmt: None,
             hold: Vec::with_capacity(BUFFERS_MAX),
             ids: Vec::with_capacity(BUFFERS_MAX),
-            coded: Vec::new(),
             staged: Staged::new(),
             disabled: false,
             warned: Warned::default(),
@@ -192,6 +190,14 @@ impl<C: Codec> VaEnc<C> {
     pub fn with_fps(mut self, num: u32, den: u32) -> Self {
         if let Some(g) = &mut self.gpu {
             g.fps = (num, den.max(1));
+        }
+        self
+    }
+
+    /// Frames of a `video/gpu` input pass at most this often, the rest are dropped.
+    pub fn with_max_fps(mut self, num: u32, den: u32) -> Self {
+        if let Some(g) = &mut self.gpu {
+            g.max_fps = (num, den.max(1));
         }
         self
     }
@@ -347,23 +353,24 @@ impl<C: Codec> VaEnc<C> {
             s.gop_pos = 0;
         }
         let key = s.gop_pos == 0;
-        self.coded.clear();
-        let r = picture::<C>(
-            display,
-            s,
-            &self.cfg,
-            fmt,
-            input,
-            key,
-            &mut self.hold,
-            &mut self.ids,
-            &mut self.coded,
-        );
-        if let Err(e) = r {
-            self.warn(ctx, K::Encode(e));
-            return Ok(());
-        }
-        log!(&*ctx, Level::Trace, "encoded", bytes = self.coded.len(), key = key);
+        let r = picture::<C>(display, s, &self.cfg, fmt, input, key, &mut self.hold, &mut self.ids);
+        let out = match r {
+            Ok(b) => b,
+            Err(e) => {
+                self.warn(ctx, K::Encode(e));
+                return Ok(());
+            }
+        };
+        let map = match out.map_coded() {
+            Ok(m) => m,
+            // its buffer goes, the session makes another
+            Err(e) => {
+                self.warn(ctx, K::Encode(e));
+                return Ok(());
+            }
+        };
+        C::commit(&mut s.codec);
+        log!(&*ctx, Level::Trace, "encoded", bytes = map.len(), key = key);
         self.frames += 1;
         s.engine.advance_recon();
         s.gop_pos += 1;
@@ -371,7 +378,12 @@ impl<C: Codec> VaEnc<C> {
             s.gop_pos = 0;
         }
         let stamp = Stamp { pts, duration, key, preview };
-        self.staged.send_or_stage(&mut Self::pad(ctx), &mut self.coded, stamp)
+        self.staged.send_coded(&mut Self::pad(ctx), &[], &map, stamp)?;
+        match map.unmap() {
+            Ok(()) => s.engine.put_coded(out),
+            Err(e) => self.warn(ctx, K::Encode(e)),
+        }
+        Ok(())
     }
 
     fn pad(ctx: &mut Ctx) -> PadOut<'_> {
@@ -440,12 +452,22 @@ impl<C: Codec> VaEnc<C> {
                 self.warn(ctx, K::NoGpuFrame { token: h.token });
                 continue;
             };
+            // the rate gate, a key the source or a seek asks for passes
+            let must = inbuf.flags.contains(BufferFlags::PREVIEW)
+                || inbuf.flags.contains(BufferFlags::INTRA);
+            if !self.gpu.as_mut().is_some_and(|g| g.keep(inbuf.pts, must)) {
+                drop(frame);
+                ctx.count_drop();
+                continue;
+            }
             if !self.ensure_session(ctx, fmt) {
                 continue;
             }
+            // the driver pads a surface past the session's alignment (720 rows come as 736),
+            // a frame at least the session's coded size encodes, the picture is the session's
             let coded =
                 self.session.as_ref().map_or((0, 0), |s| (s.engine.coded_w, s.engine.coded_h));
-            if (frame.coded_w, frame.coded_h) != coded {
+            if frame.coded_w < coded.0 || frame.coded_h < coded.1 {
                 self.warn(
                     ctx,
                     K::CodedSize { coded: (frame.coded_w, frame.coded_h), session: coded },
@@ -471,6 +493,7 @@ impl<C: Codec> VaEnc<C> {
     }
 }
 
+/// Codes one picture and waits for it, its coded buffer to read.
 #[allow(clippy::too_many_arguments)]
 fn picture<C: Codec>(
     display: &Display,
@@ -481,21 +504,12 @@ fn picture<C: Codec>(
     key: bool,
     hold: &mut Vec<VaBuffer>,
     ids: &mut Vec<ffi::VABufferID>,
-    coded: &mut Vec<u8>,
-) -> VaResult<()> {
+) -> VaResult<VaBuffer> {
     let surface = match input {
-        Input::Raw(data) => {
-            s.engine.upload(display, data, fmt.pixfmt)?;
-            s.engine.input()
-        }
+        Input::Raw(data) => s.engine.upload(display, data, fmt.pixfmt)?,
         Input::Surface(surface) => surface,
     };
-    let out = VaBuffer::new_empty(
-        display,
-        s.engine.context(),
-        ffi::VAEncCodedBufferType,
-        s.engine.coded_buf_size(),
-    )?;
+    let out = s.engine.take_coded(display)?;
     let p = Picture { key, frame_num: s.gop_pos, coded: out.id() };
     hold.clear();
     let built = C::buffers(&mut s.codec, display, &s.engine, cfg, fmt, &p, hold);
@@ -503,10 +517,12 @@ fn picture<C: Codec>(
     ids.extend(hold.iter().map(VaBuffer::id));
     let submitted = built.and_then(|_| s.engine.submit_from(display, ids, surface));
     hold.clear();
-    submitted?;
-    out.read_coded(coded)?;
-    C::commit(&mut s.codec);
-    Ok(())
+    if let Err(e) = submitted {
+        // read out and kept, not destroyed unread, the next picture writes it over
+        enc::discard_coded(Some(&mut s.engine), out);
+        return Err(e);
+    }
+    Ok(out)
 }
 
 impl<C: Codec> Element for VaEnc<C> {

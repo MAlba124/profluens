@@ -16,6 +16,8 @@ const EBML: u32 = 0x1A45_DFA3;
 const SEGMENT: u32 = 0x1853_8067;
 const CLUSTER: u32 = 0x1F43_B675;
 const TRACKS: u32 = 0x1654_AE6B;
+const ATTACHMENTS: u32 = 0x1941_A469;
+const TAGS: u32 = 0x1254_C367;
 /// Top level elements walked for the first Cluster.
 const MKV_MAX_TOP: usize = 4096;
 const MKV_HEAD_MAX: usize = 8 << 20;
@@ -77,8 +79,8 @@ pub fn mkv_header_prefix(path: &str) -> Result<Vec<u8>, HeadError> {
 }
 
 /// `window` up to the first Cluster, walking the top level elements by their sizes. Once Tracks
-/// is read, an element the walk cannot step past in the window ends the head before it,
-/// attached fonts as a rule, the demuxer reads those through the SeekHead. A head of a cut
+/// is read, the Attachments or an element the walk cannot step past in the window end the head
+/// before them, attached fonts are read through the SeekHead by what wants them. A head of a cut
 /// window is then always the start of the whole one's.
 pub fn mkv_header_from(window: &[u8]) -> Result<Vec<u8>, HeadError> {
     let (ebml, at) = ebml_header(window, 0).ok_or(HeadError::NoCluster)?;
@@ -95,7 +97,7 @@ pub fn mkv_header_from(window: &[u8]) -> Result<Vec<u8>, HeadError> {
         let Some(((id, size), data)) = ebml_header(window, at) else {
             break;
         };
-        if id == CLUSTER {
+        if id == CLUSTER || (tracks && id == ATTACHMENTS) {
             return Ok(window[..at as usize].to_vec());
         }
         let Some(end) =
@@ -139,10 +141,15 @@ fn ebml_header(b: &[u8], at: u64) -> Option<((u32, Option<u64>), u64)> {
 /// A Matroska file's head as [`MkvHeadAt`] reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MkvHead {
-    /// The bytes before the first Cluster. Short of it when an element past the cap follows
-    /// Tracks, attached fonts as a rule, the demuxer reads those through the SeekHead.
+    /// The bytes before the first Cluster. Short of it at Attachments or an element past the
+    /// cap that follow Tracks, attached fonts are read through the SeekHead by what wants them.
     pub head: Vec<u8>,
     pub first_cluster: u64,
+    /// Where the walk passed the Attachments, for a head cut before them whose SeekHead names
+    /// none.
+    pub attachments: Option<u64>,
+    /// Where the walk passed the Tags, for Tags behind such a cut.
+    pub tags: Option<u64>,
 }
 
 /// `TooLarge` is an element ending past the cap before Tracks is read, `TooMany` no Cluster among
@@ -196,8 +203,9 @@ enum MkvState {
 }
 
 /// The head of a Matroska file. The top level elements are walked by their headers alone, so
-/// attached fonts are never read. Once Tracks is read, an element ending past `max` ends the head
-/// before it and the walk goes on past it for the first Cluster. One before Tracks is refused. A
+/// attached fonts are never read. Once Tracks is read, the Attachments or an element ending past
+/// `max` end the head before them and the walk goes on past for the first Cluster. An element
+/// past `max` before Tracks is refused. A
 /// walk that breaks past such a cut takes the cut as the first Cluster, the demuxer finds the real
 /// one by its id.
 #[derive(Debug)]
@@ -213,6 +221,8 @@ pub struct MkvHeadAt {
     got: usize,
     tracks: bool,
     cut: Option<u64>,
+    attachments: Option<u64>,
+    tags: Option<u64>,
     /// Top level elements walked.
     tops: usize,
 }
@@ -235,6 +245,8 @@ impl MkvHeadAt {
             got: 0,
             tracks: false,
             cut: None,
+            attachments: None,
+            tags: None,
             tops: 0,
         }
     }
@@ -291,7 +303,8 @@ impl MkvHeadAt {
             let mut head = std::mem::take(&mut self.window);
             head.truncate(len);
             self.state = MkvState::Start;
-            return Ok(Step::Done(MkvHead { head, first_cluster }));
+            let (attachments, tags) = (self.attachments, self.tags);
+            return Ok(Step::Done(MkvHead { head, first_cluster, attachments, tags }));
         }
         self.head = std::mem::take(&mut self.window);
         self.head_from = self.head.len();
@@ -303,6 +316,7 @@ impl MkvHeadAt {
         match self.state {
             MkvState::Start => {
                 (self.tracks, self.cut, self.tops) = (false, None, 0);
+                (self.attachments, self.tags) = (None, None);
                 Ok(self.ask(MkvState::Ebml, 0))
             }
             MkvState::Ebml => {
@@ -336,7 +350,13 @@ impl MkvHeadAt {
                     None if self.cut.is_some() => return self.finish(None, at),
                     None => return Err(MkvHeadError::Malformed { at }),
                 };
-                if self.cut.is_none() && end > self.max {
+                match id {
+                    ATTACHMENTS => self.attachments = self.attachments.or(Some(at)),
+                    TAGS => self.tags = self.tags.or(Some(at)),
+                    _ => {}
+                }
+                let fonts = self.tracks && id == ATTACHMENTS;
+                if self.cut.is_none() && (fonts || end > self.max) {
                     if !self.tracks {
                         return Err(MkvHeadError::TooLarge { at, max: self.max });
                     }
@@ -350,7 +370,9 @@ impl MkvHeadAt {
                     return Err(MkvHeadError::Malformed { at: (self.head_from + self.got) as u64 });
                 }
                 (self.state, self.head_from) = (MkvState::Start, 0);
-                Ok(Step::Done(MkvHead { head: std::mem::take(&mut self.head), first_cluster }))
+                let (head, attachments, tags) =
+                    (std::mem::take(&mut self.head), self.attachments, self.tags);
+                Ok(Step::Done(MkvHead { head, first_cluster, attachments, tags }))
             }
         }
     }
@@ -526,6 +548,9 @@ pub const MAX_MOOV: u64 = 64 << 20;
 const TAIL_FIRST: usize = 1 << 20;
 const MAX_BOXES: u32 = 256;
 const MAX_MFRA: u64 = 16 << 20;
+/// Read past what a step needs, so the free and skip boxes muxers put between the `moov` and
+/// the `mdat` come in the same read.
+const PAST_END: u64 = 4096;
 
 /// What [`Mp4HeadAt`] does next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -563,11 +588,11 @@ impl Fetch for Mp4HeadAt<'_> {
     }
 
     fn buf(&mut self) -> &mut [u8] {
-        &mut self.walk.tail
+        self.walk.buf()
     }
 
     fn filled(&mut self, n: usize) {
-        self.walk.got = n.min(self.walk.tail.len());
+        self.walk.filled(n);
     }
 }
 
@@ -599,11 +624,11 @@ impl Fetch for Mp4HeadOwned {
     }
 
     fn buf(&mut self) -> &mut [u8] {
-        &mut self.walk.tail
+        self.walk.buf()
     }
 
     fn filled(&mut self, n: usize) {
-        self.walk.got = n.min(self.walk.tail.len());
+        self.walk.filled(n);
     }
 }
 
@@ -612,11 +637,13 @@ impl Fetch for Mp4HeadOwned {
 struct Mp4Walk {
     len: u64,
     state: Mp4State,
-    /// File bytes from `tail_at`, the last read.
+    /// File bytes from `tail_at`, the last read and the reads that grew it.
     tail: Vec<u8>,
     tail_at: u64,
     /// The read in flight, from its byte to the end of what the step needs.
     reading: Option<(u64, u64)>,
+    /// Where in the tail the read in flight lands, past what it holds when it grows it.
+    fill: usize,
     got: usize,
     mdat: Option<u64>,
     moov: Option<(u64, u64)>,
@@ -631,6 +658,7 @@ impl Mp4Walk {
             tail: Vec::new(),
             tail_at: 0,
             reading: None,
+            fill: 0,
             got: 0,
             mdat: None,
             moov: None,
@@ -645,14 +673,43 @@ impl Mp4Walk {
             return None;
         }
         let p = at.max(wlen);
-        if self.tail_at <= p && end <= self.tail_at + self.tail.len() as u64 {
+        let tail_end = self.tail_at + self.tail.len() as u64;
+        if self.tail_at <= p && end <= tail_end {
             return None;
         }
-        let len = (end.max(p.saturating_add(TAIL_FIRST as u64)).min(self.len) - p) as usize;
-        self.tail.clear();
-        self.tail.resize(len, 0);
-        self.reading = Some((p, end));
-        Some(Need { at: p, len })
+        // Every byte before the mdat is the prefix's, so a read there runs on from the window or
+        // the tail and the prefix is never read twice or after a read behind it.
+        let prefix = self.mdat.is_none() && end <= MAX_MOOV;
+        let grows = !self.tail.is_empty() && self.tail_at <= p && (p <= tail_end || prefix);
+        let (from, fill) = match (grows, prefix) {
+            (true, true) => (tail_end, self.tail.len()),
+            (true, false) => {
+                // Behind the prefix only `p` on is asked again. Kept whole, box headers that
+                // each end past the last read would hold every box in the tail.
+                self.tail.drain(..(p - self.tail_at) as usize);
+                self.tail_at = p;
+                (tail_end, self.tail.len())
+            }
+            (false, true) => (wlen, 0),
+            (false, false) => (p, 0),
+        };
+        let to = end.saturating_add(PAST_END).max(from.saturating_add(TAIL_FIRST as u64));
+        let len = (to.min(self.len) - from) as usize;
+        if fill == 0 {
+            self.tail_at = from;
+            self.tail.clear();
+        }
+        self.tail.resize(fill + len, 0);
+        (self.reading, self.fill) = (Some((from, end)), fill);
+        Some(Need { at: from, len })
+    }
+
+    fn buf(&mut self) -> &mut [u8] {
+        &mut self.tail[self.fill..]
+    }
+
+    fn filled(&mut self, n: usize) {
+        self.got = n.min(self.tail.len() - self.fill);
     }
 
     /// `[at, end)` as the window and the tail hold it, in two pieces.
@@ -679,7 +736,7 @@ impl Mp4Walk {
     fn reset(&mut self) {
         (self.state, self.reading, self.mdat, self.moov) =
             (Mp4State::Boxes { at: 0, n: 0 }, None, None, None);
-        (self.tail_at, self.head) = (0, Vec::new());
+        (self.tail_at, self.fill, self.head) = (0, 0, Vec::new());
         self.tail.clear();
     }
 
@@ -696,8 +753,7 @@ impl Mp4Walk {
             if (self.got as u64) < end - p {
                 return Err(Mp4HeadError::Truncated { at: p, end, len: p + self.got as u64 });
             }
-            self.tail.truncate(self.got);
-            self.tail_at = p;
+            self.tail.truncate(self.fill + self.got);
         }
         let len = self.len;
         loop {
@@ -954,6 +1010,60 @@ mod tests {
         assert_eq!((head, log.len()), (want, 0), "a window holding it all reads nothing");
     }
 
+    /// A moov at the front past the window comes in one read on from the window, not its next
+    /// header first and then a hop back for the moov.
+    #[test]
+    fn mp4_head_reads_a_moov_past_the_window_once() {
+        let moov = vec![0x4Du8; 300_000];
+        let media = vec![0x55u8; 2 << 20];
+        // a free box past the first read grows it, the moov is not read again
+        for (free, reads) in [(0, 1), (1_100_000, 2)] {
+            let free = vec![0u8; free];
+            let file =
+                boxes(&[(b"ftyp", b"isom"), (b"moov", &moov), (b"free", &free), (b"mdat", &media)]);
+            let mut log = Vec::new();
+            let mut m = Mp4HeadAt::new(&file[..4096], file.len() as u64);
+            let head = drive_slice_log(&mut m, &file, &mut log).expect("head");
+            assert_eq!(head, file[..12 + 8 + moov.len() + 8 + free.len()]);
+            assert_eq!(log.len(), reads, "{log:?}");
+            assert_eq!(log[0].at, 4096);
+            for w in log.windows(2) {
+                assert_eq!(w[1].at, w[0].at + w[0].len as u64, "on from the last, {log:?}");
+            }
+        }
+        // the owning machine reads the same
+        let file = boxes(&[(b"ftyp", b"isom"), (b"moov", &moov), (b"mdat", &media)]);
+        let mut log = Vec::new();
+        let mut m = Mp4HeadOwned::new(file[..4096].to_vec(), file.len() as u64);
+        let head = drive_slice_log(&mut m, &file, &mut log).expect("head");
+        assert_eq!((head.len(), log.len()), (12 + 8 + moov.len(), 1));
+    }
+
+    /// Box headers behind the mdat that each sit at the end of the last read do not grow the
+    /// tail past a moov's worth, the file is not held whole.
+    #[test]
+    fn mp4_head_tail_behind_the_mdat_stays_bounded() {
+        let mib = TAIL_FIRST;
+        let mut file = boxes(&[(b"ftyp", b"isom"), (b"mdat", &[0u8; 8])]);
+        let window = file.len();
+        // the first header past the window straddles the end of the first read, the 1 MiB
+        // boxes after it straddle the end of each read after
+        let mut sizes = vec![mib - 8];
+        sizes.extend(std::iter::repeat_n(mib, (MAX_MOOV as usize + 4 * mib) / mib));
+        for size in sizes {
+            file.extend_from_slice(&(size as u32).to_be_bytes());
+            file.extend_from_slice(b"free");
+            file.resize(file.len() + size - 8, 0);
+        }
+        let moov = boxes(&[(b"moov", &[0x4D; 64])]);
+        file.extend_from_slice(&moov);
+        let mut m = Mp4HeadAt::new(&file[..window], file.len() as u64);
+        let head = drive_slice(&mut m, &file).expect("head");
+        assert_eq!(head.len(), 12 + moov.len(), "the ftyp and the moov");
+        let held = m.walk.tail.capacity() as u64;
+        assert!(held <= MAX_MOOV + 2 * mib as u64, "the tail grew to {held}");
+    }
+
     #[test]
     fn mp4_head_takes_a_largesize_box() {
         let mut file = boxes(&[(b"ftyp", b"isom")]);
@@ -1139,6 +1249,33 @@ mod tests {
         // a walk that breaks behind the cut takes the cut as the first Cluster
         let h = sparse(&mut MkvHeadAt::new(64 << 20), &lead, size, &[0x00]).expect("head");
         assert_eq!(h.first_cluster, tracks_end as u64);
+    }
+
+    /// Attachments behind Tracks end the head under the cap too, so the fonts are never read and
+    /// no head copy holds them. Ahead of Tracks they are part of the head.
+    #[test]
+    fn mkv_head_ends_before_attachments_of_any_size() {
+        let mut file = mkv_lead();
+        let tracks_end = file.len();
+        file.extend(el(ATTACHMENTS, &[7; 4096]));
+        let cluster = file.len();
+        file.extend(el(CLUSTER, b"media"));
+        assert_eq!(mkv_header_from(&file).expect("head"), file[..tracks_end]);
+        let mut log = Vec::new();
+        let h = drive_slice_log(&mut MkvHeadAt::new(1 << 20), &file, &mut log).expect("head");
+        assert_eq!(h.head, file[..tracks_end]);
+        assert_eq!((h.first_cluster, h.attachments), (cluster as u64, Some(tracks_end as u64)));
+        assert!(log.iter().all(|n| n.len <= tracks_end), "the fonts unread, {log:?}");
+        let mut early = el(EBML, &el(0x4282, b"matroska"));
+        early.extend([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let at = early.len();
+        early.extend(el(ATTACHMENTS, &[7; 64]));
+        early.extend(el(TRACKS, &el(0xAE, &[0xD7, 0x81, 0x01])));
+        let cluster = early.len();
+        early.extend(el(CLUSTER, b"media"));
+        let h = drive_slice(&mut MkvHeadAt::new(1 << 20), &early).expect("head");
+        assert_eq!((h.head.len(), h.attachments), (cluster, Some(at as u64)), "ahead of Tracks");
+        assert_eq!(mkv_header_from(&early).expect("head"), early[..cluster]);
     }
 
     #[test]

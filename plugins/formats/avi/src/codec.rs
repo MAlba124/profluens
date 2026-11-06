@@ -131,6 +131,26 @@ pub fn chunk_is_key(family: &str, data: &[u8]) -> bool {
     false
 }
 
+/// The MPEG-4 Part 2 configuration at the front of `chunk`, its bytes up to the first VOP start
+/// code when a VOL (start codes 0x20 to 0x2F) comes before it, the whole chunk when no VOP
+/// follows, None without a VOL. XviD files keep the VOL in the first key chunk only, a decode
+/// started elsewhere needs it as extradata.
+pub fn vol_prefix(chunk: &[u8]) -> Option<&[u8]> {
+    let mut vol = false;
+    let mut at = 0;
+    while let Some(i) = chunk.get(at..).and_then(|d| d.windows(3).position(|w| w == [0, 0, 1])) {
+        let p = at + i;
+        let Some(&code) = chunk.get(p + 3) else { break };
+        match code {
+            0xB6 => return vol.then(|| &chunk[..p]),
+            0x20..=0x2F => vol = true,
+            _ => {}
+        }
+        at = p + 3;
+    }
+    vol.then_some(chunk)
+}
+
 /// Whether audio comes as byte slices cut at the video rate rather than as codec frames.
 pub fn reframes(family: &str, sample_size: u32) -> bool {
     sample_size == 1 && matches!(family, FAMILY_AC3 | FAMILY_MP3)
@@ -491,6 +511,21 @@ mod tests {
     #[test]
     fn unknown_video_fourcc_is_bytes() {
         assert_eq!(family_for(&video(b"MJPG", None)), "bytes");
+    }
+
+    #[test]
+    fn the_vol_prefix_runs_through_the_vol_up_to_the_vop() {
+        let vos = [0, 0, 1, 0xB0, 0xF5, 0, 0, 1, 0xB5, 0x09];
+        let vol = [0, 0, 1, 0x20, 0x08, 0x80];
+        let vop = [0, 0, 1, 0xB6, 0x10, 0];
+        let first = [vos.as_slice(), &vol, &vop].concat();
+        assert_eq!(vol_prefix(&first), Some(&first[..16]));
+        assert_eq!(vol_prefix(&[vol.as_slice(), &vop].concat()), Some(&vol[..]));
+        assert_eq!(vol_prefix(&vol), Some(&vol[..]), "a VOL alone");
+        assert_eq!(vol_prefix(&vop), None, "a VOP without its VOL");
+        assert_eq!(vol_prefix(&[vos.as_slice(), &vop].concat()), None, "no VOL between");
+        assert_eq!(vol_prefix(&[]), None);
+        assert_eq!(vol_prefix(&[0, 0, 1]), None, "a cut start code");
     }
 
     #[test]

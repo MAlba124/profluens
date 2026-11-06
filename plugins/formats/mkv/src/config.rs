@@ -2,7 +2,9 @@
 //! muxer. Untrusted bytes, bounds checked.
 
 use std::fmt;
+use std::sync::LazyLock;
 
+use memchr::memmem::Finder;
 use profluens_core::ctx::Ctx;
 use profluens_core::memory::Memory;
 
@@ -74,18 +76,12 @@ impl NalCodec {
     }
 }
 
+// Built once, `memmem::find` builds a searcher per call.
+static START_CODE: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(&[0, 0, 1]));
+
 fn start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
-    let mut i = from;
-    while i + 3 <= data.len() {
-        if data[i + 2] > 1 {
-            i += 3;
-        } else if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            return Some(if i > from && data[i - 1] == 0 { (i - 1, 4) } else { (i, 3) });
-        } else {
-            i += 1;
-        }
-    }
-    None
+    let i = from + START_CODE.find(data.get(from..)?)?;
+    Some(if i > from && data[i - 1] == 0 { (i - 1, 4) } else { (i, 3) })
 }
 
 pub struct Nals<'a> {
@@ -212,6 +208,94 @@ pub fn strip_param_sets(codec: NalCodec, au: &[u8], out: &mut Vec<u8>) -> bool {
         }
     }
     true
+}
+
+/// What a sink needs of an Annex B access unit, from one pass over it (`scan_unit`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnitScan {
+    /// It carries a VPS, SPS or PPS.
+    pub param_sets: bool,
+    /// The TemporalId all its pictures share when each is one nothing at that sub-layer refers
+    /// to, H.264 slices with nal_ref_idc 0 at 0, HEVC _N types (7.4.2.2). None without one.
+    pub nonref: Option<u8>,
+    /// Its length without the parameter sets, as `strip_param_sets` writes it.
+    pub kept_len: usize,
+}
+
+/// One pass over an Annex B access unit. Its NALs other than parameter sets go onto `kept` as
+/// ranges of `au` without trailing zero bytes, `kept_bytes` writes them out.
+pub fn scan_unit(codec: NalCodec, au: &[u8], kept: &mut Vec<(usize, usize)>) -> UnitScan {
+    kept.clear();
+    let mut s = UnitScan::default();
+    let mut vcl = false;
+    for (a, b) in nals(au) {
+        let h = au[a];
+        match codec.kind(h) {
+            NalKind::Vps | NalKind::Sps | NalKind::Pps => {
+                s.param_sets = true;
+                continue;
+            }
+            NalKind::Vcl => {
+                let tid = match codec {
+                    NalCodec::H264 => (h & 0x60 == 0).then_some(0),
+                    NalCodec::H265 => {
+                        let t = (h >> 1) & 0x3F;
+                        let free = t <= 14 && t & 1 == 0 && a + 1 < b;
+                        free.then(|| (au[a + 1] & 7).saturating_sub(1))
+                    }
+                };
+                s.nonref = if vcl { s.nonref.filter(|&p| Some(p) == tid) } else { tid };
+                vcl = true;
+            }
+            NalKind::Other => {}
+        }
+        kept.push((a, b));
+        s.kept_len += 4 + (b - a);
+    }
+    s
+}
+
+/// `unreferenced` from a scan, `head` read only for an HEVC unit that may be.
+pub fn scan_unreferenced(codec: NalCodec, head: &[u8], s: &UnitScan) -> bool {
+    s.nonref.is_some_and(|t| match codec {
+        NalCodec::H264 => true,
+        NalCodec::H265 => hevc_top_layer(head) == Some(t),
+    })
+}
+
+const START4: [u8; 4] = [0, 0, 0, 1];
+
+/// Bytes `at..` of the unit `kept` of `scan_unit` describes onto `out`, each NAL behind a four
+/// byte start code as `strip_param_sets` writes it. A fragment is cut without the whole copy.
+/// Gives how many it wrote, short of `out` only at the end.
+pub fn kept_bytes(au: &[u8], kept: &[(usize, usize)], mut at: usize, out: &mut [u8]) -> usize {
+    let mut w = 0usize;
+    for &(a, b) in kept {
+        let Some(nal) = au.get(a..b) else { break };
+        for seg in [&START4[..], nal] {
+            if at >= seg.len() {
+                at -= seg.len();
+                continue;
+            }
+            let k = (seg.len() - at).min(out.len() - w);
+            out[w..w + k].copy_from_slice(&seg[at..at + k]);
+            w += k;
+            at = 0;
+            if w == out.len() {
+                return w;
+            }
+        }
+    }
+    w
+}
+
+/// The unit `kept` of `scan_unit` describes onto `out`, as `strip_param_sets` writes it.
+pub fn extend_kept(au: &[u8], kept: &[(usize, usize)], out: &mut Vec<u8>) {
+    for &(a, b) in kept {
+        let Some(nal) = au.get(a..b) else { break };
+        out.extend_from_slice(&START4);
+        out.extend_from_slice(nal);
+    }
 }
 
 /// The highest TemporalId of an HEVC stream, sps_max_sub_layers_minus1 of the first SPS in the

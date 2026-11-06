@@ -26,11 +26,15 @@ trait EncBackend: Send {
     fn frame_bytes(&self) -> usize;
     fn encode(&mut self, frame: &[u8], out: &mut Vec<u8>) -> Result<(), CodecError>;
     fn reset(&mut self);
+    fn set_bitrate(&mut self, bps: u32) -> Result<(), CodecError>;
 }
 
 impl EncBackend for crate::libopus::LibopusEncoder {
     fn frame_bytes(&self) -> usize {
         crate::libopus::LibopusEncoder::frame_bytes(self)
+    }
+    fn set_bitrate(&mut self, bps: u32) -> Result<(), CodecError> {
+        crate::libopus::LibopusEncoder::set_bitrate(self, bps)
     }
     fn encode(&mut self, frame: &[u8], out: &mut Vec<u8>) -> Result<(), CodecError> {
         crate::libopus::LibopusEncoder::encode(self, frame, out)
@@ -87,7 +91,7 @@ static SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: &SRC_OFFERS }];
 /// `bitrate` 0 derives from channels, `vbr` 0 is CBR, `complexity` 0 to 10, `aligned` 1 puts
 /// frames on absolute multiples of the frame duration.
 static PROPS: [PropDesc; 4] = [
-    PropDesc { name: "bitrate", allowed: Constraint::Any, live: false },
+    PropDesc { name: "bitrate", allowed: Constraint::Any, live: true },
     PropDesc { name: "vbr", allowed: Constraint::Any, live: false },
     PropDesc { name: "complexity", allowed: Constraint::Any, live: false },
     PropDesc { name: "aligned", allowed: Constraint::Any, live: false },
@@ -166,6 +170,12 @@ impl OpusEnc {
     /// stamps where a full run did.
     pub fn aligned(mut self) -> Self {
         self.aligned = true;
+        self
+    }
+
+    /// The bitrate, bit/s, 0 derives from the channels. The `bitrate` prop moves it live.
+    pub fn with_bitrate(mut self, bps: u32) -> Self {
+        self.bitrate_bps = bps;
         self
     }
 
@@ -453,6 +463,16 @@ impl Element for OpusEnc {
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
         match event {
             Event::FormatChange(_) => self.build_from_sink(ctx)?,
+            Event::PropChanged { name: "bitrate", value: Value::Int(b) } if *b > 0 => {
+                self.bitrate_bps = *b as u32;
+                if let Some(enc) = self.enc.as_mut() {
+                    if let Err(e) = enc.set_bitrate(self.bitrate_bps) {
+                        log!(&*ctx, Level::Warn, "bitrate_refused", reason = e.reason());
+                    } else {
+                        log!(&*ctx, Level::Debug, "bitrate", bps = self.bitrate_bps);
+                    }
+                }
+            }
             Event::FlushStart => {
                 log!(&*ctx, Level::Debug, "flush", carry = self.acc.len());
                 if let Some(enc) = self.enc.as_mut() {

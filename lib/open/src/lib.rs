@@ -21,7 +21,8 @@ use profluens_video::color::{HdrStatic, StreamColor};
 /// What an open reads past the tracks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Want {
-    /// The Matroska Cues and the AVI idx1, for demuxers that then read none.
+    /// The Matroska Cues, the AVI idx1 and the MP4 sample tables, for demuxers that then read
+    /// or fold none.
     pub index: bool,
     /// The tags and pictures, for `pf_tags::of`.
     pub meta: bool,
@@ -37,8 +38,8 @@ impl Want {
 pub struct Caps {
     /// The first read, the sniff and every head that fits in it come from it.
     pub window: usize,
-    /// A Matroska head past it once Tracks is read ends before the element that crosses it, an
-    /// AVI head is refused.
+    /// A Matroska head past it once Tracks is read ends before the element that crosses it, as it
+    /// ends before the Attachments however large, an AVI head is refused.
     pub max_head: u64,
     /// Matroska Cues past it are not read.
     pub max_cues: u64,
@@ -184,28 +185,28 @@ pub struct Skipped {
 pub enum Index {
     #[default]
     None,
-    /// Every track's CuePoints and where the Cues lie, empty when not read or absent.
-    Mkv {
-        first_cluster: u64,
-        cues: Arc<[pf_mkv::Cue]>,
-        at: Option<u64>,
-    },
+    /// The head parsed, its tracks and where the rest lies, with every track's CuePoints, empty
+    /// when not read or absent. The demuxer of each run parses none of it again.
+    Mkv(Arc<pf_mkv::Parsed>),
     Avi(Arc<pf_avi::AviIndex>),
     Bare(Arc<pf_bare::BareHead>),
+    /// The MP4 tracks and sample index, the demuxer of each run reads these.
+    Mp4(Arc<pf_mp4::Tables>),
 }
 
 impl fmt::Debug for Index {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Index::None => f.write_str("None"),
-            Index::Mkv { first_cluster, cues, at } => f
+            Index::Mkv(p) => f
                 .debug_struct("Mkv")
-                .field("first_cluster", first_cluster)
-                .field("cues", &cues.len())
-                .field("at", at)
+                .field("first_cluster", &p.first_cluster)
+                .field("cues", &p.cues.len())
+                .field("at", &p.cued_at)
                 .finish(),
             Index::Avi(i) => f.debug_struct("Avi").field("whole", &i.whole).finish(),
             Index::Bare(h) => f.debug_tuple("Bare").field(h).finish(),
+            Index::Mp4(t) => f.debug_tuple("Mp4").field(t).finish(),
         }
     }
 }
@@ -233,7 +234,8 @@ pub struct Opened {
     pub kind: Kind,
     pub len: u64,
     pub duration_ns: u64,
-    /// The bytes the demuxer starts from, empty for a bare file.
+    /// The bytes the demuxer starts from, empty for a bare file. A Matroska demuxer starts from
+    /// the head parsed in [`Index::Mkv`], the head ending before any Attachments behind Tracks.
     pub head: Arc<[u8]>,
     pub tracks: Vec<TrackDesc>,
     /// The codec heads, languages and titles the spans of the tracks name.
@@ -278,7 +280,8 @@ impl Opened {
     /// before it, the first Cluster before any. Cues of every track when `track` has none. None
     /// for other containers.
     pub fn cue_before(&self, track: u64, t_ns: u64) -> Option<u64> {
-        let Index::Mkv { first_cluster, cues, .. } = &self.index else { return None };
+        let Index::Mkv(p) = &self.index else { return None };
+        let (first_cluster, cues) = (&p.first_cluster, &p.cues);
         let own = cues.iter().any(|c| c.track == track);
         let at = cues
             .iter()
@@ -570,8 +573,13 @@ mod tests {
         ] {
             let b = fixture(rel);
             let want = drive_slice(&mut pf_probe::head::MkvHeadAt::new(64 << 20), &b).unwrap();
-            assert_eq!(mkv::head_in(&b, 64 << 20), Some(want.head.len()), "{rel}");
-            assert_eq!(want.first_cluster, want.head.len() as u64);
+            let passed = mkv::Passed { tags: want.tags, attachments: want.attachments };
+            let at = (want.head.len(), want.first_cluster, passed);
+            assert_eq!(mkv::head_in(&b, 64 << 20), Some(at), "{rel}");
+            match want.attachments {
+                Some(a) => assert_eq!(a, want.head.len() as u64, "{rel} ends at the Attachments"),
+                None => assert_eq!(want.first_cluster, want.head.len() as u64, "{rel}"),
+            }
             assert_eq!(mkv::head_in(&b, 10), None, "past the cap");
             assert_eq!(mkv::head_in(&b[..want.head.len()], 64 << 20), None, "the Cluster unseen");
         }

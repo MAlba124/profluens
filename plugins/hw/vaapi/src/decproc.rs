@@ -1,15 +1,16 @@
 //! Scaling in the decode call, `VAConfigAttribDecProcessing`. Each decode surface has a twin at
 //! the plan's size the driver writes as it decodes (the SFC of the video box on iHD), the decode
 //! surface stays the reference. iHD keeps the parameters of the last picture for the next, so
-//! every picture of the session names its own twin.
+//! every picture of the session names its own twin. A plan that changes nothing makes none.
 
 use std::marker::PhantomData;
 
 use crate::error::VaapiErrorKind as K;
 use crate::ffi;
-use crate::va::{Buffer, Context, Display, Surfaces, VaResult};
+use crate::va::{Buffer, Context, Display, SurfaceFormat, Surfaces, VaResult};
 use crate::vpp::format::{Kind, NV12, P010};
 use crate::vpp::plan::{Plan, Rect, Target};
+use crate::vpp::proc::{Color, Out, Proc, Src};
 
 /// The scaler's bound each way, iHD's MHW_SFC_MIN_SCALINGFACTOR and MAX.
 const RATIO: u32 = 8;
@@ -29,11 +30,26 @@ pub fn plan(width: u32, height: u32, depth: u8, t: Target, fixed: bool) -> Optio
     (within(pw, width) && within(ph, height)).then_some(p)
 }
 
+/// `p` for a `width` x `height` picture cropped at `at` in surfaces of `decoded`, None when the
+/// twin would be a copy of it, and the decode surface leaves itself. The encoders read from a
+/// surface's origin, so a crop off it keeps the plan.
+pub fn needed(
+    p: Plan,
+    width: u32,
+    height: u32,
+    at: (u32, u32),
+    decoded: SurfaceFormat,
+) -> Option<Plan> {
+    let same = (p.width, p.height) == (width, height) && p.out.fourcc == decoded.fourcc;
+    (!same || p.bars() || at != (0, 0)).then_some(p)
+}
+
 /// The twin surfaces of one session, black where the plan places nothing. A plan without bars
-/// leaves them as allocated, the alignment rows are cropped, a CPU fill of 13 1080p P010
-/// surfaces holds a seek's start back by tens of ms.
+/// leaves them as allocated, the alignment rows are cropped.
 pub struct Twins {
     surfaces: Surfaces,
+    /// Dropped after the surfaces, see [`black_bars`].
+    _painter: Option<Proc>,
     pub plan: Plan,
     pub coded: (u32, u32),
     /// The decoded picture's region the scaler reads and where it writes it.
@@ -81,12 +97,11 @@ impl Twins {
         let coded = (extent.0.next_multiple_of(ALIGN), extent.1.next_multiple_of(ALIGN));
         let surfaces = Surfaces::new(display, plan.out.surface(), coded.0, coded.1, count)
             .map_err(K::SessionSetup)?;
-        if plan.bars() {
-            for &s in surfaces.ids() {
-                crate::vpp::element::black(display, s, plan.out, coded)?;
-            }
-        }
-        Ok(Twins { surfaces, plan, coded, src, dst })
+        let painter = match plan.bars() {
+            true => black_bars(display, surfaces.ids(), plan.out, coded, dst)?,
+            false => None,
+        };
+        Ok(Twins { surfaces, _painter: painter, plan, coded, src, dst })
     }
 
     pub fn kind(&self) -> Kind {
@@ -98,6 +113,44 @@ impl Twins {
         let at = decode.ids().iter().position(|&s| s == surface)?;
         self.surfaces.ids().get(at).copied()
     }
+}
+
+/// Blacks `twins` out of `dst` once, the decoder writes only `dst` and leaves the background
+/// colour unpainted (iHD 26.1 on H.264 and HEVC). A VPP pass per twin paints it over the whole
+/// surface, with a corner of a sibling copied into the corner of `dst` for the first decode to
+/// overwrite, a smaller copy than all of `dst` takes 13 1080p P010 twins from 10 ms to 3. The
+/// CPU fills them where the driver paints no background, 16 ms for those. The processor that
+/// painted is kept as long as the twins, an iHD surface points at the context that last began a
+/// picture on it and a sync of the twin after that is gone reads freed memory.
+pub fn black_bars(
+    display: &Display,
+    twins: &[ffi::VASurfaceID],
+    kind: Kind,
+    coded: (u32, u32),
+    dst: Rect,
+) -> Result<Option<Proc>, K> {
+    let proc = match twins.len() > 1 {
+        true => Proc::new(display).ok().filter(|p| p.paints_background(display)),
+        false => None,
+    };
+    let Some(proc) = proc else {
+        for &s in twins {
+            crate::vpp::element::black(display, s, kind, coded)?;
+        }
+        return Ok(None);
+    };
+    let (color, at, size) = (Color::SDR, (dst.0, dst.1), (dst.2.min(64), dst.3.min(64)));
+    let place = (dst.0, dst.1, size.0, size.1);
+    for (i, &s) in twins.iter().enumerate() {
+        let src = Src { surface: twins[usize::from(i == 0)], at, size, color };
+        let out = Out { surface: s, place, fill: true, color, rotation: 0 };
+        proc.run(src, out, None).map_err(K::SessionSetup)?;
+    }
+    // the decoder's first write lands after the fill
+    for &s in twins {
+        crate::va::sync_surface(display, s).map_err(K::SessionSetup)?;
+    }
+    Ok(Some(proc))
 }
 
 /// One picture's rectangles and twin, read by the driver when the buffer is rendered.
@@ -220,6 +273,24 @@ mod tests {
         // the same picture fitted, the rest lands past the box
         let (src, dst) = regions((0, 0, 1920, 804), (1920, 816), (0, 0, 1920, 804), (1920, 804));
         assert_eq!((src, dst), ((0, 0, 1920, 816), (0, 0, 1920, 816)));
+    }
+
+    /// A same-size plan without bars at the decoded format makes no twins, any change does.
+    #[test]
+    fn only_a_plan_that_changes_the_picture_is_needed() {
+        let nv12 = SurfaceFormat::NV12;
+        let same = plan(1920, 1080, 8, t(1920, 1080, 8), true).expect("a plan");
+        assert_eq!(needed(same, 1920, 1080, (0, 0), nv12), None);
+        assert_eq!(needed(same, 1920, 1080, (8, 0), nv12), Some(same), "a crop off the origin");
+        let bars = plan(1920, 800, 8, t(1920, 1080, 8), true).expect("a plan");
+        assert_eq!(needed(bars, 1920, 800, (0, 0), nv12), Some(bars), "bars");
+        let small = plan(1920, 1080, 8, t(1280, 720, 8), true).expect("a plan");
+        assert_eq!(needed(small, 1920, 1080, (0, 0), nv12), Some(small), "smaller");
+        let ten = plan(1920, 1080, 10, t(1920, 1080, 10), true).expect("a plan");
+        assert_eq!(needed(ten, 1920, 1080, (0, 0), SurfaceFormat::P010), None);
+        assert_eq!(needed(ten, 1920, 1080, (0, 0), SurfaceFormat::P012), Some(ten), "P012");
+        let eight = plan(1920, 1080, 10, t(1920, 1080, 8), true).expect("a plan");
+        assert_eq!(needed(eight, 1920, 1080, (0, 0), SurfaceFormat::P010), Some(eight), "to 8");
     }
 
     #[test]

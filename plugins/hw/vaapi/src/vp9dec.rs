@@ -118,7 +118,6 @@ const SEG_LVL_SKIP: usize = 3;
 const MAX_LOOP_FILTER: i32 = 63;
 /// A superframe is almost always a hidden alt-ref and its shown frame.
 const SUPERFRAME_RESERVE: usize = 2;
-const PRESENTATION_SLACK: u32 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RefSlot {
@@ -662,7 +661,7 @@ impl VaapiVp9Dec {
         let depth = if ten_bit { 10 } else { 8 };
         let shrink = match self.shrink.filter(|_| self.zerocopy.is_some()) {
             Some((t, fixed)) => match decproc::plan(w, hgt, depth, t, fixed) {
-                Some(p) => Some((p, (w, hgt))),
+                Some(p) => decproc::needed(p, w, hgt, (0, 0), format).map(|p| (p, (w, hgt))),
                 None => {
                     self.fail(ctx, K::ProcSize { width: w, height: hgt });
                     return false;
@@ -694,11 +693,10 @@ impl VaapiVp9Dec {
         let Some(display) = &self.display else {
             return false;
         };
-        let extra = if self.zerocopy.is_some() { PRESENTATION_SLACK } else { 0 };
         let count = crate::va::decode_surface_count(
             NUM_REF_FRAMES as u32,
             SUPERFRAME_RESERVE as u32,
-            extra,
+            self.zerocopy.is_some(),
         );
         log!(&*ctx, Level::Info, "surfaces", count = count, width = coded_w, height = coded_h);
         log!(
@@ -753,6 +751,8 @@ impl VaapiVp9Dec {
             let (w, h) = (t.plan.width, t.plan.height);
             log!(&*ctx, Level::Info, "shrink", width = w, height = h, layout = t.kind().name);
         }
+        let made = if twins.is_some() { count } else { 0 };
+        self.stats.made(count + made, made);
         let free = surfaces.ids().iter().copied().collect();
         self.row = if readback_mode { vec![0u8; coded_w as usize * 2] } else { Vec::new() };
         self.va = Some(VaState {

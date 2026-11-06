@@ -48,7 +48,7 @@ static SINK_OFFERS: [OfferDesc; 2] =
     [OfferDesc { family: "flac", fields: &DELAY_FIELDS }, OfferDesc::any("bytes")];
 
 static SINKS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &SINK_OFFERS }];
-static SRCS: [PadDesc; 1] = [PadDesc {
+pub(crate) static SRCS: [PadDesc; 1] = [PadDesc {
     name: "src",
     offers: &SRC_OFFERS, // format is data-dependent, announced at runtime
 }];
@@ -80,6 +80,18 @@ fn container(bits: u32) -> (&'static str, usize, u32) {
     (name, bytes, (bytes as u32 * 8).saturating_sub(bits))
 }
 
+/// What carries the FLAC bytes. The Ogg mapping prefixes the first packet with 9 bytes.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    #[default]
+    Native,
+    OggHead,
+    OggBody,
+    /// The headers again, as a demuxer reading from byte 0 behind a seek sends them, dropped up
+    /// to the first frame.
+    OggAgain,
+}
+
 #[derive(Default)]
 pub struct FlacDec {
     dec: StreamDecoder,
@@ -97,6 +109,7 @@ pub struct FlacDec {
     input: ByteIn,
     /// Decoder errors already logged, the first is a Warn and the rest a count at EOS.
     errors: u64,
+    framing: Framing,
 }
 
 #[derive(Default)]
@@ -115,6 +128,11 @@ impl FlacDec {
 
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Takes FLAC-in-Ogg packets, for `oggflacdec`.
+    pub(crate) fn ogg() -> Self {
+        Self { framing: Framing::OggHead, ..Self::default() }
     }
 
     /// Publish the file's seek index. `len` is the file's.
@@ -395,8 +413,23 @@ impl FlacDec {
                 }
                 Ok(None) => match self.input.next(ctx, inputs) {
                     Some(buf) => {
+                        let mut data = buf.memory.data();
+                        match self.framing {
+                            Framing::OggHead => {
+                                data = crate::oggflac::native(ctx, data)?;
+                                self.framing = Framing::OggBody;
+                            }
+                            Framing::OggBody if crate::oggflac::is_mapping(data) => {
+                                log!(&*ctx, Level::Debug, "heads_again", bytes = data.len());
+                                self.framing = Framing::OggAgain;
+                                continue;
+                            }
+                            Framing::OggAgain if !crate::oggflac::is_frame(data) => continue,
+                            Framing::OggAgain => self.framing = Framing::OggBody,
+                            Framing::Native | Framing::OggBody => {}
+                        }
                         self.rebase.input(buf.pts);
-                        self.dec.push(buf.memory.data()); // `buf` recycles on drop
+                        self.dec.push(data); // `buf` recycles on drop
                         self.index_head(ctx);
                     }
                     None => return Ok(Flow::Ok),
@@ -446,6 +479,10 @@ impl Element for FlacDec {
         self.rebase = Rebase::Open;
         self.index = if self.indexing.is_some() { Indexed::Head } else { Indexed::Off };
         self.errors = 0;
+        // A new run opens with the mapping packet.
+        if matches!(self.framing, Framing::OggBody | Framing::OggAgain) {
+            self.framing = Framing::OggHead;
+        }
         self.input.start(ctx, self.indexing.flatten());
         Ok(())
     }

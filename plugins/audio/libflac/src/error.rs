@@ -28,11 +28,11 @@ impl fmt::Display for FlacError {
             ),
             FlacError::MappingHeaderShort { len, need } => write!(
                 f,
-                "oggflacdeframe: first packet is {len} bytes, shorter than the {need}-byte \
+                "oggflac: first packet is {len} bytes, shorter than the {need}-byte \
                  FLAC-to-Ogg mapping header"
             ),
             FlacError::MappingSignature => f.write_str(
-                "oggflacdeframe: first packet is not a FLAC-to-Ogg mapping header (missing \
+                "oggflac: first packet is not a FLAC-to-Ogg mapping header (missing \
                  0x7F \"FLAC\" signature)",
             ),
         }
@@ -95,10 +95,10 @@ mod tests {
             ),
             (
                 FlacError::MappingHeaderShort { len: 3, need: 9 },
-                "oggflacdeframe: ",
+                "oggflac: ",
                 &["3 bytes", "9-byte"],
             ),
-            (FlacError::MappingSignature, "oggflacdeframe: ", &["0x7F \"FLAC\""]),
+            (FlacError::MappingSignature, "oggflac: ", &["0x7F \"FLAC\""]),
         ];
         for (e, prefix, needles) in rows {
             let s = format!("{e}");

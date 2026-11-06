@@ -13,6 +13,7 @@ use profluens_core::error::Error;
 use profluens_core::format::OfferDesc;
 use profluens_core::id::{SinkPad, SrcPad};
 use profluens_core::pipeline::Pipeline;
+use profluens_core::pull::Ask;
 
 fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let mut out = ((8 + body.len()) as u32).to_be_bytes().to_vec();
@@ -183,6 +184,63 @@ fn cues(file: Vec<u8>) -> (Vec<Cue>, Option<String>) {
 }
 
 const MS: u64 = 1_000_000;
+
+/// Serves the demuxer's asks, a pulled run.
+struct RangeSrc(Vec<u8>);
+
+impl Element for RangeSrc {
+    fn desc(&self) -> &'static ElementDesc {
+        &SRC_DESC
+    }
+    fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        ctx.offer_ranges(SrcPad(0));
+        Ok(())
+    }
+    fn process(&mut self, ctx: &mut Ctx, _inputs: Inputs<'_>) -> Result<Flow, Error> {
+        while let Some(Ask { offset, len, tag, mut buf }) = ctx.next_ask(SrcPad(0)) {
+            let from = (offset as usize).min(self.0.len());
+            let to = (from + len as usize).min(self.0.len());
+            buf.memory.as_mut_full()[..to - from].copy_from_slice(&self.0[from..to]);
+            buf.memory.set_len(to - from);
+            ctx.serve(SrcPad(0), tag, buf);
+        }
+        Ok(if ctx.asks_over(SrcPad(0)) { Flow::Eos } else { Flow::Ok })
+    }
+}
+
+/// Every pad's cues, the file pushed or pulled.
+fn every_pad(file: Vec<u8>, pull: bool) -> Vec<Vec<Cue>> {
+    let mut p = Pipeline::new();
+    let head = file.clone();
+    let src = if pull { p.add(RangeSrc(file)) } else { p.add(ByteSrc(file, 0)) };
+    let demux = p.add(Mp4Demux::new(head));
+    p.link(src.src(SrcPad(0)), demux.sink(Mp4Demux::IN)).expect("link");
+    let added = p.preroll().expect("preroll").srcs;
+    let recs: Vec<_> = added
+        .iter()
+        .map(|pad| {
+            let rec = Arc::new(Mutex::new((Vec::new(), None)));
+            let sink = p.add(Record(Arc::clone(&rec)));
+            p.link(pad.element.src(pad.pad), sink.sink(SinkPad(0))).expect("link");
+            rec
+        })
+        .collect();
+    p.run().expect("run");
+    recs.iter().map(|rec| std::mem::take(&mut rec.lock().unwrap().0)).collect()
+}
+
+/// A cue beside video, pushed or read by asks, lasts its sample's stts duration, an empty sample
+/// a gap, the last one to the track's end.
+#[test]
+fn a_cue_beside_video_lasts_its_samples_duration_pushed_or_pulled() {
+    let text = [(500, tx3g("")), (1_500, tx3g("one")), (700, tx3g("")), (2_300, tx3g("two"))];
+    let file = movie_beside_video(&text, 6);
+    for pull in [false, true] {
+        let pads = every_pad(file.clone(), pull);
+        let cue = |at: u64, dur: u64, text: &str| (at * MS, Some(dur * MS), text.to_string());
+        assert_eq!(pads[1], [cue(500, 1_500, "one"), cue(2_700, 2_300, "two")], "pulled {pull}");
+    }
+}
 
 /// `movie` beside a `vp09` track of `pictures` one second keyframes, the text chunk stored ahead
 /// of the video chunk.

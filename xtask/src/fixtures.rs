@@ -17,6 +17,18 @@ const AV: &[&str] = &["-f", "lavfi", "-i", VSRC, "-f", "lavfi", "-i", ASRC];
 const V: &[&str] = &["-f", "lavfi", "-i", VSRC];
 const A: &[&str] = &["-f", "lavfi", "-i", ASRC];
 const A44: &[&str] = &["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=5"];
+/// Speex codes 8, 16 and 32 kHz, the wideband mode here.
+const A16: &[&str] = &["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=2"];
+const VA_TINY: &[&str] = &[
+    "-f",
+    "lavfi",
+    "-i",
+    "testsrc2=size=160x120:rate=15:duration=2",
+    "-f",
+    "lavfi",
+    "-i",
+    "sine=frequency=440:sample_rate=16000:duration=2",
+];
 
 const SVTAV1: &[&str] = &["-c:v", "libsvtav1", "-preset", "12", "-svtav1-params", "fast-decode=1"];
 const AOMAV1: &[&str] = &["-c:v", "libaom-av1", "-cpu-used", "8", "-usage", "realtime"];
@@ -231,6 +243,13 @@ const FIXTURES: &[Fixture] = &[
     ),
     plain("ogg_flac.oga", &["flac"], A, &["-c:a", "flac", "-f", "oga"]),
     plain("ogg_vorbis.ogg", &["libvorbis"], A, &["-c:a", "libvorbis", "-b:a", "96k", "-f", "ogg"]),
+    plain("ogg_speex.spx", &["libspeex"], A16, &["-c:a", "libspeex", "-f", "ogg"]),
+    plain(
+        "ogg_theora_speex.ogv",
+        &["libtheora", "libspeex"],
+        VA_TINY,
+        &["-c:v", "libtheora", "-q:v", "5", "-c:a", "libspeex", "-f", "ogg"],
+    ),
     plain(
         "audio.mp3",
         &["libmp3lame"],
@@ -543,6 +562,6 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), FIXTURES.len());
-        assert_eq!(FIXTURES.len(), 16);
+        assert_eq!(FIXTURES.len(), 18);
     }
 }

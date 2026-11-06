@@ -138,6 +138,57 @@ fn the_index_read_at_open_is_published() {
     }
 }
 
+/// An MP4 run's demuxer holds the tables the open folded and folds none, a moov behind the
+/// mdat too.
+#[test]
+fn an_mp4_run_takes_the_tables_of_the_open() {
+    for rel in [
+        "plugins/formats/mp4/tests/fixtures/tiny_av.mp4",
+        "plugins/formats/mp4/tests/fixtures/moov_last.mp4",
+    ] {
+        let o = opened(rel);
+        let pf_open::Index::Mp4(tables) = &o.index else { panic!("{rel} {:?}", o.index) };
+        assert_eq!(Arc::strong_count(tables), 1);
+        let path = path_of(rel);
+        let mut runs = Vec::new();
+        for n in 1..=2 {
+            let mut p = pf_reactor::pipeline();
+            let demux = demuxer(&mut p, File::open(&path).unwrap(), &path, &o, false).unwrap();
+            p.preroll().unwrap();
+            assert!(!p.streams(demux).is_empty(), "{rel}");
+            assert_eq!(Arc::strong_count(tables), 1 + n, "{rel} run {n} holds the open's");
+            runs.push(p);
+        }
+        drop(runs);
+        assert_eq!(Arc::strong_count(tables), 1, "{rel}");
+    }
+}
+
+/// A Matroska run's demuxer holds the head the open parsed and its Cues, and neither the head's
+/// bytes nor a copy of them, so it parses nothing again.
+#[test]
+fn a_matroska_run_takes_the_head_the_open_parsed() {
+    let rel = "plugins/formats/mp4/tests/fixtures/cues_last.mkv";
+    let o = opened(rel);
+    let pf_open::Index::Mkv(parsed) = &o.index else { panic!("{:?}", o.index) };
+    assert!(!parsed.cues.is_empty() && !parsed.tracks.is_empty());
+    assert_eq!((Arc::strong_count(parsed), Arc::strong_count(&o.head)), (1, 1));
+    let path = path_of(rel);
+    let mut runs = Vec::new();
+    for n in 1..=2 {
+        let mut p = pf_reactor::pipeline();
+        let demux = demuxer(&mut p, File::open(&path).unwrap(), &path, &o, false).unwrap();
+        p.preroll().unwrap();
+        assert_eq!(p.streams(demux).len(), o.tracks.len());
+        assert!(p.index(demux).is_some_and(|ix| ix.complete), "the open's Cues published");
+        assert_eq!(Arc::strong_count(parsed), 1 + n, "run {n} holds the open's");
+        assert_eq!(Arc::strong_count(&o.head), 1, "run {n} holds no head");
+        runs.push(p);
+    }
+    drop(runs);
+    assert_eq!(Arc::strong_count(parsed), 1);
+}
+
 #[test]
 fn a_track_of_another_kind_or_number_has_no_route() {
     let rel = "plugins/formats/mp4/tests/fixtures/tiny_av.mp4";

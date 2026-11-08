@@ -8,7 +8,7 @@ use profluens_core::publish::{Publisher, Reader, published};
 
 use crate::ebml::{self, id};
 use crate::reader::read_uint;
-use crate::tags::{for_each_child, master_body};
+use crate::tags::{for_each_child, master_body, next_child};
 
 pub const MAX_NEST: u8 = 8;
 pub const MAX_ATTACHMENTS: usize = 1024;
@@ -124,18 +124,31 @@ pub fn parse_chapters(element: &[u8]) -> Chapters {
             _ => {}
         });
         out.editions.push(e);
-        atoms(entry, edition, None, 0, &mut out.chapters);
+        atoms(entry, edition, &mut out.chapters);
     });
     out
 }
 
+/// The ChapterAtoms of an edition and the ones nested in them, depth first, at most
+/// [`MAX_NEST`] deep.
 // Cold path, once per file.
 #[allow(clippy::disallowed_methods)]
-fn atoms(body: &[u8], edition: usize, parent: Option<usize>, depth: u8, out: &mut Vec<Chapter>) {
-    for_each_child(body, |h, atom| {
+fn atoms(entry: &[u8], edition: usize, out: &mut Vec<Chapter>) {
+    // per open level, its body, where its next child starts and the chapter it is under
+    let mut open = [(&[][..], 0usize, None); MAX_NEST as usize];
+    open[0] = (entry, 0, None);
+    let mut n = 1;
+    while n > 0 {
+        let (body, at, parent) = open[n - 1];
+        let Some((h, atom, next)) = next_child(body, at) else {
+            n -= 1;
+            continue;
+        };
+        open[n - 1].1 = next;
         if h.id != id::CHAPTER_ATOM || out.len() == MAX_CHAPTERS {
-            return;
+            continue;
         }
+        let depth = (n - 1) as u8;
         let mut c = Chapter { edition, parent, depth, enabled: true, ..Chapter::default() };
         for_each_child(atom, |h, v| match h.id {
             i if i == id::CHAPTER_UID => c.uid = read_uint(v),
@@ -148,12 +161,12 @@ fn atoms(body: &[u8], edition: usize, parent: Option<usize>, depth: u8, out: &mu
             i if i == CHAPTER_SEGMENT_UUID => c.linked = !v.is_empty(),
             _ => {}
         });
-        let at = out.len();
         out.push(c);
-        if depth + 1 < MAX_NEST {
-            atoms(atom, edition, Some(at), depth + 1, out);
+        if n < MAX_NEST as usize {
+            open[n] = (atom, 0, Some(out.len() - 1));
+            n += 1;
         }
-    });
+    }
 }
 
 const CHAPTER_SEGMENT_UUID: &[u8] = &[0x6E, 0x67];

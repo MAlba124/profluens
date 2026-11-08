@@ -354,12 +354,34 @@ fn parse_tag(tag: &[u8], album_scope: bool, sink: &mut impl TagSink) {
     let album = album_scope && target.level >= TARGET_DEFAULT;
     for_each_child(tag, |h, simple| {
         if h.id == id::SIMPLE_TAG {
-            emit_simple_tag(simple, album, 0, sink);
+            emit_simple_tag(simple, album, sink);
         }
     });
 }
 
-fn emit_simple_tag(simple: &[u8], album: bool, depth: usize, sink: &mut impl TagSink) {
+/// A SimpleTag and the ones nested in it, depth first, at most [`MAX_NEST`] deep.
+fn emit_simple_tag(simple: &[u8], album: bool, sink: &mut impl TagSink) {
+    emit_one(simple, album, sink);
+    // per open SimpleTag, its body and where its next child starts
+    let mut open = [(&[][..], 0usize); MAX_NEST];
+    open[0] = (simple, 0);
+    let mut n = 1;
+    while n > 0 {
+        let (body, at) = open[n - 1];
+        let Some((h, nested, next)) = next_child(body, at) else {
+            n -= 1;
+            continue;
+        };
+        open[n - 1].1 = next;
+        if h.id == id::SIMPLE_TAG && n < MAX_NEST {
+            emit_one(nested, album, sink);
+            open[n] = (nested, 0);
+            n += 1;
+        }
+    }
+}
+
+fn emit_one(simple: &[u8], album: bool, sink: &mut impl TagSink) {
     let mut name: Option<&str> = None;
     let mut value: Option<&str> = None;
     for_each_child(simple, |h, body| match h.id {
@@ -367,21 +389,12 @@ fn emit_simple_tag(simple: &[u8], album: bool, depth: usize, sink: &mut impl Tag
         i if i == id::TAG_STRING => value = core::str::from_utf8(ebml::read_string(body)).ok(),
         _ => {}
     });
-
     if let (Some(name), Some(value)) = (name, value)
         && !name.is_empty()
         && !value.is_empty()
     {
         let mut buf = [0u8; MAX_KEY];
         sink.text(canonical_key(name, album, &mut buf), value);
-    }
-
-    if depth + 1 < MAX_NEST {
-        for_each_child(simple, |h, nested| {
-            if h.id == id::SIMPLE_TAG {
-                emit_simple_tag(nested, album, depth + 1, sink);
-            }
-        });
     }
 }
 
@@ -483,17 +496,26 @@ pub(crate) fn for_each_child<'a>(
     mut f: impl FnMut(&ebml::ElementHeader<'a>, &'a [u8]),
 ) {
     let mut at = 0usize;
-    while at < body.len() {
-        let Ok(h) = ebml::read_element_header(body, at) else {
-            return;
-        };
-        let Ok(Some(end)) = h.data_end() else { return };
-        if end > body.len() || end <= at {
-            return;
-        }
-        f(&h, &body[h.data_start..end]);
+    while let Some((h, data, end)) = next_child(body, at) {
+        f(&h, data);
         at = end;
     }
+}
+
+/// The child of `body` starting at byte `at`, its header, its body and where the next starts.
+pub(crate) fn next_child<'a>(
+    body: &'a [u8],
+    at: usize,
+) -> Option<(ebml::ElementHeader<'a>, &'a [u8], usize)> {
+    if at >= body.len() {
+        return None;
+    }
+    let h = ebml::read_element_header(body, at).ok()?;
+    let end = h.data_end().ok()??;
+    if end > body.len() || end <= at {
+        return None;
+    }
+    Some((h, body.get(h.data_start..end)?, end))
 }
 
 #[cfg(test)]

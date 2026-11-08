@@ -1806,6 +1806,30 @@ fn a_stepped_run_hands_its_records_and_lines_to_the_writer() {
     assert!(!kept.says(Level::Debug, "negotiate"), "debug lines stay below info");
 }
 
+struct Fails;
+
+impl LogWriter for Fails {
+    fn record(&self, _: &LogRecord) {
+        panic!("a writer that fails");
+    }
+
+    fn line(&self, _: Level, _: std::fmt::Arguments<'_>) {}
+}
+
+#[test]
+fn a_writer_that_panics_in_a_stepped_pass_unwinds_to_the_caller() {
+    let mut r = Rig::logging("info");
+    r.p.set_log_writer(Arc::new(Fails) as Arc<dyn LogWriter>);
+    let (src, a) = (r.add(&SRC, Role::Source), r.add(&SINK, Role::Sink));
+    r.link(src.src(OUT), a.sink(IN));
+    // Records stay queued past the first panic, so the run's end sweeps into the writer again.
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (mut run, mut rng) = (r.step(), Rng(5));
+        r.run(&mut run, &mut rng, None);
+    }));
+    assert!(caught.is_err(), "the writer's panic reaches the caller, not an abort");
+}
+
 #[test]
 fn a_threaded_run_hands_its_records_to_the_writer() {
     let kept = Arc::new(Kept::default());
@@ -1817,6 +1841,72 @@ fn a_threaded_run_hands_its_records_to_the_writer() {
     assert_eq!(kept.started(), ["tsink"], "only the element the rule names");
     assert!(kept.lines.lock().unwrap().is_empty(), "no pipeline level, no lines");
     assert_eq!(r.count(a, What::Logs(true)), 1);
+}
+
+/// Session, element, event and the thread that wrote the record.
+type Seen = (u64, &'static str, &'static str, Option<String>);
+
+#[derive(Default)]
+struct Routed(Mutex<Vec<Seen>>);
+
+impl LogWriter for Routed {
+    fn record(&self, rec: &LogRecord) {
+        let by = std::thread::current().name().map(String::from);
+        self.0.lock().unwrap().push((rec.session, rec.name, rec.event, by));
+    }
+
+    fn line(&self, _: Level, _: std::fmt::Arguments<'_>) {}
+}
+
+impl Routed {
+    fn started(&self) -> usize {
+        self.0.lock().unwrap().iter().filter(|r| r.2 == "started").count()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn log_drains() -> usize {
+    let tasks = std::fs::read_dir("/proc/self/task").expect("linux task list");
+    let comm = |t: std::fs::DirEntry| std::fs::read_to_string(t.path().join("comm")).ok();
+    tasks.filter_map(|t| comm(t.ok()?)).filter(|c| c.trim_end() == "pf-log-drain").count()
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn two_threaded_runs_share_one_log_drain_and_keep_their_own_writers() {
+    let mut runs = Vec::new();
+    for session in [1u64, 2] {
+        let routed = Arc::new(Routed::default());
+        let mut r = Rig::logging("info");
+        r.p.set_log_writer(Arc::clone(&routed) as Arc<dyn LogWriter>);
+        r.p.set_log_session(session);
+        let hold = Arc::new(AtomicU8::new(0));
+        let src = r.add(&SRC, Role::Source);
+        let a = r.p.add(Node { hold: Some(Arc::clone(&hold)), ..r.node(&SINK, Role::Sink) });
+        r.link(src.src(OUT), a.sink(IN));
+        let run = std::thread::spawn(move || r.p.run().expect("run"));
+        runs.push((session, routed, hold, run));
+    }
+    // Both sinks hold their first process, so both runs are up while this looks.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    for (_, routed, hold, _) in &runs {
+        while hold.load(Ordering::Acquire) != 1 || routed.started() < 2 {
+            assert!(std::time::Instant::now() < deadline, "both runs up and logged");
+            std::thread::yield_now();
+        }
+    }
+    assert_eq!(log_drains(), 1, "one drain thread for both runs");
+    for (session, routed, hold, run) in runs {
+        let mid = routed.0.lock().unwrap().clone();
+        assert!(mid.iter().all(|r| r.3.as_deref() == Some("pf-log-drain")), "{mid:?}");
+        hold.store(2, Ordering::Release);
+        run.join().expect("the run thread");
+        let got = routed.0.lock().unwrap().clone();
+        assert!(got.iter().all(|r| r.0 == session), "only its own run's records: {got:?}");
+        let mut started: Vec<_> = got.iter().filter(|r| r.2 == "started").map(|r| r.1).collect();
+        started.sort();
+        assert_eq!(started, ["tsink", "tsrc"], "{got:?}");
+    }
 }
 
 #[test]

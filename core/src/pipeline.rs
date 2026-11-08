@@ -26,12 +26,13 @@ use crate::id::{ElementId, FieldId, FormatId, Interner, LinkId, SinkPad, SrcPad,
 use crate::io::{NoBackend, ReactorFactory};
 use crate::level::{Gauge, Limit};
 use crate::log::{
-    DebugSpec, Level, LevelFilter, Log, LogDrain, LogRecord, LogWriter, Logs, log_channel,
+    DebugSpec, Drains, LOG_DRAIN, Lane, Level, LevelFilter, Log, LogDrain, LogWriter, Logs,
+    log_channel,
 };
 use crate::memory::{Allocator, Pool, PoolConfig, PoolStats};
 use crate::props::{PropHandle, PropTable, validate_and_set};
 use crate::publish::{Publisher, published};
-use crate::ring::{Consumer, Producer, spsc};
+use crate::ring::{Producer, spsc};
 use crate::sched::{
     DownLink, GROUP_PARK_BACKSTOP, GroupSetup, GroupShared, Stepped, Tag, UpLink, judge,
     retire_group, run_group,
@@ -2133,21 +2134,19 @@ impl Pipeline {
         let (downstream, upstream) = self.build_links(&groups, &stations)?;
         let plan = Plan { threaded, clock, groups, stations, downstream, upstream };
         let (setups, drains) = self.group_setups(plan);
-        let (log_thread, drains) = match threaded {
-            true => {
-                let spawned = drains.map(LogDrainThread::spawn).transpose().map_err(|e| {
-                    let kind = crate::io::IoError::Os(e.raw_os_error().unwrap_or(0));
-                    Error::Io { what: "spawn log drain", kind }
-                })?;
-                (spawned, None)
-            }
-            false => (None, drains),
-        };
+        let logs: Option<Lane> = drains.map(|d| Arc::new(std::sync::Mutex::new(Some(d))));
+        // A stepped run sweeps its drains on the caller each pass.
+        if let Some(lane) = logs.as_ref().filter(|_| threaded) {
+            LOG_DRAIN.register(lane).map_err(|e| {
+                let kind = crate::io::IoError::Os(e.raw_os_error().unwrap_or(0));
+                Error::Io { what: "spawn log drain", kind }
+            })?;
+        }
         let (bus, control) = (self.bus_sender.clone(), Arc::clone(&self.control));
         let (log_rank, writer) = (self.plog_rank(), self.log_writer.clone());
         self.publish();
         let view = self.view.reader();
-        Ok((setups, RunEnd { view, log_thread, drains, bus, control, log_rank, writer }))
+        Ok((setups, RunEnd { view, logs, bus, control, log_rank, writer }))
     }
 
     fn select_clock(&mut self, order: &[ElementId]) -> Arc<dyn Clock> {
@@ -3580,8 +3579,7 @@ struct Wiring {
 
 pub(crate) struct RunEnd {
     view: Roster,
-    log_thread: Option<LogDrainThread>,
-    drains: Option<Drains>,
+    logs: Option<Lane>,
     pub(crate) bus: BusSender,
     control: Arc<Control>,
     log_rank: u8,
@@ -3590,18 +3588,22 @@ pub(crate) struct RunEnd {
 
 impl RunEnd {
     pub(crate) fn drain_logs(&mut self) {
-        if let Some(drains) = &mut self.drains {
-            drains.sweep();
+        if let Some(lane) = &self.logs {
+            crate::log::sweep_lane(lane);
+        }
+    }
+
+    /// Takes the drains back from the drain thread, so no record of the run is lost.
+    fn close_logs(&mut self) {
+        if let Some(lane) = self.logs.take() {
+            crate::log::close_lane(&lane);
         }
     }
 
     pub(crate) fn finish(mut self, first_err: Option<Error>) -> (RunReport, Result<(), Error>) {
         self.control.topology.over(&self.bus);
         self.control.leave_run();
-        self.drain_logs();
-        if let Some(mut drain) = self.log_thread.take() {
-            drain.join();
-        }
+        self.close_logs();
         let mut report = RunReport::default();
         let s = self.view.read(View::pool_stats);
         (report.pool_slot_allocations, report.pool_high_water, report.buffers) =
@@ -3632,6 +3634,16 @@ impl RunEnd {
             }
         };
         (report, result)
+    }
+}
+
+impl Drop for RunEnd {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return self.close_logs();
+        }
+        // A writer that panicked in a stepped sweep panics again here, and that would abort.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.close_logs()));
     }
 }
 
@@ -3691,95 +3703,3 @@ struct LogGate {
 }
 
 const DRAINS_WAITING: usize = 64;
-
-struct Drains {
-    held: Vec<LogDrain>,
-    joining: Consumer<LogDrain>,
-    writer: Option<Arc<dyn LogWriter>>,
-    styled: bool,
-}
-
-impl Drains {
-    fn sweep(&mut self) -> bool {
-        use std::io::Write;
-        while let Some(drain) = self.joining.try_pop() {
-            self.held.push(drain);
-        }
-        if self.held.is_empty() {
-            return false;
-        }
-        let Drains { held, writer, styled, .. } = self;
-        if let Some(writer) = writer {
-            return drain_into(held, |rec| writer.record(rec));
-        }
-        // One write per sweep, not one per format piece.
-        let mut lock = std::io::BufWriter::with_capacity(1 << 14, std::io::stderr().lock());
-        let progressed = drain_into(held, |rec| {
-            let _ = crate::log::format_record_styled(&mut lock, rec, *styled);
-        });
-        let _ = lock.flush();
-        progressed
-    }
-}
-
-fn drain_into(held: &mut Vec<LogDrain>, mut emit: impl FnMut(&LogRecord)) -> bool {
-    let mut progressed = false;
-    held.retain_mut(|d| {
-        let closed = d.is_closed();
-        progressed |= d.sweep(&mut emit);
-        !closed
-    });
-    progressed
-}
-
-struct LogDrainThread {
-    handle: Option<JoinHandle<()>>,
-    over: Arc<AtomicBool>,
-}
-
-impl LogDrainThread {
-    fn spawn(drains: Drains) -> std::io::Result<Self> {
-        let over = Arc::new(AtomicBool::new(false));
-        let told = Arc::clone(&over);
-        let handle = std::thread::Builder::new()
-            .name("pf-log-drain".into())
-            .spawn(move || Self::run(drains, &told))?;
-        Ok(Self { handle: Some(handle), over })
-    }
-
-    // The log drain thread of a threaded run, not an element.
-    #[allow(clippy::disallowed_methods)]
-    fn run(mut drains: Drains, over: &AtomicBool) {
-        let (first, most) = (Duration::from_millis(2), Duration::from_millis(64));
-        let mut idle = first;
-        loop {
-            // Read first, so what was logged before the run ended is swept after.
-            let last = over.load(Ordering::Acquire);
-            let progressed = drains.sweep();
-            if last && !progressed {
-                break;
-            }
-            match progressed {
-                true => idle = first,
-                false => {
-                    std::thread::park_timeout(idle);
-                    idle = (idle * 2).min(most);
-                }
-            }
-        }
-    }
-
-    fn join(&mut self) {
-        self.over.store(true, Ordering::Release);
-        if let Some(handle) = self.handle.take() {
-            handle.thread().unpark();
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for LogDrainThread {
-    fn drop(&mut self) {
-        self.over.store(true, Ordering::Release);
-    }
-}

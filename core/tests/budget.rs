@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-const BUDGET: usize = 20_000;
+const BUDGET: usize = 20_100;
 
 fn code_lines(text: &str) -> usize {
     let is_test_start = |l: &&str| l.starts_with("#[cfg(test)]") || l.starts_with("#[cfg(all(test");

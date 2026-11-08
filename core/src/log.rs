@@ -1,9 +1,11 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::Thread;
+use std::time::{Duration, Instant};
 
 use crate::clock::Clock;
 use crate::id::ElementId;
@@ -379,11 +381,17 @@ pub struct LogDrain {
 impl LogDrain {
     /// Hand every queued record to `emit`, then a Warn `log.dropped` record with `records=N`
     /// when the ring dropped N since the last notice. True when anything was emitted.
-    pub fn sweep(&mut self, mut emit: impl FnMut(&LogRecord)) -> bool {
+    pub fn sweep(&mut self, emit: impl FnMut(&LogRecord)) -> bool {
+        self.sweep_up_to(usize::MAX, emit)
+    }
+
+    /// `sweep`, taking at most `most` records.
+    pub(crate) fn sweep_up_to(&mut self, most: usize, mut emit: impl FnMut(&LogRecord)) -> bool {
         // Read before taking, a drop counted here was of a full ring, so a record is taken.
         let dropped = self.dropped.load(Relaxed);
         let mut progressed = false;
-        while let Some(rec) = self.rx.try_pop() {
+        for _ in 0..most {
+            let Some(rec) = self.rx.try_pop() else { break };
             emit(&rec);
             self.last = Some(rec);
             progressed = true;
@@ -699,6 +707,170 @@ impl fmt::Display for Escaped<'_> {
     }
 }
 
+/// One run's log drains and where their records go.
+pub(crate) struct Drains {
+    pub(crate) held: Vec<LogDrain>,
+    /// Drains of the elements a change adds while the run goes on.
+    pub(crate) joining: Consumer<LogDrain>,
+    pub(crate) writer: Option<Arc<dyn LogWriter>>,
+    pub(crate) styled: bool,
+}
+
+impl Drains {
+    /// Hand every queued record to the writer or stderr, true when anything was.
+    pub(crate) fn sweep(&mut self) -> bool {
+        self.sweep_up_to(false)
+    }
+
+    /// `sweep`, at most a ring's worth from each drain, so one busy run cannot hold the drain
+    /// thread from the others.
+    fn sweep_turn(&mut self) -> bool {
+        self.sweep_up_to(true)
+    }
+
+    fn sweep_up_to(&mut self, capped: bool) -> bool {
+        while let Some(drain) = self.joining.try_pop() {
+            self.held.push(drain);
+        }
+        if self.held.is_empty() {
+            return false;
+        }
+        let Drains { held, writer, styled, .. } = self;
+        if let Some(writer) = writer {
+            return drain_into(held, capped, |rec| writer.record(rec));
+        }
+        // One write per sweep, not one per format piece.
+        let mut lock = io::BufWriter::with_capacity(1 << 14, io::stderr().lock());
+        let progressed = drain_into(held, capped, |rec| {
+            let _ = format_record_styled(&mut lock, rec, *styled);
+        });
+        let _ = lock.flush();
+        progressed
+    }
+}
+
+fn drain_into(held: &mut Vec<LogDrain>, capped: bool, mut emit: impl FnMut(&LogRecord)) -> bool {
+    let mut progressed = false;
+    held.retain_mut(|d| {
+        let closed = d.is_closed();
+        // A closed ring holds at most its capacity, so a capped turn still empties it.
+        let most = if capped { d.rx.capacity() } else { usize::MAX };
+        progressed |= d.sweep_up_to(most, &mut emit);
+        !closed
+    });
+    progressed
+}
+
+/// A run's drains, shared by the drain thread and the run's end. `None` once the end took them.
+pub(crate) type Lane = Arc<Mutex<Option<Drains>>>;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Sweep a run's drains on the calling thread, a stepped run's pass.
+pub(crate) fn sweep_lane(lane: &Lane) {
+    if let Some(drains) = lock(lane).as_mut() {
+        drains.sweep();
+    }
+}
+
+/// Take a run's drains back from the drain thread and sweep what is left. Waits out a sweep in
+/// progress, so the writer has every record before the caller writes after them.
+pub(crate) fn close_lane(lane: &Lane) {
+    let taken = lock(lane).take();
+    if let Some(mut drains) = taken {
+        drains.sweep();
+    }
+}
+
+/// The one log drain thread of the process, serving every threaded run.
+pub(crate) struct LogHub {
+    waiting: Mutex<Waiting>,
+    #[cfg(test)]
+    turns: AtomicU64,
+}
+
+struct Waiting {
+    thread: Option<Thread>,
+    lanes: Vec<Lane>,
+}
+
+pub(crate) static LOG_DRAIN: LogHub = LogHub::new();
+
+impl LogHub {
+    // A const empty list, no allocation.
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) const fn new() -> LogHub {
+        LogHub {
+            waiting: Mutex::new(Waiting { thread: None, lanes: Vec::new() }),
+            #[cfg(test)]
+            turns: AtomicU64::new(0),
+        }
+    }
+
+    /// Hand a run's drains to the drain thread, started here at the first run that logs.
+    pub(crate) fn register(&'static self, lane: &Lane) -> io::Result<()> {
+        let mut waiting = lock(&self.waiting);
+        if waiting.thread.is_none() {
+            let builder = std::thread::Builder::new().name("pf-log-drain".into());
+            waiting.thread = Some(builder.spawn(|| self.run())?.thread().clone());
+        }
+        waiting.lanes.push(Arc::clone(lane));
+        if let Some(thread) = &waiting.thread {
+            thread.unpark();
+        }
+        Ok(())
+    }
+
+    // The process drain thread, not an element.
+    #[allow(clippy::disallowed_methods)]
+    fn run(&self) {
+        let (first, most) = (Duration::from_millis(2), Duration::from_millis(64));
+        let (mut idle, mut lanes, mut joining) = (first, Vec::new(), Vec::new());
+        loop {
+            #[cfg(test)]
+            self.turns.fetch_add(1, Relaxed);
+            std::mem::swap(&mut lock(&self.waiting).lanes, &mut joining);
+            lanes.append(&mut joining);
+            if lanes.is_empty() {
+                // `register` unparks, so a run that comes while this checks is not missed.
+                std::thread::park();
+                idle = first;
+                continue;
+            }
+            let mut progressed = false;
+            lanes.retain(|lane| sweep_held(lane, &mut progressed));
+            match progressed {
+                true => idle = first,
+                false => {
+                    std::thread::park_timeout(idle);
+                    idle = (idle * 2).min(most);
+                }
+            }
+        }
+    }
+}
+
+/// False once the run's end took the drains, or its writer panicked.
+fn sweep_held(lane: &Lane, progressed: &mut bool) -> bool {
+    let mut held = lock(lane);
+    let Some(drains) = held.as_mut() else {
+        return false;
+    };
+    match std::panic::catch_unwind(AssertUnwindSafe(|| drains.sweep_turn())) {
+        Ok(swept) => {
+            *progressed |= swept;
+            true
+        }
+        Err(_) => {
+            // That run loses its records, the other runs keep their drain.
+            *held = None;
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 // Test vectors, not an element hot path.
 #[allow(clippy::disallowed_methods)]
@@ -983,5 +1155,198 @@ mod tests {
         let mut buf = Vec::new();
         format_record(&mut buf, &none).unwrap();
         assert!(String::from_utf8(buf).unwrap().contains(" adaptivesrc#4 rung "), "no @ for zero");
+    }
+
+    #[derive(Default)]
+    struct Routed {
+        got: Mutex<Vec<(u64, &'static str, u64, std::thread::ThreadId)>>,
+        panics: bool,
+    }
+
+    impl LogWriter for Routed {
+        fn record(&self, rec: &LogRecord) {
+            assert!(!self.panics, "a writer that fails");
+            let n = match rec.fields().first().map(|f| f.val) {
+                Some(FieldValue::Uint(n)) => n,
+                _ => u64::MAX,
+            };
+            let at = std::thread::current().id();
+            self.got.lock().unwrap().push((rec.session, rec.event, n, at));
+        }
+
+        fn line(&self, _: Level, _: fmt::Arguments<'_>) {}
+    }
+
+    impl Routed {
+        fn len(&self) -> usize {
+            self.got.lock().unwrap().len()
+        }
+    }
+
+    fn lane(session: u64, cap: usize, writer: &Arc<Routed>) -> (Log, Lane) {
+        let (sink, drain) = log_channel(cap);
+        let mut log = Log::new(sink, Arc::new(LevelFilter::with_level(Level::Trace)));
+        log.set_session(session);
+        let (_, joining) = spsc(1);
+        let writer = Some(Arc::clone(writer) as Arc<dyn LogWriter>);
+        let drains = Drains { held: vec![drain], joining, writer, styled: false };
+        (log, Arc::new(Mutex::new(Some(drains))))
+    }
+
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn two_runs_share_the_drain_thread_and_each_writer_gets_its_own_records() {
+        static HUB: LogHub = LogHub::new();
+        let (a, b) = (Arc::new(Routed::default()), Arc::new(Routed::default()));
+        let ((log_a, lane_a), (log_b, lane_b)) = (lane(1, 256, &a), lane(2, 256, &b));
+        HUB.register(&lane_a).unwrap();
+        HUB.register(&lane_b).unwrap();
+        for i in 0..100u64 {
+            log!(&log_a, Level::Info, "a", i = i);
+            log!(&log_b, Level::Info, "b", i = i);
+        }
+        wait_for("both writers", || a.len() == 100 && b.len() == 100);
+        let (a, b) = (a.got.lock().unwrap(), b.got.lock().unwrap());
+        assert!(a.iter().enumerate().all(|(i, r)| (r.0, r.1, r.2) == (1, "a", i as u64)), "{a:?}");
+        assert!(b.iter().enumerate().all(|(i, r)| (r.0, r.1, r.2) == (2, "b", i as u64)), "{b:?}");
+        let drain = a[0].3;
+        assert_ne!(drain, std::thread::current().id());
+        assert!(a.iter().chain(b.iter()).all(|r| r.3 == drain), "one thread serves both");
+    }
+
+    #[test]
+    fn the_end_of_a_run_takes_its_drains_back_and_loses_no_record() {
+        static HUB: LogHub = LogHub::new();
+        let w = Arc::new(Routed::default());
+        let (log, lane) = lane(3, 1 << 14, &w);
+        HUB.register(&lane).unwrap();
+        let emitted = 10_000u64;
+        let log = std::thread::spawn(move || {
+            for i in 0..emitted {
+                log!(&log, Level::Debug, "tick", i = i);
+            }
+            log
+        })
+        .join()
+        .unwrap();
+        close_lane(&lane);
+        assert_eq!(log.dropped(), 0);
+        let n = w.len();
+        assert_eq!(n as u64, emitted, "every record is with the writer when the end returns");
+        assert!(w.got.lock().unwrap().iter().enumerate().all(|(i, r)| r.2 == i as u64), "in order");
+        log!(&log, Level::Debug, "late", i = 0u64);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(w.len(), n, "the drain thread let go of the run");
+    }
+
+    #[test]
+    fn the_drain_thread_parks_without_a_timeout_while_it_holds_no_run() {
+        static HUB: LogHub = LogHub::new();
+        let w = Arc::new(Routed::default());
+        let (log, first) = lane(4, 64, &w);
+        HUB.register(&first).unwrap();
+        log!(&log, Level::Info, "one", i = 0u64);
+        wait_for("the first record", || w.len() == 1);
+        close_lane(&first);
+        // Polling at 64 ms at most, so a still window of 300 ms is a park.
+        let still = (0..20).any(|_| {
+            let before = HUB.turns.load(Relaxed);
+            std::thread::sleep(Duration::from_millis(300));
+            HUB.turns.load(Relaxed) == before
+        });
+        assert!(still, "the drain thread kept turning with no run");
+        let (log, second) = lane(4, 64, &w);
+        HUB.register(&second).unwrap();
+        log!(&log, Level::Info, "two", i = 1u64);
+        wait_for("a run that registers wakes it", || w.len() == 2);
+    }
+
+    #[test]
+    fn the_drain_thread_still_counts_what_a_full_ring_drops() {
+        static HUB: LogHub = LogHub::new();
+        let w = Arc::new(Routed::default());
+        let (log, lane) = lane(5, 4, &w);
+        let emitted = 200u64;
+        for i in 0..emitted {
+            log!(&log, Level::Info, "x", i = i);
+        }
+        assert_eq!(log.dropped(), 196, "a 4 slot ring with no drain yet");
+        HUB.register(&lane).unwrap();
+        let told = || {
+            let got = w.got.lock().unwrap();
+            let kept = got.iter().filter(|r| r.1 == "x").count() as u64;
+            let notices = got.iter().filter(|r| r.1 == "log.dropped").map(|r| r.2).sum::<u64>();
+            kept + notices
+        };
+        wait_for("kept and dropped to add up", || told() == emitted);
+        close_lane(&lane);
+        assert_eq!(told(), emitted);
+    }
+
+    #[test]
+    fn a_writer_that_panics_loses_only_its_own_run() {
+        static HUB: LogHub = LogHub::new();
+        let bad = Arc::new(Routed { panics: true, ..Routed::default() });
+        let good = Arc::new(Routed::default());
+        let ((log_bad, lane_bad), (log_good, lane_good)) = (lane(6, 64, &bad), lane(7, 64, &good));
+        HUB.register(&lane_bad).unwrap();
+        log!(&log_bad, Level::Info, "boom", i = 0u64);
+        wait_for("the bad run to be dropped", || lane_bad.lock().unwrap().is_none());
+        HUB.register(&lane_good).unwrap();
+        log!(&log_good, Level::Info, "fine", i = 0u64);
+        wait_for("the other run", || good.len() == 1);
+        close_lane(&lane_bad);
+        close_lane(&lane_good);
+    }
+
+    /// A writer whose every record logs another into its own run, so its ring never empties.
+    #[derive(Default)]
+    struct Echo {
+        log: Mutex<Option<Log>>,
+        seen: AtomicU64,
+    }
+
+    impl LogWriter for Echo {
+        fn record(&self, _: &LogRecord) {
+            self.seen.fetch_add(1, Relaxed);
+            if let Some(log) = self.log.lock().unwrap().as_ref() {
+                log!(log, Level::Info, "echo", i = 0u64);
+            }
+        }
+
+        fn line(&self, _: Level, _: fmt::Arguments<'_>) {}
+    }
+
+    #[test]
+    fn a_run_that_logs_faster_than_its_writer_leaves_the_drain_to_the_others() {
+        static HUB: LogHub = LogHub::new();
+        let echo = Arc::new(Echo::default());
+        let (sink, drain) = log_channel(64);
+        let mut log = Log::new(sink, Arc::new(LevelFilter::with_level(Level::Trace)));
+        log.set_session(8);
+        log!(&log, Level::Info, "echo", i = 0u64);
+        *echo.log.lock().unwrap() = Some(log);
+        let (_, joining) = spsc(1);
+        let writer = Some(Arc::clone(&echo) as Arc<dyn LogWriter>);
+        let drains = Drains { held: vec![drain], joining, writer, styled: false };
+        let busy: Lane = Arc::new(Mutex::new(Some(drains)));
+        HUB.register(&busy).unwrap();
+        wait_for("the echo to run", || echo.seen.load(Relaxed) > 1000);
+        let other = Arc::new(Routed::default());
+        let (log_other, lane_other) = lane(9, 64, &other);
+        HUB.register(&lane_other).unwrap();
+        log!(&log_other, Level::Info, "other", i = 0u64);
+        wait_for("the other run's record past the busy one", || other.len() == 1);
+        // Stops the echo, so the busy run's end finds its ring drained.
+        echo.log.lock().unwrap().take();
+        close_lane(&busy);
+        close_lane(&lane_other);
     }
 }

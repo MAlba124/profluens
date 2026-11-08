@@ -425,14 +425,16 @@ impl OpenAt {
         self.done()
     }
 
-    /// The window grown while the first stream's comment may follow, then the last page's
-    /// granule.
+    /// The window grown while the first stream's comment or a Vorbis header may follow, then the
+    /// last page's granule.
     fn ogg_more(&mut self) -> Result<Option<Need>, OpenError> {
         let have = self.window.len() as u64;
         let cap =
             (self.caps.window as u64).saturating_add(self.caps.max_tags.max(self.caps.max_picture));
-        let wants = self.ogg.as_ref().is_some_and(ogg::Scan::wants_comment);
-        if self.want.meta && wants && have > 0 && have < self.len && have < cap {
+        let meta = self.want.meta;
+        let wants =
+            self.ogg.as_ref().is_some_and(|s| (meta && s.wants_comment()) || s.wants_heads());
+        if wants && have > 0 && have < self.len && have < cap {
             let to = have.saturating_mul(2).min(self.len).min(cap);
             return Ok(self.grow(to as usize));
         }

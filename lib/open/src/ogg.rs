@@ -20,6 +20,8 @@ struct Stream {
     ident: Span,
     /// Header packets the mapping opens with, the identification packet among them.
     headers: u32,
+    /// The comment and setup packets of a Vorbis or Theora stream, its head laces all three.
+    rest: [Span; 2],
     packets: u32,
     language: Span,
     title: Span,
@@ -85,6 +87,34 @@ fn form(mapping: Mapping, ident: &[u8], t: &mut TrackDesc) -> bool {
     true
 }
 
+/// Mappings of three header packets, laced into one head as Matroska's CodecPrivate.
+fn xiph(m: Mapping) -> bool {
+    matches!(m, Mapping::Vorbis | Mapping::Theora)
+}
+
+/// The three header packets Xiph laced as a Matroska CodecPrivate, a 2, the first two lengths
+/// in runs of 255, then the packets. The identification packet alone when a later one is
+/// missing.
+fn laced(d: &mut Desc, p: [Span; 3]) -> Span {
+    if p.iter().any(|s| s.is_empty()) {
+        return p[0];
+    }
+    let at = d.arena.len();
+    d.arena.push(2);
+    for s in &p[..2] {
+        let mut n = s.len;
+        while n >= 255 {
+            d.arena.push(255);
+            n -= 255;
+        }
+        d.arena.push(n as u8);
+    }
+    for s in p {
+        d.arena.extend_from_within(s.range());
+    }
+    Span { at: at as u32, len: (d.arena.len() - at) as u32 }
+}
+
 /// The bos pages of a file and the comment packets behind them, read as the head grows. Every bos
 /// page of the first link comes before its data pages (RFC 3533 section 4), a bos page after a
 /// data packet starts a chained link and ends the scan.
@@ -123,6 +153,7 @@ impl Scan {
                     mapping,
                     ident: d.put(&p.data),
                     headers: mapping.header_packets(&p.data),
+                    rest: [empty; 2],
                     packets: 1,
                     language: empty,
                     title: empty,
@@ -135,6 +166,9 @@ impl Scan {
                 s.packets += 1;
                 // a data packet, a bos page after it starts a chained link
                 self.grouped &= s.packets <= s.headers;
+                if xiph(s.mapping) && (2..=3).contains(&s.packets) {
+                    s.rest[s.packets as usize - 2] = d.put(&p.data);
+                }
                 if s.packets == 2
                     && let Some(body) = s.mapping.comment_body(&p.data)
                 {
@@ -162,6 +196,12 @@ impl Scan {
         !self.chained && first.is_some_and(|s| s.packets < 2 && commented(s.mapping))
     }
 
+    /// A Vorbis or Theora stream of the first link lacks a header packet yet, its head needs
+    /// all three.
+    pub fn wants_heads(&self) -> bool {
+        !self.chained && self.streams.iter().any(|s| xiph(s.mapping) && s.packets < 3)
+    }
+
     /// The tracks, the longest stream's duration by the last granule in `tail`, the file's last
     /// bytes, and the comment of the first stream that has one.
     pub fn finish(
@@ -180,7 +220,11 @@ impl Scan {
                 d.skip(u64::from(id), s.mapping.family(), SkipWhy::BadHead);
                 continue;
             }
-            (t.stream, t.head, t.language, t.title) = (s.serial, s.ident, s.language, s.title);
+            let head = match xiph(s.mapping) {
+                true => laced(d, [s.ident, s.rest[0], s.rest[1]]),
+                false => s.ident,
+            };
+            (t.stream, t.head, t.language, t.title) = (s.serial, head, s.language, s.title);
             t.duration_ns = ns;
             duration = duration.max(ns);
             d.push(t);

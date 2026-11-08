@@ -115,6 +115,32 @@ fn a_comment_past_the_window_grows_the_head() {
     assert_eq!((&o.meta, o.title(&o.tracks[0])), (&Meta::None, ""));
 }
 
+/// A Vorbis stream's head is its three header packets Xiph laced, the Matroska CodecPrivate.
+#[test]
+fn a_vorbis_head_laces_its_three_headers() {
+    let o = open(&fixture("fixtures/out/ogg_vorbis.ogg"));
+    let t = &o.tracks[0];
+    assert_eq!(t.family, "vorbis");
+    let h = o.codec_head(t);
+    assert_eq!(h[0], 2);
+    let mut at = 1;
+    let mut lens = [0usize; 2];
+    for l in &mut lens {
+        while h[at] == 255 {
+            *l += 255;
+            at += 1;
+        }
+        *l += usize::from(h[at]);
+        at += 1;
+    }
+    let (id, rest) = h[at..].split_at(lens[0]);
+    let (comment, setup) = rest.split_at(lens[1]);
+    for (p, k) in [(id, 1u8), (comment, 3), (setup, 5)] {
+        assert_eq!((p[0], &p[1..7]), (k, &b"vorbis"[..]));
+    }
+    assert!(t.channels > 0 && t.rate > 0, "from the identification header");
+}
+
 #[test]
 fn opus_fixtures() {
     let o = open(&own("tone.opus"));

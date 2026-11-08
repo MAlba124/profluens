@@ -223,7 +223,9 @@ pub struct VaapiH264Enc {
     fences: enc::Fences,
 }
 
-// SAFETY: an Active element runs on one dedicated thread, the raw VADisplay never crosses threads.
+// SAFETY: the element runs on one thread at a time, its group's after preroll, its own when
+// Active or its upstream's when Passive. The display moves with it and is never used from two
+// threads at once, which libva permits as nothing in it is thread affine.
 unsafe impl Send for VaapiH264Enc {}
 
 #[cfg(test)]

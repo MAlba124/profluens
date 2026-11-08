@@ -370,7 +370,9 @@ impl Fences {
         match c.user & USER_KIND {
             USER_ADOPT => {
                 let i = (c.user & !USER_KIND) as usize;
-                if let (IoResult::File { handle, .. }, Some(h)) = (c.result, self.handles.get_mut(i)) {
+                if let (IoResult::File { handle, .. }, Some(h)) =
+                    (c.result, self.handles.get_mut(i))
+                {
                     *h = handle;
                 }
                 None

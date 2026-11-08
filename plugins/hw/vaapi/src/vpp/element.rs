@@ -1127,9 +1127,9 @@ fn upload(display: &Display, surface: ffi::VASurfaceID, f: InFormat, data: &[u8]
     img.finish().map_err(K::Upload)
 }
 
-// SAFETY: an Active element runs on one scheduler thread at a time and never shares its
-// display. The display opened at preroll may be used from a later scheduler thread, which libva
-// permits, as nothing in it is thread affine.
+// SAFETY: the element runs on one scheduler thread at a time, its own when Active or its
+// upstream's when Passive, and never shares its display. The display opened at preroll may be
+// used from a later scheduler thread, which libva permits, as nothing in it is thread affine.
 unsafe impl Send for VaapiPostProc {}
 
 impl Element for VaapiPostProc {

@@ -31,11 +31,11 @@ use profluens_video::format::COLOR_OFFER_FIELDS;
 use crate::decproc::{self, Twins};
 use crate::error::{Transient, VaapiErrorKind as K, Verdict, Warned, failed, log_fatal};
 use crate::ffi;
+use crate::gpuframe::Handoff;
 use crate::gpuframe::{
     self, F_LAYOUT, F_MODIFIER, FAMILY_VIDEO_GPU, FrameToken, FrameTx, GPU_FRAME_HEADER_LEN,
     GpuFrame, GpuFrameChannel, GpuFrameHeader,
 };
-use crate::gpuframe::Handoff;
 use crate::probe;
 use crate::stats::Stats;
 use crate::va::{

@@ -89,8 +89,7 @@ impl Variant {
     }
 }
 
-const DEFAULT_VARIANTS: &str =
-    "done1t,queued1t,queued2t,queued3t,queued1b,queued2b,queued3b,done1i,queued1i,queued2i,queued3i";
+const DEFAULT_VARIANTS: &str = "done1t,queued1t,queued2t,queued3t,queued1b,queued2b,queued3b,done1i,queued1i,queued2i,queued3i";
 
 struct Args {
     file: PathBuf,
@@ -143,7 +142,10 @@ fn args() -> Args {
             "--vpp" => {
                 let v = value();
                 let (w, h) = v.split_once('x').unwrap_or_else(|| usage());
-                a.vpp = Some((w.parse().unwrap_or_else(|_| usage()), h.parse().unwrap_or_else(|_| usage())));
+                a.vpp = Some((
+                    w.parse().unwrap_or_else(|_| usage()),
+                    h.parse().unwrap_or_else(|_| usage()),
+                ));
             }
             "--kbps" => a.kbps = value().parse().unwrap_or_else(|_| usage()),
             "--qp" => a.qp = value().parse().unwrap_or_else(|_| usage()),
@@ -160,10 +162,8 @@ fn args() -> Args {
     if a.file.as_os_str().is_empty() {
         usage();
     }
-    a.variants = variants
-        .split(',')
-        .map(|v| Variant::parse(v.trim()).unwrap_or_else(|| usage()))
-        .collect();
+    a.variants =
+        variants.split(',').map(|v| Variant::parse(v.trim()).unwrap_or_else(|| usage())).collect();
     a
 }
 
@@ -300,7 +300,9 @@ impl Engines {
                     continue;
                 };
                 let value = value.trim();
-                let n = || value.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                let n = || {
+                    value.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+                };
                 match key {
                     "drm-client-id" => id = Some(n()),
                     "drm-engine-video" => ns.video = n(),
@@ -348,7 +350,8 @@ fn sample_clock(clock: Option<&Clock>, stop: Arc<AtomicBool>) -> std::thread::Jo
         let mut engines = Engines::default();
         while !stop.load(Ordering::Relaxed) {
             if let Some(act) = &act
-                && let Some(mhz) = std::fs::read_to_string(act).ok().and_then(|s| s.trim().parse().ok())
+                && let Some(mhz) =
+                    std::fs::read_to_string(act).ok().and_then(|s| s.trim().parse().ok())
             {
                 samples.push(mhz);
             }
@@ -360,7 +363,8 @@ fn sample_clock(clock: Option<&Clock>, stop: Arc<AtomicBool>) -> std::thread::Jo
             return Sampled { mhz: 0.0, top: 0.0, engines };
         }
         let mean = samples.iter().map(|&m| f64::from(m)).sum::<f64>() / samples.len() as f64;
-        let top = samples.iter().filter(|&&m| max > 0 && m >= max).count() as f64 / samples.len() as f64;
+        let top =
+            samples.iter().filter(|&&m| max > 0 && m >= max).count() as f64 / samples.len() as f64;
         Sampled { mhz: mean, top, engines }
     })
 }
@@ -425,7 +429,8 @@ fn run(a: &Args, o: &Opened2, v: Variant, frames: u64, clock: Option<&Clock>) ->
     let mut p = pf_reactor::pipeline();
     p.set_pool(256 * 1024, 16);
     let demux = demuxer(&mut p, file, &a.file, &o.opened, false).expect("a demuxer");
-    let (ca, cb) = (GpuFrameChannel::with_handoff(v.handoff), GpuFrameChannel::with_handoff(v.handoff));
+    let (ca, cb) =
+        (GpuFrameChannel::with_handoff(v.handoff), GpuFrameChannel::with_handoff(v.handoff));
     // the encoder takes from the decoder's channel unless vaapipostproc sits between
     let enc_in = if a.vpp.is_some() { Arc::clone(&cb) } else { Arc::clone(&ca) };
     let (dec, dec_stats): (Box<dyn Element>, Arc<Stats>) = match o.track.family {
@@ -525,9 +530,8 @@ fn run(a: &Args, o: &Opened2, v: Variant, frames: u64, clock: Option<&Clock>) ->
     let cpu = cpu_time().saturating_sub(cpu0);
     let _ = t0;
     stop.store(true, Ordering::Relaxed);
-    let Sampled { mhz, top, engines } = sampler
-        .join()
-        .unwrap_or(Sampled { mhz: 0.0, top: 0.0, engines: Engines::default() });
+    let Sampled { mhz, top, engines } =
+        sampler.join().unwrap_or(Sampled { mhz: 0.0, top: 0.0, engines: Engines::default() });
     let mut warnings = Vec::new();
     while let Some(m) = p.bus().try_recv() {
         if let BusMessage::Warning { error, .. } = m {
@@ -566,8 +570,13 @@ fn main() {
     };
     let o = open(&a.file, a.codec);
     if !caps.supports(o.track.family) || !caps.supports_encode(a.codec) {
-        eprintln!("skip: the device decodes {} {} and encodes {} {}", o.track.family,
-            caps.supports(o.track.family), a.codec, caps.supports_encode(a.codec));
+        eprintln!(
+            "skip: the device decodes {} {} and encodes {} {}",
+            o.track.family,
+            caps.supports(o.track.family),
+            a.codec,
+            caps.supports_encode(a.codec)
+        );
         return;
     }
     let clock = Clock::find();
@@ -581,7 +590,10 @@ fn main() {
         a.vpp.map(|(w, h)| format!(" through vaapipostproc at {w}x{h}")).unwrap_or_default(),
         a.frames,
         if a.kbps > 0 { format!("{} kbit/s", a.kbps) } else { format!("qp {}", a.qp) },
-        clock.as_ref().map(|c| format!(", clock {} (max {} MHz)", c.act.display(), c.max)).unwrap_or_default(),
+        clock
+            .as_ref()
+            .map(|c| format!(", clock {} (max {} MHz)", c.act.display(), c.max))
+            .unwrap_or_default(),
     );
     println!(
         "quality level {}, engine ms a frame from fdinfo (vcs video, vecs enhance, rcs render), \
@@ -593,8 +605,23 @@ fn main() {
     }
     println!(
         "{:<14} {:>6} {:>7} {:>8} {:>5} {:>7} {:>5} {:>6} {:>6} {:>6} {:>16} {:>9} {:>9} {:>9} {:>6} {:>8} {:>16}",
-        "variant", "frames", "fps", "ms/frame", "cpu%", "gpu_mhz", "top%", "vcs", "vecs", "rcs",
-        "vcs_split", "dec_wt_ms", "vpp_wt_ms", "enc_wt_ms", "polls", "first_ms", "kbit/f hash"
+        "variant",
+        "frames",
+        "fps",
+        "ms/frame",
+        "cpu%",
+        "gpu_mhz",
+        "top%",
+        "vcs",
+        "vecs",
+        "rcs",
+        "vcs_split",
+        "dec_wt_ms",
+        "vpp_wt_ms",
+        "enc_wt_ms",
+        "polls",
+        "first_ms",
+        "kbit/f hash"
     );
     let mut first_hash = None;
     for _ in 0..a.repeat {
@@ -608,8 +635,13 @@ fn main() {
                 }
                 _ => (0.0, 0.0),
             };
-            let first_ms = s.first.map(|f| (f - (Instant::now() - r.wall)).as_secs_f64() * 1e3).unwrap_or(0.0);
-            let cpu = if r.wall.is_zero() { 0.0 } else { r.cpu.as_secs_f64() / r.wall.as_secs_f64() * 100.0 };
+            let first_ms =
+                s.first.map(|f| (f - (Instant::now() - r.wall)).as_secs_f64() * 1e3).unwrap_or(0.0);
+            let cpu = if r.wall.is_zero() {
+                0.0
+            } else {
+                r.cpu.as_secs_f64() / r.wall.as_secs_f64() * 100.0
+            };
             let same = match first_hash {
                 None => {
                     first_hash = Some(s.hash);
@@ -621,8 +653,12 @@ fn main() {
             let n = s.frames.max(1);
             let per_frame = |ns: u64| ms(ns / n);
             let e = r.engines.total();
-            let split: Vec<String> =
-                r.engines.clients.iter().map(|(_, c)| format!("{:.2}", per_frame(c.video))).collect();
+            let split: Vec<String> = r
+                .engines
+                .clients
+                .iter()
+                .map(|(_, c)| format!("{:.2}", per_frame(c.video)))
+                .collect();
             // the coded size, the quality side of a setting's cost at one qp
             let kbit = s.bytes as f64 * 8.0 / 1000.0 / n as f64;
             println!(

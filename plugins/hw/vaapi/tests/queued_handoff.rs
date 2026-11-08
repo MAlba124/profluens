@@ -62,7 +62,8 @@ fn encode(s: Shape) -> Out {
     let (tx, rx) = mpsc::channel();
     let mut p = if s.reactor { pf_reactor::pipeline() } else { Pipeline::new() };
     p.set_pool(256 * 1024, 16);
-    let (a, b) = (GpuFrameChannel::with_handoff(s.handoff), GpuFrameChannel::with_handoff(s.handoff));
+    let (a, b) =
+        (GpuFrameChannel::with_handoff(s.handoff), GpuFrameChannel::with_handoff(s.handoff));
     let src = p.add(UnitSrc::new(units()));
     let dec = VaapiH264Dec::new_zerocopy(Arc::clone(&a));
     let dec_stats = dec.stats();
@@ -76,7 +77,11 @@ fn encode(s: Shape) -> Out {
         (p.add(v), st)
     });
     let enc_in = if s.vpp { b } else { a };
-    let enc = VaapiH264Enc::new_zerocopy(enc_in).with_fps(25, 1).with_qp(26).with_gop(30).with_depth(s.depth);
+    let enc = VaapiH264Enc::new_zerocopy(enc_in)
+        .with_fps(25, 1)
+        .with_qp(26)
+        .with_gop(30)
+        .with_depth(s.depth);
     let enc_stats = enc.stats();
     let enc = p.add(enc);
     let sink = p.add(Collect(tx));
@@ -132,7 +137,8 @@ fn check(test: &str, vpp: bool) {
     if !supported(test) {
         return;
     }
-    let base = encode(Shape { handoff: Handoff::Done, depth: 1, inline: false, vpp, reactor: false });
+    let base =
+        encode(Shape { handoff: Handoff::Done, depth: 1, inline: false, vpp, reactor: false });
     assert_eq!(base.frames.len(), units().len(), "{test} every picture");
     assert_eq!(base.enc_coded_bufs, 1, "{test} one picture in flight, one coded buffer");
     assert!(base.dec_waits > 0, "{test} the decoder waits for each picture it hands on");
@@ -144,9 +150,17 @@ fn check(test: &str, vpp: bool) {
             let s = Shape { handoff: Handoff::Queued, depth, inline, vpp, reactor: false };
             let out = encode(s);
             assert_eq!(out.frames, base.frames, "{test} queued, depth {depth}, inline {inline}");
-            assert_eq!((out.dec_waits, out.vpp_waits), (0, 0), "{test} nobody waited, depth {depth}");
+            assert_eq!(
+                (out.dec_waits, out.vpp_waits),
+                (0, 0),
+                "{test} nobody waited, depth {depth}"
+            );
             // the ring is read without waiting, only the end drains it waiting for each picture
-            assert!(out.enc_waits <= depth as u64, "{test} the encoder waited {} times", out.enc_waits);
+            assert!(
+                out.enc_waits <= depth as u64,
+                "{test} the encoder waited {} times",
+                out.enc_waits
+            );
             let made = out.enc_coded_bufs;
             assert!(
                 (1..=depth as u64).contains(&made),
@@ -164,10 +178,23 @@ fn a_reactor_wakes_the_encoder_on_each_fence() {
     if !supported(test) {
         return;
     }
-    let base = encode(Shape { handoff: Handoff::Done, depth: 1, inline: false, vpp: false, reactor: false });
+    let base = encode(Shape {
+        handoff: Handoff::Done,
+        depth: 1,
+        inline: false,
+        vpp: false,
+        reactor: false,
+    });
     for inline in [false, true] {
-        let polled = encode(Shape { handoff: Handoff::Queued, depth: 2, inline, vpp: false, reactor: false });
-        let fenced = encode(Shape { handoff: Handoff::Queued, depth: 2, inline, vpp: false, reactor: true });
+        let polled = encode(Shape {
+            handoff: Handoff::Queued,
+            depth: 2,
+            inline,
+            vpp: false,
+            reactor: false,
+        });
+        let fenced =
+            encode(Shape { handoff: Handoff::Queued, depth: 2, inline, vpp: false, reactor: true });
         assert_eq!(fenced.frames, base.frames, "{test} inline {inline} codes the same");
         assert!(
             fenced.enc_polls * 4 < polled.enc_polls.max(4),

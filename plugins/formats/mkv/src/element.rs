@@ -2021,7 +2021,9 @@ impl MkvDemux {
     }
 
     /// A relinked track drops what it reads again up to its last frame out, so nothing is seen
-    /// twice.
+    /// twice. A restart drops the frames the track parked for a full pool, they were read ahead
+    /// of it and would go out first, a decoder taking its time from them. The other tracks keep
+    /// theirs, they resume past them.
     fn relink(&mut self, ctx: &Ctx, pad: SrcPad, on: bool, restart: Option<SeekTarget>) {
         let Some(idx) =
             self.pad_tracks.iter().position(|pt| ctx.stream_pad(pt.stream) == Some(pad))
@@ -2031,6 +2033,15 @@ impl MkvDemux {
         self.leave_cued();
         let tick = self.tick(ctx.pulls(Self::IN));
         if restart.is_some() && on {
+            let old = self.pad_tracks[idx].pad;
+            for _ in 0..self.pending.len() {
+                let Some(c) = self.pending.pop_front() else { break };
+                if c.stamp.pad == pad || c.stamp.pad == old {
+                    recycle_park(&mut self.park_free, c.bytes);
+                } else {
+                    self.pending.push_back(c);
+                }
+            }
             self.resync();
             self.reader.restart_at(restart.map(|target| target.to_byte));
             // A held caption stays, its block may lie before the restart, cue_out drops a copy

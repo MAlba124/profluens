@@ -841,3 +841,94 @@ fn a_link_that_joins_a_pad_that_plays_is_greeted_with_the_codec_head() {
         String::from_utf8_lossy(&decoded.stderr)
     );
 }
+
+/// Keeps every buffer it takes until it is taken out, a sink whose link waits.
+struct Hold {
+    rec: Arc<Mutex<Recorded>>,
+    kept: Vec<profluens_core::buffer::Buffer>,
+}
+
+impl Element for Hold {
+    fn desc(&self) -> &'static ElementDesc {
+        &SINK_DESC
+    }
+
+    fn process(&mut self, _ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        while let Some(buf) = inputs.pop() {
+            let key = buf.flags.contains(BufferFlags::KEYFRAME);
+            let out = Out { bytes: buf.memory.data().to_vec(), pts: buf.pts.nanos(), key };
+            self.rec.lock().unwrap().bufs.push(out);
+            self.kept.push(buf);
+        }
+        Ok(Flow::Ok)
+    }
+}
+
+/// Passes every ready group until none is, false when the run did not end.
+fn step_through(run: &mut profluens_core::sched::Stepped) -> bool {
+    loop {
+        run.service();
+        let ready: Vec<usize> = (0..run.groups()).filter(|g| run.ready(*g)).collect();
+        if ready.is_empty() {
+            break;
+        }
+        for g in ready {
+            run.pass(g).expect("pass");
+        }
+    }
+    let exit = Some(profluens_core::sched::Outcome::Exit);
+    (0..run.groups()).all(|g| run.outcome(g) == exit)
+}
+
+/// An audio sink that keeps its packets dries the pool, and the demuxer parks the next sample
+/// it read, of the audio or of the video. The audio moved to another sink with a restart starts
+/// at its restart point behind its head, not at a packet it parked ahead, and the video loses no
+/// picture it parked. The pool sizes park a sample of each.
+#[test]
+fn a_restart_drops_what_the_track_parked_and_the_other_track_keeps_its_own() {
+    use profluens_core::clock::MockClock;
+    use profluens_core::topology::Leave;
+    let (file, head) = movie();
+    for slots in 60..68 {
+        let clock = MockClock::starting_at(Timestamp::from_secs(1));
+        let debug = profluens_core::log::DebugSpec::default();
+        let mut p = Pipeline::with(debug, false, Arc::new(clock.clone()));
+        p.set_pool(4096, slots);
+        p.set_select_all(false);
+        let ids = Arc::new(Mutex::new((ElementId(0), ElementId(0))));
+        let jump = Jump::Nowhere { to_time: Timestamp::ZERO };
+        let feed =
+            SeekSrc { data: file.clone(), pos: 0, seek: p.control(), jump, sought: true, ids };
+        let src = p.add(feed);
+        let demux = p.add(Mp4Demux::new(head.clone()));
+        p.link(src.src(SeekSrc::OUT), demux.sink(Mp4Demux::IN)).expect("src -> demux");
+        p.preroll().expect("preroll");
+        let (video, held, moved) = (Arc::default(), Arc::default(), Arc::default());
+        let pad = p.select(demux, 0).expect("select the video");
+        let sink = p.add(RecSink { rec: Arc::clone(&video) });
+        p.link(demux.src(pad), sink.sink(RecSink::IN)).expect("pad -> sink");
+        let pad = p.select(demux, 1).expect("select the audio");
+        let hold = p.add(Hold { rec: Arc::clone(&held), kept: Vec::new() });
+        p.link(demux.src(pad), hold.sink(RecSink::IN)).expect("pad -> hold");
+        let mut run = p.step(Arc::new(clock)).expect("step");
+        assert!(!step_through(&mut run), "the pool runs dry, {slots} slots");
+
+        let position = held.lock().unwrap().bufs.last().and_then(|b| b.pts).expect("held");
+        let index = p.index(demux).expect("an index");
+        let (byte, at) = index.restart_for(1, Timestamp(position)).expect("a sync sample");
+        p.remove(hold, Leave::Cut).expect("remove");
+        let sink = p.add(RecSink { rec: Arc::clone(&moved) });
+        p.link(demux.src(pad), sink.sink(RecSink::IN)).expect("pad -> sink");
+        p.commit_at(Timestamp(position), &[(src, byte, at), (demux, byte, at)]).expect("commit");
+        assert!(step_through(&mut run), "the run ends, {slots} slots");
+        run.finish().expect("finish");
+
+        assert_eq!(video.lock().unwrap().bufs, pictures(0), "every picture once, {slots} slots");
+        assert!(at.0 > 0, "the restart is a sync sample past the first");
+        let moved = std::mem::take(&mut moved.lock().unwrap().bufs);
+        let led = moved.first().is_some_and(|b| b.bytes == ASC);
+        assert!(led, "the head leads, not a packet parked ahead, {slots} slots");
+        let first = (0..PACKETS).find(|n| packet_at(&head, *n) >= byte).expect("a packet");
+        assert_eq!(moved, packets(first), "on from the restart, {slots} slots");
+    }
+}

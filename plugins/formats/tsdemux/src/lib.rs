@@ -19,7 +19,7 @@ use pf_registry::{Elements, Registry};
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::BufferFlags;
 use profluens_core::bus::BusMessage;
-use profluens_core::ctx::{Ctx, Disposition, Stream, StreamKind};
+use profluens_core::ctx::{Ctx, Disposition, SeekTarget, Stream, StreamKind};
 use profluens_core::element::{
     Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
@@ -184,6 +184,12 @@ struct Track {
     /// Units dropped as scrambled or encrypted, and bytes skipped between ADTS frames.
     scrambled: u64,
     adts_skipped: u64,
+    /// The offset of the last unit taken in, and behind a restart for another track the one
+    /// units read again are dropped up to.
+    read: Option<u64>,
+    resume: Option<u64>,
+    /// The next unit's discontinuity is the restart's, not the stream's.
+    quiet: bool,
 }
 
 enum Parked {
@@ -478,6 +484,15 @@ impl TsDemux {
     ) {
         let Some(track) = tracks.iter_mut().find(|track| track.pid == unit.pid) else { return };
         let Some(pad) = track.pad else { return };
+        let mut bits = unit.flags;
+        if std::mem::take(&mut track.quiet) {
+            bits &= !UF_DISCONTINUITY;
+        }
+        // Read again behind a restart for another track, it went out the first time.
+        if track.resume.is_some_and(|last| unit.offset <= last) {
+            return;
+        }
+        (track.resume, track.read) = (None, Some(unit.offset));
         // Not in the clear, nothing downstream can use it.
         if unit.flags & (UF_SCRAMBLED | UF_ENCRYPTED) != 0 {
             if track.scrambled == 0 {
@@ -487,7 +502,7 @@ impl TsDemux {
             return;
         }
         let stamps = clock.place(unit, &mut track.last_dts, track.lead_ns);
-        let broke = unit.flags & UF_DISCONTINUITY != 0;
+        let broke = bits & UF_DISCONTINUITY != 0;
         let mut flags = if broke { BufferFlags::DISCONT } else { BufferFlags::empty() };
         let keys = grown.keys(unit.pid);
         // Every unit of audio decodes alone.
@@ -496,7 +511,7 @@ impl TsDemux {
             track.need_key |= broke;
             let (key, marked) = match track.codec {
                 Codec::H264 | Codec::Hevc => {
-                    let marked = unit.flags & UF_RANDOM_ACCESS != 0;
+                    let marked = bits & UF_RANDOM_ACCESS != 0;
                     // The first slice is read only where the flag does not say.
                     let hevc = track.codec == Codec::Hevc;
                     let key = marked
@@ -674,6 +689,7 @@ impl TsDemux {
             track.need_key = track.kind == StreamKind::Video;
             track.pages_due |= flushed;
             track.carry.clear();
+            (track.read, track.resume, track.quiet) = (None, None, false);
         }
     }
 
@@ -734,13 +750,17 @@ impl TsDemux {
         }
     }
 
-    /// With `restart` the source went back for it, so byte counts are off until the next seek.
-    fn relink(&mut self, ctx: &Ctx, pad: SrcPad, on: bool, restart: bool) {
-        let Some(track) =
-            self.tracks.iter_mut().find(|track| ctx.stream_pad(track.stream) == Some(pad))
+    /// With `restart` the source went back for the track and the demuxer reads on from there.
+    fn relink(&mut self, ctx: &Ctx, pad: SrcPad, on: bool, restart: Option<SeekTarget>) {
+        let Some(at) =
+            self.tracks.iter().position(|track| ctx.stream_pad(track.stream) == Some(pad))
         else {
             return;
         };
+        if let Some(target) = restart.filter(|_| on) {
+            self.rejoin(at, pad, target);
+        }
+        let track = &mut self.tracks[at];
         track.pad = on.then_some(pad);
         (track.started, track.run) = (false, None);
         track.need_key = track.kind == StreamKind::Video;
@@ -749,10 +769,35 @@ impl TsDemux {
         if let Some(demux) = self.demux.as_mut() {
             demux.select(track.pid, on);
         }
-        if restart && on && self.grown.placed == Placed::File {
-            self.grown.placed = Placed::Lost;
-        }
         self.grown.rekey(key_of(&self.tracks));
+    }
+
+    /// The track drops what it parked for a full pool, it was read ahead of the restart and
+    /// would go out first and again when read. The other tracks keep theirs and drop what they
+    /// read again up to their last unit, what was in progress is read again whole.
+    fn rejoin(&mut self, at: usize, pad: SrcPad, target: SeekTarget) {
+        let old = self.tracks[at].pad;
+        let gone = |row: &Parked| match *row {
+            Parked::Unit { pad: of, .. } | Parked::Format { pad: of, .. } => {
+                of == pad || Some(of) == old
+            }
+        };
+        self.park.rows.retain(|row| !gone(row));
+        for (n, track) in self.tracks.iter_mut().enumerate() {
+            let on = track.pad.is_some();
+            track.resume = track.read.or(track.resume).filter(|_| on && n != at);
+            (track.read, track.quiet) = (None, on || n == at);
+        }
+        self.feeding = None;
+        if let Some(demux) = self.demux.as_mut() {
+            demux.discontinuity();
+            if self.grown.placed != Placed::Segments {
+                demux.set_position(target.to_byte);
+            }
+        }
+        // Same time base, so the track read again is not behind itself.
+        (self.clock.sought, self.clock.broke) = (true, false);
+        self.clock.stretch = self.clock.stretch.wrapping_add(1).max(1);
     }
 }
 
@@ -920,6 +965,9 @@ impl Element for TsDemux {
                 pages_due: true,
                 scrambled: 0,
                 adts_skipped: 0,
+                read: None,
+                resume: None,
+                quiet: false,
             });
             if info.dovi_len > 0 && self.tracks.last().is_some_and(|t| t.dovi.is_none()) {
                 log!(&*ctx, Level::Warn, "dovi_config_bad", pid = pid, bytes = info.dovi_len);
@@ -1085,7 +1133,7 @@ impl TsDemux {
                 (self.clock.sought, self.clock.broke) = (true, false);
                 self.clock.stretch = self.clock.stretch.wrapping_add(1).max(1);
             }
-            Event::SrcLinked { pad, on, restart } => self.relink(ctx, *pad, *on, restart.is_some()),
+            Event::SrcLinked { pad, on, restart } => self.relink(ctx, *pad, *on, *restart),
             _ => {}
         }
         Ok(())

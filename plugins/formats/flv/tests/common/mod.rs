@@ -112,6 +112,13 @@ impl Element for PieceSrc {
         self.at += n;
         Ok(Flow::Ok)
     }
+
+    fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        if let (Event::FlushStart, Some(target)) = (event, ctx.seek_target()) {
+            self.at = target.to_byte as usize;
+        }
+        Ok(())
+    }
 }
 
 static ANY: ConstraintDesc = ConstraintDesc::Any;
@@ -204,6 +211,27 @@ impl Element for RecSink {
             self.rec.lock().unwrap().formats.push(Format { family, rate, channels, width, height });
         }
         Ok(())
+    }
+}
+
+/// Keeps every buffer it takes until it is taken out, a sink whose link waits.
+pub struct Hold {
+    pub rec: Arc<Mutex<Recorded>>,
+    pub kept: Vec<profluens_core::buffer::Buffer>,
+}
+
+impl Element for Hold {
+    fn desc(&self) -> &'static ElementDesc {
+        &REC_DESC
+    }
+
+    fn process(&mut self, _ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        let mut rec = self.rec.lock().unwrap();
+        while let Some(buf) = inputs.pop() {
+            rec.units.push((buf.pts.nanos(), buf.memory.len(), buf.flags.0));
+            self.kept.push(buf);
+        }
+        Ok(Flow::Ok)
     }
 }
 

@@ -1019,6 +1019,9 @@ impl Mp4Demux {
         ctx.publish_index(index);
     }
 
+    /// A restart drops what the track parked for a full pool, it was read ahead of the restart
+    /// and would go out ahead of the codec head and again when read. The other tracks keep
+    /// theirs, their gates resume past them.
     fn relink(&mut self, ctx: &Ctx, pad: SrcPad, on: bool, restart: Option<SeekTarget>) {
         let of = |pt: &PadTrack| ctx.stream_pad(pt.stream) == Some(pad);
         let Some(idx) = self.pad_tracks.iter().position(of) else {
@@ -1029,7 +1032,11 @@ impl Mp4Demux {
             return;
         };
         match restart.filter(|_| on) {
-            Some(target) => reader.rejoin(idx, target.to_byte, target.at.nanos().unwrap_or(0)),
+            Some(target) => {
+                let old = self.pad_tracks[idx].pad;
+                self.pending.retain(|c| c.pad != pad && c.pad != old);
+                reader.rejoin(idx, target.to_byte, target.at.nanos().unwrap_or(0));
+            }
             None => reader.select(idx, on),
         }
         let head =

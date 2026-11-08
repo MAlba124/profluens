@@ -1,4 +1,4 @@
-//! `flvdemux` on the flv fixtures against `ffprobe`, the codecs it refuses and decoding.
+//! `flvdemux` on the flv fixtures against `ffprobe`, the codecs it refuses, decoding and restarts.
 
 #![allow(clippy::disallowed_methods)] // test fixtures
 
@@ -262,4 +262,96 @@ fn the_streams_decode() {
     let got = decode("h264_mp3", [None, Some(Box::new(LibavAudioDec::mp3()))]);
     assert!(got[0] > 50, "{} buffers of sound", got[0]);
     assert_eq!(decode("vp9_pcm", [Some(Box::new(LibavVp9Dec::new())), None]), [15]);
+}
+
+/// Passes every ready group until none is, false when the run did not end.
+fn step_through(run: &mut profluens_core::sched::Stepped) -> bool {
+    loop {
+        run.service();
+        let ready: Vec<usize> = (0..run.groups()).filter(|g| run.ready(*g)).collect();
+        if ready.is_empty() {
+            break;
+        }
+        for g in ready {
+            run.pass(g).expect("pass");
+        }
+    }
+    let exit = Some(profluens_core::sched::Outcome::Exit);
+    (0..run.groups()).all(|g| run.outcome(g) == exit)
+}
+
+/// An audio sink that keeps its frames dries the pool, and the demuxer parks the next tag it
+/// read, of the audio or of the video. The audio moved to another sink with a restart starts at
+/// the first tag behind the restart, behind its config, not at a frame it parked ahead, and the
+/// video loses no picture it parked and gets none twice, also with the audio moved on again
+/// right behind. The pool sizes park a frame of each.
+#[test]
+fn a_restart_drops_what_the_track_parked_and_the_other_track_keeps_its_own() {
+    use common::{Hold, PieceSrc, RecSink};
+    use profluens_core::clock::MockClock;
+    use profluens_core::time::Timestamp;
+    use profluens_core::topology::Leave;
+    let data = fixture("h264_aac");
+    let out = whole("h264_aac", 4096);
+    let (video_all, audio_all) = (&out.streams[0].2, &out.streams[1].2);
+    let index = out.index.expect("the keyframes");
+    for (slots, twice) in (24..32).chain(64..72).flat_map(|n| [(n, false), (n, true)]) {
+        let case = format!("{slots} slots, moved twice {twice}");
+        let clock = MockClock::starting_at(Timestamp::from_secs(1));
+        let debug = profluens_core::log::DebugSpec::default();
+        let mut p = Pipeline::with(debug, false, Arc::new(clock.clone()));
+        p.set_pool(1 << 16, slots);
+        p.set_select_all(false);
+        let src = p.add(PieceSrc { data: data.clone(), chunk: 4096, at: 0 });
+        let demux = FlvDemux::new(data.clone()).with_len(data.len() as u64);
+        let demux = p.add(demux);
+        p.link(src.src(PieceSrc::OUT), demux.sink(FlvDemux::IN)).expect("src to demux");
+        p.preroll().expect("preroll");
+        let (video, held, mut moved) = (Arc::default(), Arc::default(), Arc::default());
+        let pad = p.select(demux, 0).expect("select the video");
+        let sink = p.add(RecSink { rec: Arc::clone(&video) });
+        p.link(demux.src(pad), sink.sink(RecSink::IN)).expect("pad to sink");
+        let pad = p.select(demux, 1).expect("select the audio");
+        let hold = p.add(Hold { rec: Arc::clone(&held), kept: Vec::new() });
+        p.link(demux.src(pad), hold.sink(RecSink::IN)).expect("pad to hold");
+        let mut run = p.step(Arc::new(clock)).expect("step");
+        assert!(!step_through(&mut run), "the pool runs dry, {case}");
+
+        let position = held.lock().unwrap().units.last().and_then(|u| u.0).expect("held");
+        let (byte, at) = index.restart_for(1, Timestamp(position)).expect("a keyframe");
+        p.remove(hold, Leave::Cut).expect("remove");
+        let sink = p.add(RecSink { rec: Arc::clone(&moved) });
+        p.link(demux.src(pad), sink.sink(RecSink::IN)).expect("pad to sink");
+        p.commit_at(Timestamp(position), &[(src, byte, at), (demux, byte, at)]).expect("commit");
+        if twice {
+            // The audio moves on again before the video read past what it put out.
+            while p.changing() {
+                run.service();
+                if let Some(g) = (0..run.groups()).find(|g| run.ready(*g)) {
+                    run.pass(g).expect("pass");
+                }
+            }
+            p.remove(sink, Leave::Cut).expect("remove");
+            moved = Arc::default();
+            let sink = p.add(RecSink { rec: Arc::clone(&moved) });
+            p.link(demux.src(pad), sink.sink(RecSink::IN)).expect("pad to sink");
+            let targets = [(src, byte, at), (demux, byte, at)];
+            p.commit_at(Timestamp(position), &targets).expect("commit");
+        }
+        assert!(step_through(&mut run), "the run ends, {case}");
+        run.finish().expect("finish");
+
+        let video = video.lock().unwrap();
+        assert_eq!(video.units, video_all.units, "every picture once, {case}");
+        let moved = moved.lock().unwrap();
+        let head = moved.units.first().copied().expect("the config");
+        assert!(head.2 & BufferFlags::HEADER.0 != 0, "the config leads, {case}");
+        let rows = of(&packets("h264_aac"), 1);
+        let first = rows.iter().find(|p| p.pos >= byte).expect("a tag behind the restart");
+        let frames = audio_all.frames();
+        let from = frames.iter().position(|u| u.0 == Some(first.pts as u64 * MS));
+        let from = from.expect("the frame in the whole run");
+        assert_eq!(moved.units[1..], frames[from..], "on from the restart, {case}");
+        eprintln!("{case}: position {position}, restart {byte} at {at:?}");
+    }
 }

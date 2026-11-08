@@ -19,7 +19,7 @@ pub const AUDIO_SPACING: u64 = 1_000_000_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placed {
     File,
-    /// Behind a flush with no target or a source restarted for one stream, until the next flush.
+    /// Behind a flush with no target or a break in the input, until the next flush.
     Lost,
     Segments,
 }

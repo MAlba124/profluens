@@ -1,7 +1,9 @@
 //! Seeks in a VOB ffmpeg writes, pulled with the bisection and pushed from the estimate. Skipped
-//! without ffmpeg.
+//! without ffmpeg. A restart for one track, on a fixture and on that VOB.
 
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)] // test fixtures and rig
+
+mod common;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -21,7 +23,7 @@ use profluens_core::event::Event;
 use profluens_core::format::OfferDesc;
 use profluens_core::id::{SinkPad, SrcPad};
 use profluens_core::log::DebugSpec;
-use profluens_core::pipeline::{Pipeline, SeekMode, Serves};
+use profluens_core::pipeline::{Index, Pipeline, SeekMode, Serves};
 use profluens_core::sched::Outcome;
 use profluens_core::time::Timestamp;
 
@@ -288,4 +290,164 @@ fn a_pushed_seek_starts_at_a_keyframe_near_the_estimate() {
     assert!(f.keys.contains(&ns), "{ns} is a keyframe of the file");
     assert!(ns.abs_diff(10_000_000_000) < 4_000_000_000, "landed at {ns}");
     assert!(f.end > 19_000_000_000);
+}
+
+/// Keeps every buffer it takes past the first `skip` until it is taken out, a sink whose link
+/// waits.
+struct Hold {
+    seen: Seen,
+    kept: Vec<profluens_core::buffer::Buffer>,
+    skip: usize,
+}
+
+impl Element for Hold {
+    fn desc(&self) -> &'static ElementDesc {
+        &SINK
+    }
+
+    fn process(&mut self, _ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        while let Some(buf) = inputs.pop() {
+            if self.skip > 0 {
+                self.skip -= 1;
+                continue;
+            }
+            self.seen.lock().expect("seen").push((buf.pts.nanos(), buf.flags.0));
+            self.kept.push(buf);
+        }
+        Ok(Flow::Ok)
+    }
+}
+
+/// Passes every ready group until none is, false when the run did not end.
+fn step_through(run: &mut profluens_core::sched::Stepped) -> bool {
+    loop {
+        run.service();
+        let ready: Vec<usize> = (0..run.groups()).filter(|g| run.ready(*g)).collect();
+        if ready.is_empty() {
+            break;
+        }
+        for g in ready {
+            run.pass(g).expect("pass");
+        }
+    }
+    (0..run.groups()).all(|g| run.outcome(g) == Some(Outcome::Exit))
+}
+
+type Units = Vec<(Option<u64>, u32)>;
+
+/// Every unit of the video and of the audio as a whole run reads them, and the index it grew.
+fn whole(file: &Arc<[u8]>) -> (Units, Units, Arc<Index>) {
+    let mut p = Pipeline::new();
+    let src = p.add(MemSrc { file: Arc::clone(file), pull: false, pos: 0 });
+    let demux = p.add(PsDemux::new(file.to_vec()));
+    p.link(src.src(SrcPad(0)), demux.sink(PsDemux::IN)).expect("src to demux");
+    p.set_select_all(false);
+    p.preroll().expect("preroll");
+    let (video, audio): (Seen, Seen) = Default::default();
+    for (stream, seen) in [(0, &video), (1, &audio)] {
+        let pad = p.select(demux, stream).expect("select");
+        let sink = p.add(RecSink { seen: Arc::clone(seen) });
+        p.link(demux.src(pad), sink.sink(SinkPad(0))).expect("demux to sink");
+    }
+    p.run().expect("the run ends");
+    let index = p.index(demux).expect("an index grown to the end");
+    let (video, audio) = (video.lock().unwrap().clone(), audio.lock().unwrap().clone());
+    (video, audio, index)
+}
+
+/// The audio of `file`, stream 1 under key `sound`, moved with a restart once the pool ran dry
+/// with `slots` of it held past the first `skip`, pushed and pulled. Where each restarted, and
+/// the first keyframe.
+fn restart(file: &Arc<[u8]>, sound: u16, skip: usize, cases: &[(bool, u32)]) -> (Vec<u64>, u64) {
+    use profluens_core::topology::Leave;
+    let (video_all, audio_all, index) = whole(file);
+    let (_, units) = common::units(file, sound, 4096);
+    assert_eq!(audio_all.len(), units.len(), "a unit a PES");
+    let mut restarts = Vec::new();
+    for (&(pull, slots), twice) in cases.iter().flat_map(|c| [(c, false), (c, true)]) {
+        let clock = MockClock::starting_at(Timestamp::from_secs(1));
+        let shared: Arc<dyn Clock> = Arc::new(clock.clone());
+        let mut p = Pipeline::with(DebugSpec::default(), false, Arc::clone(&shared));
+        let src = p.add(MemSrc { file: Arc::clone(file), pull, pos: 0 });
+        let len = Some(file.len() as u64);
+        let demux = p.add(PsDemux::new(file.to_vec()).with_len(len));
+        p.set_element_pool_bytes(demux, 64 << 10, slots, 4 << 20);
+        p.link(src.src(SrcPad(0)), demux.sink(PsDemux::IN)).expect("src to demux");
+        p.set_select_all(false);
+        p.preroll().expect("preroll");
+        let (video, held, mut moved): (Seen, Seen, Seen) = Default::default();
+        let pad = p.select(demux, 0).expect("the video");
+        let sink = p.add(RecSink { seen: Arc::clone(&video) });
+        p.link(demux.src(pad), sink.sink(SinkPad(0))).expect("demux to sink");
+        let pad = p.select(demux, 1).expect("the audio");
+        let hold = p.add(Hold { seen: Arc::clone(&held), kept: Vec::new(), skip });
+        p.link(demux.src(pad), hold.sink(SinkPad(0))).expect("demux to hold");
+        let mut run = p.step(Arc::clone(&shared)).expect("step");
+        let case = format!("pulled {pull}, {slots} slots, moved twice {twice}");
+        assert!(!step_through(&mut run), "the pool runs dry, {case}");
+
+        let position = held.lock().unwrap().last().and_then(|u| u.0).expect("held");
+        let (byte, at) = index.restart_for(1, Timestamp(position)).expect("a keyframe");
+        p.remove(hold, Leave::Cut).expect("remove");
+        let sink = p.add(RecSink { seen: Arc::clone(&moved) });
+        p.link(demux.src(pad), sink.sink(SinkPad(0))).expect("demux to sink");
+        p.commit_at(Timestamp(position), &[(src, byte, at), (demux, byte, at)]).expect("commit");
+        if twice {
+            // The audio moves on again before the video read past what it put out.
+            while p.changing() {
+                run.service();
+                if let Some(g) = (0..run.groups()).find(|g| run.ready(*g)) {
+                    run.pass(g).expect("pass");
+                }
+            }
+            p.remove(sink, Leave::Cut).expect("remove");
+            moved = Arc::default();
+            let sink = p.add(RecSink { seen: Arc::clone(&moved) });
+            p.link(demux.src(pad), sink.sink(SinkPad(0))).expect("demux to sink");
+            let targets = [(src, byte, at), (demux, byte, at)];
+            p.commit_at(Timestamp(position), &targets).expect("commit");
+        }
+        assert!(step_through(&mut run), "the run ends, {case}");
+        let _ = run.finish();
+
+        assert_eq!(*video.lock().unwrap(), video_all, "every picture once, {case}");
+        let from = units.iter().position(|u| u.offset >= byte).expect("a unit behind");
+        let moved = moved.lock().unwrap();
+        let moved: Vec<_> = moved.iter().copied().filter(|u| u.1 != FLUSHED).collect();
+        // A new run on a new sink, whether it starts at a break of the stream does not matter.
+        let mut want = audio_all[from..].to_vec();
+        want.iter_mut().take(1).for_each(|u| u.1 &= !BufferFlags::DISCONT.0);
+        assert_eq!(moved, want, "on from the restart, {case}");
+        restarts.push(byte);
+    }
+    (restarts, index.entries.first().expect("a keyframe").byte)
+}
+
+/// An audio sink that keeps its units dries the pool, and the demuxer parks the next unit it
+/// read, of the audio or of the video. The audio moved to another sink with a restart starts at
+/// the first unit behind the restart, not at a unit it parked ahead, and the video loses no
+/// picture it parked or had in progress and gets none twice, also with the audio moved on again
+/// right behind. Pushed and pulled, the restart reads from its byte, with no bisection. The pool
+/// sizes park a unit of each.
+#[test]
+fn a_restart_drops_what_the_track_parked_and_the_other_track_keeps_its_own() {
+    let file: Arc<[u8]> = Arc::from(common::fixture("mpeg2_mp2.vob"));
+    let cases = [(false, 1), (false, 2), (false, 3), (false, 4), (true, 1), (true, 2)];
+    restart(&file, 0xC000, 0, &cases);
+    let Some(f) = film() else { return };
+    let cases: Vec<(bool, u32)> =
+        [false, true].into_iter().flat_map(|pull| (6..14).map(move |n| (pull, n))).collect();
+    let (restarts, first) = restart(&f.bytes, 0xC000, 0, &cases);
+    assert!(restarts.iter().all(|byte| *byte > first), "past the first GOP, {restarts:?}");
+}
+
+/// Two VOBs joined, the clock going back at the join, and the audio moved with a restart past
+/// it. The video goes on on the line the join made, not on the file's.
+#[test]
+fn a_restart_past_a_clock_break_keeps_the_other_track_on_its_line() {
+    let one = common::fixture("mpeg2_mp2.vob");
+    let file: Arc<[u8]> = Arc::from([one.as_slice(), &one].concat());
+    let (_, audio, _) = whole(&file);
+    let (restarts, _) = restart(&file, 0xC000, audio.len() / 2 + 3, &[(false, 1), (true, 1)]);
+    assert!(restarts.iter().all(|byte| *byte >= one.len() as u64), "past the join, {restarts:?}");
 }

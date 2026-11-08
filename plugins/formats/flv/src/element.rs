@@ -8,7 +8,7 @@ use pf_mkv::Reframer;
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::BufferFlags;
 use profluens_core::bus::BusMessage;
-use profluens_core::ctx::{Ctx, Disposition, Stream, StreamKind};
+use profluens_core::ctx::{Ctx, Disposition, SeekTarget, Stream, StreamKind};
 use profluens_core::element::{
     Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
@@ -106,9 +106,22 @@ struct Track {
     head: Vec<u8>,
     nal: Option<Reframer>,
     form: Form,
+    /// The byte of the last tag taken in, and behind a restart for another track the one tags
+    /// read again are dropped up to.
+    read: Option<u64>,
+    resume: Option<u64>,
 }
 
 impl Track {
+    /// Read again behind a restart for another track, it went out the first time.
+    fn again(&mut self, pos: u64) -> bool {
+        if self.resume.is_some_and(|last| pos <= last) {
+            return true;
+        }
+        (self.resume, self.read) = (None, Some(pos));
+        false
+    }
+
     // Once per configuration record, rare in a stream.
     #[allow(clippy::disallowed_methods)]
     fn set_record(&mut self, ctx: &Ctx, record: &[u8]) -> bool {
@@ -538,6 +551,9 @@ impl Live {
         };
         let payload = tag.body.get(v.from..v.to).unwrap_or_default();
         let t = &mut self.tracks[n];
+        if t.again(tag.pos) {
+            return;
+        }
         match v.packet {
             Packet::Config => {
                 if t.set_record(ctx, payload) {
@@ -590,6 +606,9 @@ impl Live {
         };
         let payload = tag.body.get(a.from..).unwrap_or_default();
         let t = &mut self.tracks[n];
+        if t.again(tag.pos) {
+            return;
+        }
         match a.packet {
             Packet::Config => {
                 if t.set_record(ctx, payload) {
@@ -631,6 +650,7 @@ impl Live {
         for t in &mut self.tracks {
             t.started = false;
             t.need_key = t.kind == StreamKind::Video;
+            (t.read, t.resume) = (None, None);
         }
     }
 
@@ -727,6 +747,8 @@ impl FlvDemux {
             head: Vec::new(),
             nal: matches!(codec, Codec::Video(v) if v.nal()).then_some(NAL4),
             form,
+            read: None,
+            resume: None,
         });
     }
 }
@@ -928,18 +950,40 @@ impl FlvDemux {
         self.live.reset_tracks();
     }
 
-    fn relink(&mut self, ctx: &Ctx, pad: SrcPad, on: bool, restart: bool) {
-        let live = &mut self.live;
-        let Some(t) = live.tracks.iter_mut().find(|t| ctx.stream_pad(t.stream) == Some(pad)) else {
+    /// With `restart` the source went back for the track and the reader reads on from there.
+    fn relink(&mut self, ctx: &Ctx, pad: SrcPad, on: bool, restart: Option<SeekTarget>) {
+        let Some(at) = self.live.tracks.iter().position(|t| ctx.stream_pad(t.stream) == Some(pad))
+        else {
             return;
         };
+        if let Some(target) = restart.filter(|_| on) {
+            self.rejoin(at, pad, target);
+        }
+        let live = &mut self.live;
+        let t = &mut live.tracks[at];
         t.pad = on.then_some(pad);
         t.started = false;
         t.need_key = t.kind == StreamKind::Video;
-        if restart && on {
-            live.grown.lost = true;
-        }
         live.rekey();
+    }
+
+    /// The track drops what it parked for a full pool, it was read ahead of the restart and
+    /// would go out first and again when read. The other tracks keep theirs and drop what they
+    /// read again up to their last tag.
+    fn rejoin(&mut self, at: usize, pad: SrcPad, target: SeekTarget) {
+        let live = &mut self.live;
+        let old = live.tracks[at].pad;
+        live.park.rows.retain(|row| match *row {
+            Parked::Unit { pad: of, .. } | Parked::Format { pad: of, .. } => {
+                of != pad && Some(of) != old
+            }
+        });
+        for (n, t) in live.tracks.iter_mut().enumerate() {
+            t.resume = t.read.or(t.resume).filter(|_| t.pad.is_some() && n != at);
+            t.read = None;
+        }
+        self.feeding = None;
+        self.reader.restart(target.to_byte);
     }
 
     fn on_event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
@@ -993,7 +1037,7 @@ impl FlvDemux {
                 live.park.rows.clear();
                 live.park.bytes.clear();
             }
-            Event::SrcLinked { pad, on, restart } => self.relink(ctx, *pad, *on, restart.is_some()),
+            Event::SrcLinked { pad, on, restart } => self.relink(ctx, *pad, *on, *restart),
             _ => {}
         }
         Ok(())

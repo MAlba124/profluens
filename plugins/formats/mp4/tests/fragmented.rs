@@ -672,3 +672,44 @@ fn many_short_runs_of_empty_samples_share_one_budget_per_moof() {
     assert!(out.is_empty());
     assert!(matches!(reader.take_error(), Some(Mp4Error::Inconsistent(_))));
 }
+
+/// A source that goes back for one track of a fragmented movie. The walk follows it, the other
+/// track plays on from the sample it was at and puts nothing out twice, and the track starts
+/// at its restart point.
+#[test]
+fn a_source_that_goes_back_for_one_track_of_a_fragmented_movie_puts_nothing_out_twice() {
+    let file = fixture("frag_av.mp4");
+    let whole = read_all(&file, 4096);
+    let size = frag::mfra_size(&file).unwrap() as usize;
+    let mut reader = Mp4Reader::indexed(&file, &file[file.len() - size..]).expect("resolves");
+    let fragments = reader.tables().fragments().to_vec();
+    reader.select(1, false);
+    reader.reset_stream();
+    let point = 2 * SECOND + SECOND / 2;
+    let lead = reader.tracks()[1].pre_roll_ns();
+    for cut in [fragments[2].offset as usize + 3000, file.len() - size - 100] {
+        let mut out = Vec::new();
+        reader.select(1, false);
+        reader.reset_stream();
+        for piece in file[..cut].chunks(4096) {
+            reader.push_bytes(piece);
+            drain(&mut reader, &mut out);
+        }
+        assert!(out.iter().all(|s| s.track == 0), "the audio is off");
+        let restart = reader.tables().restart(point, point, &|_| true);
+        assert!(restart.to_byte < cut as u64, "the restart lies behind the walk");
+        reader.rejoin(1, restart.to_byte, point);
+        for piece in file[restart.to_byte as usize..].chunks(4096) {
+            reader.push_bytes(piece);
+            drain(&mut reader, &mut out);
+        }
+        assert_eq!(reader.take_error(), None);
+        let of = |out: &[Out], track: usize| -> Vec<Out> {
+            out.iter().filter(|s| s.track == track).cloned().collect()
+        };
+        assert_eq!(of(&out, 0), of(&whole, 0), "every picture once, cut at {cut}");
+        let audio = of(&whole, 1);
+        let from = audio.iter().rposition(|s| s.pts_ns <= point - lead).expect("a packet");
+        assert_eq!(of(&out, 1), audio[from..], "from the restart point, cut at {cut}");
+    }
+}

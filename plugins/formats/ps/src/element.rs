@@ -217,6 +217,10 @@ struct Lane {
     lpcm: Option<Lpcm>,
     /// Last decode time in ticks, and the stretch it was read in.
     last_dts: (u32, i64),
+    /// The offset of the last unit taken in, and behind a restart for another track the one
+    /// units read again are dropped up to.
+    read: Option<u64>,
+    resume: Option<u64>,
 }
 
 struct Pcm {
@@ -236,6 +240,7 @@ impl Track {
     fn restart(&mut self) {
         let lane = &mut self.lane;
         (lane.started, lane.need_key, lane.broke) = (false, lane.kind == StreamKind::Video, false);
+        (lane.read, lane.resume) = (None, None);
         if let Some(f) = &mut self.framer {
             f.reset();
         }
@@ -274,6 +279,8 @@ struct Clock {
     anchor: Option<u64>,
     origin: Option<i64>,
     sought: bool,
+    /// Behind a restart for one track the next stamp steps back on the same line, no break.
+    back: bool,
     last_ns: u64,
     stretch: u32,
     broke: bool,
@@ -289,9 +296,10 @@ impl Clock {
             self.shift = ticks_ns(origin);
         }
         let placed = self.unwrap.unwrap(dts);
+        let back = std::mem::take(&mut self.back);
+        let jumped = placed.step == Stepped::Discontinuity && !back;
         let behind = *last_dts != (0, 0) && last_dts.0 == self.stretch && placed.ticks < last_dts.1;
-        let broke =
-            std::mem::take(&mut self.broke) || placed.step == Stepped::Discontinuity || behind;
+        let broke = std::mem::take(&mut self.broke) || jumped || behind;
         if broke && self.anchor.is_none() {
             self.anchor = Some(self.last_ns);
         }
@@ -490,6 +498,12 @@ fn on_unit(emit: &mut Emit<'_>, tracks: &mut [Track], u: &Unit<'_>) {
     else {
         return;
     };
+    // Read again behind a restart for another track, it went in the first time.
+    let lane = &mut track.lane;
+    if lane.resume.is_some_and(|last| u.offset <= last) {
+        return;
+    }
+    (lane.resume, lane.read) = (None, Some(u.offset));
     // Not in the clear (CSS on a DVD), nothing downstream can use it.
     if u.flags & PH_SCRAMBLED != 0 {
         if emit.drops.scrambled == 0 {
@@ -561,6 +575,8 @@ pub struct PsDemux {
     bisect: Option<(Bisect, SeekTarget)>,
     probe: Option<u64>,
     tail_at: Tail,
+    /// The pull reset ahead is a restart for one track, read from its byte without a bisection.
+    rejoined: bool,
 }
 
 impl PsDemux {
@@ -582,6 +598,7 @@ impl PsDemux {
                 anchor: None,
                 origin: None,
                 sought: false,
+                back: false,
                 last_ns: 0,
                 stretch: 1,
                 broke: false,
@@ -600,6 +617,7 @@ impl PsDemux {
             bisect: None,
             probe: None,
             tail_at: Tail::Absent,
+            rejoined: false,
         }
     }
 
@@ -710,22 +728,50 @@ impl PsDemux {
         self.park.clear();
         (self.feeding, self.ending) = (None, false);
         self.clock.scr.reset();
-        (self.clock.sought, self.clock.broke) = (true, false);
+        (self.clock.sought, self.clock.back, self.clock.broke) = (true, false, false);
         self.clock.stretch = self.clock.stretch.wrapping_add(1).max(1);
     }
 
-    fn relink(&mut self, ctx: &Ctx, pad: SrcPad, on: bool, restart: bool) {
-        let Some(track) =
-            self.tracks.iter_mut().find(|t| ctx.stream_pad(t.lane.stream) == Some(pad))
+    /// With `restart` the source went back for the track and the demuxer reads on from there.
+    fn relink(&mut self, ctx: &Ctx, pad: SrcPad, on: bool, restart: Option<SeekTarget>) {
+        let Some(at) = self.tracks.iter().position(|t| ctx.stream_pad(t.lane.stream) == Some(pad))
         else {
             return;
         };
+        if let Some(target) = restart.filter(|_| on) {
+            self.rejoin(ctx, at, pad, target);
+        }
+        let track = &mut self.tracks[at];
         track.restart();
         track.lane.pad = on.then_some(pad);
-        if restart && on && self.grown.placed == Placed::File {
-            self.grown.placed = Placed::Lost;
-        }
         self.grown.rekey(key_of(&self.tracks));
+    }
+
+    /// The track drops what it parked for a full pool, it was read ahead of the restart and
+    /// would go out first and again when read. The other tracks keep theirs, and what they had
+    /// in progress, and drop what they read again up to their last unit.
+    fn rejoin(&mut self, ctx: &Ctx, at: usize, pad: SrcPad, target: SeekTarget) {
+        let old = self.tracks[at].lane.pad;
+        self.park.rows.retain(|row| match *row {
+            Parked::Unit { pad: of, .. } | Parked::Format { pad: of, .. } => {
+                of != pad && Some(of) != old
+            }
+        });
+        for (n, track) in self.tracks.iter_mut().enumerate() {
+            let lane = &mut track.lane;
+            lane.resume = lane.read.or(lane.resume).filter(|_| lane.pad.is_some() && n != at);
+            lane.read = None;
+        }
+        self.feeding = None;
+        self.feed.restart(target.to_byte);
+        self.demux.set_position(target.to_byte);
+        (self.bisect, self.probe) = (None, None);
+        self.rejoined = ctx.pulls(Self::IN);
+        // The packs and stamps read again go back, which is no break, and the track read again
+        // is not behind itself. The line stays, a jump the other tracks made is kept.
+        self.clock.scr.reset();
+        (self.clock.back, self.clock.broke) = (true, false);
+        self.clock.stretch = self.clock.stretch.wrapping_add(1).max(1);
     }
 
     fn publish(&mut self, ctx: &mut Ctx) {
@@ -823,8 +869,9 @@ impl PsDemux {
         self.feed.restart(from.to_byte);
         self.demux.set_position(from.to_byte);
         (self.bisect, self.probe) = (None, None);
-        // The first pairing reads from the start, any later one is a seek.
-        if std::mem::replace(&mut self.paired, true) {
+        // The first pairing reads from the start, any later one is a seek or a restart.
+        let rejoined = std::mem::take(&mut self.rejoined);
+        if std::mem::replace(&mut self.paired, true) && !rejoined {
             self.bisect = self.bisector(ctx, from).map(|b| (b, from));
             let bisect = self.bisect.is_some();
             log!(&*ctx, Level::Debug, "seek", target = from.at, at = from.to_byte, bisect = bisect);
@@ -979,6 +1026,8 @@ impl Element for PsDemux {
                     broke: false,
                     lpcm: None,
                     last_dts: (0, 0),
+                    read: None,
+                    resume: None,
                 },
                 framer: video.map(|v| Framer::new(v, AU_RESERVE, AU_MAX)),
                 spu: (codec == Codec::Subpicture).then(Spu::new),
@@ -1025,6 +1074,7 @@ impl Element for PsDemux {
         clock.scr.reset();
         (clock.shift, clock.anchor, clock.sought, clock.last_ns, clock.broke) =
             (0, Some(0), false, 0, false);
+        clock.back = false;
         if let Some((first, least)) = self.opening {
             clock.unwrap.prime(first);
             (clock.shift, clock.anchor) = (ticks_ns(least), None);
@@ -1072,6 +1122,7 @@ impl Element for PsDemux {
                 if self.grown.unpublished() {
                     self.publish(ctx);
                 }
+                self.rejoined = false;
                 self.restart_streams();
                 let target = ctx.seek_target();
                 let at = target.map_or(0, |t| t.to_byte);
@@ -1081,7 +1132,7 @@ impl Element for PsDemux {
                     self.demux.set_position(target.to_byte);
                 }
             }
-            Event::SrcLinked { pad, on, restart } => self.relink(ctx, *pad, *on, restart.is_some()),
+            Event::SrcLinked { pad, on, restart } => self.relink(ctx, *pad, *on, *restart),
             _ => {}
         }
         Ok(())
@@ -1090,5 +1141,46 @@ impl Element for PsDemux {
     fn stop(&mut self, _ctx: &mut Ctx) {
         (self.feeding, self.bisect, self.probe) = (None, None, None);
         self.park.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECOND: u64 = 90_000;
+
+    /// Behind a restart for one track the stamps read again step back on the line the other
+    /// tracks are on, even past the 10 s a step may make.
+    #[test]
+    fn a_restart_far_back_keeps_the_line() {
+        let mut clock = Clock {
+            unwrap: Unwrapper::for_timestamps(),
+            scr: Unwrapper::for_timestamps(),
+            shift: 0,
+            anchor: None,
+            origin: Some(0),
+            sought: false,
+            back: false,
+            last_ns: 0,
+            stretch: 1,
+            broke: false,
+        };
+        let mut last = (0, 0);
+        let at = |pts: u64| Stamp { pts, dts: None };
+        // A jump the other tracks made moves the line.
+        let first = clock.place(at(200 * SECOND), &mut last);
+        let joined = clock.place(at(400 * SECOND), &mut last);
+        assert_eq!(joined.0, first.0);
+        clock.place(at(408 * SECOND), &mut last);
+        (clock.back, clock.stretch) = (true, clock.stretch + 1);
+        let again = clock.place(at(395 * SECOND), &mut last);
+        assert_eq!(again.0 + 5_000_000_000, joined.0);
+        // A near restart takes it too, a later jump is a break again.
+        (clock.back, clock.stretch) = (true, clock.stretch + 1);
+        let near = clock.place(at(390 * SECOND), &mut last);
+        assert_eq!(near.0 + 5_000_000_000, again.0);
+        let jumped = clock.place(at(600 * SECOND), &mut last);
+        assert_eq!(jumped.0, 208_000_000_000, "on from the last stamp out");
     }
 }

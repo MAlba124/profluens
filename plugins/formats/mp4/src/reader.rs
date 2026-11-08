@@ -779,6 +779,8 @@ enum Gate {
     Shut,
     NextSync,
     From { bound_ns: u64 },
+    // From the first sample at or past `byte`, what lies before went out before a restart.
+    Past { byte: u64 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -940,8 +942,26 @@ impl Mp4Reader {
         if track >= MAX_TRACKS {
             return;
         }
-        if self.walk.is_some() {
-            return self.select(track, true);
+        if let Some(walk) = self.walk.as_mut() {
+            let resume = walk.resume();
+            walk.restart(to_byte);
+            for gate in walk.gates.iter_mut().filter(|gate| **gate == Gate::Open) {
+                *gate = Gate::Past { byte: resume };
+            }
+            let rule = self.tables.rules.get(track);
+            if let Some(gate) = walk.gates.get_mut(track) {
+                *gate = match rule.map(|rule| (rule.kind, rule.pre_roll_ns)) {
+                    Some((TrackKind::Video, _)) => Gate::From { bound_ns: point },
+                    Some((TrackKind::Audio, lead)) => {
+                        Gate::From { bound_ns: point.saturating_sub(lead) }
+                    }
+                    _ => Gate::Open,
+                };
+            }
+            self.off[track] = false;
+            self.chunks.clear();
+            (self.buffered, self.stream_base) = (0, to_byte);
+            return;
         }
         let resume = self.tables.samples.get(self.next).map_or(SHUT, |s| s.offset);
         self.gates.iter_mut().for_each(|gate| *gate = (*gate).max(resume));
@@ -1778,6 +1798,15 @@ impl Walk {
         self.step = Step::Lost;
     }
 
+    /// The first byte of what the walk has not let out, the run is in file order.
+    fn resume(&self) -> u64 {
+        match self.step {
+            Step::Mdat { end } => self.run.get(self.next).map_or(end, |s| s.offset),
+            Step::Gather { start, .. } => start,
+            Step::Box | Step::Lost => self.at,
+        }
+    }
+
     /// Let through the run as each track's gate says, in `moof` order. A sync sample comes from
     /// the sample flags (ISO/IEC 14496-12 8.8.3.1). A fragment ending before the bound is
     /// dropped whole and the gate stays.
@@ -1826,6 +1855,13 @@ impl Walk {
                     }
                     from.unwrap_or(usize::MAX)
                 }
+                Gate::Past { byte } => match of.clone().position(|s| s.offset >= byte) {
+                    Some(n) => {
+                        *gate = Gate::Open;
+                        n
+                    }
+                    None => usize::MAX,
+                },
             };
         }
         let mut seen = [0usize; MAX_TRACKS];

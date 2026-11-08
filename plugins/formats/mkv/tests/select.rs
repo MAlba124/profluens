@@ -406,6 +406,62 @@ fn a_switch_puts_out_a_caption_read_again_once() {
     assert_eq!(stamps(&text), [800, 1_900], "once each");
 }
 
+/// Keeps every buffer it takes until it is taken out, a sink whose link waits.
+struct Hold(Taken, Vec<profluens_core::buffer::Buffer>);
+
+impl Element for Hold {
+    fn desc(&self) -> &'static ElementDesc {
+        &SINK_DESC
+    }
+
+    fn process(&mut self, _ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        while let Some(buf) = inputs.pop() {
+            let bytes = buf.memory.data();
+            if bytes != HEAD {
+                self.0.lock().unwrap().push(([bytes[0], bytes[1]], buf.pts.0 / 1_000_000));
+            }
+            self.1.push(buf);
+        }
+        Ok(Flow::Ok)
+    }
+}
+
+/// An audio sink that keeps its frames dries the pool, and the demuxer parks the next frame it
+/// read, of the audio or of the video. The audio moved to another sink with a restart starts
+/// at its line, not at a frame it parked ahead, and the video loses no picture it parked. The
+/// pool sizes park a frame of each.
+#[test]
+fn a_restart_drops_what_the_track_parked_and_the_other_tracks_keep_theirs() {
+    let stream = movie();
+    let cues = cues_of(&stream);
+    for slots in [24, 25, 26, 27] {
+        let mut r = Rig::new(&stream);
+        r.p.set_pool(4096, slots);
+        let (_, video) = r.play(0);
+        let pad = r.p.select(r.demux, 1).expect("select");
+        let held = Taken::default();
+        let hold = r.p.add(Hold(Arc::clone(&held), Vec::new()));
+        r.p.link(r.demux.src(pad), hold.sink(SinkPad(0))).expect("pad -> hold");
+        let mut run = r.p.step(Arc::new(r.clock.clone())).expect("step");
+        assert!(!r.run(&mut run, || false), "the pool runs dry, {slots} slots");
+        let position = *stamps(&held).last().expect("held") * 1_000_000;
+        let line = position - 21_333_334 - 1_000_000;
+        let &(at, byte) =
+            cues.iter().rev().find(|(time, _)| *time <= line).expect("a cue ahead of the line");
+        r.p.remove(hold, Leave::Cut).expect("remove");
+        let moved = Taken::default();
+        let sink = r.p.add(Rec(Arc::clone(&moved)));
+        r.p.link(r.demux.src(pad), sink.sink(SinkPad(0))).expect("pad -> sink");
+        let targets = [(r.src, byte, Timestamp(at)), (r.demux, byte, Timestamp(position))];
+        r.p.commit_at(Timestamp(position), &targets).expect("commit");
+        assert!(r.run(&mut run, || false), "the run ends");
+        run.finish().expect("finish");
+        assert_eq!(stamps(&video), every(40, 0), "every picture once, {slots} slots");
+        let from = (line / 20_000_000) * 20;
+        assert_eq!(stamps(&moved), every(20, from), "from its line, {slots} slots");
+    }
+}
+
 /// The seek index of the Cues is computed once a set of linked tracks. A seek computes none, a
 /// link that changes the set computes it once, and one back to a set seen lately none. The
 /// captions are not computed again for any of them. What preroll logs is not handed to the

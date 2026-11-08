@@ -225,6 +225,21 @@ fn fragments_round_trip_through_the_reader() {
     }
 }
 
+/// A 5.1 stream's dOps, mapping family 1, and its OpusHead.
+#[test]
+fn dops_becomes_an_opus_head() {
+    let dops = [0, 6, 0x01, 0x38, 0, 0, 0xBB, 0x80, 0xFF, 0xF6, 1, 4, 2, 0, 4, 1, 2, 3, 5];
+    let mut head = b"OpusHead".to_vec();
+    head.extend_from_slice(&[1, 6, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0xF6, 0xFF, 1, 4, 2]);
+    head.extend_from_slice(&[0, 4, 1, 2, 3, 5]);
+    assert_eq!(opus_head_from_dops(&dops).unwrap(), head);
+    assert_eq!(dops_from_opus_head(&head).unwrap(), dops, "and back");
+    assert!(opus_head_from_dops(&dops[..18]).is_none(), "a short table");
+    let mut v1 = dops;
+    v1[0] = 1;
+    assert!(opus_head_from_dops(&v1).is_none());
+}
+
 #[test]
 fn opus_head_becomes_dops() {
     let mut head = b"OpusHead".to_vec();

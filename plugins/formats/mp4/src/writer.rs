@@ -748,6 +748,28 @@ fn sample_entry(out: &mut Vec<u8>, h: &TrackHead) {
     close(out, at);
 }
 
+/// The OpusHead (RFC 7845 5.1) of a `dOps` body (Opus in ISOBMFF 4.3.2), the inverse of
+/// [`dops_from_opus_head`]. `None` for another version or a short body.
+pub fn opus_head_from_dops(dops: &[u8]) -> Option<Vec<u8>> {
+    let f = dops.get(..11)?;
+    if f[0] != 0 {
+        return None;
+    }
+    let (channels, family) = (f[1], f[10]);
+    let mut out = Vec::with_capacity(21 + usize::from(channels));
+    out.extend_from_slice(b"OpusHead");
+    out.push(1);
+    out.push(channels);
+    out.extend_from_slice(&u16::from_be_bytes([f[2], f[3]]).to_le_bytes());
+    out.extend_from_slice(&u32::from_be_bytes([f[4], f[5], f[6], f[7]]).to_le_bytes());
+    out.extend_from_slice(&i16::from_be_bytes([f[8], f[9]]).to_le_bytes());
+    out.push(family);
+    if family != 0 {
+        out.extend_from_slice(dops.get(11..13 + usize::from(channels))?);
+    }
+    Some(out)
+}
+
 /// RFC 7845 5.1. `None` for a short head or another magic.
 pub fn dops_from_opus_head(head: &[u8]) -> Option<Vec<u8>> {
     if head.len() < 19 || &head[..8] != b"OpusHead" {

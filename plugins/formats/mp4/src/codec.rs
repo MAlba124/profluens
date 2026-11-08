@@ -443,6 +443,12 @@ fn parse_audio_entry(payload: &[u8], entry: &mut SampleEntry) -> Result<(), BoxE
                 entry.family = "bytes";
             }
         }
+        // Kept as the Matroska CodecPrivate and the open's head, the demuxer sends none.
+        b"Opus" => {
+            if let Some(head) = child(b"dOps").and_then(crate::writer::opus_head_from_dops) {
+                entry.config_record = head;
+            }
+        }
         b"alac" => {
             if let Some(cookie) = child(b"alac").and_then(|b| b.get(4..)) {
                 // ALACSpecificConfig bitDepth, behind frameLength and compatibleVersion

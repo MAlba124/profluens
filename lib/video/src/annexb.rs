@@ -1,19 +1,16 @@
 //! The NAL units of an Annex B byte stream (ITU-T H.264 and H.265 Annex B).
 //! Reads headers only, emulation prevention bytes are left in place.
 
+use pf_hdr::h26x::start_code;
+
 pub struct Nals<'a> {
     rest: &'a [u8],
 }
 
 /// Walk the NAL units of `unit`, skipping bytes ahead of the first start code.
 pub fn nals(unit: &[u8]) -> Nals<'_> {
-    let rest = start_code(unit).map_or(&[][..], |at| &unit[at + 3..]);
+    let rest = start_code(unit, 0).map_or(&[][..], |at| &unit[at + 3..]);
     Nals { rest }
-}
-
-/// Where the next `00 00 01` start code prefix begins (B.1.1).
-fn start_code(data: &[u8]) -> Option<usize> {
-    data.windows(3).position(|w| w == [0, 0, 1])
 }
 
 impl<'a> Iterator for Nals<'a> {
@@ -24,7 +21,7 @@ impl<'a> Iterator for Nals<'a> {
         if self.rest.is_empty() {
             return None;
         }
-        let (nal, rest) = match start_code(self.rest) {
+        let (nal, rest) = match start_code(self.rest, 0) {
             Some(end) => (&self.rest[..end], &self.rest[end + 3..]),
             None => (self.rest, &[][..]),
         };

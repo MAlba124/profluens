@@ -2,6 +2,7 @@
 
 pub use crate::bits::{BitReader, de_emulate};
 use crate::fixed::FixedList;
+use pf_hdr::h26x::start_code;
 
 /// A parsed NAL (7.4.1) as offsets into the access unit, header and emulation bytes included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,23 +65,14 @@ pub fn split_nals_into(au: &[u8], out: &mut Vec<Nal>) {
 
 /// Calls `f` on each NAL of an Annex-B access unit in order, as [`split_nals`] finds them.
 pub fn for_each_nal(au: &[u8], mut f: impl FnMut(Nal)) {
-    let mut open: Option<usize> = None;
-    let mut i = 0;
-    while i + 3 <= au.len() {
-        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
-            if let Some(s) = open {
-                let end = if i > s && au[i - 1] == 0 { i - 1 } else { i };
-                push_nal(au, s, end, &mut f);
-            }
-            open = Some(i + 3);
-            i += 3;
-        } else {
-            i += 1;
-        }
+    let Some(first) = start_code(au, 0) else { return };
+    let mut open = first + 3;
+    while let Some(i) = start_code(au, open) {
+        let end = if i > open && au[i - 1] == 0 { i - 1 } else { i };
+        push_nal(au, open, end, &mut f);
+        open = i + 3;
     }
-    if let Some(s) = open {
-        push_nal(au, s, au.len(), &mut f);
-    }
+    push_nal(au, open, au.len(), &mut f);
 }
 
 fn push_nal(au: &[u8], start: usize, end: usize, f: &mut impl FnMut(Nal)) {
@@ -1409,6 +1401,45 @@ mod tests {
         let mut out = [0xAA; 16];
         assert_eq!(de_emulate(&body, &mut out), 8, "a short body ends it");
         assert_eq!(&out[..8], &[0x88, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x11]);
+    }
+
+    #[test]
+    // Test code.
+    #[allow(clippy::disallowed_methods)]
+    fn split_nals_into_matches_a_byte_walk() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut out = Vec::new();
+        for len in 0..600usize {
+            let au: Vec<u8> = (0..len % 90)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    [0, 0, 0, 1, 1, 3, 0x40, 0x26, 0x65, 0xAA][(x % 10) as usize]
+                })
+                .collect();
+            // the walk the start code finder replaced
+            let mut walk = Vec::new();
+            let (mut open, mut i) = (None, 0);
+            while i + 3 <= au.len() {
+                if au[i..i + 3] == [0, 0, 1] {
+                    if let Some(s) = open {
+                        walk.push((s, if i > s && au[i - 1] == 0 { i - 1 } else { i }));
+                    }
+                    open = Some(i + 3);
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            if let Some(s) = open {
+                walk.push((s, au.len()));
+            }
+            walk.retain(|&(s, e)| e > s);
+            split_nals_into(&au, &mut out);
+            let got: Vec<_> = out.iter().map(|n| (n.start as usize, n.end as usize)).collect();
+            assert_eq!(got, walk, "{au:?}");
+        }
     }
 
     #[test]

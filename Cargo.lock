@@ -237,6 +237,7 @@ dependencies = [
 name = "pf-hdr"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "profluens-core",
 ]
 

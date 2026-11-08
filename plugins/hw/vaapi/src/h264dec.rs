@@ -24,16 +24,16 @@ use std::sync::Arc;
 use crate::decproc::{self, Twins};
 use crate::error::{Transient, VaapiErrorKind as K, Verdict, Warned, failed, log_fatal};
 use crate::ffi;
+use crate::gpuframe::Handoff;
 use crate::gpuframe::{
     self, F_LAYOUT, F_MODIFIER, FAMILY_VIDEO_GPU, FrameToken, FrameTx, GPU_FRAME_HEADER_LEN,
     GpuFrame, GpuFrameChannel, GpuFrameHeader, LAYOUT_NV12_DMABUF,
 };
-use crate::gpuframe::Handoff;
-use crate::stats::Stats;
 use crate::h264parse::{
     self, MmcoOp, Nal, Pps, PredWeightTable, RefListMod, SliceHeader, SliceType, Sps,
 };
 use crate::probe;
+use crate::stats::Stats;
 use crate::va::{
     Buffer as VaBuffer, Config, Context, Display, ExportFn, ExportedSurface, MappedImage,
     SurfaceFormat, Surfaces,
@@ -531,13 +531,6 @@ impl VaapiH264Dec {
         }
     }
 
-    fn decode_au(&mut self, ctx: &mut Ctx, au: &[u8], pts: Timestamp, duration: Timestamp) {
-        let mut sc = std::mem::take(&mut self.scratch);
-        self.decode_au_with(ctx, au, pts, duration, &mut sc);
-        sc.clear();
-        self.scratch = sc;
-    }
-
     fn decode_au_with(
         &mut self,
         ctx: &mut Ctx,
@@ -546,7 +539,6 @@ impl VaapiH264Dec {
         duration: Timestamp,
         sc: &mut AuScratch,
     ) {
-        h264parse::split_nals_into(au, &mut sc.nals);
         self.seq_end = sc
             .nals
             .iter()
@@ -1504,7 +1496,7 @@ impl Element for VaapiH264Dec {
                     continue;
                 }
                 if self.pending.is_none() && self.output_queue.is_empty() {
-                    break; // held by the DPB alone, decode_au's drop is the fuse
+                    break; // held by the DPB alone, decode_au_with's drop is the fuse
                 }
                 if !self.emit_pending(ctx)? {
                     return Ok(Flow::Ok); // pool dry, re-cranked on slot return
@@ -1516,8 +1508,12 @@ impl Element for VaapiH264Dec {
             }
             let Some(inbuf) = inputs.pop() else { break };
             self.only = inbuf.flags.contains(BufferFlags::DECODE_ONLY);
+            let au = inbuf.memory.data();
+            let mut sc = std::mem::take(&mut self.scratch);
+            h264parse::split_nals_into(au, &mut sc.nals);
             if self.side.gather(
                 pf_hdr::h26x::Codec::H264,
+                sc.nals.iter().map(|n| n.raw(au)),
                 &inbuf.memory,
                 inbuf.pts.0,
                 &mut self.hdr,
@@ -1531,7 +1527,9 @@ impl Element for VaapiH264Dec {
                     max_cll = l.max_cll
                 );
             }
-            self.decode_au(ctx, inbuf.memory.data(), inbuf.pts, inbuf.duration);
+            self.decode_au_with(ctx, au, inbuf.pts, inbuf.duration, &mut sc);
+            sc.clear();
+            self.scratch = sc;
         }
         Ok(Flow::Ok)
     }

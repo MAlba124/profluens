@@ -2,6 +2,7 @@
 
 use crate::bits::BitReader;
 use crate::fixed::FixedList;
+use pf_hdr::h26x::start_code;
 
 // NAL unit types (Table 7-1). The header is 2 bytes.
 pub const NAL_TRAIL_N: u8 = 0;
@@ -96,23 +97,14 @@ pub fn split_nals(au: &[u8]) -> Vec<Nal> {
 /// [`split_nals`] into `out`, cleared first, which a decoder keeps across units. One pass.
 pub fn split_nals_into(au: &[u8], out: &mut Vec<Nal>) {
     out.clear();
-    let mut open: Option<usize> = None;
-    let mut i = 0;
-    while i + 3 <= au.len() {
-        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
-            if let Some(s) = open {
-                let end = if i > s && au[i - 1] == 0 { i - 1 } else { i };
-                push_nal(au, s, end, out);
-            }
-            open = Some(i + 3);
-            i += 3;
-        } else {
-            i += 1;
-        }
+    let Some(first) = start_code(au, 0) else { return };
+    let mut open = first + 3;
+    while let Some(i) = start_code(au, open) {
+        let end = if i > open && au[i - 1] == 0 { i - 1 } else { i };
+        push_nal(au, open, end, out);
+        open = i + 3;
     }
-    if let Some(s) = open {
-        push_nal(au, s, au.len(), out);
-    }
+    push_nal(au, open, au.len(), out);
 }
 
 fn push_nal(au: &[u8], start: usize, end: usize, out: &mut Vec<Nal>) {
@@ -2123,6 +2115,45 @@ mod tests {
         assert_eq!(whole.slice_data_byte_offset, sh.slice_data_byte_offset);
         assert_eq!(whole.slice_qp_delta, sh.slice_qp_delta);
         assert_eq!(rbsp.len(), nal.len() - 4, "two bytes of header and two emulation bytes");
+    }
+
+    #[test]
+    // Test code.
+    #[allow(clippy::disallowed_methods)]
+    fn split_nals_into_matches_a_byte_walk() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut out = Vec::new();
+        for len in 0..600usize {
+            let au: Vec<u8> = (0..len % 90)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    [0, 0, 0, 1, 1, 3, 0x40, 0x26, 0x65, 0xAA][(x % 10) as usize]
+                })
+                .collect();
+            // the walk the start code finder replaced
+            let mut walk = Vec::new();
+            let (mut open, mut i) = (None, 0);
+            while i + 3 <= au.len() {
+                if au[i..i + 3] == [0, 0, 1] {
+                    if let Some(s) = open {
+                        walk.push((s, if i > s && au[i - 1] == 0 { i - 1 } else { i }));
+                    }
+                    open = Some(i + 3);
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            if let Some(s) = open {
+                walk.push((s, au.len()));
+            }
+            walk.retain(|&(s, e)| e >= s + 2);
+            split_nals_into(&au, &mut out);
+            let got: Vec<_> = out.iter().map(|n| (n.start as usize, n.end as usize)).collect();
+            assert_eq!(got, walk, "{au:?}");
+        }
     }
 
     #[test]

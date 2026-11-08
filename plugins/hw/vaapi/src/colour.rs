@@ -106,15 +106,18 @@ impl HdrCarry {
         }
     }
 
-    pub fn gather(
+    /// The HDR of `unit` from the NAL units the decoder split it into, so its bytes are scanned
+    /// once.
+    pub fn gather<'a>(
         &mut self,
         codec: pf_hdr::h26x::Codec,
+        nals: impl Iterator<Item = &'a [u8]>,
         unit: &profluens_core::memory::Memory,
         pts: u64,
         hdr: &mut HdrStatic,
     ) -> bool {
         let mut scan = pf_hdr::h26x::Scan::new(pf_hdr::side::Writer::new(&mut self.side));
-        pf_hdr::h26x::scan_annexb(codec, unit.data(), &mut self.scratch, &mut scan);
+        pf_hdr::h26x::scan_nals(codec, nals, &mut self.scratch, &mut scan);
         settle(&mut self.carry, &mut self.dovi, scan, unit, pts, hdr)
     }
 

@@ -10,3 +10,4 @@ name = "pf_hdr"
 
 [dependencies]
 profluens-core = { path = "../../../core" }
+memchr = "2.8"

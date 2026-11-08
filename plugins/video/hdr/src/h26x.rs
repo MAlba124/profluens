@@ -81,28 +81,56 @@ pub fn sei(rbsp: &[u8], scan: &mut Scan<'_>) {
     }
 }
 
+/// Where the first `00 00 01` start code prefix at or past `from` begins (B.1.1). Steps between
+/// the 0x01 bytes by memchr, which a slice payload holds few of.
+pub fn start_code(data: &[u8], from: usize) -> Option<usize> {
+    let mut at = from.checked_add(2)?;
+    while at < data.len() {
+        let one = at + memchr::memchr(1, &data[at..])?;
+        if data[one - 1] == 0 && data[one - 2] == 0 {
+            return Some(one - 2);
+        }
+        at = one + 1;
+    }
+    None
+}
+
 /// The NAL units of an Annex B access unit (Annex B.2), trailing zero bytes off each.
 pub fn annexb_nals(unit: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let start = |d: &[u8]| d.windows(3).position(|w| w == [0, 0, 1]);
-    let mut rest = start(unit).map_or(&[][..], |at| &unit[at + 3..]);
+    let mut rest = start_code(unit, 0).map_or(&[][..], |at| &unit[at + 3..]);
     std::iter::from_fn(move || {
         if rest.is_empty() {
             return None;
         }
-        let (nal, next) = match start(rest) {
+        let (nal, next) = match start_code(rest, 0) {
             Some(end) => (&rest[..end], &rest[end + 3..]),
             None => (rest, &[][..]),
         };
         rest = next;
-        let trimmed = nal.iter().rposition(|&b| b != 0).map_or(&[][..], |last| &nal[..=last]);
-        Some(trimmed)
+        Some(trim_zeros(nal))
     })
 }
 
+fn trim_zeros(nal: &[u8]) -> &[u8] {
+    nal.iter().rposition(|&b| b != 0).map_or(&[][..], |last| &nal[..=last])
+}
+
 pub fn scan_annexb(codec: Codec, unit: &[u8], scratch: &mut [u8], scan: &mut Scan<'_>) {
+    scan_nals(codec, annexb_nals(unit), scratch, scan);
+}
+
+/// [`scan_annexb`] over NAL units a decoder has split already, header first, trailing zero bytes
+/// allowed.
+pub fn scan_nals<'a>(
+    codec: Codec,
+    nals: impl Iterator<Item = &'a [u8]>,
+    scratch: &mut [u8],
+    scan: &mut Scan<'_>,
+) {
     let mut rpu: Option<&[u8]> = None;
     let mut el = false;
-    for nal in annexb_nals(unit) {
+    for nal in nals {
+        let nal = trim_zeros(nal);
         let (sei_body, header) = match codec {
             Codec::H264 => match nal.first() {
                 Some(b) if b & 0x1F == H264_SEI => (true, 1),
@@ -222,6 +250,56 @@ mod tests {
             out.extend_from_slice(n);
         }
         out
+    }
+
+    /// Bytes thick with zeros and ones, so start codes, near misses and runs of zeros come often.
+    fn dense(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                [0, 0, 0, 0, 1, 1, 3, 0x40, 0x26, 0xAA][(x % 10) as usize]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn start_code_finds_what_a_byte_walk_finds() {
+        for seed in 0..400u64 {
+            let d = dense(seed, (seed % 70) as usize);
+            for from in 0..=d.len() + 1 {
+                let walk = (from..d.len().saturating_sub(2)).find(|&i| d[i..i + 3] == [0, 0, 1]);
+                assert_eq!(start_code(&d, from), walk, "{d:?} from {from}");
+            }
+        }
+        assert_eq!(start_code(&[0, 0, 1], usize::MAX), None);
+    }
+
+    #[test]
+    fn a_split_list_scans_as_the_whole_unit_does() {
+        let mut prefix = vec![H265_PREFIX_SEI << 1, 1];
+        prefix.extend(escape(&hdr10_sei()));
+        let rpu = vec![H265_DOVI_RPU << 1, 1, 0x19, 0x08, 0x09, 0x00, 0x00, 0x03, 0x01, 0x80];
+        let mut u = unit(&[prefix, vec![1 << 1, 1, 0xAF], rpu]);
+        u.extend_from_slice(&[0, 0]);
+        let (mut whole, mut split, mut scratch) = ([0u8; 256], [0u8; 256], [0u8; 256]);
+        let mut a = Scan::new(Writer::new(&mut whole));
+        scan_annexb(Codec::H265, &u, &mut scratch, &mut a);
+        // as a decoder splits, each NAL to the next start code with its trailing zeros
+        let mut nals = Vec::new();
+        let mut open = start_code(&u, 0).unwrap() + 3;
+        while let Some(i) = start_code(&u, open) {
+            nals.push(&u[open..i]);
+            open = i + 3;
+        }
+        nals.push(&u[open..]);
+        let mut b = Scan::new(Writer::new(&mut split));
+        scan_nals(Codec::H265, nals.into_iter(), &mut scratch, &mut b);
+        assert_eq!((a.mastering, a.light), (b.mastering, b.light));
+        assert!(a.light.is_some());
+        assert_eq!(a.side.bytes(), b.side.bytes(), "the RPU ends at its last byte both ways");
     }
 
     #[test]

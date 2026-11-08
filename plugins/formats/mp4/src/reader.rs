@@ -160,6 +160,9 @@ pub struct Track {
     /// Bits a second, the entry's stated avgBitrate, else its sample sizes summed over the
     /// media's duration. 0 for unknown, a fragmented track's samples are not in the head.
     pub bitrate: u64,
+    /// The sample delta most samples take in media ticks, the `stts` one, else a fragmented
+    /// movie's `trex` default. 0 for unknown.
+    pub frame_ticks: u32,
 }
 
 impl Track {
@@ -1626,6 +1629,10 @@ fn resolve_moov(moov_body: &[u8], limits: Option<Limits>) -> Result<Movie, Mp4Er
     for track in tracks.iter_mut().filter(|track| track.duration_ns == 0) {
         track.duration_ns = duration_ns;
     }
+    // a fragment's samples are not in the head, their default duration stands for them
+    for (track, x) in tracks.iter_mut().zip(&trex).filter(|(t, _)| t.frame_ticks == 0) {
+        track.frame_ticks = x.duration;
+    }
     Ok(Movie { tracks, samples, trex: Some(trex), duration_ns, skipped })
 }
 
@@ -1946,6 +1953,7 @@ fn resolve_track(
         0 => bytes.map_or(0, |b| bits_per_second(b, mdhd.duration, mdhd.timescale)),
         avg => u64::from(avg),
     };
+    let frame_ticks = stts.map_or(0, |b| frame_ticks(b.body(stbl_body)));
     let stbl = match (stts, sizes_box, stsc, chunk_offsets_box) {
         (Some(stts), Some(sizes_box), Some(stsc), Some(chunk_offsets_box)) => {
             let stz2 = sizes_box.kind == boxes::boxtype::STZ2;
@@ -2013,6 +2021,7 @@ fn resolve_track(
         disposition: role,
         forced,
         bitrate,
+        frame_ticks,
     };
     Ok(Some((track, stbl)))
 }
@@ -2037,6 +2046,50 @@ fn sizes_total(body: &[u8], stz2: bool) -> Option<u64> {
         8 => table[..n].iter().map(|&b| u64::from(b)).sum(),
         _ => (0..n).map(|k| u64::from(table[k / 2] >> (4 * (1 - k % 2)) & 0x0F)).sum(),
     })
+}
+
+/// Distinct deltas `frame_ticks` tallies, a table with more takes the mean.
+const DELTAS: usize = 16;
+
+/// The delta most samples of an `stts` body take, walked in place. A variable rate table of more
+/// than `DELTAS` distinct deltas gives the mean instead, 0 for a table of no timed sample.
+fn frame_ticks(body: &[u8]) -> u32 {
+    let be32 = |o: usize| body.get(o..o + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let Some(n) = be32(4) else { return 0 };
+    let mut tally = [(0u32, 0u64); DELTAS];
+    let (mut used, mut over) = (0, false);
+    let (mut ticks, mut samples) = (0u128, 0u64);
+    for i in 0..n as usize {
+        let at = 8 + i * 8;
+        let (Some(count), Some(delta)) = (be32(at), be32(at + 4)) else { break };
+        if count == 0 || delta == 0 {
+            continue;
+        }
+        ticks += u128::from(count) * u128::from(delta);
+        samples += u64::from(count);
+        match tally[..used].iter_mut().find(|t| t.0 == delta) {
+            Some(t) => t.1 += u64::from(count),
+            None if used < DELTAS => {
+                tally[used] = (delta, u64::from(count));
+                used += 1;
+            }
+            None => over = true,
+        }
+    }
+    if samples == 0 {
+        return 0;
+    }
+    if over {
+        return u32::try_from(ticks / u128::from(samples)).unwrap_or(0);
+    }
+    // the first of equal counts, a table's leading run
+    let mut best = tally[0];
+    for t in &tally[1..used] {
+        if t.1 > best.1 {
+            best = *t;
+        }
+    }
+    best.0
 }
 
 /// `bytes` over `duration` ticks of `timescale` a second, as bits a second.
@@ -2468,6 +2521,34 @@ impl<'a> SyncLookup<'a> {
 mod tests {
     use super::*;
     use crate::boxes::{CttsEntry, SampleSizes, StscEntry, SttsEntry};
+
+    /// An `stts` body of `runs`, count and delta each.
+    fn stts(runs: &[(u32, u32)]) -> Vec<u8> {
+        let mut b = vec![0u8; 4];
+        b.extend_from_slice(&(runs.len() as u32).to_be_bytes());
+        for (c, d) in runs {
+            b.extend_from_slice(&c.to_be_bytes());
+            b.extend_from_slice(&d.to_be_bytes());
+        }
+        b
+    }
+
+    /// The delta most samples take, a short last sample left out. Past `DELTAS` distinct ones the
+    /// mean, an empty or cut table is 0 or what it holds.
+    #[test]
+    fn the_frame_delta_is_the_one_most_samples_take() {
+        assert_eq!(frame_ticks(&stts(&[(299, 1001), (1, 500)])), 1001);
+        assert_eq!(frame_ticks(&stts(&[(10, 3000), (50, 1500), (10, 3000), (5, 1500)])), 1500);
+        assert_eq!(frame_ticks(&stts(&[(4, 1000), (4, 2000)])), 1000, "a tie takes the first");
+        let vfr: Vec<(u32, u32)> = (0..40).map(|i| (1, 990 + i)).collect();
+        assert_eq!(frame_ticks(&stts(&vfr)), 1009, "the mean of 990 to 1029");
+        assert_eq!(frame_ticks(&stts(&[])), 0);
+        assert_eq!(frame_ticks(&stts(&[(5, 0), (0, 40)])), 0, "no timed sample");
+        let mut cut = stts(&[(3, 512), (9, 256)]);
+        cut.truncate(cut.len() - 4);
+        assert_eq!(frame_ticks(&cut), 512, "the runs the body holds");
+        assert_eq!(frame_ticks(&[0, 0]), 0);
+    }
 
     #[test]
     fn error_messages_carry_the_variant_data() {

@@ -47,6 +47,8 @@ pub struct Meta {
     pub duration: Option<f64>,
     pub width: Option<f64>,
     pub height: Option<f64>,
+    /// Frames a second.
+    pub framerate: Option<f64>,
     pub video_codec: Option<f64>,
     pub audio_codec: Option<f64>,
     pub filepositions: Option<Array>,
@@ -151,6 +153,7 @@ fn props(c: &mut Cursor<'_>, depth: u8, level: Level, meta: &mut Meta) -> Result
             (Level::Top, b"duration", NUMBER) => Some(&mut meta.duration),
             (Level::Top, b"width", NUMBER) => Some(&mut meta.width),
             (Level::Top, b"height", NUMBER) => Some(&mut meta.height),
+            (Level::Top, b"framerate", NUMBER) => Some(&mut meta.framerate),
             (Level::Top, b"videocodecid", NUMBER) => Some(&mut meta.video_codec),
             (Level::Top, b"audiocodecid", NUMBER) => Some(&mut meta.audio_codec),
             _ => None,
@@ -280,6 +283,7 @@ mod tests {
         b.push(STRING);
         key(&mut b, "Lavf");
         num(&mut b, "width", 128.0);
+        num(&mut b, "framerate", 29.97);
         key(&mut b, "nested");
         b.push(OBJECT);
         num(&mut b, "duration", 99.0);
@@ -300,6 +304,7 @@ mod tests {
             let b = body(ecma);
             let m = on_meta_data(&b).unwrap();
             assert_eq!((m.duration, m.width, m.height), (Some(4.25), Some(128.0), None));
+            assert_eq!(m.framerate, Some(29.97));
             assert_eq!((m.video_codec, m.audio_codec), (Some(7.0), None), "a nested one is not");
             let pos: Vec<_> = numbers(&b, m.filepositions.unwrap()).collect();
             let times: Vec<_> = numbers(&b, m.times.unwrap()).collect();

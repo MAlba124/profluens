@@ -69,6 +69,9 @@ fn tracks_into(tracks: &[Track], d: &mut Desc) -> Result<u64, OpenError> {
             out.par = crate::ratio(u64::from(e.par.0), u64::from(e.par.1));
         }
         out.rotation = t.rotation;
+        if kind == TrackKind::Video {
+            out.frame_ns = ns(i64::from(t.frame_ticks), t.timescale);
+        }
         out.bitrate = t.bitrate;
         out.delay_ns = ns(t.delay_ticks(), t.timescale);
         out.seek_preroll_ns = if family == "opus" { OPUS_PREROLL_NS } else { 0 };

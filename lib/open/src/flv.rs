@@ -14,6 +14,8 @@ struct Found {
     video_record: Option<(usize, usize, u64)>,
     audio_record: Option<(usize, usize, u64)>,
     mp3: Option<(u32, u32)>,
+    /// The first and the last video frame tag's stamp, ms, and how many frame tags.
+    frames: Option<(u32, u32, u32)>,
 }
 
 impl Found {
@@ -30,6 +32,11 @@ impl Found {
                 let codec = *self.video.get_or_insert(v.codec);
                 if v.packet == Packet::Config && codec == v.codec && self.video_record.is_none() {
                     self.video_record = Some((v.from, v.to, at));
+                }
+                if v.packet == Packet::Frame && codec == v.codec {
+                    let ts = tag.header.ts_ms;
+                    let (first, _, n) = self.frames.unwrap_or((ts, ts, 0));
+                    self.frames = Some((first, ts, n.saturating_add(1)));
                 }
             }
             tag::AUDIO => {
@@ -48,6 +55,21 @@ impl Found {
             }
             _ => {}
         }
+    }
+}
+
+/// A frame's duration by `onMetaData`'s framerate, else the mean step of the head's frame tags,
+/// 0 for neither.
+fn frame_ns(framerate: Option<f64>, frames: Option<(u32, u32, u32)>) -> u64 {
+    if let Some(r) = framerate.filter(|r| r.is_finite() && (1.0..=1000.0).contains(r)) {
+        return (1e9 / r).round() as u64;
+    }
+    match frames {
+        // stamps are decode order and whole ms, the span over many frames evens them out
+        Some((first, last, n)) if n > 1 && last > first => {
+            u64::from(last - first) * 1_000_000 / u64::from(n - 1)
+        }
+        _ => 0,
     }
 }
 
@@ -76,6 +98,7 @@ pub(crate) fn describe(head: &[u8], d: &mut Desc) -> Result<u64, OpenError> {
             Some(family) => {
                 let mut t = TrackDesc::new(1, TrackKind::Video, family);
                 (t.width, t.height) = (pixels(meta.width), pixels(meta.height));
+                t.frame_ns = frame_ns(meta.framerate, found.frames);
                 let rec = record(head, found.video_record);
                 if v.nal() {
                     // a broken record leaves the parameter sets in band, the units 4 octet long

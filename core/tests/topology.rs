@@ -13,7 +13,7 @@ use profluens_core::error::PropError;
 use profluens_core::error::{Error, GraphError, Scope, TopologyError};
 use profluens_core::event::Event;
 use profluens_core::format::{OfferDesc, Value};
-use profluens_core::id::{ElementId, LinkId, SinkPad, SrcPad};
+use profluens_core::id::{ElementId, FormatId, LinkId, SinkPad, SrcPad};
 use profluens_core::level::Limit;
 use profluens_core::log::{DebugSpec, Level, LogRecord, LogWriter, Loggable, Logs, with_logs};
 use profluens_core::pipeline::Pipeline;
@@ -1021,6 +1021,52 @@ fn a_stream_has_no_pad_until_it_is_selected() {
     );
     assert_eq!(r.rows(sink), (0..400).collect::<Vec<_>>());
     assert_eq!(r.p.counters(demux).drops, 0);
+}
+
+/// A demuxer of two streams in different families.
+struct TwoFamilies;
+
+impl Element for TwoFamilies {
+    fn desc(&self) -> &'static ElementDesc {
+        &DEMUX
+    }
+
+    fn preroll(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        static AC3: [OfferDesc; 1] = [OfferDesc::any("ac3")];
+        for (n, offers) in [&BYTES, &AC3].into_iter().enumerate() {
+            ctx.add_stream(Stream {
+                kind: StreamKind::Audio,
+                codec: offers[0].family,
+                language: "en".into(),
+                title: "".into(),
+                default: n == 0,
+                forced: false,
+                disposition: Disposition::MAIN,
+                channels: 0,
+                duration: Timestamp::NONE,
+                sparse: false,
+                name: format!("src_{n}").into(),
+                offers,
+            });
+        }
+        Ok(())
+    }
+
+    fn process(&mut self, _ctx: &mut Ctx, _inputs: Inputs<'_>) -> Result<Flow, Error> {
+        Ok(Flow::Eos)
+    }
+}
+
+#[test]
+fn a_stream_selected_later_has_its_family_named_at_preroll() {
+    let mut r = Rig::new();
+    let src = r.add(&SRC, Role::Source);
+    let demux = r.p.add(TwoFamilies);
+    r.link(src.src(OUT), demux.sink(IN));
+    r.p.set_select_all(false);
+    r.p.preroll().expect("preroll");
+    let named = (0..64).filter_map(|i| r.p.family_name(FormatId(i))).any(|f| f == "ac3");
+    assert!(named, "a switch to it announces in the run's vocabulary");
 }
 
 #[test]

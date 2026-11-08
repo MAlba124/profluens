@@ -1983,6 +1983,10 @@ impl Pipeline {
                 self.dyn_pads[i].sinks.push(ap);
             }
             self.streams[i] = ctx.take_streams();
+            // the run's vocabulary is fixed at its start, a stream selected later announces in it
+            for s in &self.streams[i] {
+                Interned::intern(s.offers, [&mut self.formats, &mut self.fields, &mut self.values]);
+            }
             for stream in 0..if self.select_all { self.streams[i].len() as u32 } else { 0 } {
                 let pad = self.select(id, stream)?;
                 let name = self.streams[i][stream as usize].name.to_string();

@@ -642,7 +642,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 [[package]]
 name = "stein-arena"
 version = "0.1.0"
-source = "git+https://github.com/MAlba124/steinlibs.git?rev=ea62632a679f3b06a0b1e1e69470d72cf190bf32#ea62632a679f3b06a0b1e1e69470d72cf190bf32"
+source = "git+https://github.com/MAlba124/steinlibs.git?rev=3b28d6a7773c2dbb6e7d008cd5c1a6810d4d7d62#3b28d6a7773c2dbb6e7d008cd5c1a6810d4d7d62"
 dependencies = [
  "rustix",
 ]
@@ -650,7 +650,7 @@ dependencies = [
 [[package]]
 name = "stein-io"
 version = "0.1.0"
-source = "git+https://github.com/MAlba124/steinlibs.git?rev=ea62632a679f3b06a0b1e1e69470d72cf190bf32#ea62632a679f3b06a0b1e1e69470d72cf190bf32"
+source = "git+https://github.com/MAlba124/steinlibs.git?rev=3b28d6a7773c2dbb6e7d008cd5c1a6810d4d7d62#3b28d6a7773c2dbb6e7d008cd5c1a6810d4d7d62"
 dependencies = [
  "io-uring",
  "libc",

@@ -322,7 +322,9 @@ impl Element for AudioDownmix {
                 return Err(failed(ctx, DESC.name, K::InputStrideUnknown));
             }
             let len = buf.memory.len();
-            if let Some((rate, 1..=2, _)) = self.input
+            // what passes as it is, a stereo input to a mono fold goes through `emit`
+            if let Some((rate, channels @ 1..=2, _)) = self.input
+                && (channels == 1 || !self.mono)
                 && self.carry.is_empty()
                 && len > 0
                 && len % self.in_stride == 0

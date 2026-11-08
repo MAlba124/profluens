@@ -86,6 +86,17 @@ fn the_downmix_folds_by_the_layout_and_says_stereo() {
 }
 
 #[test]
+fn a_mono_downmix_folds_a_stereo_input_to_one_channel() {
+    let mut h = rig(AudioDownmix::new().to_mono(), 2, Some(STEREO));
+    let frames: Vec<i16> = (0..480).flat_map(|_| [1000, 3000]).collect();
+    let out = run(&mut h, &frames);
+    assert_eq!(out.len(), 480 * 2, "one s16 sample a frame");
+    let first = i16::from_le_bytes([out[0], out[1]]);
+    assert!((first - 2000).abs() <= 1, "the mean of the pair, {first}");
+    assert_eq!(said_layout(&h), Some(FC));
+}
+
+#[test]
 fn the_downmix_hands_on_the_layout_of_what_it_passes() {
     let mut h = rig(AudioDownmix::new(), 1, Some(FC));
     run(&mut h, &[7; 480]);

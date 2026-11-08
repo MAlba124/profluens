@@ -2,6 +2,7 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use pf_avi::AviDemux;
 use pf_avi::riff::{self, MoviWalker, StreamKind};
@@ -16,6 +17,7 @@ use profluens_core::id::SinkPad;
 use profluens_elements::io::FileSrc;
 
 const TINY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny.avi");
+const AC3: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../fixtures/out/avi_mpeg4_ac3.avi");
 
 #[allow(clippy::disallowed_methods)] // test setup reads the fixture directly
 fn header_prefix(path: &str) -> Vec<u8> {
@@ -446,4 +448,112 @@ fn byte_sliced_ac3_chunks_come_out_as_frames_stamped_by_their_bytes() {
     );
     assert!(pts.windows(2).all(|w| w[1] - w[0] == pts[1]), "{pts:?}");
     assert_eq!(audio.total_bytes, lens.len() as u64 * 1792);
+}
+
+static DIGEST_OFFERS: [OfferDesc; 1] = [OfferDesc::wildcard()];
+static DIGEST_PADS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &DIGEST_OFFERS }];
+static DIGEST_DESC: ElementDesc = ElementDesc {
+    name: "digestsink",
+    sinks: &DIGEST_PADS,
+    srcs: &[],
+    props: &[],
+    sched: SchedHint::Active,
+    inputs: InputPolicy::Single,
+    latency: LatencyDesc::NONE,
+    make_default: None,
+    io: false,
+    couplings: &[],
+};
+
+/// Buffers seen and an FNV-1a digest over each one's length, pts, flags and bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Digest(usize, u64);
+
+impl Digest {
+    fn eat(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.1 = (self.1 ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+}
+
+struct DigestSink(Arc<Mutex<Digest>>, Duration);
+
+impl Element for DigestSink {
+    fn desc(&self) -> &'static ElementDesc {
+        &DIGEST_DESC
+    }
+    fn process(&mut self, _ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        let mut taken = 0;
+        let mut d = self.0.lock().unwrap();
+        while let Some(b) = inputs.pop() {
+            let data = b.memory.data();
+            d.0 += 1;
+            d.eat(&(data.len() as u64).to_le_bytes());
+            d.eat(&b.pts.0.to_le_bytes());
+            d.eat(&b.flags.0.to_le_bytes());
+            d.eat(data);
+            taken += 1;
+        }
+        drop(d);
+        std::thread::sleep(self.1 * taken);
+        Ok(Flow::Ok)
+    }
+}
+
+fn digests(path: &str, header: Vec<u8>, slots: u32, pace: Duration) -> Vec<Digest> {
+    let mut p = pf_reactor::pipeline();
+    p.set_pool(256 << 10, slots);
+    let src = p.add(FileSrc::new(path));
+    let demux = p.add(AviDemux::new(header));
+    p.link(src.src(FileSrc::OUT), demux.sink(AviDemux::IN)).expect("src ! demux");
+    let added = p.preroll().expect("preroll").srcs;
+    let mut caps = Vec::new();
+    for ap in &added {
+        let cap = Arc::new(Mutex::new(Digest(0, 0xcbf2_9ce4_8422_2325)));
+        let sink = p.add(DigestSink(Arc::clone(&cap), pace));
+        p.link(ap.element.src(ap.pad), sink.sink(SinkPad(0))).expect("demux ! sink");
+        caps.push(cap);
+    }
+    p.run().expect("run");
+    caps.iter().map(|c| *c.lock().unwrap()).collect()
+}
+
+/// The byte-sliced AC-3 file written where `FileSrc` reads it.
+fn sliced_file(frames: u8) -> (String, Vec<u8>) {
+    let file = byte_sliced_ac3_file(frames);
+    let name = format!("pf-avi-digest-{frames}-{}.avi", std::process::id());
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, &file).expect("write");
+    (path.to_string_lossy().into_owned(), file)
+}
+
+/// Every buffer as it came out before chunks went straight from the walker into the pool.
+#[test]
+fn the_buffers_put_out_are_unchanged() {
+    let tiny = digests(TINY, std::fs::read(TINY).expect("fixture"), 32, Duration::ZERO);
+    let (path, file) = sliced_file(20);
+    let sliced = digests(&path, file, 32, Duration::ZERO);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(tiny, [Digest(76, 0x9ed7_62e7_0068_f03b), Digest(87, 0xb1fd_8cd6_fb7c_cf9b)]);
+    assert_eq!(sliced, [Digest(16, 0xe821_b637_bf5a_6b5b), Digest(20, 0x436d_f936_e6d1_2260)]);
+    if std::path::Path::new(AC3).exists() {
+        let header = std::fs::read(AC3).expect("fixture")[..64 << 10].to_vec();
+        let ac3 = digests(AC3, header, 32, Duration::ZERO);
+        assert_eq!(ac3, [Digest(126, 0xb468_f7a5_17ae_8dba), Digest(157, 0xe5af_5f69_17fb_71e6)]);
+    }
+}
+
+#[test]
+fn a_pool_that_runs_dry_puts_out_the_same_buffers() {
+    let header = std::fs::read(TINY).expect("fixture");
+    let want = digests(TINY, header.clone(), 32, Duration::ZERO);
+    let (path, file) = sliced_file(21);
+    let framed = digests(&path, file.clone(), 32, Duration::ZERO);
+    for slots in [2, 3, 5] {
+        let pace = Duration::from_micros(300);
+        assert_eq!(digests(TINY, header.clone(), slots, pace), want, "{slots} slots");
+        assert_eq!(digests(&path, file.clone(), slots, pace), framed, "framed, {slots} slots");
+    }
+    let _ = std::fs::remove_file(&path);
 }

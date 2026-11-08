@@ -239,13 +239,21 @@ fn mpa_frame_len(d: &[u8]) -> Option<usize> {
 #[derive(Default)]
 pub struct Framer {
     carry: Vec<u8>,
+    /// The last push's frames as `(at, len)` in `carry`, the next to hand out and where the
+    /// last ends.
+    frames: Vec<(usize, usize)>,
+    next: usize,
+    used: usize,
 }
 
 impl Framer {
-    /// Hands each completed frame to `out`, returns the bytes dropped as no part of a frame.
-    // A frame may join slices of several chunks.
-    #[allow(clippy::disallowed_methods)]
-    pub fn push(&mut self, family: &str, bytes: &[u8], mut out: impl FnMut(Vec<u8>)) -> usize {
+    /// Cuts the carry and `bytes` into whole frames, read with [`frame`](Self::frame), and
+    /// returns the bytes dropped as no part of a frame. Frames of the last push not taken go.
+    pub fn push(&mut self, family: &str, bytes: &[u8]) -> usize {
+        // A frame may join slices of several chunks, the tail waits in the carry.
+        self.carry.drain(..self.used);
+        self.frames.clear();
+        self.next = 0;
         self.carry.extend_from_slice(bytes);
         let mut dropped = 0;
         let mut at = 0;
@@ -267,15 +275,28 @@ impl Framer {
                 dropped += 1;
                 continue;
             }
-            out(rest[..len].to_vec());
+            self.frames.push((at, len));
             at += len;
         }
-        self.carry.drain(..at);
+        self.used = at;
         dropped
+    }
+
+    /// The next whole frame of the last push.
+    pub fn frame(&self) -> Option<&[u8]> {
+        let &(at, len) = self.frames.get(self.next)?;
+        self.carry.get(at..at + len)
+    }
+
+    /// Steps past the frame [`frame`](Self::frame) gave.
+    pub fn take(&mut self) {
+        self.next = (self.next + 1).min(self.frames.len());
     }
 
     pub fn clear(&mut self) {
         self.carry.clear();
+        self.frames.clear();
+        (self.next, self.used) = (0, 0);
     }
 }
 
@@ -372,6 +393,14 @@ mod tests {
 
     #[test]
     fn a_framer_cuts_byte_slices_into_frames() {
+        fn push(fr: &mut super::Framer, bytes: &[u8], out: &mut Vec<Vec<u8>>) -> usize {
+            let dropped = fr.push("ac3", bytes);
+            while let Some(f) = fr.frame() {
+                out.push(f.to_vec());
+                fr.take();
+            }
+            dropped
+        }
         let frames: Vec<Vec<u8>> = (0..5u8).map(|i| ac3(448, i)).collect();
         let mut stream = vec![9u8; 100];
         for f in &frames {
@@ -381,7 +410,7 @@ mod tests {
         let mut out = Vec::new();
         let mut dropped = 0;
         for slice in stream.chunks(2333) {
-            dropped += fr.push("ac3", slice, |f| out.push(f));
+            dropped += push(&mut fr, slice, &mut out);
         }
         assert_eq!(dropped, 100, "the bytes before the first header");
         assert_eq!(out, frames, "every frame whole, the last with nothing behind it");
@@ -390,11 +419,11 @@ mod tests {
         stray[704] = 30;
         stray[705] = 8 << 3;
         out.clear();
-        assert_eq!(fr.push("ac3", &[stray.clone(), ac3(448, 2)].concat(), |f| out.push(f)), 0);
+        assert_eq!(push(&mut fr, &[stray.clone(), ac3(448, 2)].concat(), &mut out), 0);
         assert_eq!(out, [stray, ac3(448, 2)]);
         fr.clear();
         assert_eq!(
-            fr.push("ac3", &ac3(448, 9)[6..], |f| out.push(f)),
+            push(&mut fr, &ac3(448, 9)[6..], &mut out),
             1781,
             "a seek drops the carry and what is no frame, five bytes may still head one"
         );

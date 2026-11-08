@@ -22,7 +22,7 @@ use profluens_core::time::Timestamp;
 
 use crate::codec;
 use crate::index::{self, AviIndex, Scan};
-use crate::riff::{self, AviError, MediaChunk, MoviWalker, Stream, StreamKind};
+use crate::riff::{self, AviError, ChunkHead, FourCc, MoviWalker, Stream, StreamKind};
 
 /// Most of `idx1` asked for at a time, its 8 octet header in the first piece.
 pub const IDX1_PIECE: u32 = 64 << 10;
@@ -77,7 +77,6 @@ struct PadStream {
     gate: u64,
     started: bool,
     is_video: bool,
-    framer: Option<codec::Framer>,
     warned_undecodable: bool,
     /// Bytes the framer skipped between frames.
     junk: u64,
@@ -95,12 +94,40 @@ impl PadStream {
     }
 }
 
+/// Where a unit's bytes stay until it is out, so they go straight into a pool buffer.
+#[derive(Clone, Copy)]
+enum Spot {
+    /// The chunk at the walker's head.
+    Walker(ChunkHead),
+    /// The next frame of the framer of the stream at this place in `pad_streams`.
+    Framer(usize),
+}
+
+#[derive(Clone, Copy)]
+struct Unit {
+    stream_index: usize,
+    id: FourCc,
+    spot: Spot,
+}
+
+/// A unit routed but not all out, the pool ran dry.
 struct Carry {
     pad: SrcPad,
     pts_ns: Option<u64>,
     flags: BufferFlags,
-    bytes: Vec<u8>,
+    spot: Spot,
     off: usize,
+}
+
+fn bytes_of<'a>(
+    walker: &'a MoviWalker,
+    framers: &'a [Option<codec::Framer>],
+    spot: Spot,
+) -> &'a [u8] {
+    match spot {
+        Spot::Walker(c) => walker.data(&c),
+        Spot::Framer(i) => framers.get(i).and_then(|f| f.as_ref()?.frame()).unwrap_or_default(),
+    }
 }
 
 /// Demultiplexes an AVI (RIFF) byte stream into one src pad per stream.
@@ -113,8 +140,11 @@ pub struct AviDemux {
     skipped: u64,
     in_movi: bool,
     walker: MoviWalker,
-    framed: std::collections::VecDeque<MediaChunk>,
-    pending: std::collections::VecDeque<Carry>,
+    /// Each stream's framer by its place in `pad_streams`, for streams that slice by bytes.
+    framers: Vec<Option<codec::Framer>>,
+    /// The framer holding frames of the last chunk, with that chunk's stream and id.
+    framing: Option<(usize, usize, FourCc)>,
+    carry: Option<Carry>,
     posted_duration: bool,
     duration_ns: Option<u64>,
     file_len: Option<u64>,
@@ -150,8 +180,9 @@ impl AviDemux {
             skipped: 0,
             in_movi: false,
             walker: MoviWalker::new(),
-            framed: std::collections::VecDeque::new(),
-            pending: std::collections::VecDeque::new(),
+            framers: Vec::new(),
+            framing: None,
+            carry: None,
             posted_duration: false,
             duration_ns: None,
             file_len: None,
@@ -262,38 +293,53 @@ impl AviDemux {
     }
 
     fn drain_pending(&mut self, ctx: &mut Ctx) -> bool {
-        while let Some(mut c) = self.pending.pop_front() {
-            c.off = Self::emit_bounded(ctx, c.pad, c.pts_ns, c.flags, &c.bytes, c.off);
-            if c.off < c.bytes.len() {
-                self.pending.push_front(c);
-                return false;
-            }
+        let Some(mut c) = self.carry.take() else {
+            return true;
+        };
+        let bytes = bytes_of(&self.walker, &self.framers, c.spot);
+        c.off = Self::emit_bounded(ctx, c.pad, c.pts_ns, c.flags, bytes, c.off);
+        if c.off < bytes.len() {
+            self.carry = Some(c);
+            return false;
         }
+        self.pass(c.spot);
         true
     }
 
+    /// Steps past a unit [`next_unit`](Self::next_unit) gave.
+    fn pass(&mut self, spot: Spot) {
+        match spot {
+            Spot::Walker(c) => self.walker.take(&c),
+            Spot::Framer(i) => {
+                if let Some(f) = self.framers.get_mut(i).and_then(Option::as_mut) {
+                    f.take();
+                }
+            }
+        }
+    }
+
     fn route(
-        &mut self,
+        streams: &mut [PadStream],
+        strays: &mut u64,
         ctx: &mut Ctx,
-        chunk: &MediaChunk,
+        unit: &Unit,
+        data: &[u8],
     ) -> Option<(SrcPad, Option<u64>, BufferFlags, bool)> {
-        let Some(idx) =
-            self.pad_streams.iter().position(|ps| ps.stream_index == chunk.stream_index)
-        else {
-            let level = if self.strays == 0 { Level::Warn } else { Level::Trace };
-            log!(&*ctx, level, "chunk_stray", id = chunk.id, bytes = chunk.data.len());
-            self.strays += 1;
+        let Some(idx) = streams.iter().position(|ps| ps.stream_index == unit.stream_index) else {
+            let level = if *strays == 0 { Level::Warn } else { Level::Trace };
+            log!(&*ctx, level, "chunk_stray", id = unit.id, bytes = data.len());
+            *strays += 1;
             return None;
         };
-        let ps = &mut self.pad_streams[idx];
+        let ps = &mut streams[idx];
         let held = ps.ticks < ps.gate;
-        let pts = ps.next_pts_ns(chunk.data.len());
+        let pts = ps.next_pts_ns(data.len());
         if held {
             return None;
         }
         if ps.head.is_empty()
             && ps.family == codec::FAMILY_MPEG4_ASP
-            && let Some(vol) = codec::vol_prefix(&chunk.data)
+            && let Some(vol) = codec::vol_prefix(data)
         {
             ps.head.extend_from_slice(vol);
         }
@@ -301,21 +347,20 @@ impl AviDemux {
         if fresh {
             ps.started = true;
             let (pad, family) = (ps.pad, ps.family);
-            Self::announce(ctx, pad, family, &self.pad_streams[idx].stream);
-            if !codec::is_decodable(family) && !self.pad_streams[idx].warned_undecodable {
-                self.pad_streams[idx].warned_undecodable = true;
+            Self::announce(ctx, pad, family, &ps.stream);
+            if !codec::is_decodable(family) && !ps.warned_undecodable {
+                ps.warned_undecodable = true;
                 let element = ctx.element();
                 ctx.post(BusMessage::Warning {
                     element,
                     error: Error::element_failed(
                         element,
-                        AviError::NoDecoderFamily { stream: chunk.stream_index },
+                        AviError::NoDecoderFamily { stream: unit.stream_index },
                     ),
                 });
             }
         }
-        let ps = &self.pad_streams[idx];
-        let flags = if ps.is_video && codec::chunk_is_key(ps.family, &chunk.data) {
+        let flags = if ps.is_video && codec::chunk_is_key(ps.family, data) {
             BufferFlags::KEYFRAME
         } else {
             BufferFlags::empty()
@@ -372,19 +417,23 @@ impl AviDemux {
         if !self.drain_pending(ctx) {
             return false;
         }
-        while let Some(chunk) = self.next_unit() {
-            let Some((pad, pts, flags, fresh)) = self.route(ctx, &chunk) else {
+        while let Some(unit) = self.next_unit() {
+            let data = bytes_of(&self.walker, &self.framers, unit.spot);
+            let routed = Self::route(&mut self.pad_streams, &mut self.strays, ctx, &unit, data);
+            let Some((pad, pts, flags, fresh)) = routed else {
+                self.pass(unit.spot);
                 continue;
             };
             if fresh {
                 self.greet(ctx, pad, pts);
             }
-            let off = Self::emit_bounded(ctx, pad, pts, flags, &chunk.data, 0);
-            if off < chunk.data.len() {
-                self.pending.push_back(Carry { pad, pts_ns: pts, flags, bytes: chunk.data, off });
+            let off = Self::emit_bounded(ctx, pad, pts, flags, data, 0);
+            if off < data.len() {
+                self.carry = Some(Carry { pad, pts_ns: pts, flags, spot: unit.spot, off });
                 return false; // pool dry, stop pulling walker chunks
             }
-            if let (true, Some(pts)) = (chunk.stream_index == self.key, pts) {
+            self.pass(unit.spot);
+            if let (true, Some(pts)) = (unit.stream_index == self.key, pts) {
                 self.key_out(ctx, Timestamp::from_nanos(pts));
             }
         }
@@ -392,41 +441,51 @@ impl AviDemux {
     }
 
     fn flush_exact(&mut self, ctx: &mut Ctx) {
-        while let Some(c) = self.pending.pop_front() {
-            Self::emit_exact(ctx, c.pad, c.pts_ns, c.flags, &c.bytes, c.off);
+        if let Some(c) = self.carry.take() {
+            let bytes = bytes_of(&self.walker, &self.framers, c.spot);
+            Self::emit_exact(ctx, c.pad, c.pts_ns, c.flags, bytes, c.off);
+            self.pass(c.spot);
         }
-        while let Some(chunk) = self.next_unit() {
-            let Some((pad, pts, flags, fresh)) = self.route(ctx, &chunk) else {
-                continue;
-            };
-            if fresh {
-                self.greet(ctx, pad, pts);
+        while let Some(unit) = self.next_unit() {
+            let data = bytes_of(&self.walker, &self.framers, unit.spot);
+            let routed = Self::route(&mut self.pad_streams, &mut self.strays, ctx, &unit, data);
+            if let Some((pad, pts, flags, fresh)) = routed {
+                if fresh {
+                    self.greet(ctx, pad, pts);
+                }
+                Self::emit_exact(ctx, pad, pts, flags, data, 0);
             }
-            Self::emit_exact(ctx, pad, pts, flags, &chunk.data, 0);
+            self.pass(unit.spot);
         }
     }
 
-    fn next_unit(&mut self) -> Option<MediaChunk> {
+    /// The next unit, left where it is until [`pass`](Self::pass), a framed stream's chunk cut
+    /// into its frames first.
+    fn next_unit(&mut self) -> Option<Unit> {
         loop {
-            if let Some(c) = self.framed.pop_front() {
-                return Some(c);
+            if let Some((i, stream_index, id)) = self.framing {
+                let framer = self.framers.get(i).and_then(Option::as_ref);
+                if framer.and_then(codec::Framer::frame).is_some() {
+                    return Some(Unit { stream_index, id, spot: Spot::Framer(i) });
+                }
+                self.framing = None;
             }
-            let chunk = self.walker.next_chunk()?;
-            let framed = &mut self.framed;
-            let Some(ps) =
-                self.pad_streams.iter_mut().find(|ps| ps.stream_index == chunk.stream_index)
-            else {
-                return Some(chunk);
-            };
-            let Some(framer) = ps.framer.as_mut() else {
-                return Some(chunk);
-            };
+            let chunk = self.walker.peek_chunk()?;
             let (stream_index, id) = (chunk.stream_index, chunk.id);
-            let dropped = framer.push(ps.family, &chunk.data, |data| {
-                framed.push_back(MediaChunk { stream_index, id, data })
-            });
+            let unit = Unit { stream_index, id, spot: Spot::Walker(chunk) };
+            let Some(i) = self.pad_streams.iter().position(|ps| ps.stream_index == stream_index)
+            else {
+                return Some(unit);
+            };
+            let Some(framer) = self.framers.get_mut(i).and_then(Option::as_mut) else {
+                return Some(unit);
+            };
+            let ps = &mut self.pad_streams[i];
+            let dropped = framer.push(ps.family, self.walker.data(&chunk));
+            self.walker.take(&chunk);
             ps.junk += dropped as u64;
             ps.ticks = ps.ticks.saturating_add(index::ticks(ps.stream.sample_size, dropped));
+            self.framing = Some((i, stream_index, id));
         }
     }
 
@@ -502,7 +561,11 @@ impl AviDemux {
     }
 
     fn restart_at(&mut self, byte: Option<u64>) {
-        self.walker.resync();
+        // A chunk held for the pool still goes out, as one taken from the walker would.
+        match self.carry.as_ref().map(|c| c.spot) {
+            Some(Spot::Walker(c)) => self.walker.resync_keeping(&c),
+            _ => self.walker.resync(),
+        }
         match byte {
             Some(byte) if byte < self.movi_data_start => {
                 (self.in_movi, self.skipped) = (false, byte)
@@ -691,6 +754,8 @@ impl Element for AviDemux {
             let pad = ctx.add_src_pad(&name, codec::offers_for(stream));
             log_stream(ctx, stream, family);
             let head = self.head_of(stream, family, movi.movi_data_start);
+            let framer = codec::reframes(family, stream.sample_size).then(codec::Framer::default);
+            self.framers.push(framer);
             self.pad_streams.push(PadStream {
                 stream_index: stream.index,
                 pad,
@@ -700,7 +765,6 @@ impl Element for AviDemux {
                 gate: 0,
                 started: false,
                 is_video: matches!(stream.kind, StreamKind::Video),
-                framer: codec::reframes(family, stream.sample_size).then(codec::Framer::default),
                 warned_undecodable: false,
                 junk: 0,
                 stream: stream.clone(),
@@ -750,7 +814,7 @@ impl Element for AviDemux {
         self.walker = MoviWalker::new();
         self.skipped = 0;
         self.in_movi = false;
-        self.pending.clear();
+        self.carry = None;
         self.posted_duration = false;
         (self.taken, self.measured, self.teller) =
             (0, rate::ByteRate::default(), rate::Teller::default());
@@ -838,7 +902,7 @@ impl AviDemux {
                 );
             }
             Event::FlushStart => {
-                self.pending.clear();
+                self.carry = None;
                 self.measured.clear();
                 self.teller.restart();
                 let target = ctx.seek_target();
@@ -849,12 +913,10 @@ impl AviDemux {
                 let at = target.map_or(0, |t| t.to_byte);
                 let (seek, clocked) = (target.is_some(), clocks.is_some());
                 log!(&*ctx, Level::Debug, "flush", seek = seek, at = at, clocked = clocked);
-                self.framed.clear();
+                self.framing = None;
+                self.framers.iter_mut().flatten().for_each(codec::Framer::clear);
                 for (n, ps) in self.pad_streams.iter_mut().enumerate() {
                     ps.started = false;
-                    if let Some(f) = ps.framer.as_mut() {
-                        f.clear();
-                    }
                     let tick = ps.sample_dur_ns.filter(|ns| *ns > 0);
                     let at = to.zip(tick).map_or(0, |(to, ns)| (to + ns / 2) / ns);
                     (ps.ticks, ps.gate) = match clocks.and_then(|c| c.get(n)) {
@@ -871,7 +933,7 @@ impl AviDemux {
     fn on_stop(&mut self, ctx: &mut Ctx) {
         self.flush_exact(ctx);
         self.walker = MoviWalker::new();
-        self.pending.clear();
+        self.carry = None;
         self.posted_duration = false;
     }
 }

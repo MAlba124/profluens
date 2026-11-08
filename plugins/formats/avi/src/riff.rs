@@ -533,7 +533,17 @@ pub struct MediaChunk {
     pub data: Vec<u8>,
 }
 
-/// Incremental `movi` walker. `push` bytes as they arrive, `next_chunk` pulls chunks.
+/// A whole media chunk at the walker's head, its payload in [`MoviWalker::data`] until
+/// [`MoviWalker::take`] steps past it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkHead {
+    pub stream_index: usize,
+    pub id: FourCc,
+    pub len: usize,
+    total: usize,
+}
+
+/// Incremental `movi` walker. `push` bytes as they arrive, `peek_chunk` finds chunks.
 #[derive(Default)]
 pub struct MoviWalker {
     buf: Vec<u8>,
@@ -607,10 +617,37 @@ impl MoviWalker {
         self.synced = false;
     }
 
-    /// The next complete chunk, `None` if more bytes are needed or the stream is done.
+    /// [`resync`](Self::resync) keeping `chunk`, the one at the head, for [`data`](Self::data)
+    /// and [`take`](Self::take).
+    pub fn resync_keeping(&mut self, chunk: &ChunkHead) {
+        self.buf.truncate((self.head + chunk.total).min(self.buf.len()));
+        self.buf.drain(..self.head);
+        (self.head, self.skip, self.synced) = (0, 0, false);
+    }
+
+    /// The next complete chunk copied out and stepped past.
     // One copy, the payload handed to the caller.
     #[allow(clippy::disallowed_methods)]
     pub fn next_chunk(&mut self) -> Option<MediaChunk> {
+        let c = self.peek_chunk()?;
+        let data = self.data(&c).to_vec();
+        self.take(&c);
+        Some(MediaChunk { stream_index: c.stream_index, id: c.id, data })
+    }
+
+    /// The payload of `chunk`, the one [`peek_chunk`](Self::peek_chunk) found at the head.
+    pub fn data(&self, chunk: &ChunkHead) -> &[u8] {
+        self.buf.get(self.head + 8..self.head + 8 + chunk.len).unwrap_or_default()
+    }
+
+    /// Steps past `chunk`, the one at the head.
+    pub fn take(&mut self, chunk: &ChunkHead) {
+        self.advance(chunk.total);
+    }
+
+    /// The next complete chunk, left at the head, `None` if more bytes are needed or the stream
+    /// is done.
+    pub fn peek_chunk(&mut self) -> Option<ChunkHead> {
         loop {
             let window = &self.buf[self.head..];
             if window.len() < 8 {
@@ -685,10 +722,8 @@ impl MoviWalker {
             if window.len() < total {
                 return None; // wait for the rest of the payload
             }
-            let data = window[8..8 + size].to_vec();
             let stream_index = usize::from(id[0] - b'0') * 10 + usize::from(id[1] - b'0');
-            self.advance(total);
-            return Some(MediaChunk { stream_index, id, data });
+            return Some(ChunkHead { stream_index, id, len: size, total });
         }
     }
 }
@@ -964,6 +999,24 @@ mod tests {
         assert_eq!(c0.data, vec![1, 2, 3]);
         let c1 = w.next_chunk().expect("chunk 1");
         assert_eq!(c1.data, vec![4, 5]);
+    }
+
+    #[test]
+    fn a_chunk_kept_through_a_resync_is_still_read_then_the_walk_starts_over() {
+        fn chunk(id: &[u8; 4], body: &[u8; 6]) -> Vec<u8> {
+            [id.as_slice(), &6u32.to_le_bytes(), body].concat()
+        }
+        let movi = [chunk(b"00dc", b"first1"), chunk(b"01wb", b"second")].concat();
+        let mut w = MoviWalker::new();
+        w.push(&movi);
+        let c = w.peek_chunk().expect("a chunk");
+        w.resync_keeping(&c);
+        assert_eq!(w.data(&c), b"first1");
+        w.take(&c);
+        assert_eq!(w.held(), 0, "the rest went with the resync");
+        w.push(&[b"junk".as_slice(), &chunk(b"01wb", b"third3")].concat());
+        let next = w.next_chunk().expect("the walk after the restart");
+        assert_eq!((next.id, next.data), (*b"01wb", b"third3".to_vec()));
     }
 
     #[test]

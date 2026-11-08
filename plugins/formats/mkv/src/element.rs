@@ -13,7 +13,7 @@ use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueD
 use profluens_core::id::{FormatId, SinkPad, SrcPad};
 use profluens_core::log;
 use profluens_core::log::Level;
-use profluens_core::memory::{Known, Memory, RESERVE_FLOOR, SIZED_TOP};
+use profluens_core::memory::{Memory, RESERVE_FLOOR, SIZED_TOP};
 use profluens_core::pipeline::{Caption, Index, IndexEntry};
 use profluens_core::pull::Ask;
 use profluens_core::rate;
@@ -28,7 +28,7 @@ use crate::index::{CaptionSpan, CueEnd, Grown, cue_end, cue_ends, cue_entries_of
 use crate::parsed::Parsed;
 use crate::pull::{Need, Plan, Planned, Span, State, Step, Walk, Window};
 use crate::reader::{
-    Cue, Frame, MatroskaReader, PTS_NONE, Track, cues_demand, parse_cue_tracks, seek_head_pos,
+    Cue, Frame, MatroskaReader, PTS_NONE, Track, cues_typical, parse_cue_tracks, seek_head_pos,
 };
 use crate::writer::{MatroskaWriter, MuxOut, TrackConfig};
 
@@ -770,6 +770,9 @@ fn pass(
 
 /// A lace is at most 256 frames (RFC 9559 section 10.3).
 const MAX_HELD: usize = 256;
+/// Blocks the reserve holds at once, the few the demuxer has in flight, more take slots of
+/// their own classes within the pool's budget.
+const RESERVE_SLOTS: u64 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Emit {
@@ -1419,15 +1422,15 @@ impl MkvDemux {
     }
 
     fn reserve(ctx: &Ctx, cues: &[Cue], cues_at: u64, file_len: Option<u64>) {
-        let demand = cues_demand(cues, cues_at, file_len.unwrap_or(cues_at));
-        let fits = (RESERVE_FLOOR as u64..=SIZED_TOP as u64).contains(&demand.largest);
-        if demand.known != Known::Clusters || !fits {
+        // the clusters most blocks sit in, a rarer larger one takes a slot of its own class
+        let size = cues_typical(cues, cues_at, file_len.unwrap_or(cues_at));
+        if !(RESERVE_FLOOR as u64..=SIZED_TOP as u64).contains(&size) {
             return;
         }
         let stats = ctx.pool_stats();
-        let count = (stats.bytes_budget / demand.largest).clamp(1, stats.max_slots.max(1));
-        if ctx.reserve_sized(demand.largest as usize, count.min(u32::MAX as u64) as u32).is_err() {
-            log!(ctx, Level::Debug, "reserve_refused", bytes = demand.largest, count = count);
+        let count = (stats.bytes_budget / size).clamp(1, stats.max_slots.max(1)).min(RESERVE_SLOTS);
+        if ctx.reserve_sized(size as usize, count as u32).is_err() {
+            log!(ctx, Level::Debug, "reserve_refused", bytes = size, count = count);
         }
     }
 

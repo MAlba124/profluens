@@ -1711,20 +1711,44 @@ impl profluens_core::fetch::Fetch for CuesAt {
     }
 }
 
-/// The largest span between cued Clusters bounds a block, `None` with fewer than two.
+/// The spans between cued Clusters, the last one's to the Cues or the file's end, none with
+/// fewer than two.
 // Cold path, once per open.
 #[allow(clippy::disallowed_methods)]
-pub fn cues_demand(cues: &[Cue], cues_at: u64, file_len: u64) -> Demand {
+fn cue_spans(cues: &[Cue], cues_at: u64, file_len: u64) -> Vec<u64> {
     let mut at: Vec<u64> = cues.iter().map(|c| c.byte).collect();
     at.sort_unstable();
     at.dedup();
     let (Some(&last), true) = (at.last(), at.len() > 1) else {
-        return Demand::unknown();
+        return Vec::new();
     };
     let end = if cues_at > last { cues_at.min(file_len) } else { file_len };
-    let spans = at.windows(2).map(|w| w[1] - w[0]);
-    let largest = spans.max().unwrap_or(0).max(end.saturating_sub(last));
-    Demand { known: Known::Clusters, largest, peak: 0, window: 0 }
+    for i in 0..at.len() - 1 {
+        at[i] = at[i + 1] - at[i];
+    }
+    if let Some(tail) = at.last_mut() {
+        *tail = end.saturating_sub(last);
+    }
+    at
+}
+
+/// The largest span between cued Clusters bounds a block, `None` with fewer than two.
+pub fn cues_demand(cues: &[Cue], cues_at: u64, file_len: u64) -> Demand {
+    match cue_spans(cues, cues_at, file_len).into_iter().max() {
+        Some(largest) => Demand { known: Known::Clusters, largest, peak: 0, window: 0 },
+        None => Demand::unknown(),
+    }
+}
+
+/// The span nine in ten cued Clusters fit in, what the demuxer's blocks are sized for, 0 with
+/// fewer than two.
+pub fn cues_typical(cues: &[Cue], cues_at: u64, file_len: u64) -> u64 {
+    let mut spans = cue_spans(cues, cues_at, file_len);
+    if spans.is_empty() {
+        return 0;
+    }
+    let at = (spans.len() - 1) * 9 / 10;
+    *spans.select_nth_unstable(at).1
 }
 
 fn cue_point_tracks(data: &[u8], segment_data_start: u64, scale: u64, out: &mut Vec<Cue>) {
@@ -2019,6 +2043,8 @@ mod tests {
             "Cues up front, to the file's end"
         );
         assert_eq!(cues_demand(&[], 9000, 10_000), Demand::unknown());
+        assert_eq!(cues_typical(&cues, 9000, 10_000), 2000, "the spans 900, 4000, 2000, 2000");
+        assert_eq!(cues_typical(&[cue(100, 1)], 9000, 10_000), 0);
         assert_eq!(
             cues_demand(&[cue(100, 1), cue(100, 2)], 9000, 10_000),
             Demand::unknown(),

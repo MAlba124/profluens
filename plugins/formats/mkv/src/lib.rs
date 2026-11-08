@@ -44,7 +44,8 @@ pub use mux_multi::MkvMuxN;
 pub use parsed::Parsed;
 pub use reader::{
     Cue, CueIndex, CuedBlock, CuesAt, Frame, MatroskaReader, PTS_NONE, SeekHeadInfo, Track,
-    cluster_timestamp, cued_block, cues_demand, parse_cue_tracks, parse_cues, parse_seek_head,
+    cluster_timestamp, cued_block, cues_demand, cues_typical, parse_cue_tracks, parse_cues,
+    parse_seek_head,
 };
 pub use writer::{
     APP_NAME, AudioConfig, CLUSTER_BLOCKS_MAX, CLUSTER_BYTES_MAX, ColourConfig,

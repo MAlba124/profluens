@@ -353,6 +353,7 @@ dependencies = [
  "pf-avi",
  "pf-bare",
  "pf-flv",
+ "pf-hdr",
  "pf-libav",
  "pf-libflac",
  "pf-mkv",

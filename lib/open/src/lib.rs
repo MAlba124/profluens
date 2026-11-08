@@ -2,6 +2,7 @@ mod at;
 mod avi;
 mod bare;
 mod flv;
+mod layout;
 mod mkv;
 mod mp4;
 mod ogg;
@@ -90,6 +91,32 @@ pub enum TrackKind {
     Other,
 }
 
+/// How a video track's pictures sample chroma, H.264 and H.265 `chroma_format_idc`, AV1's
+/// subsampling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Chroma {
+    #[default]
+    Unknown,
+    /// Luma alone, 4:0:0.
+    Mono,
+    C420,
+    C422,
+    C444,
+}
+
+impl Chroma {
+    /// From an H.264 or H.265 `chroma_format_idc`.
+    pub fn from_idc(idc: u32) -> Chroma {
+        match idc {
+            0 => Chroma::Mono,
+            1 => Chroma::C420,
+            2 => Chroma::C422,
+            3 => Chroma::C444,
+            _ => Chroma::Unknown,
+        }
+    }
+}
+
 /// A track as its container states it, the bitstream filling in what the container leaves out.
 /// Zero is unknown for every number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +154,11 @@ pub struct TrackDesc {
     /// Decode this much before a seek target.
     pub seek_preroll_ns: u64,
     pub colour: StreamColor,
+    /// What the head's SPS or AV1 config states.
+    pub chroma: Chroma,
+    /// The speakers of an audio track as its head states them, a WAVE `dwChannelMask` bit each
+    /// (`profluens_audio::layout`), as many as its channels.
+    pub layout: u64,
     /// The NAL length prefix size of the stored units, 0 for Annex B or codecs without NALs.
     pub nal_length: u8,
     pub duration_ns: u64,
@@ -157,6 +189,8 @@ impl TrackDesc {
             delay_ns: 0,
             seek_preroll_ns: 0,
             colour: StreamColor::default(),
+            chroma: Chroma::Unknown,
+            layout: 0,
             nal_length: 0,
             duration_ns: 0,
         }
@@ -421,11 +455,14 @@ impl Desc {
         self.skipped.push(Skipped { id, family, why });
     }
 
-    /// The track with the colour, size, depth and pixel aspect its first SPS states where the
-    /// container leaves them out.
+    /// The track with the colour, size, depth, chroma and pixel aspect its first SPS states
+    /// where the container leaves them out, and the speakers its audio head states.
     pub fn push(&mut self, mut t: TrackDesc) {
-        let head = t.head;
-        sps::fill(&mut t, self.arena.get(head.range()).unwrap_or_default());
+        let head = self.arena.get(t.head.range()).unwrap_or_default();
+        sps::fill(&mut t, head);
+        if t.kind == TrackKind::Audio {
+            t.layout = layout::of(t.family, head, u32::from(t.channels));
+        }
         if t.par.0 == 0 || t.par.1 == 0 {
             t.par = (1, 1);
         }
@@ -535,6 +572,114 @@ mod tests {
         assert_eq!(codes(&d.tracks[1].colour), [1, 2, 2, 0]);
         assert_eq!(d.tracks[1].depth, 0);
         assert_eq!(codes(&StreamColor::default()), [2, 2, 2, 0]);
+    }
+
+    /// An HEVC head's prefix SEI states the mastering display and light level, the bitstream's
+    /// over the container's. Its SPS states 4:2:0.
+    #[test]
+    fn the_heads_sei_and_sps_fill_the_hdr_and_the_chroma() {
+        let m = Mastering {
+            primaries: [[35400, 14600], [8500, 39850], [6550, 2300]],
+            white: [15635, 16450],
+            max_luminance: 10_000_000,
+            min_luminance: 50,
+        };
+        let light = ContentLight { max_cll: 1000, max_fall: 400 };
+        let payloads = hdr_meta(&HdrStatic { mastering: m, light }).unwrap();
+        let mut rbsp = vec![137, 24];
+        rbsp.extend_from_slice(&payloads[..24]);
+        rbsp.extend_from_slice(&[144, 4]);
+        rbsp.extend_from_slice(&payloads[24..]);
+        rbsp.push(0x80);
+        let mut head = PQ_SETS.to_vec();
+        head.extend_from_slice(&[0, 0, 0, 1, 0x4E, 0x01]);
+        profluens_video::bits::push_ebsp(&rbsp, &mut head);
+        // the luminance's zeros take emulation prevention bytes
+        assert!(head.len() > PQ_SETS.len() + 6 + rbsp.len());
+        let mut d = Desc::default();
+        let mut t = TrackDesc::new(1, TrackKind::Video, "h265/annexb");
+        t.head = d.put(&head);
+        t.colour.hdr.light = ContentLight { max_cll: 4000, max_fall: 0 };
+        d.push(t);
+        let t = d.tracks[0];
+        assert_eq!(t.colour.hdr.mastering, m);
+        assert_eq!(t.colour.hdr.light, light);
+        assert_eq!(t.chroma, Chroma::C420);
+        let mut d = Desc::default();
+        let mut t = TrackDesc::new(1, TrackKind::Video, "h265/annexb");
+        t.head = d.put(&PQ_SETS);
+        t.colour.hdr.light = light;
+        d.push(t);
+        assert_eq!(d.tracks[0].colour.hdr.light, light, "the container's without an SEI");
+    }
+
+    /// An H.264 High 4:2:2 SPS states its chroma, an AV1 config record its subsampling.
+    #[test]
+    fn the_chroma_is_what_the_sps_or_the_av1_record_states() {
+        let mut w = profluens_video::bits::BitWriter::new();
+        w.u(122, 8);
+        w.u(0, 8);
+        w.u(40, 8);
+        // sps id, chroma_format_idc 2, both depths 8, no transform bypass, no scaling matrix
+        for v in [0, 2, 0, 0] {
+            w.ue(v);
+        }
+        w.flag(false);
+        w.flag(false);
+        // log2_max_frame_num 4, poc type 2, one reference, 1920 x 1088 frames
+        for v in [0, 2, 1] {
+            w.ue(v);
+        }
+        w.flag(false);
+        w.ue(119);
+        w.ue(67);
+        for b in [true, true, false, false] {
+            w.flag(b);
+        }
+        w.rbsp_trailing_bits();
+        let mut head = vec![0, 0, 0, 1, 0x67];
+        profluens_video::bits::push_ebsp(w.as_bytes(), &mut head);
+        let mut d = Desc::default();
+        let mut t = TrackDesc::new(1, TrackKind::Video, "h264/annexb");
+        t.head = d.put(&head);
+        d.push(t);
+        assert_eq!((d.tracks[0].chroma, d.tracks[0].width), (Chroma::C422, 1920));
+        for (b, want) in [
+            (0b0000_1100, Chroma::C420),
+            (0b0000_1000, Chroma::C422),
+            (0, Chroma::C444),
+            (0b0001_1100, Chroma::Mono),
+            (0b0000_0100, Chroma::Unknown),
+        ] {
+            assert_eq!(sps::av1c_chroma(&[0x81, 0, b, 0]), want, "{b:#b}");
+        }
+        assert_eq!(sps::av1c_chroma(&[0x12, 0, 0, 0]), Chroma::Unknown, "not a record");
+        let mut t = TrackDesc::new(2, TrackKind::Video, "av1");
+        t.head = d.put(&[0x81, 0, 0b0000_1100, 0]);
+        d.push(t);
+        assert_eq!(d.tracks[1].chroma, Chroma::C420);
+        // an MP4's record set it, the empty head leaves it
+        let mut t = TrackDesc::new(3, TrackKind::Video, "av1");
+        t.chroma = Chroma::C444;
+        d.push(t);
+        assert_eq!(d.tracks[2].chroma, Chroma::C444);
+        assert_eq!((Chroma::from_idc(0), Chroma::from_idc(4)), (Chroma::Mono, Chroma::Unknown));
+    }
+
+    /// An audio track's layout is its head's, a video track has none.
+    #[test]
+    fn an_audio_track_takes_its_heads_layout() {
+        let mut d = Desc::default();
+        let mut t = TrackDesc::new(1, TrackKind::Audio, "aac");
+        t.channels = 6;
+        t.head = d.put(&[0x11, 0xB0]);
+        d.push(t);
+        let mut v = TrackDesc::new(2, TrackKind::Video, "aac");
+        v.channels = 6;
+        v.head = d.put(&[0x11, 0xB0]);
+        d.push(v);
+        assert_eq!(d.tracks[0].layout, 0x3F);
+        assert_eq!(d.tracks[1].layout, 0);
     }
 
     #[test]

@@ -76,6 +76,9 @@ fn tracks_into(tracks: &[Track], d: &mut Desc) -> Result<u64, OpenError> {
         out.delay_ns = ns(t.delay_ticks(), t.timescale);
         out.seek_preroll_ns = if family == "opus" { OPUS_PREROLL_NS } else { 0 };
         out.colour = e.colour;
+        if family == "av1" {
+            out.chroma = crate::sps::av1c_chroma(&e.config_record);
+        }
         if let Reframer::Nal { length_size } = e.reframer {
             out.nal_length = length_size.min(255) as u8;
         }

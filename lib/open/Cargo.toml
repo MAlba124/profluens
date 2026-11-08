@@ -17,6 +17,10 @@ pipeline = ["dep:profluens-elements"]
 profluens-core = { path = "../../core" }
 # The SPS colour, size and depth a container leaves out.
 profluens-video = { path = "../video" }
+# The HDR SEI a codec head carries.
+pf-hdr = { path = "../../plugins/video/hdr" }
+# The speaker bits of an audio head's layout.
+profluens-audio = { path = "../audio" }
 pf-probe = { path = "../probe" }
 pf-mkv = { path = "../../plugins/formats/mkv" }
 pf-mp4 = { path = "../../plugins/formats/mp4" }
@@ -33,8 +37,6 @@ pf-reactor = { path = "../reactor" }
 # The decoders a bare file plays through, today's FileSrc path against baresrc.
 pf-libflac = { path = "../../plugins/audio/libflac", features = ["encoder"] }
 pf-libav = { path = "../../plugins/libav" }
-# The stamps a decoder's PCM is checked on.
-profluens-audio = { path = "../audio" }
 
 [lints]
 workspace = true

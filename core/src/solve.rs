@@ -857,26 +857,21 @@ impl Solver {
 
     /// Two alternatives met. A wildcard with fields is a filter met into a wildcard.
     fn meet_alt(&mut self, a: Alt, b: Alt, why: Why) -> Result<Alt, Miss> {
-        match (a.wild, b.wild) {
+        let tame = |x: Alt, family| Alt { wild: false, family, ..x };
+        let (a, b, wild) = match (a.wild, b.wild) {
             (true, _) if a.n == 0 => return Ok(b),
             (_, true) if b.n == 0 => return Ok(a),
-            (true, true) => {
-                let x = self.meet_alt(
-                    Alt { wild: false, ..a },
-                    Alt { wild: false, family: a.family, ..b },
-                    why,
-                )?;
-                return Ok(Alt { wild: true, ..x });
-            }
-            (true, false) => {
-                return self.meet_alt(b, Alt { family: b.family, wild: false, ..a }, why);
-            }
-            (false, true) => {
-                return self.meet_alt(a, Alt { family: a.family, wild: false, ..b }, why);
-            }
-            _ if a.family != b.family => return Err(Miss::Disjoint),
-            _ => {}
-        }
+            (true, true) => (tame(a, a.family), tame(b, a.family), true),
+            (true, false) => (b, tame(a, b.family), false),
+            (false, true) => (a, tame(b, a.family), false),
+            (false, false) if a.family != b.family => return Err(Miss::Disjoint),
+            (false, false) => (a, b, false),
+        };
+        self.meet_plain(a, b, why).map(|x| if wild { Alt { wild, ..x } } else { x })
+    }
+
+    /// Two alternatives of one family met, neither a wildcard.
+    fn meet_plain(&mut self, a: Alt, b: Alt, why: Why) -> Result<Alt, Miss> {
         let plain = |x: Alt| Ok(Alt { pa: NONE, pb: NONE, ..x });
         if (a.at, a.n) == (b.at, b.n) {
             return plain(a);

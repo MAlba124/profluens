@@ -442,10 +442,11 @@ pub(crate) struct Group {
 // Once per hand-over at a splice.
 #[allow(clippy::disallowed_methods)]
 fn queue_behind(up: &mut UpLink, link: UpLink, format: Option<FixedFormat>) {
-    match up.next.as_mut() {
-        Some(next) => queue_behind(&mut next.0, link, format),
-        None => up.next = Some(Box::new((link, format))),
+    let mut last = &mut up.next;
+    while let Some(next) = last {
+        last = &mut next.0.next;
     }
+    *last = Some(Box::new((link, format)));
 }
 
 fn fans_out(links: &[DownLink]) -> bool {

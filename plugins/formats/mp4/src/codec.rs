@@ -25,6 +25,8 @@ pub struct SampleEntry {
     pub family: &'static str,
     pub width: u32,
     pub height: u32,
+    /// The `pasp` pixel aspect ratio (12.1.4), 0 to 0 where the entry has none.
+    pub par: (u32, u32),
     pub sample_rate: u32,
     pub channels: u32,
     pub codec_head: Vec<u8>,
@@ -160,6 +162,7 @@ fn parse_sample_entry(h: &BoxHeader, data: &[u8]) -> Result<SampleEntry, BoxErro
         family,
         width: 0,
         height: 0,
+        par: (0, 0),
         sample_rate: 0,
         channels: 0,
         codec_head: Vec::new(),
@@ -232,7 +235,19 @@ fn parse_visual_entry(payload: &[u8], entry: &mut SampleEntry) -> Result<(), Box
         mp4v_esds(children, entry);
     }
     entry.avg_bitrate = btrt_avg(children).unwrap_or(entry.avg_bitrate);
+    entry.par = pasp(children).unwrap_or((0, 0));
     Ok(())
+}
+
+/// The hSpacing and vSpacing of a `pasp` among `children` (12.1.4), None without one or with a 0.
+fn pasp(children: &[u8]) -> Option<(u32, u32)> {
+    let b = boxes::find_child(children, boxes::fourcc(b"pasp")).ok().flatten()?;
+    let b = b.body(children).get(..8)?;
+    let (h, v) = (
+        u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+        u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
+    );
+    (h != 0 && v != 0).then_some((h, v))
 }
 
 /// The avgBitrate of a `btrt` among `children` (8.5.2.2), None without one or for 0.
@@ -680,6 +695,26 @@ mod tests {
         assert_eq!((entry.width, entry.height), (128, 96));
         assert!(matches!(entry.reframer, Reframer::Passthrough));
         assert!(entry.codec_head.is_empty());
+        assert_eq!(entry.par, (0, 0));
+    }
+
+    #[test]
+    fn stsd_pasp_states_the_pixel_aspect() {
+        let entry_with = |pasp: &[u8]| {
+            let mut ve = vec![0u8; 78];
+            ve[24..26].copy_from_slice(&720u16.to_be_bytes());
+            ve[26..28].copy_from_slice(&480u16.to_be_bytes());
+            ve.extend_from_slice(&box_bytes(b"pasp", pasp));
+            let mut stsd = vec![0u8; 4];
+            stsd.extend_from_slice(&1u32.to_be_bytes());
+            stsd.extend_from_slice(&box_bytes(b"vp09", &ve));
+            parse_stsd(&stsd).unwrap()
+        };
+        let par = [32u32.to_be_bytes(), 27u32.to_be_bytes()].concat();
+        assert_eq!(entry_with(&par).par, (32, 27));
+        let zero = [32u32.to_be_bytes(), 0u32.to_be_bytes()].concat();
+        assert_eq!(entry_with(&zero).par, (0, 0), "a 0 states none");
+        assert_eq!(entry_with(&par[..6]).par, (0, 0), "cut");
     }
 
     #[test]

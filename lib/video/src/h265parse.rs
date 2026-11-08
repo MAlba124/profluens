@@ -237,6 +237,8 @@ pub struct Sps {
     /// A format range extensions profile (A.3.5), decoded as VA's Main 12.
     pub rext: bool,
     pub colour: crate::decoder::Color,
+    /// The VUI's sample aspect ratio, 0 to 0 where it states none.
+    pub sar: (u16, u16),
 }
 
 /// `range_ext` bits iHD decodes none of, extended_precision_processing_flag and
@@ -1183,8 +1185,8 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
     let sps_temporal_mvp_enabled_flag = r.flag();
     let strong_intra_smoothing_enabled_flag = r.flag();
     let vui_parameters_present_flag = r.flag();
-    let colour = match vui_parameters_present_flag {
-        true => crate::color::vui_signal(&mut r),
+    let (sar, colour) = match vui_parameters_present_flag {
+        true => crate::color::vui_head(&mut r),
         false => Default::default(),
     };
     // Main and Main 10 refuse no extension as before. A range extensions profile is taken only
@@ -1247,6 +1249,7 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
         range_ext,
         rext: rext && !ok_profile,
         colour,
+        sar,
     })
 }
 
@@ -2257,6 +2260,7 @@ mod tests {
             range_ext: 0,
             rext: false,
             colour: Default::default(),
+            sar: (0, 0),
         }
     }
 

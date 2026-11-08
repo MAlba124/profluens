@@ -35,7 +35,7 @@ use crate::gpuframe::{
 use crate::probe;
 use crate::va::{Display, ExportedSurface, ReadbackImage, SurfaceFormat, Surfaces, UploadImage};
 use crate::vpp::format::{self, Kind, NV12, P010};
-use crate::vpp::plan::{Plan, Target};
+use crate::vpp::plan::{Plan, Target, shown};
 use crate::vpp::proc::{
     Color, Hdr10, Imported, Out, Proc, Src, ToneMap, dmabuf_key, import, surfaces,
 };
@@ -307,6 +307,8 @@ pub struct VaapiPostProc {
     fixed: bool,
     /// Degrees clockwise each picture is turned.
     rotation: u16,
+    /// The pixel aspect ratio of the pictures in, they come out square.
+    par: (u32, u32),
     // field order is drop order, what holds the display's handle goes first
     session: Option<Session>,
     /// A processor made and warmed at start, the first session takes it.
@@ -334,6 +336,7 @@ impl VaapiPostProc {
             target,
             fixed: false,
             rotation: 0,
+            par: (1, 1),
             session: None,
             warm: None,
             warm_asked: false,
@@ -387,6 +390,12 @@ impl VaapiPostProc {
     /// Turns every picture `degrees` clockwise, 90, 180 or 270, the box fit to the turned one.
     pub fn with_rotation(mut self, degrees: u16) -> Self {
         self.rotation = degrees;
+        self
+    }
+
+    /// Pictures in of pixel aspect `num`:`den` come out square, stretched to the shape they show.
+    pub fn with_par(mut self, num: u32, den: u32) -> Self {
+        self.par = (num, den);
         self
     }
 
@@ -477,7 +486,8 @@ impl VaapiPostProc {
     }
 
     fn plan_of(&self, f: InFormat) -> Option<Plan> {
-        Plan::turned(f.width, f.height, f.kind(), self.target, self.rotation, self.fixed)
+        let (w, h) = shown(f.width, f.height, self.par);
+        Plan::turned(w, h, f.kind(), self.target, self.rotation, self.fixed)
     }
 
     fn session(&mut self, ctx: &Ctx, f: InFormat, p: Plan) -> Result<(), K> {

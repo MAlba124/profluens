@@ -149,7 +149,8 @@ impl TrackDesc {
             depth: 0,
             width: 0,
             height: 0,
-            par: (1, 1),
+            // nothing stated yet, `Desc::push` makes it square when nothing does
+            par: (0, 0),
             rotation: 0,
             frame_ns: 0,
             bitrate: 0,
@@ -420,11 +421,14 @@ impl Desc {
         self.skipped.push(Skipped { id, family, why });
     }
 
-    /// The track with the colour, size and depth its first SPS states where the container
-    /// leaves them out.
+    /// The track with the colour, size, depth and pixel aspect its first SPS states where the
+    /// container leaves them out.
     pub fn push(&mut self, mut t: TrackDesc) {
         let head = t.head;
         sps::fill(&mut t, self.arena.get(head.range()).unwrap_or_default());
+        if t.par.0 == 0 || t.par.1 == 0 {
+            t.par = (1, 1);
+        }
         self.tracks.push(t);
     }
 }

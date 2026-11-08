@@ -25,6 +25,7 @@ fn heads() -> [TrackHead; 2] {
             timescale: VIDEO_TIMESCALE,
             width: 128,
             height: 96,
+            par: (0, 0),
             channels: 0,
             rate: 0,
         },
@@ -35,6 +36,7 @@ fn heads() -> [TrackHead; 2] {
             timescale: 48_000,
             width: 0,
             height: 0,
+            par: (0, 0),
             channels: 2,
             rate: 48_000,
         },
@@ -275,6 +277,7 @@ fn vp9_entry_reads_back_with_its_vpcc() {
         timescale: VIDEO_TIMESCALE,
         width: 640,
         height: 360,
+        par: (0, 0),
         channels: 0,
         rate: 0,
     };
@@ -283,6 +286,7 @@ fn vp9_entry_reads_back_with_its_vpcc() {
     let e = crate::codec::parse_stsd(&stsd).unwrap();
     assert_eq!(&e.kind, b"vp09");
     assert_eq!((e.family, e.width, e.height), ("vp9", 640, 360));
+    assert_eq!(e.par, (0, 0), "square states no pasp");
     let c = e.colour;
     assert_eq!(c.range, Some(profluens_video::color::Range::from_flag(true)));
     assert_eq!(c.matrix, profluens_video::color::Matrix::from_h273(1));
@@ -290,4 +294,26 @@ fn vp9_entry_reads_back_with_its_vpcc() {
     let at = stsd.windows(4).position(|w| w == b"vpcC").unwrap();
     assert_eq!(&stsd[at + 4..at + 8], &[1, 0, 0, 0], "a version 1 FullBox");
     assert_eq!(&stsd[at + 8..], &vpcc);
+}
+
+#[test]
+fn an_anamorphic_entry_states_its_pasp_and_shows_stretched() {
+    let h = TrackHead { par: (32, 27), ..video_head(1, Entry::Avc(AVCC.to_vec()), 720, 480) };
+    let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
+    sample_entry(&mut stsd, &h);
+    let e = crate::codec::parse_stsd(&stsd).unwrap();
+    assert_eq!(((e.width, e.height), e.par), ((720, 480), (32, 27)));
+    // the presentation size widens, 720 * 32 / 27 is 853.3
+    assert_eq!(shown(&h), (853, 480));
+    let narrow = TrackHead { par: (8, 9), ..h.clone() };
+    assert_eq!(shown(&narrow), (720, 540));
+    let mut init = Vec::new();
+    crate::cmaf::init(&mut init, &h);
+    let at = init.windows(4).position(|w| w == b"tkhd").unwrap();
+    // version 0, the sizes the last 8 bytes of the box, 16.16 fixed point
+    let size = u32::from_be_bytes(init[at - 4..at].try_into().unwrap()) as usize;
+    let end = at - 4 + size;
+    let w = u32::from_be_bytes(init[end - 8..end - 4].try_into().unwrap());
+    let hh = u32::from_be_bytes(init[end - 4..end].try_into().unwrap());
+    assert_eq!((w >> 16, hh >> 16), (853, 480));
 }

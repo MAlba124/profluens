@@ -65,6 +65,8 @@ pub struct TrackHead {
     pub timescale: u32,
     pub width: u32,
     pub height: u32,
+    /// The pixel aspect ratio a video entry states in a `pasp`, none where square or 0.
+    pub par: (u32, u32),
     pub channels: u16,
     pub rate: u32,
 }
@@ -78,6 +80,7 @@ pub fn video_head(id: u32, entry: Entry, width: u32, height: u32) -> TrackHead {
         timescale: VIDEO_TIMESCALE,
         width,
         height,
+        par: (0, 0),
         channels: 0,
         rate: 0,
     }
@@ -92,6 +95,7 @@ pub fn audio_head(id: u32, entry: Entry, rate: u32, channels: u16) -> TrackHead 
         timescale: rate.max(1),
         width: 0,
         height: 0,
+        par: (0, 0),
         channels,
         rate,
     }
@@ -420,7 +424,7 @@ fn trak(out: &mut Vec<u8>, t: &TrackMoov<'_>) {
     u16be(out, if h.handler == Handler::Audio { 0x0100 } else { 0 });
     u16be(out, 0);
     matrix(out);
-    let (w, hh) = if h.handler == Handler::Video { (h.width, h.height) } else { (0, 0) };
+    let (w, hh) = if h.handler == Handler::Video { shown(h) } else { (0, 0) };
     // 16.16 fixed point, a dimension past 65535 would wrap.
     u32be(out, w.min(0xFFFF) << 16);
     u32be(out, hh.min(0xFFFF) << 16);
@@ -641,6 +645,25 @@ fn esds(out: &mut Vec<u8>, id: u32, oti: u8, asc: &[u8]) {
     close(out, at);
 }
 
+/// The pixel aspect ratio of `h` where it is not square.
+fn anamorphic(h: &TrackHead) -> Option<(u32, u32)> {
+    let (n, d) = h.par;
+    (n > 0 && d > 0 && n != d).then_some((n, d))
+}
+
+/// The presentation size of a video track (8.3.2.3), its coded size stretched by its pixel
+/// aspect ratio along the short side.
+fn shown(h: &TrackHead) -> (u32, u32) {
+    let grow = |v: u32, a: u32, b: u32| {
+        ((u64::from(v) * u64::from(a) + u64::from(b) / 2) / u64::from(b)).min(0xFFFF) as u32
+    };
+    match anamorphic(h) {
+        Some((n, d)) if n > d => (grow(h.width, n, d), h.height),
+        Some((n, d)) => (h.width, grow(h.height, d, n)),
+        None => (h.width, h.height),
+    }
+}
+
 fn sample_entry(out: &mut Vec<u8>, h: &TrackHead) {
     let kind: &[u8; 4] = match &h.entry {
         Entry::Avc(_) => b"avc1",
@@ -678,6 +701,12 @@ fn sample_entry(out: &mut Vec<u8>, h: &TrackHead) {
             let c = if full { open_full(out, cfg, 1, 0) } else { open(out, cfg) };
             out.extend_from_slice(body);
             close(out, c);
+            if let Some((n, d)) = anamorphic(h) {
+                let p = open(out, b"pasp");
+                u32be(out, n);
+                u32be(out, d);
+                close(out, p);
+            }
         }
         Handler::Audio => {
             out.extend_from_slice(&[0; 8]);

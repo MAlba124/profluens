@@ -132,6 +132,8 @@ pub struct Sps {
     pub max_num_reorder_frames: Option<u32>,
     pub max_dec_frame_buffering: Option<u32>,
     pub colour: crate::decoder::Color,
+    /// The VUI's sample aspect ratio, 0 to 0 where it states none.
+    pub sar: (u16, u16),
     /// `seq_scaling_matrix_present_flag` lists, fall-back rule A applied. None is Flat_16.
     pub scaling: Option<ScalingLists>,
 }
@@ -334,9 +336,10 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
         return None;
     }
     let (mut max_num_reorder_frames, mut max_dec_frame_buffering) = (None, None);
-    let mut colour = Default::default();
+    let (mut sar, mut colour) = ((0, 0), Default::default());
     if r.flag()
-        && let Some((reorder, dpb)) = parse_vui_restriction(&mut r, rbsp.len() * 8, &mut colour)
+        && let Some((reorder, dpb)) =
+            parse_vui_restriction(&mut r, rbsp.len() * 8, &mut sar, &mut colour)
     {
         max_num_reorder_frames = Some(reorder);
         max_dec_frame_buffering = Some(dpb);
@@ -372,6 +375,7 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
         max_num_reorder_frames,
         max_dec_frame_buffering,
         colour,
+        sar,
         scaling,
     })
 }
@@ -379,11 +383,12 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
 fn parse_vui_restriction(
     r: &mut BitReader,
     bits: usize,
+    sar: &mut (u16, u16),
     colour: &mut crate::decoder::Color,
 ) -> Option<(u32, u32)> {
-    let signal = crate::color::vui_signal(r);
+    let (aspect, signal) = crate::color::vui_head(r);
     if r.bit_pos() <= bits {
-        *colour = signal;
+        (*sar, *colour) = (aspect, signal);
     }
     if r.flag() {
         r.u(32); // num_units_in_tick

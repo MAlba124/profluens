@@ -1982,8 +1982,9 @@ fn resolve_track(
 
     let (track_id, tk_w, tk_h) =
         tkhd.map(|t| (t.track_id, t.width, t.height)).unwrap_or((track_index as u32 + 1, 0, 0));
-    let width = if tk_w != 0 { tk_w } else { entry.width };
-    let height = if tk_h != 0 { tk_h } else { entry.height };
+    // the entry's is the coded size, the tkhd's the shown one a `pasp` stretches
+    let width = if entry.width != 0 { entry.width } else { tk_w };
+    let height = if entry.height != 0 { entry.height } else { tk_h };
 
     let mut duration_ns = ticks_to_ns(mdhd.duration as i64, mdhd.timescale);
     // The edit list's span is used where it differs from the media's by more than a movie

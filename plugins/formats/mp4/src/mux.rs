@@ -1280,6 +1280,7 @@ fn text_head(id: u32) -> TrackHead {
         timescale: writer::TEXT_TIMESCALE,
         width: 0,
         height: 0,
+        par: (0, 0),
         channels: 0,
         rate: 0,
     }

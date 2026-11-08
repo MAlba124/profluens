@@ -67,6 +67,21 @@ impl Plan {
     }
 }
 
+/// The sides a `width` x `height` picture of pixel aspect `par` is shown at, its short side
+/// grown as players stretch it. A square or unstated ratio leaves it.
+pub fn shown(width: u32, height: u32, par: (u32, u32)) -> (u32, u32) {
+    let (n, d) = (u64::from(par.0), u64::from(par.1));
+    let grow =
+        |v: u32, a: u64, b: u64| ((u64::from(v) * a + b / 2) / b).min(u64::from(u32::MAX)) as u32;
+    if n == 0 || d == 0 || n == d {
+        (width, height)
+    } else if n > d {
+        (grow(width, n, d), height)
+    } else {
+        (width, grow(height, d, n))
+    }
+}
+
 fn out_kind(input: Kind, t: Target) -> Kind {
     if input.depth.min(t.depth) > 8 { P010 } else { NV12 }
 }
@@ -104,6 +119,8 @@ pub fn plan_fixed(width: u32, height: u32, input: Kind, t: Target) -> Option<Pla
     let (ow, oh) = (even(u64::from(t.max_width)), even(u64::from(t.max_height)));
     let (pw, ph) = fit(u64::from(width), u64::from(height), u64::from(ow), u64::from(oh));
     let (pw, ph) = (even(pw).min(ow), even(ph).min(oh));
+    // a side short of the box by its rounding fills it, the box is the free plan of the shape
+    let (pw, ph) = if ow - pw <= 2 && oh - ph <= 2 { (ow, oh) } else { (pw, ph) };
     let place = (((ow - pw) / 2) & !1, ((oh - ph) / 2) & !1, pw, ph);
     Some(Plan { width: ow, height: oh, out: out_kind(input, t), place, rotation: 0 })
 }
@@ -150,6 +167,28 @@ mod tests {
         assert_eq!(
             Plan::turned(64, 64, NV12, t(0, 0, 8), 30, false).map(|p| p.va_rotation()),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn a_pixel_aspect_grows_the_short_side() {
+        // NTSC DVD 16:9 and 4:3, PAL 16:9, HDV 1440 wide
+        assert_eq!(shown(720, 480, (32, 27)), (853, 480));
+        assert_eq!(shown(720, 480, (8, 9)), (720, 540));
+        assert_eq!(shown(720, 576, (64, 45)), (1024, 576));
+        assert_eq!(shown(1440, 1080, (4, 3)), (1920, 1080));
+        assert_eq!(shown(720, 480, (1, 1)), (720, 480));
+        assert_eq!(shown(720, 480, (0, 0)), (720, 480), "unstated");
+        // a shown size is fitted as any other, then stays within it
+        let (w, h) = shown(720, 480, (32, 27));
+        assert_eq!(
+            plan(w, h, NV12, t(1920, 1080, 8)).map(|p| (p.width, p.height)),
+            Some((852, 480))
+        );
+        assert_eq!(
+            plan_fixed(w, h, NV12, t(852, 480, 8)).map(|p| p.place),
+            Some((0, 0, 852, 480)),
+            "no bars"
         );
     }
 

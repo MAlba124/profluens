@@ -65,6 +65,9 @@ fn tracks_into(tracks: &[Track], d: &mut Desc) -> Result<u64, OpenError> {
             _ => e.bit_depth.min(255) as u8,
         };
         (out.width, out.height) = (e.width, e.height);
+        if e.par.0 > 0 && e.par.1 > 0 {
+            out.par = crate::ratio(u64::from(e.par.0), u64::from(e.par.1));
+        }
         out.rotation = t.rotation;
         out.bitrate = t.bitrate;
         out.delay_ns = ns(t.delay_ticks(), t.timescale);

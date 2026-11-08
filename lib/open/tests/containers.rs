@@ -186,3 +186,20 @@ fn an_open_states_its_brand() {
     let o = open(&b);
     assert_eq!((o.kind, o.brand(), o.tracks.len()), (Kind::Mp4, Brand::QuickTime, 2));
 }
+
+/// An MP4's AV1 and Opus tracks send no head, the open states their av1C and the OpusHead of
+/// their dOps as Matroska does.
+#[test]
+fn an_mp4s_av1c_and_opus_head_are_its_tracks_heads() {
+    let o = open(&own("av1.mp4"));
+    let t = &o.tracks[0];
+    assert_eq!(t.family, "av1");
+    assert_eq!(o.codec_head(t)[..4], [0x81, 0, 0x0c, 0]);
+    let o = open(&own("opus_5_1.mp4"));
+    let t = &o.tracks[0];
+    assert_eq!((t.family, t.channels), ("opus", 6));
+    let mut want = b"OpusHead".to_vec();
+    want.extend_from_slice(&[1, 6, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 1, 4, 2, 0, 4, 1, 2, 3, 5]);
+    assert_eq!(o.codec_head(t), want);
+    assert_eq!(t.layout.count_ones(), 6, "the mapping family's layout");
+}

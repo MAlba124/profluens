@@ -46,7 +46,11 @@ fn tracks_into(tracks: &[Track], d: &mut Desc) -> Result<u64, OpenError> {
         };
         let e = &t.entry;
         let mut out = TrackDesc::new(t.track_id, kind, family);
-        out.head = d.put(t.codec_head());
+        // AV1 and Opus send no head, their av1C and OpusHead describe them as Matroska does
+        out.head = match family {
+            "av1" | "opus" if t.codec_head().is_empty() => d.put(&e.config_record),
+            _ => d.put(t.codec_head()),
+        };
         out.language = match t.language_tag.is_empty() {
             true => d.put(std::str::from_utf8(&t.language).unwrap_or_default().as_bytes()),
             false => d.put(t.language_tag.as_bytes()),

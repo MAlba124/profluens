@@ -7,10 +7,18 @@ use crate::id::{ElementId, SrcPad};
 use crate::pipeline::{Addressed, Index, Reach, SeekMode, SeekPlan, Seekable, Serves};
 use crate::time::Timestamp;
 
-pub(crate) struct Planned {
-    pub(crate) plan: SeekPlan,
+/// The planner's lists, kept from plan to plan so a warm seek allocates nothing.
+#[derive(Default)]
+pub(crate) struct Scratch {
+    path: Vec<Frame>,
+    routes: Vec<Route>,
+    timed: Vec<ElementId>,
+    seeks: Vec<Step>,
     pub(crate) targets: Vec<Target>,
 }
+
+/// A path a seek restarts, how its source is addressed, its plan and where it restarts.
+type Step = (Route, Addressed, SeekPlan, Option<(u64, Timestamp)>);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Route {
@@ -29,56 +37,55 @@ fn serves_of(row: &Row) -> Option<Serves> {
     row.counters.serves().or((!row.desc.io).then_some(Serves::FILE))
 }
 
+/// The elements fed that feed none, by id. A few edges, rescanned rather than collected.
 fn sinks(view: &View) -> impl Iterator<Item = ElementId> + '_ {
     let feeds = |el: ElementId| view.edges.iter().any(|e| e.0 == el);
-    let mut fed = view.edges.iter().map(|e| e.2).filter(move |el| !feeds(*el)).collect::<Vec<_>>();
-    fed.sort_unstable_by_key(|el| el.0);
-    fed.dedup();
-    fed.into_iter()
+    let above = move |after: Option<u32>| {
+        let fed = view.edges.iter().map(|e| e.2).filter(move |el| after.is_none_or(|a| el.0 > a));
+        fed.filter(|el| !feeds(*el)).min_by_key(|el| el.0)
+    };
+    std::iter::successors(above(None), move |el| above(Some(el.0)))
 }
 
-fn walk(view: &View, sink: ElementId, chain: &mut Vec<ElementId>, routes: &mut Vec<Route>) {
-    chain.push(sink);
-    let ins = view.edges.iter().filter(|e| e.2 == sink).map(|e| e.0);
-    let mut fed = false;
-    for up in ins {
-        fed = true;
+/// An element on a walked path, the next edge to look at and whether any fed it.
+type Frame = (ElementId, usize, bool);
+
+/// Every path up from `sink` to a source, in the order a depth first walk meets them, once each.
+fn walk(view: &View, sink: ElementId, path: &mut Vec<Frame>, routes: &mut Vec<Route>) {
+    path.push((sink, 0, false));
+    while let Some(&(el, at, fed)) = path.last() {
+        let Some(i) = view.edges[at..].iter().position(|e| e.2 == el).map(|i| at + i) else {
+            if let Some(r) = (!fed).then(|| route(view, path)).filter(|r| !routes.contains(r)) {
+                routes.push(r);
+            }
+            path.pop();
+            continue;
+        };
+        if let Some(top) = path.last_mut() {
+            (top.1, top.2) = (i + 1, true);
+        }
+        let up = view.edges[i].0;
         // A DAG, the depth is bounded by the elements there are.
-        if chain.len() <= view.slots.len() && !chain.contains(&up) {
-            walk(view, up, chain, routes);
+        if path.len() <= view.slots.len() && !path.iter().any(|f| f.0 == up) {
+            path.push((up, 0, false));
         }
     }
-    if !fed {
-        routes.push(route(view, chain));
-    }
-    chain.pop();
 }
 
-fn route(view: &View, chain: &[ElementId]) -> Route {
-    let source = chain[chain.len() - 1];
+fn route(view: &View, path: &[Frame]) -> Route {
+    let source = path[path.len() - 1].0;
     let serves = live(view, source).and_then(serves_of);
-    let indexes = |el: &&ElementId| {
-        live(view, **el)
+    let indexes = |el: &ElementId| {
+        live(view, *el)
             .is_some_and(|row| row.counters.index.get().is_some() || row.counters.indexing())
     };
-    let publisher = chain.iter().rev().find(indexes).copied();
+    let publisher = path.iter().rev().map(|f| f.0).find(indexes);
     Route { source, serves, publisher }
 }
 
-// Off the media path, on an app thread or once per publication while a seek is held.
-#[allow(clippy::disallowed_methods)]
-fn routes(view: &View) -> Vec<Route> {
-    let (mut chain, mut routes) = (Vec::new(), Vec::new());
-    for sink in sinks(view) {
-        walk(view, sink, &mut chain, &mut routes);
-    }
-    let mut unique: Vec<Route> = Vec::with_capacity(routes.len());
-    for r in routes {
-        if !unique.contains(&r) {
-            unique.push(r);
-        }
-    }
-    unique
+fn routes(view: &View, path: &mut Vec<Frame>, routes: &mut Vec<Route>) {
+    routes.clear();
+    sinks(view).for_each(|sink| walk(view, sink, path, routes));
 }
 
 /// Whether a skip leaves every sink's streams together, every element feeding a sink having stamped
@@ -101,13 +108,13 @@ fn reader_pad(view: &View, publisher: ElementId, index: &Index) -> Option<SrcPad
     }
 }
 
-pub(crate) fn seekable(view: &View) -> Seekable {
-    let routes = routes(view);
-    if routes.is_empty() {
+pub(crate) fn seekable(view: &View, s: &mut Scratch) -> Seekable {
+    routes(view, &mut s.path, &mut s.routes);
+    if s.routes.is_empty() {
         return Seekable::No;
     }
     let mut best = Seekable::No;
-    for r in &routes {
+    for r in &s.routes {
         // A path nothing indexes is unseekable however its source answers, as plan has it.
         let Some(serves) = r.serves else {
             match r.publisher {
@@ -139,35 +146,33 @@ fn aim(targets: &mut Vec<Target>, (el, byte, at): Target) {
     }
 }
 
-/// Plan a seek to `to` from `position`. `settled` is read by the caller before any counter.
-// Off the media path, a few targets a seek.
-#[allow(clippy::disallowed_methods)]
+/// Plan a seek to `to` from `position`, its targets left in `s`. `settled` is read by the caller
+/// before any counter.
 pub(crate) fn plan(
     view: &View,
     settled: bool,
-    position: Timestamp,
-    to: Timestamp,
-    mode: SeekMode,
-) -> Planned {
-    let unseekable = Planned { plan: SeekPlan::Unseekable, targets: Vec::new() };
-    let deferred = || Planned { plan: SeekPlan::Deferred, targets: Vec::new() };
-    let routes = routes(view);
+    (position, to, mode): (Timestamp, Timestamp, SeekMode),
+    s: &mut Scratch,
+) -> SeekPlan {
+    s.timed.clear();
+    s.seeks.clear();
+    s.targets.clear();
+    routes(view, &mut s.path, &mut s.routes);
     let skips = settled && can_skip(view);
-    let (mut timed, mut seeks, mut all_skip, mut any_byte) = (Vec::new(), Vec::new(), true, false);
-    let mut stuck = false;
-    for r in &routes {
+    let (mut all_skip, mut any_byte, mut stuck) = (true, false, false);
+    for r in &s.routes {
         // A path nothing indexes is unseekable however its source is addressed.
         if r.publisher.is_none() && r.serves.is_some_and(|s| s.by != Addressed::Time) {
             continue;
         }
         let Some(serves) = r.serves else {
             match r.publisher {
-                Some(_) => return deferred(),
+                Some(_) => return SeekPlan::Deferred,
                 None => continue,
             }
         };
         if serves.by == Addressed::Time {
-            timed.push(r.source);
+            s.timed.push(r.source);
             continue;
         }
         let Some(publisher) = r.publisher else {
@@ -177,7 +182,7 @@ pub(crate) fn plan(
             continue;
         };
         let Some(index) = row.counters.index.get().filter(|_| !row.counters.indexing()) else {
-            return deferred();
+            return SeekPlan::Deferred;
         };
         let read = match (skips, reader_pad(view, publisher, &index)) {
             (true, Some(pad)) => row.counters.snapshot().pad_pts(pad),
@@ -196,60 +201,61 @@ pub(crate) fn plan(
             SeekPlan::Unseekable | SeekPlan::Deferred => continue,
         }
         any_byte = true;
-        seeks.push((*r, serves, index, plan, reach));
+        // A path that could skip restarts at its own keyframe, a seek it costs nothing.
+        let plan = match plan {
+            SeekPlan::Skip { .. } => index.plan(to, mode, position, None, reach),
+            plan => plan,
+        };
+        s.seeks.push((*r, serves.by, plan, index.restart(plan)));
     }
-    if !any_byte && timed.is_empty() {
-        return unseekable;
+    if !any_byte && s.timed.is_empty() {
+        return SeekPlan::Unseekable;
     }
-    if any_byte && all_skip && timed.is_empty() && !stuck {
-        return Planned { plan: SeekPlan::Skip { to_time: to }, targets: Vec::new() };
+    if any_byte && all_skip && s.timed.is_empty() && !stuck {
+        return SeekPlan::Skip { to_time: to };
     }
     // A seek flushes every path, and one source cannot go back.
     if stuck {
-        return unseekable;
+        return SeekPlan::Unseekable;
     }
-    let one_source = routes.iter().all(|r| r.source == routes[0].source);
-    let single = seeks.len() == 1 && timed.is_empty() && one_source;
-    if seeks.is_empty() {
-        let plan = SeekPlan::Seek { to_byte: 0, key: to, to_time: to };
-        return Planned { plan, targets: vec![(ALL, 0, to)] };
+    let one_source = s.routes.iter().all(|r| r.source == s.routes[0].source);
+    let single = s.seeks.len() == 1 && s.timed.is_empty() && one_source;
+    if s.seeks.is_empty() {
+        s.targets.push((ALL, 0, to));
+        return SeekPlan::Seek { to_byte: 0, key: to, to_time: to };
     }
-    let (mut targets, mut decided, mut aligned) = (Vec::new(), None::<SeekPlan>, true);
-    for (r, serves, index, plan, reach) in &seeks {
-        // A path that could skip restarts at its own keyframe, a seek it costs nothing.
-        let plan = match plan {
-            SeekPlan::Skip { .. } => index.plan(to, mode, position, None, *reach),
-            plan => *plan,
-        };
+    let (mut decided, mut aligned) = (None::<SeekPlan>, true);
+    for &(r, by, plan, restart) in &s.seeks {
         let SeekPlan::Seek { to_byte, key, .. } = plan else {
             continue;
         };
         // A source that cannot restart is flushed by no seek.
-        if serves.by == Addressed::No {
-            return unseekable;
+        if by == Addressed::No {
+            s.targets.clear();
+            return SeekPlan::Unseekable;
         }
-        let (byte, at) = index.restart(plan).unwrap_or((to_byte, key));
+        let (byte, at) = restart.unwrap_or((to_byte, key));
         aligned &= (byte, at) == (to_byte, key);
-        aim(&mut targets, (r.source, byte, at));
+        aim(&mut s.targets, (r.source, byte, at));
         if let Some(publisher) = r.publisher.filter(|p| *p != r.source) {
-            aim(&mut targets, (publisher, byte, key));
+            aim(&mut s.targets, (publisher, byte, key));
         }
         let later = |d: &SeekPlan| matches!(d, SeekPlan::Seek { key: k, .. } if *k >= key);
         if !decided.as_ref().is_some_and(later) {
             decided = Some(plan);
         }
     }
-    for source in timed {
-        aim(&mut targets, (source, 0, to));
-    }
+    s.timed.iter().for_each(|&source| aim(&mut s.targets, (source, 0, to)));
     let Some(plan) = decided else {
-        return unseekable;
+        s.targets.clear();
+        return SeekPlan::Unseekable;
     };
     // One source restarting at its keyframe is told through the slot of every element.
     if let (true, true, SeekPlan::Seek { to_byte, key, .. }) = (aligned, single, plan) {
-        targets = vec![(ALL, to_byte, key)];
+        s.targets.clear();
+        s.targets.push((ALL, to_byte, key));
     }
-    Planned { plan, targets }
+    plan
 }
 
 pub(crate) fn duration(view: &View) -> Option<Timestamp> {
@@ -366,8 +372,9 @@ mod tests {
     }
 
     fn planned(p: &Pipeline, position: Timestamp, to: Timestamp) -> (SeekPlan, Vec<Target>) {
-        let planned = p.control().planned(position, to, SeekMode::Accurate);
-        (planned.plan, planned.targets)
+        let mut s = super::Scratch::default();
+        let plan = p.control().planned(&mut s, position, to, SeekMode::Accurate);
+        (plan, s.targets)
     }
 
     fn seek(to_byte: u64, key: u64, to: u64) -> SeekPlan {
@@ -494,6 +501,56 @@ mod tests {
         let (plan, targets) = planned(&p, MS(1_000), MS(5_000));
         assert_eq!(plan, seek(3_000, 4_000, 5_000));
         assert_eq!(targets.len(), 4, "both sources and both demuxers, {targets:?}");
+    }
+
+    #[test]
+    fn a_second_plan_on_the_same_scratch_reuses_its_lists_and_plans_the_same() {
+        let mut p = Pipeline::new();
+        let mix = p.add(El(&MIX));
+        let (a, da) = (p.add(El(&FILE)), p.add(El(&DEMUX)));
+        let (b, db) = (p.add(El(&FILE)), p.add(El(&DEMUX)));
+        for (n, (s, d)) in [(a, da), (b, db)].into_iter().enumerate() {
+            link(&mut p, (s, 0), (d, 0));
+            link(&mut p, (d, 0), (mix, n as u32));
+        }
+        p.publish_index(da, gops(true));
+        p.publish_index(db, gops(false));
+        let control = p.control();
+        let mut s = super::Scratch::default();
+        let lists = |s: &super::Scratch| {
+            let ptrs = [s.path.as_ptr() as usize, s.routes.as_ptr() as usize];
+            (ptrs, s.seeks.as_ptr() as usize, s.targets.as_ptr() as usize)
+        };
+        let first = control.planned(&mut s, MS(1_000), MS(5_000), SeekMode::Accurate);
+        let (targets, warm) = (s.targets.clone(), lists(&s));
+        assert_eq!((first, targets.len()), (seek(3_000, 4_000, 5_000), 4));
+        let again = control.planned(&mut s, MS(1_000), MS(5_000), SeekMode::Accurate);
+        assert_eq!((again, &s.targets), (first, &targets), "the same plan");
+        assert_eq!(lists(&s), warm, "grown once, then reused");
+        out(&p, da, 0, MS(6_000));
+        out(&p, db, 0, MS(6_000));
+        let skip = control.planned(&mut s, MS(4_100), MS(5_000), SeekMode::Accurate);
+        assert_eq!((skip, s.targets.len()), (SeekPlan::Skip { to_time: MS(5_000) }, 0));
+        let back = control.planned(&mut s, MS(1_000), MS(5_000), SeekMode::Accurate);
+        assert_eq!((back, &s.targets, lists(&s)), (first, &targets, warm), "a skip leaves none");
+    }
+
+    #[test]
+    fn sinks_are_walked_by_id_whatever_order_they_were_linked_in() {
+        let mut p = Pipeline::new();
+        let (k1, k2) = (p.add(El(&SINK)), p.add(El(&SINK)));
+        let (b, db) = (p.add(El(&FILE)), p.add(El(&DEMUX)));
+        let (a, da) = (p.add(El(&FILE)), p.add(El(&DEMUX)));
+        for (s, d, k) in [(b, db, k2), (a, da, k1)] {
+            link(&mut p, (s, 0), (d, 0));
+            link(&mut p, (d, 0), (k, 0));
+        }
+        p.publish_index(da, gops(true));
+        p.publish_index(db, gops(true));
+        let (plan, targets) = planned(&p, MS(1_000), MS(5_000));
+        assert_eq!(plan, seek(3_000, 4_000, 5_000));
+        let order: Vec<ElementId> = targets.iter().map(|t| t.0).collect();
+        assert_eq!(order, [a, da, b, db], "the first sink's path first");
     }
 
     #[test]
@@ -643,7 +700,7 @@ mod tests {
         let head = Index { file_len: Some(17_000), duration: MS(32_000), ..Index::default() };
         p.publish_index(demux, head);
         let guess = SeekPlan::Seek { to_byte: 2_125, key: MS(4_000), to_time: MS(4_000) };
-        assert_eq!(p.control().planned(MS(0), MS(4_000), SeekMode::Keyframe).plan, guess);
+        assert_eq!(p.control().plan_from(MS(0), MS(4_000), SeekMode::Keyframe), guess);
         assert_eq!(p.control().duration(), Some(MS(32_000)));
     }
 

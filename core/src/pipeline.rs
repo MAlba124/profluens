@@ -2070,7 +2070,7 @@ impl Pipeline {
                 break;
             }
             while let Some(edit) = control.topology.take_edit() {
-                edit(self);
+                edit(Ok(self));
             }
             control.topology.advance(&control, &self.bus_sender);
             // Pools of elements a committed change removed go back as soon as their group is out.

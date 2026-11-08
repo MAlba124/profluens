@@ -104,8 +104,8 @@ impl Joining {
     }
 }
 
-/// An edit for the thread that is in `run()`.
-pub(crate) type Edit = Box<dyn FnOnce(&mut Pipeline) + Send>;
+/// An edit for the thread that is in `run()`, given the refusal where it was not queued.
+pub(crate) type Edit = Box<dyn FnOnce(Result<&mut Pipeline, CommandError>) + Send>;
 
 pub(crate) struct Flight {
     pub(crate) change: u32,
@@ -352,14 +352,14 @@ impl Topology {
         }
     }
 
-    pub(crate) fn push_edit(&self, edit: Edit) -> Result<(), CommandError> {
+    pub(crate) fn push_edit(&self, edit: Edit) -> Result<(), (CommandError, Edit)> {
         let mut st = relock(&self.inner);
         if !st.serving {
-            return Err(CommandError::NotRunning);
+            return Err((CommandError::NotRunning, edit));
         }
         // The run thread executes the edits, so one made from it would wait on itself.
         if st.runner == Some(std::thread::current().id()) {
-            return Err(CommandError::OnRunThread);
+            return Err((CommandError::OnRunThread, edit));
         }
         st.edits.push_back(edit);
         drop(st);

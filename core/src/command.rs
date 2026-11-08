@@ -216,8 +216,9 @@ pub struct Control {
     stations: Mutex<Stations>,
     pub(crate) topology: Topology,
     view: std::sync::OnceLock<Roster>,
-    /// A seek held until an index lands. Taken before the writer lock, never after.
-    pending: std::sync::Mutex<Option<Held>>,
+    /// A seek held until an index lands, with the planner's lists. Taken before the writer lock,
+    /// never after.
+    pending: std::sync::Mutex<(Option<Held>, crate::seeker::Scratch)>,
     /// Mirrors `pending`, so a group's pass checks for a held seek without the lock.
     holding: AtomicBool,
     over_at: Plain,
@@ -273,20 +274,13 @@ fn relock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// What a queued [`Control::edit_then`] owes: its callback, queued, dropped unrun.
-type Owed<F> = Arc<Mutex<(Option<F>, bool, bool)>>;
+/// A queued edit's callback, answered `Finished` where the edit is dropped unrun.
+struct Owed<T, F: FnOnce(Result<T, CommandError>)>(Option<F>, PhantomData<fn() -> T>);
 
-/// Held by a queued edit, one dropped unrun answers `Finished` once it is queued.
-struct Unanswered<T, F: FnOnce(Result<T, CommandError>)>(Owed<F>, PhantomData<fn() -> T>);
-
-impl<T, F: FnOnce(Result<T, CommandError>)> Drop for Unanswered<T, F> {
+impl<T, F: FnOnce(Result<T, CommandError>)> Drop for Owed<T, F> {
     fn drop(&mut self) {
-        let mut o = relock(&self.0);
-        o.2 = true;
-        let done = if o.1 { o.0.take() } else { None };
-        drop(o);
-        if let Some(d) = done {
-            d(Err(CommandError::Finished));
+        if let Some(done) = self.0.take() {
+            done(Err(CommandError::Finished));
         }
     }
 }
@@ -328,7 +322,7 @@ impl Control {
             stations: Mutex::new(Stations { live: Vec::new(), retired: SchedulerStats::default() }),
             topology: Topology::new(),
             view: std::sync::OnceLock::new(),
-            pending: std::sync::Mutex::new(None),
+            pending: std::sync::Mutex::new((None, crate::seeker::Scratch::default())),
             holding: AtomicBool::new(false),
             over_at: Plain::new(0),
         })
@@ -366,48 +360,47 @@ impl Control {
         mode: SeekMode,
     ) -> Result<SeekPlan, CommandError> {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        let planned = self.planned(from.unwrap_or_else(|| self.position()), to, mode);
-        if planned.plan == SeekPlan::Deferred && relock(&self.writer).clock.is_none() {
+        let (held, s) = &mut *pending;
+        let plan = self.planned(s, from.unwrap_or_else(|| self.position()), to, mode);
+        if plan == SeekPlan::Deferred && relock(&self.writer).clock.is_none() {
             return Err(CommandError::NotRunning);
         }
-        *pending = (planned.plan == SeekPlan::Deferred).then_some(Held { from, to, mode });
-        self.holding.store(pending.is_some(), Ordering::Release);
-        self.carry(&planned, mode == SeekMode::Preview)?;
-        Ok(planned.plan)
+        *held = (plan == SeekPlan::Deferred).then_some(Held { from, to, mode });
+        self.holding.store(held.is_some(), Ordering::Release);
+        self.carry(plan, &s.targets, mode == SeekMode::Preview)?;
+        Ok(plan)
     }
 
     /// What [`seek`](Self::seek) would carry out now, sending nothing.
     pub fn plan(&self, to: Timestamp, mode: SeekMode) -> SeekPlan {
-        self.planned(self.position(), to, mode).plan
+        self.plan_from(self.position(), to, mode)
     }
 
     /// What [`seek_from`](Self::seek_from) would carry out now, sending nothing.
     pub fn plan_from(&self, position: Timestamp, to: Timestamp, mode: SeekMode) -> SeekPlan {
-        self.planned(position, to, mode).plan
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        self.planned(&mut pending.1, position, to, mode)
     }
 
-    // An empty Vec allocates nothing.
-    #[allow(clippy::disallowed_methods)]
+    /// The plan, its targets left in `s`.
     pub(crate) fn planned(
         &self,
+        s: &mut crate::seeker::Scratch,
         position: Timestamp,
         to: Timestamp,
         mode: SeekMode,
-    ) -> crate::seeker::Planned {
-        let Some(view) = self.view.get() else {
-            return crate::seeker::Planned { plan: SeekPlan::Unseekable, targets: Vec::new() };
-        };
+    ) -> SeekPlan {
+        s.targets.clear();
+        let Some(view) = self.view.get() else { return SeekPlan::Unseekable };
         // Settled before the counters are read, see the planner's docs.
         let settled = self.settled();
-        view.read(|v| crate::seeker::plan(v, settled, position, to, mode))
+        view.read(|v| crate::seeker::plan(v, settled, (position, to, mode), s))
     }
 
-    fn carry(&self, planned: &crate::seeker::Planned, preview: bool) -> Result<(), CommandError> {
-        match planned.plan {
+    fn carry(&self, plan: SeekPlan, targets: &[Target], preview: bool) -> Result<(), CommandError> {
+        match plan {
             SeekPlan::Skip { to_time } => self.append(Command::SkipTo { to_time }).map(drop),
-            SeekPlan::Seek { to_time, .. } => {
-                self.append_seek(to_time, &planned.targets, preview).map(drop)
-            }
+            SeekPlan::Seek { to_time, .. } => self.append_seek(to_time, targets, preview).map(drop),
             SeekPlan::Deferred | SeekPlan::Unseekable => Ok(()),
         }
     }
@@ -415,23 +408,24 @@ impl Control {
     /// Plan the held seek again on what was just published, and send it once no longer held.
     pub(crate) fn resolve_pending(&self) {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(Held { from, to, mode }) = *pending else {
+        let (held, s) = &mut *pending;
+        let Some(Held { from, to, mode }) = *held else {
             return;
         };
         if self.is_stopped() {
-            *pending = None;
+            *held = None;
             self.holding.store(false, Ordering::Release);
             return;
         }
-        let planned = self.planned(from.unwrap_or_else(|| self.position()), to, mode);
-        if planned.plan == SeekPlan::Deferred {
+        let plan = self.planned(s, from.unwrap_or_else(|| self.position()), to, mode);
+        if plan == SeekPlan::Deferred {
             return;
         }
         if !matches!(
-            self.carry(&planned, mode == SeekMode::Preview),
+            self.carry(plan, &s.targets, mode == SeekMode::Preview),
             Err(CommandError::Full | CommandError::NotRunning)
         ) {
-            *pending = None;
+            *held = None;
             self.holding.store(false, Ordering::Release);
         }
     }
@@ -445,7 +439,7 @@ impl Control {
 
     /// The seek held for an index, if one is.
     pub fn pending(&self) -> Option<(Timestamp, SeekMode)> {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).map(|h| (h.to, h.mode))
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).0.map(|h| (h.to, h.mode))
     }
 
     /// The stream time being presented, held at the last one once the run is over.
@@ -481,7 +475,9 @@ impl Control {
 
     /// What a seek can do now.
     pub fn seekable(&self) -> Seekable {
-        self.view.get().map_or(Seekable::Unknown, |view| view.read(crate::seeker::seekable))
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let seekable = |v: &_| crate::seeker::seekable(v, &mut pending.1);
+        self.view.get().map_or(Seekable::Unknown, |view| view.read(seekable))
     }
 
     /// The byte level of [`seek`](Self::seek), with where each source reads.
@@ -528,7 +524,7 @@ impl Control {
     /// the run starts, it stops that run at its first pass.
     pub fn stop(&self) {
         self.stop_asked.store(true, Ordering::Release);
-        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).0 = None;
         self.holding.store(false, Ordering::Release);
         if self.append(Command::Stop).is_err() {
             self.abort();
@@ -555,7 +551,7 @@ impl Control {
     /// Queue `edit` for the `run()` thread and return at once. `done` runs exactly once: on the
     /// run thread with the result, with `Finished` where the run drops it unrun, here with the
     /// refusal when it cannot be queued.
-    // One box and one cell per edit, off the media path.
+    // One box per edit, off the media path.
     #[allow(clippy::disallowed_methods)]
     pub fn edit_then<T: Send + 'static, F>(
         &self,
@@ -564,23 +560,14 @@ impl Control {
     ) where
         F: FnOnce(Result<T, CommandError>) + Send + 'static,
     {
-        let owed: Owed<F> = Arc::new(Mutex::new((Some(done), false, false)));
-        let guard = Unanswered(Arc::clone(&owed), PhantomData);
-        let queued = self.topology.push_edit(Box::new(move |p| {
-            let t = edit(p);
-            let done = relock(&guard.0).0.take();
-            if let Some(d) = done {
-                d(Ok(t));
+        let mut owed = Owed(Some(done), PhantomData);
+        let edit: crate::topology::Edit = Box::new(move |p: Result<&mut Pipeline, _>| {
+            if let Some(done) = owed.0.take() {
+                done(p.map(edit));
             }
-        }));
-        // a refused edit was dropped unqueued, one dropped since by an ended run too
-        let mut o = relock(&owed);
-        o.1 = true;
-        let why = queued.err().or(o.2.then_some(CommandError::Finished));
-        let done = why.and_then(|e| o.0.take().map(|d| (d, e)));
-        drop(o);
-        if let Some((d, e)) = done {
-            d(Err(e));
+        });
+        if let Err((why, edit)) = self.topology.push_edit(edit) {
+            edit(Err(why));
         }
     }
 
@@ -814,7 +801,7 @@ impl Control {
     ) -> (Vec<Arc<Cursor>>, u64) {
         debug_assert_eq!(stations.len(), terminal.len(), "one flag per group");
         // A hold of the run before is not this one's, and the pending lock is taken first.
-        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).0 = None;
         self.holding.store(false, Ordering::Release);
         let mut w = relock(&self.writer);
         let head = self.log.head();
@@ -1041,7 +1028,7 @@ mod tests {
         let edit = control.topology.take_edit();
         assert!(edit.is_some());
         if let Some(e) = edit {
-            e(&mut Pipeline::new());
+            e(Ok(&mut Pipeline::new()));
         }
         assert_eq!(rx.try_recv(), Ok(Ok(2)), "answered by the run thread");
         control.edit_then(|_: &mut Pipeline| 3, answer(&tx));
@@ -1050,6 +1037,17 @@ mod tests {
         assert!(rx.try_recv().is_err(), "each answered once");
         // the blocking edit is the same path
         assert_eq!(control.edit(|_: &mut Pipeline| 4), Err(CommandError::NotRunning));
+    }
+
+    #[test]
+    fn an_edit_then_from_the_run_thread_is_refused_once_and_never_queued() {
+        let control = Control::new(Arc::new(AtomicI64::new(0)));
+        control.topology.serve(true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        control.edit_then(|_: &mut Pipeline| 1, move |r| tx.send(r).unwrap_or(()));
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), [Err(CommandError::OnRunThread)]);
+        assert!(control.topology.take_edit().is_none(), "not queued");
+        control.topology.serve(false);
     }
 
     #[test]

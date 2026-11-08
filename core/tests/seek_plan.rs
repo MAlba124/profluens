@@ -585,3 +585,91 @@ fn a_link_of_an_uncued_stream_goes_back_the_reach() {
     assert_eq!(index.restart_for(7, MS(35_000)), Some((10_000, MS(10_000))));
     assert_eq!(index.restart_for(8, MS(35_000)), Some((30_000, MS(30_000))), "a cued stream");
 }
+
+mod warm {
+    use profluens_core::batch::Inputs;
+    use profluens_core::ctx::Ctx;
+    use profluens_core::element::{
+        Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
+    };
+    use profluens_core::error::Error;
+    use profluens_core::format::OfferDesc;
+    use profluens_core::id::{SinkPad, SrcPad};
+    use profluens_core::pipeline::{Pipeline, SeekMode, SeekPlan};
+
+    use super::{MS, gops};
+    use crate::link_leak::alloc_calls;
+
+    static BYTES: [OfferDesc; 1] = [OfferDesc::any("bytes")];
+    static ONE: [PadDesc; 1] = [PadDesc { name: "pad", offers: &BYTES }];
+
+    const fn desc(
+        name: &'static str,
+        sinks: &'static [PadDesc],
+        srcs: &'static [PadDesc],
+    ) -> ElementDesc {
+        let inputs = if sinks.is_empty() { InputPolicy::None } else { InputPolicy::Any };
+        let (props, sched, latency) = (&[], SchedHint::Active, LatencyDesc::NONE);
+        ElementDesc {
+            name,
+            sinks,
+            srcs,
+            props,
+            sched,
+            inputs,
+            latency,
+            io: false,
+            make_default: None,
+            couplings: &[],
+        }
+    }
+
+    static FILE: ElementDesc = desc("file", &[], &ONE);
+    static DEMUX: ElementDesc = desc("demux", &ONE, &ONE);
+    static SINK: ElementDesc = desc("sink", &ONE, &[]);
+
+    struct El(&'static ElementDesc);
+
+    impl Element for El {
+        fn desc(&self) -> &'static ElementDesc {
+            self.0
+        }
+
+        fn process(&mut self, _ctx: &mut Ctx, _inputs: Inputs<'_>) -> Result<Flow, Error> {
+            Ok(Flow::Eos)
+        }
+    }
+
+    #[test]
+    fn a_warm_seek_plan_allocates_nothing() {
+        let mut p = Pipeline::new();
+        let (file, demux, sink) = (p.add(El(&FILE)), p.add(El(&DEMUX)), p.add(El(&SINK)));
+        p.link((file, SrcPad(0)), (demux, SinkPad(0))).expect("links");
+        p.link((demux, SrcPad(0)), (sink, SinkPad(0))).expect("links");
+        p.publish_index(demux, gops());
+        let control = p.control();
+        let want = SeekPlan::Seek { to_byte: 10_000, key: MS(10_000), to_time: MS(15_000) };
+        let before = alloc_calls();
+        assert_eq!(control.plan_from(MS(1_000), MS(15_000), SeekMode::Accurate), want);
+        assert!(alloc_calls() > before, "a cold plan grows its lists");
+        let before = alloc_calls();
+        for _ in 0..4 {
+            assert_eq!(control.plan_from(MS(1_000), MS(15_000), SeekMode::Accurate), want);
+            control.seekable();
+            control.can_skip();
+        }
+        assert_eq!(alloc_calls() - before, 0, "a warm plan reuses them");
+    }
+
+    #[test]
+    fn an_edit_then_costs_one_box_and_answers_once() {
+        let control = Pipeline::new().control();
+        // Bounded, so a send allocates nothing.
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let before = alloc_calls();
+        control.edit_then(|_: &mut Pipeline| 1, move |r| tx.send(r).unwrap_or(()));
+        assert_eq!(alloc_calls() - before, 1, "the edit and its answer in one box");
+        let refused = Err(profluens_core::command::CommandError::NotRunning);
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), [refused], "no run serves edits");
+    }
+}

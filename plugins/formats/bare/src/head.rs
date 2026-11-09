@@ -8,7 +8,9 @@
 use crate::BareError;
 use crate::flac::{self, MAX_HEADER, STREAMINFO_LEN, StreamInfo};
 use crate::reader::header;
+use crate::sync::{self, SyncKind};
 use pf_mp3::frame::Header as MpaHeader;
+use profluens_audio::{SampleFormat, WavError};
 use profluens_core::fetch::{Fetch, Need, Step};
 use std::ops::Range;
 
@@ -24,6 +26,9 @@ const MAX_APE: u64 = 1 << 20;
 const MAX_BLOCKS: usize = 1024;
 /// A FLAC PICTURE block past this is not read, a 16 MiB image and its fields.
 const MAX_PICTURE_BLOCK: u64 = (16 << 20) + (64 << 10);
+/// Sample frames a PCM unit holds at most, and its bytes at most.
+const PCM_FRAMES: u64 = 4096;
+const PCM_UNIT: u64 = 64 << 10;
 /// ADTS sampling frequencies by index, ISO/IEC 14496-3 1.6.3.4.
 const ADTS_RATES: [u32; 13] = [
     96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000,
@@ -36,14 +41,41 @@ pub enum BareKind {
     Flac,
     Mp3,
     Adts,
+    Wav,
+    Ac3,
+    Eac3,
+    Dts,
 }
 
 /// What frames of the stream must match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
-    Flac { si: StreamInfo, variable: bool },
-    Mpa { stream: MpaHeader },
-    Adts { profile: u8, sfi: u8, channels: u8 },
+    Flac {
+        si: StreamInfo,
+        variable: bool,
+    },
+    Mpa {
+        stream: MpaHeader,
+    },
+    Adts {
+        profile: u8,
+        sfi: u8,
+        channels: u8,
+    },
+    /// AC-3, E-AC-3 or DTS, primary frames matching `key`.
+    Sync {
+        kind: SyncKind,
+        key: u32,
+        channels: u8,
+        depth: u8,
+    },
+    /// Interleaved PCM, `align` bytes a sample frame, `mask` the WAVE speakers or 0.
+    Pcm {
+        sample: SampleFormat,
+        channels: u16,
+        align: u32,
+        mask: u32,
+    },
 }
 
 /// What is kept of a bare file, read once at open.
@@ -87,15 +119,28 @@ impl BareHead {
         match self.codec {
             Codec::Flac { si, .. } => si.channels,
             Codec::Mpa { stream } => stream.channel_count(),
-            Codec::Adts { channels, .. } => channels,
+            Codec::Adts { channels, .. } | Codec::Sync { channels, .. } => channels,
+            Codec::Pcm { channels, .. } => channels.min(255) as u8,
         }
     }
 
-    /// Bits a sample, 16 for the lossy codecs.
+    /// Bits a sample, 16 for the lossy codecs, the source's where DTS states it.
     pub fn depth(&self) -> u8 {
         match self.codec {
             Codec::Flac { si, .. } => si.bits,
-            Codec::Mpa { .. } | Codec::Adts { .. } => 16,
+            Codec::Sync { depth, .. } if depth > 0 => depth,
+            Codec::Pcm { sample, .. } => sample.bits() as u8,
+            Codec::Mpa { .. } | Codec::Adts { .. } | Codec::Sync { .. } => 16,
+        }
+    }
+
+    /// The speakers a WAVE header states when they are as many as its channels, else 0.
+    pub fn layout(&self) -> u64 {
+        match self.codec {
+            Codec::Pcm { channels, mask, .. } if mask.count_ones() == u32::from(channels) => {
+                u64::from(mask)
+            }
+            _ => 0,
         }
     }
 
@@ -191,10 +236,13 @@ enum OpenState {
     Frame {
         end: u64,
     },
+    /// WAV, the head grown until it holds the `data` chunk's header.
+    Wav,
 }
 
-/// Opens a bare FLAC, MP3 or ADTS file of `len` bytes, the head, the trailing tags, and the tag
-/// bytes the file holds. The head grows a read at a time, the tail is read once.
+/// Opens a bare FLAC, MP3, ADTS, AC-3, E-AC-3 or DTS file of `len` bytes, the head, the trailing
+/// tags, and the tag bytes the file holds, or a WAV file's head to its `data` chunk. The head
+/// grows a read at a time, the tail is read once.
 #[derive(Debug)]
 pub struct OpenAt {
     len: u64,
@@ -321,6 +369,15 @@ impl OpenAt {
                 open_adts(self.tags.head.get(tag as usize..).unwrap_or(&[]), tag, end)?
             }
             BareKind::Mp3 => open_mp3(self.tags.head.get(tag as usize..).unwrap_or(&[]), tag, end)?,
+            BareKind::Ac3 | BareKind::Eac3 | BareKind::Dts => {
+                let kind = match self.kind {
+                    BareKind::Ac3 => SyncKind::Ac3,
+                    BareKind::Eac3 => SyncKind::Eac3,
+                    _ => SyncKind::Dts,
+                };
+                open_sync(kind, self.tags.head.get(tag as usize..).unwrap_or(&[]), tag, end)?
+            }
+            BareKind::Wav => return Err(BareError::NoStreams),
         };
         self.state = OpenState::Start;
         Ok(Step::Done((h, std::mem::take(&mut self.tags))))
@@ -359,6 +416,60 @@ impl OpenAt {
         Ok(Step::Done((BareHead { duration_ns, ..h }, std::mem::take(&mut self.tags))))
     }
 
+    /// The PCM of a WAV head, its tags left alone, the head grown while the `data` chunk lies
+    /// past it.
+    fn wav(&mut self) -> Result<Step<(BareHead, RawTags)>, BareError> {
+        let have = self.tags.head.len() as u64;
+        let h = match profluens_audio::parse_wav_header(&self.tags.head) {
+            Ok(h) => h,
+            Err(WavError::NeedMore) if have < self.len => {
+                return match self.extend(OpenState::Wav, have.saturating_mul(2).max(HEAD))? {
+                    Some(need) => Ok(Step::Need(need)),
+                    None => Err(BareError::Malformed(have)),
+                };
+            }
+            Err(WavError::NeedMore | WavError::Malformed) => {
+                return Err(BareError::Malformed(have));
+            }
+            Err(WavError::NotRiff | WavError::NotWave) => return Err(BareError::NoStreams),
+            Err(WavError::BadFmt | WavError::NoFmt) => return Err(BareError::BadHead("wav")),
+            Err(WavError::Unsupported { .. }) => return Err(BareError::Unsupported("wav format")),
+        };
+        let f = h.format;
+        let align = f.frame_stride() as u64;
+        let first = h.data_offset as u64;
+        if align == 0 || first > self.len || align > PCM_UNIT {
+            return Err(BareError::Malformed(first));
+        }
+        let held = self.len - first;
+        let data = h.data_len.map_or(held, |d| d.min(held));
+        let samples = data / align;
+        let spf = (PCM_UNIT / align).min(PCM_FRAMES);
+        let codec = Codec::Pcm {
+            sample: f.format,
+            channels: f.channels,
+            align: align as u32,
+            mask: wav_mask(&self.tags.head),
+        };
+        let h = BareHead {
+            codec,
+            family: profluens_audio::FAMILY,
+            head: Vec::new(),
+            first,
+            end: first + samples * align,
+            rate: f.sample_rate,
+            spf: spf as u32,
+            samples,
+            duration_ns: 0,
+            points: Vec::new(),
+            cbr: Some((spf * align, 1)),
+            gapless: (0, 0),
+        };
+        self.state = OpenState::Start;
+        let duration_ns = h.ns(samples);
+        Ok(Step::Done((BareHead { duration_ns, ..h }, std::mem::take(&mut self.tags))))
+    }
+
     fn step(&mut self) -> Result<Step<(BareHead, RawTags)>, BareError> {
         loop {
             let need = match self.state {
@@ -367,6 +478,10 @@ impl OpenAt {
                     self.tags.head = std::mem::take(&mut self.seed);
                     self.extend(OpenState::Head, HEAD)?
                 }
+                OpenState::Head | OpenState::Wav if self.kind == BareKind::Wav => {
+                    return self.wav();
+                }
+                OpenState::Wav => return Err(BareError::NoStreams),
                 OpenState::Head => {
                     self.tag = pf_mp3::id3::v2_total_len(&self.tags.head).map_or(0, |n| n as u64);
                     match self.kind {
@@ -585,6 +700,88 @@ fn open_adts(audio: &[u8], tag: u64, end: u64) -> Result<BareHead, BareError> {
         duration_ns: 0,
         points: Vec::new(),
         cbr: None,
+        gapless: (0, 0),
+    };
+    Ok(BareHead { duration_ns: h.ns(samples), ..h })
+}
+
+/// The WAVE_FORMAT_EXTENSIBLE `dwChannelMask` of the `fmt ` chunk in `head`, 0 without one.
+fn wav_mask(head: &[u8]) -> u32 {
+    let le = |at: usize| head.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let mut at = 12usize;
+    while let (Some(id), Some(size)) = (head.get(at..at + 4), le(at + 4)) {
+        if id == b"fmt " {
+            let tag = head.get(at + 8..at + 10).map(|b| u16::from_le_bytes([b[0], b[1]]));
+            return match (tag, size >= 24) {
+                (Some(0xFFFE), true) => le(at + 28).unwrap_or(0),
+                _ => 0,
+            };
+        }
+        at = at.saturating_add(8).saturating_add(size as usize + (size & 1) as usize);
+    }
+    0
+}
+
+/// The first primary frame of `kind` a successor confirms, the frames the head holds giving the
+/// average size, the line when every primary frame has one size or bit rate and nothing is
+/// attached.
+fn open_sync(kind: SyncKind, audio: &[u8], tag: u64, end: u64) -> Result<BareHead, BareError> {
+    let audio = &audio[..audio.len().min(end.saturating_sub(tag) as usize)];
+    let primary = |at: usize| sync::frame(kind, audio.get(at..)?).filter(|f| !f.attached);
+    let confirmed = |at: usize| {
+        let f = primary(at)?;
+        let next = at + f.len as usize;
+        (next >= audio.len() || sync::frame(kind, &audio[next..]).is_some()).then_some(f)
+    };
+    let (at, f) = (0..audio.len().saturating_sub(1))
+        .filter(|&i| sync::is_sync(kind, audio[i], audio[i + 1]))
+        .find_map(|i| Some((i, confirmed(i)?)))
+        .ok_or(BareError::NoStreams)?;
+    let (mut p, mut n, mut bytes, mut same, mut attached) = (at, 0u64, 0u64, true, false);
+    while let Some(g) = audio.get(p..).and_then(|b| sync::frame(kind, b)) {
+        if p + g.len as usize > audio.len() || (!g.attached && g.key != f.key) {
+            break;
+        }
+        match g.attached {
+            true => attached = true,
+            false => {
+                n += 1;
+                same &= if kind == SyncKind::Ac3 { g.kbps == f.kbps } else { g.len == f.len };
+            }
+        }
+        (p, bytes) = (p + g.len as usize, bytes + u64::from(g.len));
+    }
+    if n == 0 {
+        (n, bytes) = (1, u64::from(f.len));
+    }
+    let cbr = match (kind, same && !attached) {
+        (_, false) => None,
+        (SyncKind::Ac3, true) => {
+            Some((u64::from(f.kbps) * 1000 * u64::from(f.samples), u64::from(f.rate) * 8))
+        }
+        (_, true) => Some((u64::from(f.len), 1)),
+    };
+    let first = tag + at as u64;
+    let span = u128::from(end.saturating_sub(first));
+    let frames = match cbr {
+        // a padded line ends a fraction of a frame either side of its whole frames
+        Some((num, den)) => (span * u128::from(den) + u128::from(num) / 2) / u128::from(num.max(1)),
+        None => span * u128::from(n) / u128::from(bytes.max(1)),
+    };
+    let samples = u64::try_from(frames * u128::from(f.samples)).unwrap_or(u64::MAX);
+    let codec = Codec::Sync { kind, key: f.key, channels: f.channels, depth: f.depth };
+    let h = BareHead {
+        codec,
+        family: kind.family(),
+        head: Vec::new(),
+        first,
+        end,
+        rate: f.rate,
+        spf: f.samples,
+        samples,
+        duration_ns: 0,
+        points: Vec::new(),
+        cbr,
         gapless: (0, 0),
     };
     Ok(BareHead { duration_ns: h.ns(samples), ..h })

@@ -35,6 +35,15 @@ FFMPEG=/path/to/ffmpeg cargo xtask fixtures   # FFPROBE likewise, else the ffpro
 | `audio.flac`                | FLAC (native)                                       |
 | `audio.wav`                 | WAV, s16le PCM                                      |
 | `audio.aac`                 | raw ADTS AAC (no container)                         |
+| `audio_f32.wav`             | WAV, f32le PCM                                      |
+| `audio.ac3`                 | AC-3, stereo                                        |
+| `audio_51.ac3`              | AC-3, 5.1                                           |
+| `audio.eac3`                | E-AC-3                                              |
+| `audio.dts`                 | DTS core, stereo                                    |
+| `ts_h264_aac.ts`            | H.264 + AAC in MPEG-TS                              |
+| `ts_h265_ac3.ts`            | H.265 + AC-3 in MPEG-TS                             |
+| `ps_mpeg1_mp2.mpg`          | MPEG-1 video + MP2 in an MPEG-1 program stream      |
+| `ps_mpeg2_ac3.vob`          | MPEG-2 video + AC-3 in DVD VOB packs                |
 
 ## Running the matrix
 

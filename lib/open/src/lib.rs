@@ -1,6 +1,7 @@
 mod at;
 mod avi;
 mod bare;
+mod es;
 mod flv;
 mod layout;
 mod mkv;
@@ -8,7 +9,9 @@ mod mp4;
 mod ogg;
 #[cfg(feature = "pipeline")]
 pub mod pipeline;
+mod ps;
 mod sps;
+mod ts;
 
 use std::fmt;
 use std::ops::Range;

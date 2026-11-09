@@ -83,11 +83,16 @@ fn opened_at(path: &Path) -> Opened {
 
 /// Every audio and video track of `rel` routed to a counter and the file played to its end.
 fn plays(rel: &str, kind: Kind) {
-    let o = opened(rel);
+    plays_at(&path_of(rel), kind);
+}
+
+fn plays_at(path: &Path, kind: Kind) {
+    let rel = path.display();
+    let o = opened_at(path);
     assert_eq!(o.kind, kind, "{rel}");
     let mut p = pf_reactor::pipeline();
     p.set_select_all(false);
-    let path = path_of(rel);
+    let path = path.to_path_buf();
     let demux = demuxer(&mut p, File::open(&path).unwrap(), &path, &o, false).unwrap();
     p.preroll().unwrap();
     let mut counts = Vec::new();
@@ -119,6 +124,97 @@ fn every_container_plays_its_tracks_through_the_routes() {
     plays("plugins/formats/bare/tests/fixtures/tone.flac", Kind::Flac);
     plays("plugins/formats/bare/tests/fixtures/tone.mp3", Kind::Mp3);
     plays("plugins/formats/bare/tests/fixtures/tone.aac", Kind::AdtsAac);
+    plays("plugins/formats/ts/tests/fixtures/h264_aac.ts", Kind::Ts);
+    plays("plugins/formats/ts/tests/fixtures/hevc_eac3_dvb.ts", Kind::Ts);
+    plays("plugins/formats/tsdemux/tests/fixtures/dvbsub.ts", Kind::Ts);
+    plays("plugins/formats/ps/tests/fixtures/mpeg2_ac3.vob", Kind::Ps);
+    plays("plugins/formats/ps/tests/fixtures/lpcm16.vob", Kind::Ps);
+    plays("plugins/formats/ps/tests/fixtures/mpeg1_mp2.mpg", Kind::Ps);
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let made = |name: &str, bytes: Vec<u8>| {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    use pf_bare::fixture::{ac3_frame, dts_frame, eac3_frame, wav_file};
+    let ac3 = made("plays.ac3", (0..200).flat_map(|_| ac3_frame(0, 192, false, 2)).collect());
+    plays_at(&ac3, Kind::Ac3);
+    let eac3 = made("plays.eac3", (0..200).flat_map(|_| eac3_frame(512, 0, 0)).collect());
+    plays_at(&eac3, Kind::Eac3);
+    plays_at(&made("plays.dts", (0..200).flat_map(|_| dts_frame(1006)).collect()), Kind::Dts);
+    plays_at(&made("plays.wav", wav_file(48_000, 2, 16, false, 96_000, None, 0)), Kind::Wav);
+    let corpus = path_of("fixtures/out");
+    for (name, kind) in [
+        ("ts_h264_aac.ts", Kind::Ts),
+        ("ts_h265_ac3.ts", Kind::Ts),
+        ("ps_mpeg1_mp2.mpg", Kind::Ps),
+        ("ps_mpeg2_ac3.vob", Kind::Ps),
+        ("audio.wav", Kind::Wav),
+        ("audio.ac3", Kind::Ac3),
+        ("audio.eac3", Kind::Eac3),
+        ("audio.dts", Kind::Dts),
+    ] {
+        match corpus.join(name).exists() {
+            true => plays_at(&corpus.join(name), kind),
+            false => eprintln!("{name} not generated, skipped"),
+        }
+    }
+}
+
+/// A transport or program stream seeks ahead of what was read, the transport stream on the
+/// duration the open found, the program stream by bisecting its packs, and lands on a key near
+/// the target.
+#[test]
+fn a_transport_or_program_stream_seeks_where_nothing_was_read() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    for (name, bytes) in
+        [("seek.ts", common::ts_file(30, 900_000)), ("seek.vob", common::ps_file(30, true, true))]
+    {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let o = opened_at(&path);
+        let mut p = pf_reactor::pipeline();
+        p.set_select_all(false);
+        let demux = demuxer(&mut p, File::open(&path).unwrap(), &path, &o, false).unwrap();
+        p.preroll().unwrap();
+        let v = o.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap();
+        let pad = route(&p, demux, &o, v).unwrap().pad(&mut p, demux).unwrap();
+        let got = Arc::new(Mutex::new(Pcm::default()));
+        let ((first_tx, first_rx), (go_tx, go_rx)) = (channel(), channel());
+        let sink = p.add(Collect { got: Arc::clone(&got), gate: Some((first_tx, go_rx)) });
+        p.link(demux.src(pad), sink.sink(SinkPad(0))).unwrap();
+        let ctl = p.control();
+        let run = std::thread::spawn(move || {
+            let r = p.run();
+            (p, r)
+        });
+        first_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let to = Timestamp(20_000_000_000);
+        let mut plan = None;
+        for _ in 0..10_000 {
+            if ctl.seekable() != Seekable::Unknown
+                && ctl.plan_from(Timestamp::NONE, to, SeekMode::Keyframe) != SeekPlan::Deferred
+            {
+                plan = Some(ctl.seek_from(Timestamp::NONE, to, SeekMode::Keyframe).unwrap());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        go_tx.send(()).unwrap();
+        let (p, r) = run.join().unwrap();
+        r.unwrap();
+        assert!(matches!(plan, Some(SeekPlan::Seek { .. })), "{name} {plan:?}");
+        let ix = p.index(demux).unwrap();
+        assert_eq!(ix.duration, Timestamp(o.duration_ns), "{name}");
+        let g = got.lock().unwrap();
+        let first = g.bufs[g.flushed..].iter().find(|b| b.0 != Timestamp::NONE).unwrap().0;
+        // psdemux bisects to 5 s ahead of the target, the mux delay and a few GOPs back
+        let back = if o.kind == Kind::Ps { 5_000_000_000 } else { 0 };
+        let near = (to.0 - back).saturating_sub(1_000_000_000)..to.0 + 1_000_000_000;
+        assert!(near.contains(&first.0), "{name} lands at {first:?}");
+        let left = (o.duration_ns - first.0) / 40_000_000 + 2;
+        assert!((g.bufs.len() - g.flushed) as u64 <= left, "{name} read on from where it landed");
+    }
 }
 
 /// The Matroska demuxer publishes the Cues the open read, the AVI one the idx1 index.
@@ -201,9 +297,9 @@ fn a_track_of_another_kind_or_number_has_no_route() {
     assert!(matches!(route(&p, demux, &o, &t), Some(Out::Stream(_))));
     t.id = 99;
     assert_eq!(route(&p, demux, &o, &t), None);
-    let o = Opened { kind: Kind::Ts, ..o };
+    let o = Opened { kind: Kind::Wav, index: pf_open::Index::None, ..o };
     let e = demuxer(&mut p, File::open(&path).unwrap(), &path, &o, false).unwrap_err();
-    assert!(matches!(e, BuildError::Unsupported(Kind::Ts)), "{e}");
+    assert!(matches!(e, BuildError::Unsupported(Kind::Wav)), "a bare kind without its head, {e}");
 }
 
 static PCM_DESC: ElementDesc = ElementDesc { name: "pcm", ..DESC };

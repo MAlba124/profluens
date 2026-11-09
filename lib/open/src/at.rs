@@ -13,7 +13,9 @@ use pf_probe::head::{AviHeadAt, MkvHead, MkvHeadAt, Mp4HeadOwned};
 use pf_probe::{Kind, PREFIX_LEN, probe};
 use profluens_core::fetch::{Fetch, Need, Step};
 
-use crate::{Caps, Desc, Index, Meta, OpenError, Opened, Want, avi, bare, flv, mkv, mp4, ogg};
+use crate::{
+    Caps, Desc, Index, Meta, OpenError, Opened, Want, avi, bare, flv, mkv, mp4, ogg, ps, ts,
+};
 
 /// The read in flight, or the inner machine that asks the next one.
 enum Stage {
@@ -82,6 +84,8 @@ pub struct OpenAt {
     ogg: Option<ogg::Scan>,
     /// Where an AVI's `movi` lies, for the reads behind its head.
     movi: Option<pf_avi::MoviLocation>,
+    /// A transport stream's packets as the window and the tail are read.
+    ts: Option<Box<ts::Scan>>,
 }
 
 impl OpenAt {
@@ -106,6 +110,7 @@ impl OpenAt {
             mkv: MkvPart::default(),
             ogg: None,
             movi: None,
+            ts: None,
         }
     }
 
@@ -127,6 +132,8 @@ impl OpenAt {
                     self.tail.truncate(self.got);
                     match self.kind {
                         Kind::Ogg => self.ogg_done(),
+                        Kind::Ts => self.ts_done(),
+                        Kind::Ps => self.ps_done(),
                         _ => self.mkv_cues(),
                     }
                 }
@@ -264,17 +271,33 @@ impl OpenAt {
                 self.ogg_more()
             }
             Kind::Flv => self.flv_more(),
-            Kind::Flac | Kind::Mp3 | Kind::AdtsAac => {
+            Kind::Ts => {
+                let mut scan = ts::Scan::new()?;
+                scan.push(&self.window);
+                self.ts = Some(Box::new(scan));
+                self.ts_more()
+            }
+            Kind::Ps => self.ps_more(),
+            Kind::Flac
+            | Kind::Mp3
+            | Kind::AdtsAac
+            | Kind::Wav
+            | Kind::Ac3
+            | Kind::Eac3
+            | Kind::Dts => {
                 let bk = match self.kind {
                     Kind::Flac => BareKind::Flac,
                     Kind::Mp3 => BareKind::Mp3,
+                    Kind::Wav => BareKind::Wav,
+                    Kind::Ac3 => BareKind::Ac3,
+                    Kind::Eac3 => BareKind::Eac3,
+                    Kind::Dts => BareKind::Dts,
                     _ => BareKind::Adts,
                 };
                 let m = pf_bare::OpenAt::with_head(self.len, bk, take(&mut self.window));
                 self.stage = Stage::Bare(Box::new(m));
                 Ok(None)
             }
-            k => Err(OpenError::Unsupported(k)),
         }
     }
 
@@ -288,6 +311,13 @@ impl OpenAt {
                 self.avi_vol();
                 self.avi_tail()
             }
+            (Kind::Ts, _) => {
+                if let Some(scan) = self.ts.as_mut() {
+                    scan.push(&self.window[from..]);
+                }
+                self.ts_more()
+            }
+            (Kind::Ps, _) => self.ps_tail(),
             _ => self.flv_done(),
         }
     }
@@ -503,6 +533,58 @@ impl OpenAt {
     fn flv_done(&mut self) -> Result<Option<Need>, OpenError> {
         self.window.truncate(pf_flv::HEAD);
         self.duration = flv::describe(&self.window, &mut self.desc)?;
+        self.head = Arc::from(take(&mut self.window));
+        self.done()
+    }
+
+    /// The window grown while the program map or a stream's head is still to come, then the
+    /// tail for the last stamps.
+    fn ts_more(&mut self) -> Result<Option<Need>, OpenError> {
+        let have = self.window.len();
+        let wants = self.ts.as_ref().is_some_and(|s| s.wants());
+        if wants && (have as u64) < self.len && have < ts::HEAD_MAX {
+            let to = have.saturating_mul(2).clamp(64 << 10, ts::HEAD_MAX);
+            return Ok(self.grow(usize::try_from(self.len).map_or(to, |l| to.min(l))));
+        }
+        match self.len > have as u64 {
+            true => Ok(self.read_tail(self.len.saturating_sub(ts::TAIL).max(have as u64))),
+            false => self.ts_done(),
+        }
+    }
+
+    fn ts_done(&mut self) -> Result<Option<Need>, OpenError> {
+        let mut scan = self.ts.take().ok_or(OpenError::NoStreams)?;
+        if !self.tail.is_empty() {
+            scan.tail(self.tail_at, &self.tail);
+        }
+        self.duration = scan.finish(&mut self.desc)?;
+        self.head = Arc::from(take(&mut self.window));
+        self.done()
+    }
+
+    /// The window grown to the head `psdemux` starts from.
+    fn ps_more(&mut self) -> Result<Option<Need>, OpenError> {
+        let to = usize::try_from(self.len).map_or(ps::HEAD, |l| l.min(ps::HEAD));
+        match self.window.len() < to {
+            true => Ok(self.grow(to)),
+            false => self.ps_tail(),
+        }
+    }
+
+    fn ps_tail(&mut self) -> Result<Option<Need>, OpenError> {
+        let have = self.window.len() as u64;
+        match self.len > have {
+            true => Ok(self.read_tail(self.len.saturating_sub(pf_ps::TAIL_LEN as u64).max(have))),
+            false => self.ps_done(),
+        }
+    }
+
+    fn ps_done(&mut self) -> Result<Option<Need>, OpenError> {
+        let tail = match self.tail.is_empty() {
+            true => &self.window[self.window.len().saturating_sub(pf_ps::TAIL_LEN)..],
+            false => &self.tail[..],
+        };
+        self.duration = ps::describe(&self.window, tail, &mut self.desc)?;
         self.head = Arc::from(take(&mut self.window));
         self.done()
     }

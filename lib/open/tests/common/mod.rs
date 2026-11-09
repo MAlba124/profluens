@@ -329,3 +329,136 @@ pub fn patch_last(b: &mut [u8], pat: &[u8], with: &[u8]) {
     let at = b.windows(pat.len()).rposition(|w| w == pat).unwrap();
     b[at..at + with.len()].copy_from_slice(with);
 }
+
+/// A sequence header of 720 by 576 at 25 frames, 16:9, its extension and a GOP header.
+pub const SEQ: [u8; 28] = [
+    0, 0, 1, 0xB3, 0x2D, 0x02, 0x40, 0x33, 0xFF, 0xFF, 0xE0, 0x18, 0, 0, 1, 0xB5, 0x14, 0x8A, 0, 1,
+    0, 0, 0, 0, 1, 0xB8, 0, 8,
+];
+
+/// The five bytes of a PES stamp behind its `prefix` bits, H.222.0 2.4.3.7.
+pub fn stamp(prefix: u8, t: u64) -> [u8; 5] {
+    [
+        prefix << 4 | ((t >> 29) & 0x0E) as u8 | 1,
+        (t >> 22) as u8,
+        ((t >> 14) & 0xFE) as u8 | 1,
+        (t >> 7) as u8,
+        ((t << 1) & 0xFE) as u8 | 1,
+    ]
+}
+
+/// A PES packet of `id` stamped `pts`, its length unbounded for video.
+pub fn pes(id: u8, pts: Option<u64>, payload: &[u8]) -> Vec<u8> {
+    let mut h = vec![0, 0, 1, id, 0, 0, 0x80];
+    match pts {
+        Some(t) => {
+            h.extend_from_slice(&[0x80, 5]);
+            h.extend_from_slice(&stamp(2, t));
+        }
+        None => h.extend_from_slice(&[0, 0]),
+    }
+    let len = h.len() - 6 + payload.len();
+    if id & 0xF0 != 0xE0 || len <= 0xFFFF {
+        h[4..6].copy_from_slice(&(len.min(0xFFFF) as u16).to_be_bytes());
+    }
+    h.extend_from_slice(payload);
+    h
+}
+
+/// Transport packets of `pid` carrying `unit`, the first with PUSI, the last stuffed.
+pub fn packets(pid: u16, cc: &mut u8, unit: &[u8], out: &mut Vec<u8>) {
+    for (i, chunk) in unit.chunks(184).enumerate() {
+        let mut p = vec![0x47, (pid >> 8) as u8 | if i == 0 { 0x40 } else { 0 }, pid as u8];
+        let stuff = 184 - chunk.len();
+        match stuff {
+            0 => p.push(0x10 | *cc),
+            1 => p.extend_from_slice(&[0x30 | *cc, 0]),
+            n => {
+                p.extend_from_slice(&[0x30 | *cc, (n - 1) as u8, 0]);
+                p.resize(p.len() + n - 2, 0xFF);
+            }
+        }
+        p.extend_from_slice(chunk);
+        *cc = (*cc + 1) & 0xF;
+        out.extend_from_slice(&p);
+    }
+}
+
+/// A PSI section with its CRC, behind a zero pointer field.
+pub fn section(table: u8, id: u16, body: &[u8]) -> Vec<u8> {
+    let len = 5 + body.len() + 4;
+    let mut s =
+        vec![table, 0xB0 | (len >> 8) as u8, len as u8, (id >> 8) as u8, id as u8, 0xC1, 0, 0];
+    s.extend_from_slice(body);
+    let crc = pf_mpegts::crc32(&s);
+    s.extend_from_slice(&crc.to_be_bytes());
+    [&[0u8][..], &s].concat()
+}
+
+/// A PAT naming program 1 at `pmt` and its PMT of `streams`, type and PID.
+pub fn tables(pmt: u16, streams: &[(u8, u16)], out: &mut Vec<u8>, cc: &mut [u8; 2]) {
+    packets(0, &mut cc[0], &section(0, 1, &[0, 1, 0xE0 | (pmt >> 8) as u8, pmt as u8]), out);
+    let mut body = vec![0xE1, 0x00, 0xF0, 0];
+    for &(kind, pid) in streams {
+        body.extend_from_slice(&[kind, 0xE0 | (pid >> 8) as u8, pid as u8, 0xF0, 0]);
+    }
+    packets(pmt, &mut cc[1], &section(2, 1, &body), out);
+}
+
+/// A transport stream of MPEG-2 video at 25 frames and AC-3 at 48 kHz, `secs` long from
+/// `start` ticks, the tables every 10 frames.
+pub fn ts_file(secs: u64, start: u64) -> Vec<u8> {
+    let (mut out, mut cc, mut vcc, mut acc) = (Vec::new(), [0u8; 2], 0u8, 0u8);
+    let ac3 = pf_bare::fixture::ac3_frame(0, 192, false, 2);
+    let mut audio = 0u64;
+    for f in 0..secs * 25 {
+        if f % 10 == 0 {
+            tables(0x1000, &[(0x02, 0x100), (0x81, 0x101)], &mut out, &mut cc);
+        }
+        let t = start + f * 3600;
+        let mut pic = if f % 12 == 0 { SEQ.to_vec() } else { Vec::new() };
+        pic.extend_from_slice(&[0, 0, 1, 0, 0, if f % 12 == 0 { 0x0F } else { 0x17 }, 0xFF]);
+        pic.resize(pic.len() + 900, 0x5A);
+        packets(0x100, &mut vcc, &pes(0xE0, Some(t), &pic), &mut out);
+        while audio * 2880 <= f * 3600 {
+            let p = pes(0xBD, Some(start + audio * 2880), &ac3);
+            packets(0x101, &mut acc, &p, &mut out);
+            audio += 1;
+        }
+    }
+    out
+}
+
+/// A program stream of MPEG-2 video and AC-3 in private stream 1, packs of 2048 bytes.
+pub fn ps_file(secs: u64, scr: bool, pts: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    let ac3 = pf_bare::fixture::ac3_frame(0, 192, false, 7);
+    let pack = |out: &mut Vec<u8>, t: u64| {
+        let s = if scr { t } else { 0 };
+        out.extend_from_slice(&[0, 0, 1, 0xBA]);
+        // the SCR in its MPEG-2 form, extension 0, mux rate, no stuffing
+        out.push(0x44 | ((s >> 27) & 0x38) as u8 | ((s >> 28) & 3) as u8);
+        out.push((s >> 20) as u8);
+        out.push(((s >> 12) & 0xF8) as u8 | 4 | ((s >> 13) & 3) as u8);
+        out.push((s >> 5) as u8);
+        out.extend_from_slice(&[((s << 3) & 0xF8) as u8 | 4, 1, 0x01, 0x89, 0xC3, 0xF8]);
+    };
+    let mut audio = 0u64;
+    for f in 0..secs * 25 {
+        let t = 90_000 + f * 3600;
+        pack(&mut out, t);
+        let mut pic = if f % 12 == 0 { SEQ.to_vec() } else { Vec::new() };
+        pic.extend_from_slice(&[0, 0, 1, 0, 0, 0x0F, 0xFF]);
+        pic.resize(pic.len() + 600, 0x5A);
+        out.extend_from_slice(&pes(0xE0, pts.then_some(t), &pic));
+        while audio * 2880 <= f * 3600 {
+            pack(&mut out, t);
+            let mut payload = vec![0x80, 1, 0, 1];
+            payload.extend_from_slice(&ac3);
+            out.extend_from_slice(&pes(0xBD, pts.then_some(90_000 + audio * 2880), &payload));
+            audio += 1;
+        }
+    }
+    out.extend_from_slice(&[0, 0, 1, 0xB9]);
+    out
+}

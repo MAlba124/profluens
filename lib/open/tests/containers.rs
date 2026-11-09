@@ -165,11 +165,16 @@ fn an_flv_describes_what_its_head_states() {
     assert_eq!(log, [Need { at: 0, len: 1000 }, Need { at: 1000, len: b.len() - 1000 }]);
 }
 
+/// Every kind the sniff tells opens, none is refused as unsupported.
 #[test]
-fn what_is_not_opened_here_says_so() {
-    let ts = fixture("plugins/formats/ts/tests/fixtures/h264_aac.ts");
-    let (o, _) = open_with(&ts, Want::ALL, Caps::default());
-    assert_eq!(o.err(), Some(pf_open::OpenError::Unsupported(Kind::Ts)));
+fn every_kind_the_sniff_tells_opens() {
+    for (rel, kind) in [
+        ("plugins/formats/ts/tests/fixtures/h264_aac.ts", Kind::Ts),
+        ("plugins/formats/ps/tests/fixtures/mpeg2_ac3.vob", Kind::Ps),
+    ] {
+        let (o, _) = open_with(&fixture(rel), Want::ALL, Caps::default());
+        assert_eq!(o.map(|o| o.kind), Ok(kind), "{rel}");
+    }
 }
 
 #[test]

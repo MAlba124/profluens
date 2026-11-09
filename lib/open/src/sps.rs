@@ -46,7 +46,7 @@ fn first_sps(codec: NalCodec, head: &[u8]) -> Option<Stated> {
 
 /// The mastering display and content light level the SEI units of Annex B `head` state, an
 /// HEVC config record may carry them.
-fn sei_hdr(codec: NalCodec, head: &[u8]) -> HdrStatic {
+pub(crate) fn sei_hdr(codec: NalCodec, head: &[u8]) -> HdrStatic {
     let mut h = HdrStatic::default();
     let mut rbsp = [0u8; SEI_READ];
     for (from, to) in nals(head) {
@@ -92,6 +92,15 @@ pub(crate) fn av1c_chroma(head: &[u8]) -> Chroma {
 /// over the container's, and its size, depth, chroma and pixel aspect where the container states
 /// none. A Matroska file may leave the colour to the bitstream, a PQ track would then read as
 /// SDR. An AV1 head that is its config record states the chroma, an MP4's record set it before.
+/// The NAL codec of a family whose heads are Annex B.
+pub(crate) fn nal_codec(family: &str) -> Option<NalCodec> {
+    match family {
+        "h264/annexb" => Some(NalCodec::H264),
+        "h265/annexb" => Some(NalCodec::H265),
+        _ => None,
+    }
+}
+
 pub(crate) fn fill(t: &mut TrackDesc, head: &[u8]) {
     let codec = match t.family {
         "h264/annexb" => NalCodec::H264,

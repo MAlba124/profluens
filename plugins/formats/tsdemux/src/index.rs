@@ -37,6 +37,8 @@ pub struct Grown {
     pub entries: Vec<IndexEntry>,
     pub published: usize,
     pub file_len: Option<u64>,
+    /// What the opener of the file found it lasts, for the estimate past the last entry.
+    pub duration: Option<u64>,
 }
 
 impl Grown {
@@ -48,6 +50,7 @@ impl Grown {
             entries: Vec::with_capacity(RESERVE),
             published: 0,
             file_len: None,
+            duration: None,
         }
     }
 
@@ -95,7 +98,7 @@ impl Grown {
         Index {
             entries: self.entries.clone(),
             file_len: self.file_len,
-            duration: Timestamp::NONE,
+            duration: self.duration.map_or(Timestamp::NONE, Timestamp),
             complete: false,
             stream: self.key.map(|key| key.stream),
             grouped: self.key.is_some_and(|key| key.video),

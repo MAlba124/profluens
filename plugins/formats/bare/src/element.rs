@@ -1,8 +1,9 @@
-//! `baresrc`, the source of a bare FLAC, MP3 or ADTS file. It drives a [`Reader`]'s machines
-//! over the file with positioned reads through the reactor, a frame per buffer, and takes a seek's
-//! target time from the flush, the reader finds the frame. A run opens with the codec head flagged
-//! HEADER as the Matroska demuxer does it. The index it publishes has no entries, so the pipeline
-//! plans by time and a snap seek lands on its target, every frame is a key.
+//! `baresrc`, the source of a bare FLAC, MP3, ADTS, AC-3, E-AC-3 or DTS file, or of a WAV file's
+//! PCM. It drives a [`Reader`]'s machines over the file with positioned reads through the
+//! reactor, a frame per buffer, and takes a seek's target time from the flush, the reader finds
+//! the frame. A run opens with the codec head flagged HEADER as the Matroska demuxer does it. The
+//! index it publishes has no entries, so the pipeline plans by time and a snap seek lands on its
+//! target, every frame is a key.
 
 // The caller's open file, handed to the reactor, see `BareSrc::new`.
 #[allow(clippy::disallowed_types)]
@@ -18,7 +19,7 @@ use profluens_core::element::{
 use profluens_core::error::Error;
 use profluens_core::event::Event;
 use profluens_core::fetch::{Fetch, Need, Step};
-use profluens_core::format::{OfferDesc, ValueDesc};
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
 use profluens_core::id::SrcPad;
 use profluens_core::io::{Handle, IoError, IoResult, OpenMode};
 use profluens_core::log;
@@ -30,22 +31,50 @@ use std::fmt;
 use crate::BareError;
 use crate::head::{BareHead, Codec};
 use crate::reader::{CHUNK, NextPark, Reader, SeekPark, Unit};
+use profluens_audio::layout::{FIELD_LAYOUT, LAYOUT_FIELD};
+use profluens_audio::{FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE};
 
 /// Frames put out per process call at most, the scheduler comes back for more.
 const BURST: usize = 64;
 /// ADTS frames a decoder runs ahead of a seek, one for the MDCT overlap and one more for SBR.
 const AAC_PREROLL: u64 = 2;
+/// AC-3 and DTS frames overlap their neighbour's last block, one frame ahead fills it.
+const SYNC_PREROLL: u64 = 1;
 /// Read past the reader's window while frames go out, so the next fill is in flight.
 const AHEAD: u64 = CHUNK;
 const OPEN: u64 = u64::MAX;
 
+static PCM_FIELDS: [FieldDesc; 4] = [
+    FieldDesc { field: FIELD_RATE, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: FIELD_CHANNELS, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: FIELD_SAMPLE, allowed: ConstraintDesc::Any, preferred: None },
+    LAYOUT_FIELD,
+];
+const PCM_OFFER: OfferDesc = OfferDesc { family: profluens_audio::FAMILY, fields: &PCM_FIELDS };
+
 static FLAC: [OfferDesc; 1] = [OfferDesc::any("flac")];
 static MP3: [OfferDesc; 1] = [OfferDesc::any("mp3")];
 static AAC: [OfferDesc; 1] = [OfferDesc::any("aac")];
-static ANY: [OfferDesc; 3] = [OfferDesc::any("flac"), OfferDesc::any("mp3"), OfferDesc::any("aac")];
+static AC3: [OfferDesc; 1] = [OfferDesc::any("ac3")];
+static EAC3: [OfferDesc; 1] = [OfferDesc::any("eac3")];
+static DTS: [OfferDesc; 1] = [OfferDesc::any("dts")];
+static PCM: [OfferDesc; 1] = [PCM_OFFER];
+static ANY: [OfferDesc; 7] = [
+    OfferDesc::any("flac"),
+    OfferDesc::any("mp3"),
+    OfferDesc::any("aac"),
+    OfferDesc::any("ac3"),
+    OfferDesc::any("eac3"),
+    OfferDesc::any("dts"),
+    PCM_OFFER,
+];
 static FLAC_PADS: [PadDesc; 1] = [PadDesc { name: "src", offers: &FLAC }];
 static MP3_PADS: [PadDesc; 1] = [PadDesc { name: "src", offers: &MP3 }];
 static AAC_PADS: [PadDesc; 1] = [PadDesc { name: "src", offers: &AAC }];
+static AC3_PADS: [PadDesc; 1] = [PadDesc { name: "src", offers: &AC3 }];
+static EAC3_PADS: [PadDesc; 1] = [PadDesc { name: "src", offers: &EAC3 }];
+static DTS_PADS: [PadDesc; 1] = [PadDesc { name: "src", offers: &DTS }];
+static PCM_PADS: [PadDesc; 1] = [PadDesc { name: "src", offers: &PCM }];
 static ANY_PADS: [PadDesc; 1] = [PadDesc { name: "src", offers: &ANY }];
 
 const fn desc(srcs: &'static [PadDesc]) -> ElementDesc {
@@ -66,6 +95,10 @@ const fn desc(srcs: &'static [PadDesc]) -> ElementDesc {
 static FLAC_DESC: ElementDesc = desc(&FLAC_PADS);
 static MP3_DESC: ElementDesc = desc(&MP3_PADS);
 static AAC_DESC: ElementDesc = desc(&AAC_PADS);
+static AC3_DESC: ElementDesc = desc(&AC3_PADS);
+static EAC3_DESC: ElementDesc = desc(&EAC3_PADS);
+static DTS_DESC: ElementDesc = desc(&DTS_PADS);
+static PCM_DESC: ElementDesc = desc(&PCM_PADS);
 /// What the registry lists, a running element offers its file's one family.
 pub(crate) static REGISTRY_DESC: ElementDesc = desc(&ANY_PADS);
 
@@ -383,7 +416,8 @@ impl BareSrc {
             _ if !self.decoder => 0,
             Codec::Mpa { stream } => pf_mp3::index::preroll_frames(&stream, self.head.cbr),
             Codec::Adts { .. } => AAC_PREROLL,
-            Codec::Flac { .. } => 0,
+            Codec::Sync { .. } => SYNC_PREROLL,
+            Codec::Flac { .. } | Codec::Pcm { .. } => 0,
         }
     }
 
@@ -403,12 +437,23 @@ impl BareSrc {
 
     fn announce(&self, ctx: &mut Ctx) {
         let delay = self.delay();
-        let fields = [
-            ("rate", ValueDesc::Int(i64::from(self.head.rate))),
-            ("channels", ValueDesc::Int(i64::from(self.head.channels()))),
+        let mut fields = [
+            (FIELD_RATE, ValueDesc::Int(i64::from(self.head.rate))),
+            (FIELD_CHANNELS, ValueDesc::Int(i64::from(self.head.channels()))),
             (profluens_audio::FIELD_DELAY, ValueDesc::Int(self.head.ns(delay))),
+            (FIELD_LAYOUT, ValueDesc::Int(0)),
         ];
-        let n = if delay > 0 { 3 } else { 2 };
+        let n = match self.head.codec {
+            Codec::Pcm { sample, channels, .. } => {
+                fields[1].1 = ValueDesc::Int(i64::from(channels));
+                fields[2] = (FIELD_SAMPLE, ValueDesc::Id(sample.caps_name()));
+                let layout = self.head.layout();
+                fields[3].1 = ValueDesc::Int(layout as i64);
+                if layout > 0 { 4 } else { 3 }
+            }
+            _ if delay > 0 => 3,
+            _ => 2,
+        };
         ctx.announce_format(Self::OUT, self.head.family, &fields[..n]);
     }
 
@@ -524,6 +569,10 @@ impl Element for BareSrc {
         match self.head.family {
             "flac" => &FLAC_DESC,
             "mp3" => &MP3_DESC,
+            "ac3" => &AC3_DESC,
+            "eac3" => &EAC3_DESC,
+            "dts" => &DTS_DESC,
+            profluens_audio::FAMILY => &PCM_DESC,
             _ => &AAC_DESC,
         }
     }

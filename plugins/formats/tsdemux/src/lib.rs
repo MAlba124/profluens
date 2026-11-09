@@ -296,12 +296,7 @@ impl TsDemux {
         Self {
             head,
             program: None,
-            limits: Limits {
-                max_programs: 16,
-                max_streams_per_program: 32,
-                max_pes_pids: 16,
-                ..Limits::default()
-            },
+            limits: limits(),
             demux: None,
             tracks: Vec::new(),
             clock: Clock {
@@ -337,6 +332,14 @@ impl TsDemux {
     #[must_use]
     pub fn with_len(mut self, len: u64) -> Self {
         self.grown.file_len = Some(len);
+        self
+    }
+
+    /// A file an opener found lasts `ns`, published from the start so a seek ahead of what was
+    /// read is estimated on the file's mean rate.
+    #[must_use]
+    pub fn with_duration(mut self, ns: u64) -> Self {
+        self.grown.duration = (ns > 0).then_some(ns);
         self
     }
 
@@ -1011,6 +1014,10 @@ impl Element for TsDemux {
         self.park.rows.clear();
         self.park.bytes.clear();
         self.break_stream(None);
+        if let Some(ns) = self.grown.duration {
+            ctx.set_duration(ns);
+            Self::publish(ctx, &mut self.grown);
+        }
         Ok(())
     }
 
@@ -1140,11 +1147,18 @@ impl TsDemux {
     }
 }
 
+/// What the demuxer and an opener of the same file read the head with, so both find the same
+/// program and streams.
+pub fn limits() -> Limits {
+    Limits { max_programs: 16, max_streams_per_program: 32, max_pes_pids: 16, ..Limits::default() }
+}
+
 /// Each ADTS stream's AudioSpecificConfig in `head` by pad name `src_<pid>`, from its first frame.
 #[allow(clippy::disallowed_methods)] // once per lane
 pub fn aac_configs(head: &[u8]) -> Vec<(Box<str>, [u8; 2])> {
-    let limits = TsDemux::new(Vec::new()).limits;
-    let Ok(mut probe) = Demux::new(Config { limits, select_all: true }) else { return Vec::new() };
+    let Ok(mut probe) = Demux::new(Config { limits: limits(), select_all: true }) else {
+        return Vec::new();
+    };
     let (mut aac, mut found): (Vec<u16>, Vec<(u16, [u8; 2])>) = (Vec::new(), Vec::new());
     let mut sink = |event: pf_mpegts::Event<'_>| match event {
         pf_mpegts::Event::Pmt { streams, .. } if aac.is_empty() => {

@@ -28,6 +28,12 @@ pf-avi = { path = "../../plugins/formats/avi" }
 pf-ogg = { path = "../../plugins/formats/ogg" }
 pf-bare = { path = "../../plugins/formats/bare" }
 pf-flv = { path = "../../plugins/formats/flv" }
+pf-mpegts = { path = "../../plugins/formats/ts" }
+# The program choice, the ADTS and sequence header reads and the demuxer of a transport stream.
+pf-tsdemux = { path = "../../plugins/formats/tsdemux" }
+pf-ps = { path = "../../plugins/formats/ps" }
+# The MPEG audio header of a transport or program stream's first frame.
+pf-mp3 = { path = "../../plugins/audio/mp3" }
 # The filesrc in front of a demuxer.
 profluens-elements = { path = "../elements", optional = true }
 

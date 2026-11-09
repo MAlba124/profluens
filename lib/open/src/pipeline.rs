@@ -12,6 +12,8 @@ use pf_flv::FlvDemux;
 use pf_mkv::MkvDemux;
 use pf_mp4::{Limits, Mp4Demux, Mp4Reader};
 use pf_ogg::OggDemux;
+use pf_ps::PsDemux;
+use pf_tsdemux::TsDemux;
 use profluens_core::error::Error;
 use profluens_core::id::{ElementId, SinkPad, SrcPad};
 use profluens_core::pipeline::Pipeline;
@@ -83,7 +85,7 @@ pub fn demuxer(
     held: bool,
 ) -> Result<ElementId, BuildError> {
     let (demux, input) = match (o.kind, &o.index) {
-        (Kind::Flac | Kind::Mp3 | Kind::AdtsAac, Index::Bare(h)) => {
+        (k, Index::Bare(h)) if k.is_elementary() => {
             return Ok(p.add(BareSrc::new(file, (**h).clone(), o.len).for_decoder()));
         }
         (Kind::Mkv, index) => {
@@ -124,6 +126,18 @@ pub fn demuxer(
             (p.add(d), OggDemux::IN)
         }
         (Kind::Flv, _) => (p.add(FlvDemux::new(o.head.to_vec()).with_len(o.len)), FlvDemux::IN),
+        (Kind::Ts, _) => {
+            let d = TsDemux::new(o.head.to_vec()).with_len(o.len).with_duration(o.duration_ns);
+            (p.add(d), TsDemux::IN)
+        }
+        (Kind::Ps, _) => {
+            let d = PsDemux::new(o.head.to_vec());
+            let d = match o.duration_ns {
+                0 => d.with_len(Some(o.len)),
+                ns => d.with_duration(o.len, ns),
+            };
+            (p.add(d), PsDemux::IN)
+        }
         (k, _) => return Err(BuildError::Unsupported(k)),
     };
     link(p, file, path, demux, input)?;
@@ -149,8 +163,8 @@ fn named(name: &str, prefix: &str, radix: u32) -> Option<u64> {
 }
 
 /// Where `t` comes out of `demux` once prerolled. Matroska and MP4 name streams by the track
-/// number, Ogg by the serial, FLV by the kind, AVI has a pad per stream ordinal, `baresrc` its
-/// one pad.
+/// number, Ogg by the serial, FLV by the kind, a transport stream by the PID, a program stream by
+/// its stream id and sub-stream, AVI has a pad per stream ordinal, `baresrc` its one pad.
 pub fn route(p: &Pipeline, demux: ElementId, o: &Opened, t: &TrackDesc) -> Option<Out> {
     let streams = p.streams(demux);
     let find = |prefix: &str, radix: u32, want: u64| {
@@ -159,7 +173,8 @@ pub fn route(p: &Pipeline, demux: ElementId, o: &Opened, t: &TrackDesc) -> Optio
     };
     match o.kind {
         Kind::Mkv | Kind::Mp4 => find("src_track", 10, u64::from(t.id)),
-        Kind::Ogg => find("src_", 16, u64::from(t.stream)),
+        Kind::Ogg | Kind::Ps => find("src_", 16, u64::from(t.stream)),
+        Kind::Ts => find("src_", 10, u64::from(t.stream)),
         Kind::Flv => {
             let name = match t.kind {
                 TrackKind::Video => "src_video",
@@ -170,7 +185,7 @@ pub fn route(p: &Pipeline, demux: ElementId, o: &Opened, t: &TrackDesc) -> Optio
             Some(Out::Stream(at as u32))
         }
         Kind::Avi => p.src_pad(demux, &format!("src_stream{}", t.stream)).ok().map(Out::Pad),
-        Kind::Flac | Kind::Mp3 | Kind::AdtsAac => (t.id == 1).then_some(Out::Pad(BareSrc::OUT)),
+        k if k.is_elementary() => (t.id == 1).then_some(Out::Pad(BareSrc::OUT)),
         _ => None,
     }
 }

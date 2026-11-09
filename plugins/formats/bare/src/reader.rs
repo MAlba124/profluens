@@ -8,6 +8,7 @@
 use crate::BareError;
 use crate::flac::{self, MAX_HEADER};
 use crate::head::{BareHead, Codec, adts};
+use crate::sync;
 use pf_mp3::frame::Header as MpaHeader;
 use profluens_core::fetch::{Fetch, Need, Step};
 
@@ -62,16 +63,45 @@ pub(crate) fn header(c: &Codec, b: &[u8]) -> Option<Hdr> {
                 sample: None,
             })
         }
+        Codec::Sync { kind, key, .. } => {
+            let f = sync::frame(kind, b).filter(|f| f.key == key && !f.attached)?;
+            Some(Hdr { len: u64::from(f.len), skip: 0, samples: f.samples, sample: None })
+        }
+        // PCM has no headers, see `pcm_hdr`
+        Codec::Pcm { .. } => None,
     }
 }
 
+/// The length of the frame at the start of `b` that belongs to the primary frame before it.
+fn attached(c: &Codec, b: &[u8]) -> Option<u64> {
+    let Codec::Sync { kind, .. } = *c else { return None };
+    sync::frame(kind, b).filter(|f| f.attached).map(|f| u64::from(f.len))
+}
+
+/// The bytes a header is read from.
+fn peek(c: &Codec) -> u64 {
+    match c {
+        Codec::Sync { kind: sync::SyncKind::Dts, .. } => 24,
+        _ => MAX_HEADER as u64,
+    }
+}
+
+/// The PCM unit at `at`, the stream's samples a frame or what is left.
+fn pcm_hdr(h: &BareHead, at: u64, align: u32) -> Option<Hdr> {
+    let align = u64::from(align.max(1));
+    let len = (u64::from(h.spf) * align).min(h.end.saturating_sub(at));
+    let len = len - len % align;
+    (len > 0).then_some(Hdr { len, skip: 0, samples: (len / align) as u32, sample: None })
+}
+
 fn is_sync(c: &Codec, b0: u8, b1: u8) -> bool {
-    b0 == 0xFF
-        && match c {
-            Codec::Flac { .. } => b1 & 0xFE == 0xF8,
-            Codec::Mpa { .. } => b1 & 0xE0 == 0xE0,
-            Codec::Adts { .. } => b1 & 0xF6 == 0xF0,
-        }
+    match c {
+        Codec::Flac { .. } => b0 == 0xFF && b1 & 0xFE == 0xF8,
+        Codec::Mpa { .. } => b0 == 0xFF && b1 & 0xE0 == 0xE0,
+        Codec::Adts { .. } => b0 == 0xFF && b1 & 0xF6 == 0xF0,
+        Codec::Sync { kind, .. } => sync::is_sync(*kind, b0, b1),
+        Codec::Pcm { .. } => false,
+    }
 }
 
 /// File bytes `[at, at + buf.len())`, one reused buffer.
@@ -246,14 +276,28 @@ impl HdrAt {
         HdrAt { at, asked: false }
     }
 
+    /// The header, `at` moved past the frames attached to the one before.
     fn step(&mut self, cx: &mut Cx<'_>) -> Go<Option<Hdr>> {
-        let mh = MAX_HEADER as u64;
-        if !std::mem::replace(&mut self.asked, true)
-            && let Some(need) = cx.win.want(self.at, self.at + mh, cx.h.end)?
-        {
-            return Ok(Step::Need(need));
+        if let Codec::Pcm { align, .. } = cx.h.codec {
+            return Ok(Step::Done(pcm_hdr(cx.h, self.at, align)));
         }
-        Ok(Step::Done(header(&cx.h.codec, cx.win.get(self.at, mh))))
+        let mh = peek(&cx.h.codec);
+        loop {
+            if !std::mem::replace(&mut self.asked, true)
+                && let Some(need) = cx.win.want(self.at, self.at + mh, cx.h.end)?
+            {
+                return Ok(Step::Need(need));
+            }
+            let b = cx.win.get(self.at, mh);
+            match attached(&cx.h.codec, b).filter(|&n| self.at + n < cx.h.end) {
+                Some(n) => {
+                    *cx.work =
+                        cx.work.checked_sub(PARSE_COST).ok_or(BareError::Malformed(self.at))?;
+                    (self.at, self.asked) = (self.at + n, false);
+                }
+                None => return Ok(Step::Done(header(&cx.h.codec, b))),
+            }
+        }
     }
 }
 
@@ -285,7 +329,7 @@ impl Sync {
     }
 
     fn step(&mut self, cx: &mut Cx<'_>) -> Go<Option<(u64, Hdr)>> {
-        let (h, mh) = (cx.h, MAX_HEADER as u64);
+        let (h, mh) = (cx.h, peek(&cx.h.codec));
         loop {
             match self.phase {
                 SyncPhase::Fill => {
@@ -550,7 +594,7 @@ impl NextAt<'_> {
     /// Holds the frame at `at` to `end` and the header behind it.
     fn fill(&mut self, at: u64, hd: Hdr, end: u64, n: u64) -> Result<Option<Need>, BareError> {
         self.st = NextSt::Fill { at, hd, end, n };
-        self.rd.win.want(at, end + MAX_HEADER as u64, self.h.end)
+        self.rd.win.want(at, end + peek(&self.h.codec), self.h.end)
     }
 
     fn step(&mut self) -> Go<Option<Unit>> {
@@ -564,9 +608,13 @@ impl NextAt<'_> {
                     None
                 }
                 NextSt::Hdr(x) => {
+                    let step = x.step(&mut cx)?;
                     let at = x.at;
-                    match x.step(&mut cx)? {
+                    match step {
                         Step::Need(need) => Some(need),
+                        Step::Done(None) if matches!(h.codec, Codec::Pcm { .. }) => {
+                            return Ok(Step::Done(None));
+                        }
                         Step::Done(None) => {
                             self.st = NextSt::Resync(Resync::new(h, at + 1, h.end));
                             None
@@ -603,7 +651,12 @@ impl NextAt<'_> {
                 }
                 NextSt::Fill { at, hd, end, n } => {
                     let (at, hd, end, n) = (*at, *hd, *end, *n);
-                    return self.unit(at, hd, end, n);
+                    // the frames attached to it go out in its unit, as one access unit
+                    let more = attached(&h.codec, self.rd.win.get(end, peek(&h.codec)));
+                    match more.filter(|&k| end + k <= h.end) {
+                        Some(k) => self.fill(at, hd, end + k, n)?,
+                        None => return self.unit(at, hd, end, n),
+                    }
                 }
             };
             if let Some(need) = need {
@@ -706,10 +759,9 @@ enum SeekSt {
         n: u64,
         probe: Resync,
     },
-    /// The headers walked to the target, the one at `at` of sample `n`.
+    /// The headers walked to the target, the one `hdr` reads of sample `n`.
     Count {
         n: u64,
-        at: u64,
         exact: bool,
         hdr: HdrAt,
     },
@@ -756,7 +808,7 @@ impl SeekAt<'_> {
     fn count(&mut self, n: u64, at: u64, exact: bool) -> Option<Step<()>> {
         let spf = u64::from(self.h.spf.max(1));
         if n + spf <= self.want && at < self.h.end {
-            self.st = SeekSt::Count { n, at, exact, hdr: HdrAt::new(at) };
+            self.st = SeekSt::Count { n, exact, hdr: HdrAt::new(at) };
             return None;
         }
         (self.rd.at, self.rd.n, self.rd.exact) = (at, n, exact);
@@ -765,6 +817,11 @@ impl SeekAt<'_> {
 
     fn start(&mut self) -> Option<Step<()>> {
         let (h, want) = (self.h, self.want);
+        if let Codec::Pcm { align, .. } = h.codec {
+            let at = h.first.saturating_add(want.saturating_mul(u64::from(align))).min(h.end);
+            (self.rd.at, self.rd.n, self.rd.exact) = (at, want, true);
+            return Some(Step::Done(()));
+        }
         if let Codec::Flac { si, .. } = h.codec {
             let (mut lo, mut hi) =
                 ((0u64, h.first), (if h.samples > 0 { h.samples } else { u64::MAX }, h.end));
@@ -902,9 +959,11 @@ impl SeekAt<'_> {
                     Step::Done(found) => Ok(self.count(n, found.map_or(h.end, |(b, _)| b), false)),
                 }
             }
-            SeekSt::Count { n, at, exact, hdr } => {
-                let (n, at, exact) = (*n, *at, *exact);
-                let hd = match hdr.step(&mut cx)? {
+            SeekSt::Count { n, exact, hdr } => {
+                let (n, exact) = (*n, *exact);
+                let step = hdr.step(&mut cx)?;
+                let at = hdr.at;
+                let hd = match step {
                     Step::Need(need) => return Ok(Some(Step::Need(need))),
                     Step::Done(Some(hd)) => hd,
                     Step::Done(None) => {

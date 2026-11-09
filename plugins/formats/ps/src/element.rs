@@ -35,6 +35,7 @@ use profluens_core::time::Timestamp;
 use crate::demux::{self, Demux, Unit};
 use crate::es::{Au, Framer, Spu, Stamp};
 use crate::lpcm::{self, Lpcm};
+use crate::pack::PRIVATE_1;
 use crate::seek::{Base, Bisect, Landing, Step};
 use crate::streams::{self, Codec};
 
@@ -171,8 +172,9 @@ pub fn scan_head(head: &[u8]) -> Head {
                 }
             };
             let seen = &mut out.seen[at];
-            if (0xE0..=0xEF).contains(&u.stream_id()) && seen.sniff.len() < SNIFF {
-                let take = (SNIFF - seen.sniff.len()).min(u.payload.len());
+            // video for its codec, audio for an opener's rate and channels
+            if !(0xBD..=0xBF).contains(&u.stream_id()) || u.stream_id() == PRIVATE_1 {
+                let take = SNIFF.saturating_sub(seen.sniff.len()).min(u.payload.len());
                 seen.sniff.extend_from_slice(&u.payload[..take]);
             }
             if let (None, Some(raw)) = (seen.first, u.dts.or(u.pts)) {
@@ -629,6 +631,15 @@ impl PsDemux {
         self
     }
 
+    /// A source `len` bytes long that an opener found lasts `ns`, the duration published from the
+    /// start and no tail asked.
+    #[must_use]
+    pub fn with_duration(self, len: u64, ns: u64) -> Self {
+        let mut d = self.with_len(Some(len));
+        (d.duration, d.tail_at) = ((ns > 0).then_some(ns), Tail::In);
+        d
+    }
+
     /// A source `len` bytes long whose last bytes are `tail`, read by the caller, which gives the
     /// duration from the last stamp there and asks no tail.
     #[must_use]
@@ -1041,7 +1052,7 @@ impl Element for PsDemux {
         if head.capped > 0 {
             log!(&*ctx, Level::Warn, "streams_capped", max = STREAMS_MAX, units = head.capped);
         }
-        if self.tail_at == Tail::In {
+        if self.tail_at == Tail::In && self.duration.is_none() {
             let tail = std::mem::take(&mut self.tail);
             let last = self.base().and_then(|base| last_ticks(&tail, base));
             self.duration = last.map(|ticks| ticks_ns(ticks).max(0) as u64);

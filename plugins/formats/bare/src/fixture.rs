@@ -113,3 +113,129 @@ pub fn flac_file(n: usize, last: u32, meta: &[(u8, Vec<u8>)], seektable: bool) -
     }
     SynthFlac { bytes, frames, streaminfo: si }
 }
+
+/// An AC-3 frame of `kbps` at `fscod` with `acmod` and the LFE on, filler to its length.
+pub fn ac3_frame(fscod: u8, kbps: u32, odd: bool, acmod: u8) -> Vec<u8> {
+    let code = crate::sync::AC3_KBPS.iter().position(|&k| k == kbps).unwrap_or(0) as u8 * 2
+        + u8::from(odd);
+    // bsid 8, bsmod 0, then acmod and for 3/2 the two mix levels before lfeon
+    let mut b = vec![0x0B, 0x77, 0, 0, fscod << 6 | code, 8 << 3, acmod << 5, 0];
+    let lfe_at = 51
+        + if acmod & 1 == 1 && acmod != 1 { 2 } else { 0 }
+        + if acmod & 4 != 0 { 2 } else { 0 }
+        + if acmod == 2 { 2 } else { 0 };
+    b[lfe_at / 8] |= 0x80 >> (lfe_at % 8);
+    let len = crate::sync::frame(crate::sync::SyncKind::Ac3, &b).map_or(8, |f| f.len as usize);
+    b.resize(len, 0x55);
+    b
+}
+
+/// An E-AC-3 frame of `len` bytes, six blocks at 48 kHz, 3/2 with LFE.
+pub fn eac3_frame(len: usize, strmtyp: u8, substream: u8) -> Vec<u8> {
+    let words = (len / 2 - 1) as u16;
+    let mut b = vec![
+        0x0B,
+        0x77,
+        strmtyp << 6 | substream << 3 | (words >> 8) as u8,
+        words as u8,
+        0b0011_1111,
+        16 << 3,
+    ];
+    b.resize(len, 0x33);
+    b
+}
+
+/// A DTS core frame in the 16 bit big endian form, 512 samples at 48 kHz, 5.1, 24 bit.
+pub fn dts_frame(len: usize) -> Vec<u8> {
+    let mut h = [0u8; 16];
+    let mut put = |at: usize, n: usize, v: u32| {
+        for i in 0..n {
+            if v >> (n - 1 - i) & 1 == 1 {
+                h[(at + i) / 8] |= 0x80 >> ((at + i) % 8);
+            }
+        }
+    };
+    put(0, 32, 0x7FFE_8001);
+    put(32, 1, 1);
+    put(33, 5, 31);
+    put(39, 7, 15);
+    put(46, 14, len as u32 - 1);
+    put(60, 6, 9);
+    put(66, 4, 13);
+    put(70, 5, 15);
+    put(85, 2, 1);
+    put(95, 3, 6);
+    let mut b = h.to_vec();
+    b.resize(len, 0x11);
+    b
+}
+
+/// `b` in the 14 bit big endian form, 14 bits in each 16 bit word.
+pub fn to_14(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let (mut acc, mut held) = (0u64, 0u32);
+    for &x in b {
+        (acc, held) = (acc << 8 | u64::from(x), held + 8);
+        while held >= 14 {
+            held -= 14;
+            let w = (acc >> held) as u16 & 0x3FFF;
+            // the sign extension of the 14 bit word, as the sync word shows it
+            let w = if w & 0x2000 != 0 { w | 0xC000 } else { w };
+            out.extend_from_slice(&w.to_be_bytes());
+            acc &= (1 << held) - 1;
+        }
+    }
+    out
+}
+
+/// A WAV file of `frames` sample frames, the sample index in every byte, WAVE_FORMAT_EXTENSIBLE
+/// with `mask` when given, a `LIST` chunk of `pad` bytes ahead of `data` and one behind it.
+pub fn wav_file(
+    rate: u32,
+    channels: u16,
+    bits: u16,
+    float: bool,
+    frames: u32,
+    mask: Option<u32>,
+    pad: usize,
+) -> Vec<u8> {
+    let align = channels * bits / 8;
+    let tag: u16 = if float { 3 } else { 1 };
+    let mut fmt = Vec::new();
+    fmt.extend_from_slice(&if mask.is_some() { 0xFFFEu16 } else { tag }.to_le_bytes());
+    fmt.extend_from_slice(&channels.to_le_bytes());
+    fmt.extend_from_slice(&rate.to_le_bytes());
+    fmt.extend_from_slice(&(rate * u32::from(align)).to_le_bytes());
+    fmt.extend_from_slice(&align.to_le_bytes());
+    fmt.extend_from_slice(&bits.to_le_bytes());
+    if let Some(m) = mask {
+        fmt.extend_from_slice(&22u16.to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+        fmt.extend_from_slice(&m.to_le_bytes());
+        fmt.extend_from_slice(&tag.to_le_bytes());
+        fmt.extend_from_slice(&[0, 0, 0x10, 0, 0x80, 0, 0, 0xAA, 0, 0x38, 0x9B, 0x71]);
+    }
+    let data: Vec<u8> = (0..frames)
+        .flat_map(|i| std::iter::repeat_n((i % 251) as u8, usize::from(align)))
+        .collect();
+    let mut chunks = Vec::new();
+    let mut chunk = |id: &[u8; 4], body: &[u8]| {
+        chunks.extend_from_slice(id);
+        chunks.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        chunks.extend_from_slice(body);
+        if body.len() % 2 == 1 {
+            chunks.push(0);
+        }
+    };
+    chunk(b"fmt ", &fmt);
+    if pad > 0 {
+        chunk(b"LIST", &vec![b'x'; pad]);
+    }
+    chunk(b"data", &data);
+    chunk(b"LIST", b"INFOtail");
+    let mut b = b"RIFF".to_vec();
+    b.extend_from_slice(&(chunks.len() as u32 + 4).to_le_bytes());
+    b.extend_from_slice(b"WAVE");
+    b.extend_from_slice(&chunks);
+    b
+}

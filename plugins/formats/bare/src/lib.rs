@@ -1,8 +1,8 @@
-//! pf-bare, audio files with no container, native FLAC, MPEG audio and ADTS AAC. Opening reads
-//! the head and the tail, a [`Reader`] finds the frames as a session reads forward and seeks
-//! on them, `baresrc` puts them out a frame per buffer. Tags are left to the caller, the opener
-//! hands back the tag bytes it read on the way. The opener and the reader are fetch machines,
-//! the caller does the reads.
+//! pf-bare, audio files with no container, native FLAC, MPEG audio, ADTS AAC, AC-3, E-AC-3,
+//! DTS and the PCM of a WAV file. Opening reads the head and the tail, a [`Reader`] finds the
+//! frames as a session reads forward and seeks on them, `baresrc` puts them out a frame per
+//! buffer. Tags are left to the caller, the opener hands back the tag bytes it read on the way.
+//! The opener and the reader are fetch machines, the caller does the reads.
 
 #![deny(unsafe_code)]
 
@@ -11,10 +11,12 @@ pub mod fixture;
 pub mod flac;
 pub mod head;
 pub mod reader;
+pub mod sync;
 
 pub use element::{BareSrc, BareSrcError};
 pub use head::{BareHead, BareKind, Codec, OpenAt, RawTags};
 pub use reader::{NextAt, Reader, SeekAt, Unit};
+pub use sync::SyncKind;
 
 use pf_registry::{Elements, Registry};
 use profluens_core::fetch::FileError;
@@ -80,6 +82,6 @@ mod tests {
         assert_eq!(reg.names(), vec!["baresrc"]);
         let d = reg.get("baresrc").unwrap();
         assert!(d.make_default.is_none(), "baresrc needs the file and its head");
-        assert_eq!(d.srcs[0].offers.len(), 3, "flac, mp3 and aac");
+        assert_eq!(d.srcs[0].offers.len(), 7, "flac, mp3, aac, ac3, eac3, dts and pcm");
     }
 }

@@ -303,6 +303,97 @@ const FIXTURES: &[Fixture] = &[
     plain("audio.flac", &["flac"], A, &["-c:a", "flac"]),
     plain("audio.wav", &["pcm_s16le"], A, &["-c:a", "pcm_s16le", "-f", "wav"]),
     plain("audio.aac", &["aac"], A, &["-c:a", "aac", "-b:a", "128k", "-f", "adts"]),
+    plain("audio_f32.wav", &["pcm_f32le"], A, &["-c:a", "pcm_f32le", "-f", "wav"]),
+    plain("audio.ac3", &["ac3"], A, &["-c:a", "ac3", "-b:a", "192k", "-f", "ac3"]),
+    plain("audio_51.ac3", &["ac3"], A, &["-c:a", "ac3", "-ac", "6", "-b:a", "448k", "-f", "ac3"]),
+    plain("audio.eac3", &["eac3"], A, &["-c:a", "eac3", "-b:a", "192k", "-f", "eac3"]),
+    // ffmpeg's DTS encoder is marked experimental
+    plain(
+        "audio.dts",
+        &["dca"],
+        A,
+        &["-c:a", "dca", "-strict", "-2", "-ac", "2", "-b:a", "768k", "-f", "dts"],
+    ),
+    plain(
+        "ts_h264_aac.ts",
+        &["libx264", "aac"],
+        AV,
+        &[
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-shortest",
+            "-f",
+            "mpegts",
+        ],
+    ),
+    plain(
+        "ts_h265_ac3.ts",
+        &["libx265", "ac3"],
+        AV,
+        &[
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "ac3",
+            "-b:a",
+            "192k",
+            "-shortest",
+            "-f",
+            "mpegts",
+        ],
+    ),
+    // MPEG-1 system stream, as a VCD carries it
+    plain(
+        "ps_mpeg1_mp2.mpg",
+        &["mpeg1video", "mp2"],
+        AV,
+        &[
+            "-c:v",
+            "mpeg1video",
+            "-b:v",
+            "800k",
+            "-c:a",
+            "mp2",
+            "-b:a",
+            "192k",
+            "-shortest",
+            "-f",
+            "mpeg",
+        ],
+    ),
+    // DVD packs, AC-3 in private stream 1
+    plain(
+        "ps_mpeg2_ac3.vob",
+        &["mpeg2video", "ac3"],
+        AV,
+        &[
+            "-c:v",
+            "mpeg2video",
+            "-b:v",
+            "1500k",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "ac3",
+            "-b:a",
+            "192k",
+            "-shortest",
+            "-f",
+            "vob",
+        ],
+    ),
     chapters("chapters.mkv", &["aac"], &["-c:a", "aac", "-b:a", "32k", "-f", "matroska"]),
     // a chpl and a chapter track both
     chapters(
@@ -650,6 +741,6 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), FIXTURES.len());
-        assert_eq!(FIXTURES.len(), 23);
+        assert_eq!(FIXTURES.len(), 32);
     }
 }

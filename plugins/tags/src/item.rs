@@ -1,5 +1,12 @@
 use crate::Tags;
 use crate::flacmeta;
+
+pub use crate::chapters::{
+    ChapterEdition, ChapterSource, ChapterTitle, ItemChapter, ItemChapters, MAX_CHAPTER_DEPTH,
+    MAX_CHAPTER_TEXT, MAX_CHAPTER_TITLE, MAX_CHAPTER_TITLES, MAX_CHAPTERS, MAX_EDITIONS,
+    MAX_LANGUAGE, RawChapter, bcp47, chapters, is_chapter_key, mkv_chapters, moov_chapters,
+    normalise, vorbis_chapters,
+};
 use profluens_core::event::TagSink;
 use profluens_core::scratch::Arena;
 
@@ -85,7 +92,8 @@ pub fn capped(mut text: Vec<(String, String)>, mut pictures: Vec<ItemPicture>) -
         t.0 = "DATE".to_string();
     }
     let rank = |k: &str| FIRST.iter().position(|f| *f == k).unwrap_or(FIRST.len());
-    let mut order: Vec<usize> = (0..text.len()).collect();
+    // chapter comments are read as chapters
+    let mut order: Vec<usize> = (0..text.len()).filter(|&i| !is_chapter_key(&text[i].0)).collect();
     order.sort_by_key(|&i| rank(&text[i].0));
     let mut out = ItemTags::default();
     let mut used = 0;
@@ -231,7 +239,7 @@ impl TagSink for Collect {
     // Owned result, at most MAX_TAGS * 4 entries.
     #[allow(clippy::disallowed_methods)]
     fn text(&mut self, key: &str, value: &str) {
-        if self.text.len() < MAX_TAGS * 4 && key.len() <= MAX_KEY {
+        if self.text.len() < MAX_TAGS * 4 && key.len() <= MAX_KEY && !is_chapter_key(key) {
             self.text.push((key.to_string(), cut(value.trim(), MAX_VALUE).to_string()));
         }
     }
@@ -351,6 +359,12 @@ pub fn taken(o: &mut pf_open::Opened) -> ItemTags {
         pf_open::Meta::Mkv(m) => mkv(m),
         meta => read(o, &meta),
     }
+}
+
+/// [`taken`] with the [`chapters`] read before the meta moves.
+pub fn taken_with_chapters(o: &mut pf_open::Opened) -> (ItemTags, ItemChapters) {
+    let c = chapters(o);
+    (taken(o), c)
 }
 
 fn read(o: &pf_open::Opened, meta: &pf_open::Meta) -> ItemTags {

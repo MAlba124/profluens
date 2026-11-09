@@ -111,3 +111,53 @@ fn no_meta_wanted_is_no_tags() {
         assert_eq!(pf_tags::of(&o), ItemTags::default(), "{rel}");
     }
 }
+
+/// Each chapter's start and end in ms and its first title with its language.
+fn chapter_rows(c: &pf_tags::item::ItemChapters) -> Vec<(u64, Option<u64>, String, String)> {
+    c.default_chapters()
+        .iter()
+        .map(|c| {
+            let t = c.titles.first().cloned().unwrap_or_default();
+            (c.start_ns / 1_000_000, c.end_ns.map(|e| e / 1_000_000), t.text, t.language)
+        })
+        .collect()
+}
+
+/// The chapter fixtures `cargo xtask fixtures` writes, skipped when not generated.
+#[test]
+fn chapters_of_every_container_are_one_form() {
+    use pf_tags::item::{ChapterSource, chapters, taken_with_chapters};
+    let row = |s: u64, e: u64, t: &str, l: &str| (s, Some(e), t.to_string(), l.to_string());
+    let want = |de: &str| {
+        [row(0, 1250, "Intro", ""), row(1250, 3250, "Mittelstück", ""), row(3250, 5000, "Ende", de)]
+    };
+    for (name, source, de) in [
+        // ffmpeg writes ChapLanguage und and the language as a LANGUAGE tag, no title
+        ("chapters.mkv", ChapterSource::Matroska, ""),
+        ("chapters.mp4", ChapterSource::ChapterTrack, ""),
+        ("chapters.mov", ChapterSource::ChapterTrack, ""),
+        // ffmpeg passes the chapter's language on as a comment
+        ("chapters.opus", ChapterSource::VorbisComment, "de"),
+        ("chapters.flac", ChapterSource::VorbisComment, ""),
+    ] {
+        let rel = format!("fixtures/out/{name}");
+        if !path(&rel).exists() {
+            eprintln!("{name} not generated, skipped");
+            continue;
+        }
+        let mut o = opened(&rel, Want::ALL);
+        let c = chapters(&o);
+        assert_eq!((c.source, c.editions.len()), (source, 1), "{name}");
+        let mut rows = chapter_rows(&c);
+        // the last ends at the item's end, which an Opus stream's pre-skip moves by a few ms
+        if let Some(r) = rows.last_mut() {
+            assert!(r.1.is_some_and(|e| e.abs_diff(5000) < 30), "{name} {rows:?}");
+            r.1 = Some(5000);
+        }
+        assert_eq!(rows, want(de), "{name}");
+        let tags = pf_tags::of(&o);
+        assert!(tags.tags.iter().all(|t| !t.0.starts_with("CHAPTER")), "{name} {:?}", tags.tags);
+        assert_eq!(taken_with_chapters(&mut o), (tags, c), "{name}");
+        assert!(chapters(&opened(&rel, Want::TRACKS)).is_empty(), "{name} no meta wanted");
+    }
+}

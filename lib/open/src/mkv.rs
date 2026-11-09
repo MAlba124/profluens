@@ -11,12 +11,13 @@ const MAX_TOP: usize = 4096;
 /// An element head at most, a 4 octet id and an 8 octet size.
 const EL_HEAD: usize = 12;
 
-/// Where the head walk passed the Tags and the Attachments, for a head cut before them whose
-/// SeekHead names neither.
+/// Where the head walk passed the Tags, the Attachments and the Chapters, for a head cut before
+/// them whose SeekHead names none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Passed {
     pub(crate) tags: Option<u64>,
     pub(crate) attachments: Option<u64>,
+    pub(crate) chapters: Option<u64>,
 }
 
 /// The head [`pf_probe::head::MkvHeadAt`] reads when `window` holds every element before the
@@ -47,6 +48,9 @@ pub(crate) fn head_in(window: &[u8], max: u64) -> Option<(usize, u64, Passed)> {
         if h.id == id::TAGS {
             passed.tags = passed.tags.or(Some(at as u64));
         }
+        if h.id == id::CHAPTERS {
+            passed.chapters = passed.chapters.or(Some(at as u64));
+        }
         tracks |= h.id == id::TRACKS;
         let end = h.data_end().ok()??;
         if end > window.len() || end <= at {
@@ -76,11 +80,16 @@ pub(crate) fn doc_type(head: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Where the Cues, the Tags and the Attachments lie, absolute, by the head's SeekHead and its own
-/// elements.
-pub(crate) fn places(p: &Parsed) -> (Option<u64>, Option<u64>, Option<u64>) {
+/// Where the Cues lie and the metadata the open reads, absolute, by the head's SeekHead and its
+/// own elements.
+pub(crate) fn places(p: &Parsed) -> (Option<u64>, Passed) {
     let ix = p.index;
-    (p.cues_pos(), ix.and_then(|ix| ix.tags), ix.and_then(|ix| ix.attachments))
+    let passed = Passed {
+        tags: ix.and_then(|ix| ix.tags),
+        attachments: ix.and_then(|ix| ix.attachments),
+        chapters: ix.and_then(|ix| ix.chapters),
+    };
+    (p.cues_pos(), passed)
 }
 
 /// The Cues at the start of `b`, the held bytes from where the SeekHead puts them, as

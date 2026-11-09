@@ -6,6 +6,7 @@
 
 mod aiff;
 mod ape;
+mod chapters;
 pub mod fixture;
 mod flac;
 pub mod flacmeta;

@@ -222,6 +222,19 @@ fn long_text_is_cut_as_it_is_read() {
 }
 
 #[test]
+fn chapter_comments_are_chapters_not_tags() {
+    let mut entries = vec!["TITLE=Book"];
+    let many: Vec<String> =
+        (0..MAX_TAGS * 4).map(|i| format!("CHAPTER{i:03}=00:00:{:02}.000", i % 60)).collect();
+    entries.extend(many.iter().map(String::as_str));
+    entries.extend(["chapter001name=One", "CHAPTER001URL=x", "CHAPTERS=kept", "ARTIST=Late"]);
+    let t = flac([&vorbis("v", &entries)[..]], none());
+    assert_eq!(t.tags, [pair("TITLE", "Book"), pair("ARTIST", "Late"), pair("CHAPTERS", "kept")]);
+    let c = capped(vec![pair("CHAPTER002NAME", "x"), pair("TITLE", "y")], Vec::new());
+    assert_eq!(c.tags, [pair("TITLE", "y")]);
+}
+
+#[test]
 fn a_year_stands_in_for_a_missing_date() {
     let c = capped(vec![pair("TITLE", "x"), pair("YEAR", "2005")], Vec::new());
     assert_eq!(c.get("DATE"), Some("2005"));
@@ -415,6 +428,7 @@ fn matroska_tags_and_attachments_read_all_or_nothing() {
             attachment("text/plain", b"x".to_vec()),
         ],
         error: None,
+        chapters: Vec::new(),
     };
     let t = mkv(meta.clone());
     assert_eq!(t.tags, [pair("TITLE", "A film"), pair("DATE", "1999")]);

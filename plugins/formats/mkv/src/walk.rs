@@ -10,6 +10,8 @@ use crate::tags::{index_segment, is_cover_name};
 
 /// Element heads a [`TrackEnd`] reads at most, a few seconds of a busy file take thousands.
 pub const MAX_HEADS: usize = 1 << 18;
+/// A Chapters element past this is left out, room for [`crate::extras::MAX_CHAPTERS`] atoms.
+pub const MAX_CHAPTERS_LEN: u64 = 1 << 20;
 /// An attachment's name, media type or description past this is read as empty.
 const MAX_LABEL: u64 = 1 << 10;
 /// Bytes of a Cluster read at a time while looking for its keyframe.
@@ -84,7 +86,7 @@ fn label(b: &[u8]) -> String {
     String::from_utf8_lossy(ebml::read_string(b)).into_owned()
 }
 
-/// A file's Tags and image attachments as [`MetaAt`] reads them.
+/// A file's Tags, Chapters and image attachments as [`MetaAt`] reads them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Meta {
     /// The Tags element with its head, empty without one or past the cap.
@@ -93,6 +95,9 @@ pub struct Meta {
     pub pictures: Vec<Attachment>,
     /// What stopped the walk, the first error. What was read before it is kept.
     pub error: Option<WalkError>,
+    /// The Chapters element with its head, empty without one, past [`MAX_CHAPTERS_LEN`] or
+    /// malformed. A bad Chapters is no error, the Tags are read all the same.
+    pub chapters: Vec<u8>,
 }
 
 /// An AttachedFile's fields by where [`MetaAt`] keeps their spans, in the order it reads them.
@@ -106,6 +111,12 @@ const DATA: usize = 4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MetaState {
     Start,
+    /// The Chapters element's head at `at`.
+    ChapHead {
+        at: u64,
+    },
+    /// The Chapters whole.
+    Chapters,
     /// The Tags element's head at `at`.
     TagsHead {
         at: u64,
@@ -130,10 +141,11 @@ enum MetaState {
     },
 }
 
-/// The Tags and image attachments the SeekHead of a head names. Tags in the head need no read,
-/// past it one, and Tags past `max_tags` bytes are left out. The Attachments are walked by their
-/// elements' heads, an attachment's media type is read first and an image's other fields and
-/// data of `max_picture` bytes or less after it, fonts stay unread. Whatever the head holds is
+/// The Chapters, Tags and image attachments the SeekHead of a head names. Tags in the head need
+/// no read, past it one, and Tags past `max_tags` bytes are left out, Chapters likewise past
+/// [`MAX_CHAPTERS_LEN`]. The Attachments are walked by their elements' heads, an attachment's
+/// media type is read first and an image's other fields and data of `max_picture` bytes or less
+/// after it, fonts stay unread. Whatever the head holds is
 /// taken from it unread. An error in the Tags still walks the Attachments, one in the
 /// Attachments keeps the images before it.
 #[derive(Debug)]
@@ -186,8 +198,16 @@ impl<H: AsRef<[u8]>> MetaOwned<H> {
     /// The Tags and the Attachments at `tags` and `attachments` where the head names neither,
     /// a head cut before them whose SeekHead leaves them out.
     pub fn with_places(mut self, tags: Option<u64>, attachments: Option<u64>) -> Self {
-        if let Some((t, a)) = &mut self.walk.index {
-            (*t, *a) = (t.or(tags), a.or(attachments));
+        if let Some(p) = &mut self.walk.index {
+            (p.tags, p.attachments) = (p.tags.or(tags), p.attachments.or(attachments));
+        }
+        self
+    }
+
+    /// The Chapters at `chapters` where the head names none, as [`MetaOwned::with_places`].
+    pub fn with_chapters(mut self, chapters: Option<u64>) -> Self {
+        if let Some(p) = &mut self.walk.index {
+            p.chapters = p.chapters.or(chapters);
         }
         self
     }
@@ -210,16 +230,24 @@ impl<H: AsRef<[u8]>> Fetch for MetaOwned<H> {
     }
 }
 
+/// Where the walk finds each master, absolute.
+#[derive(Clone, Copy, Debug)]
+struct Places {
+    tags: Option<u64>,
+    attachments: Option<u64>,
+    chapters: Option<u64>,
+}
+
 /// The walk of [`MetaAt`] and [`MetaOwned`], the head handed in at each poll.
 #[derive(Debug)]
 struct MetaWalk {
-    /// The SeekHead's Tags and Attachments, None for a head with no Segment.
-    index: Option<(Option<u64>, Option<u64>)>,
+    /// The SeekHead's masters, None for a head with no Segment.
+    index: Option<Places>,
     max_tags: u64,
     max_picture: u64,
     state: MetaState,
     hd: [u8; ELEMENT_HEAD],
-    /// The Tags, a label or an image's data, read whole.
+    /// The Chapters, the Tags, a label or an image's data, read whole.
     whole: Vec<u8>,
     /// Bytes of the read in flight, in `hd` or `whole`.
     len: usize,
@@ -248,7 +276,11 @@ impl MetaWalk {
     #[allow(clippy::disallowed_methods)]
     fn new(head: &[u8], max_tags: u64, max_picture: u64) -> Self {
         MetaWalk {
-            index: index_segment(head).map(|ix| (ix.tags, ix.attachments)),
+            index: index_segment(head).map(|ix| Places {
+                tags: ix.tags,
+                attachments: ix.attachments,
+                chapters: ix.chapters,
+            }),
             max_tags,
             max_picture,
             state: MetaState::Start,
@@ -284,9 +316,17 @@ impl MetaWalk {
         head_in(&self.hd[..self.got], at)?.ok_or(WalkError::Malformed { at })
     }
 
+    /// The Tags once the Chapters are done, else the Attachments.
+    fn tags(&mut self) -> Option<Need> {
+        match self.index?.tags {
+            Some(at) => self.small_at(MetaState::TagsHead { at }, at, ELEMENT_HEAD),
+            None => self.attachments(),
+        }
+    }
+
     /// The Attachments once the Tags are done, None when the walk is.
     fn attachments(&mut self) -> Option<Need> {
-        let at = self.index?.1?;
+        let at = self.index?.attachments?;
         self.small_at(MetaState::AttHead { at }, at, ELEMENT_HEAD)
     }
 
@@ -352,13 +392,31 @@ impl MetaWalk {
         match self.state {
             MetaState::Start => {
                 (self.meta, self.covers) = (Meta::default(), 0);
-                match self.index {
-                    Some((Some(at), _)) => {
-                        Ok(self.small_at(MetaState::TagsHead { at }, at, ELEMENT_HEAD))
-                    }
-                    Some((None, _)) => Ok(self.attachments()),
-                    None => Ok(None),
+                match self.index.and_then(|p| p.chapters) {
+                    Some(at) => Ok(self.small_at(MetaState::ChapHead { at }, at, ELEMENT_HEAD)),
+                    None => Ok(self.tags()),
                 }
+            }
+            MetaState::ChapHead { at } => {
+                let Ok(el) = self.element(at) else { return Ok(self.tags()) };
+                let len = el.end.map(|end| end - at);
+                let len = len.filter(|&len| len <= MAX_CHAPTERS_LEN && el.is(id::CHAPTERS));
+                let Some(len) = len.and_then(|len| usize::try_from(len).ok()) else {
+                    return Ok(self.tags());
+                };
+                let from = usize::try_from(at).ok();
+                match from.and_then(|from| head.get(from..from.checked_add(len)?)) {
+                    Some(b) => {
+                        self.meta.chapters = b.to_vec();
+                        Ok(self.tags())
+                    }
+                    None => Ok(self.whole_at(MetaState::Chapters, at, len)),
+                }
+            }
+            MetaState::Chapters => {
+                self.whole.truncate(self.got);
+                self.meta.chapters = std::mem::take(&mut self.whole);
+                Ok(self.tags())
             }
             MetaState::TagsHead { at } => {
                 let el = self.element(at)?;
@@ -464,6 +522,7 @@ impl MetaWalk {
         let heads = matches!(
             self.state,
             MetaState::TagsHead { .. }
+                | MetaState::ChapHead { .. }
                 | MetaState::AttHead { .. }
                 | MetaState::File { .. }
                 | MetaState::Field { .. }
@@ -478,9 +537,9 @@ impl MetaWalk {
 
     fn buf(&mut self) -> &mut [u8] {
         match self.state {
-            MetaState::Tags | MetaState::Pic { field: MIME | NAME | DESC | DATA } => {
-                &mut self.whole
-            }
+            MetaState::Chapters
+            | MetaState::Tags
+            | MetaState::Pic { field: MIME | NAME | DESC | DATA } => &mut self.whole,
             _ => &mut self.hd[..self.len.min(ELEMENT_HEAD)],
         }
     }
@@ -1262,6 +1321,65 @@ mod tests {
         assert_eq!(m.pictures.len(), 1, "the image before it");
         let need = first_need(&mut MetaAt::new(&file[..head], 1 << 20, 100));
         assert_eq!(need, Need { at: tags_at, len: ELEMENT_HEAD }, "the read is the caller's");
+    }
+
+    /// Chapters and Tags behind the Cluster, the SeekHead naming both, and where each lies.
+    fn chapters_file(chapters: &[u8]) -> (Vec<u8>, usize, u64) {
+        let tags = master(id::TAGS, &[master(id::TAG, &[leaf(id::SIMPLE_TAG, b"x")])]);
+        let seek = |pos: u64, target: &[u8]| {
+            master(
+                id::SEEK,
+                &[leaf(id::SEEK_ID, target), leaf(id::SEEK_POSITION, &pos.to_be_bytes())],
+            )
+        };
+        let seek_head =
+            |c: u64, t: u64| master(id::SEEK_HEAD, &[seek(c, id::CHAPTERS), seek(t, id::TAGS)]);
+        let cluster = cluster(0, &leaf(id::SIMPLE_BLOCK, &block(1, 0)));
+        let chap_pos = (seek_head(0, 0).len() + cluster.len()) as u64;
+        let tags_pos = chap_pos + chapters.len() as u64;
+        let body = [seek_head(chap_pos, tags_pos), cluster, chapters.to_vec(), tags].concat();
+        let mut file = master(id::EBML, &[leaf(id::DOC_TYPE, b"matroska")]);
+        ebml::write_id(&mut file, id::SEGMENT);
+        ebml::write_size(&mut file, body.len() as u64);
+        let data = file.len() as u64;
+        let head = file.len() + seek_head(0, 0).len();
+        file.extend_from_slice(&body);
+        (file, head, data + chap_pos)
+    }
+
+    #[test]
+    fn the_chapters_are_read_by_the_seek_head_before_the_tags() {
+        let atom = master(id::CHAPTER_ATOM, &[leaf(id::CHAPTER_TIME_START, &[0])]);
+        let chapters = master(id::CHAPTERS, &[master(id::EDITION_ENTRY, &[atom])]);
+        let (file, head, at) = chapters_file(&chapters);
+        let mut log = Vec::new();
+        let m = drive_slice_log(&mut MetaAt::new(&file[..head], 1 << 20, 100), &file, &mut log);
+        let m = m.unwrap();
+        assert_eq!((m.chapters.as_slice(), m.error), (&chapters[..], None));
+        assert!(!m.tags.is_empty(), "the Tags behind them");
+        assert_eq!(log[0], Need { at, len: ELEMENT_HEAD }, "{log:?}");
+        log.clear();
+        let held = drive_slice_log(&mut MetaAt::new(&file, 1 << 20, 100), &file, &mut log);
+        assert_eq!(held.unwrap().chapters, chapters, "held in the head, read from it");
+        assert!(log.is_empty(), "{log:?}");
+        // past the cap, a wrong element and a broken head leave them out, never an error
+        let big = master(id::CHAPTERS, &[leaf(id::VOID, &vec![0; MAX_CHAPTERS_LEN as usize])]);
+        let (file, head, _) = chapters_file(&big);
+        let m = drive_slice(&mut MetaAt::new(&file[..head], 1 << 20, 100), &file).unwrap();
+        assert!(m.chapters.is_empty() && m.error.is_none() && !m.tags.is_empty());
+        for bad in [master(id::TAGS, &[]), vec![0x00; 16]] {
+            let (file, head, _) = chapters_file(&bad);
+            let m = drive_slice(&mut MetaAt::new(&file[..head], 1 << 20, 100), &file).unwrap();
+            assert!(m.chapters.is_empty() && m.error.is_none(), "{:?}", m.error);
+        }
+        // a head cut before Chapters its SeekHead leaves out is told where they lie
+        let (mut file, head, at) = chapters_file(&chapters);
+        let seek_id = file.windows(4).position(|w| w == id::CHAPTERS).unwrap();
+        file[seek_id..seek_id + 4].copy_from_slice(id::CLUSTER);
+        let blind = MetaOwned::new(file[..head].to_vec(), 1 << 20, 100);
+        assert!(drive_slice(&mut { blind }, &file).unwrap().chapters.is_empty());
+        let told = MetaOwned::new(file[..head].to_vec(), 1 << 20, 100).with_chapters(Some(at));
+        assert_eq!(drive_slice(&mut { told }, &file).unwrap().chapters, chapters);
     }
 
     #[test]

@@ -18,6 +18,7 @@ const CLUSTER: u32 = 0x1F43_B675;
 const TRACKS: u32 = 0x1654_AE6B;
 const ATTACHMENTS: u32 = 0x1941_A469;
 const TAGS: u32 = 0x1254_C367;
+const CHAPTERS: u32 = 0x1043_A770;
 /// Top level elements walked for the first Cluster.
 const MKV_MAX_TOP: usize = 4096;
 const MKV_HEAD_MAX: usize = 8 << 20;
@@ -150,6 +151,8 @@ pub struct MkvHead {
     pub attachments: Option<u64>,
     /// Where the walk passed the Tags, for Tags behind such a cut.
     pub tags: Option<u64>,
+    /// Where the walk passed the Chapters, likewise.
+    pub chapters: Option<u64>,
 }
 
 /// `TooLarge` is an element ending past the cap before Tracks is read, `TooMany` no Cluster among
@@ -223,6 +226,7 @@ pub struct MkvHeadAt {
     cut: Option<u64>,
     attachments: Option<u64>,
     tags: Option<u64>,
+    chapters: Option<u64>,
     /// Top level elements walked.
     tops: usize,
 }
@@ -247,6 +251,7 @@ impl MkvHeadAt {
             cut: None,
             attachments: None,
             tags: None,
+            chapters: None,
             tops: 0,
         }
     }
@@ -303,8 +308,8 @@ impl MkvHeadAt {
             let mut head = std::mem::take(&mut self.window);
             head.truncate(len);
             self.state = MkvState::Start;
-            let (attachments, tags) = (self.attachments, self.tags);
-            return Ok(Step::Done(MkvHead { head, first_cluster, attachments, tags }));
+            let (attachments, tags, chapters) = (self.attachments, self.tags, self.chapters);
+            return Ok(Step::Done(MkvHead { head, first_cluster, attachments, tags, chapters }));
         }
         self.head = std::mem::take(&mut self.window);
         self.head_from = self.head.len();
@@ -316,7 +321,7 @@ impl MkvHeadAt {
         match self.state {
             MkvState::Start => {
                 (self.tracks, self.cut, self.tops) = (false, None, 0);
-                (self.attachments, self.tags) = (None, None);
+                (self.attachments, self.tags, self.chapters) = (None, None, None);
                 Ok(self.ask(MkvState::Ebml, 0))
             }
             MkvState::Ebml => {
@@ -353,6 +358,7 @@ impl MkvHeadAt {
                 match id {
                     ATTACHMENTS => self.attachments = self.attachments.or(Some(at)),
                     TAGS => self.tags = self.tags.or(Some(at)),
+                    CHAPTERS => self.chapters = self.chapters.or(Some(at)),
                     _ => {}
                 }
                 let fonts = self.tracks && id == ATTACHMENTS;
@@ -370,9 +376,9 @@ impl MkvHeadAt {
                     return Err(MkvHeadError::Malformed { at: (self.head_from + self.got) as u64 });
                 }
                 (self.state, self.head_from) = (MkvState::Start, 0);
-                let (head, attachments, tags) =
-                    (std::mem::take(&mut self.head), self.attachments, self.tags);
-                Ok(Step::Done(MkvHead { head, first_cluster, attachments, tags }))
+                let (attachments, tags, chapters) = (self.attachments, self.tags, self.chapters);
+                let head = std::mem::take(&mut self.head);
+                Ok(Step::Done(MkvHead { head, first_cluster, attachments, tags, chapters }))
             }
         }
     }

@@ -25,7 +25,7 @@ pub struct Want {
     /// The Matroska Cues, the AVI idx1 and the MP4 sample tables, for demuxers that then read
     /// or fold none.
     pub index: bool,
-    /// The tags and pictures, for `pf_tags::of`.
+    /// The tags, pictures and chapters, for `pf_tags::of` and `pf_tags::item::chapters`.
     pub meta: bool,
 }
 
@@ -277,6 +277,9 @@ pub struct Opened {
     pub arena: Vec<u8>,
     pub index: Index,
     pub meta: Meta,
+    /// An MP4's QuickTime chapter track with its samples read, when [`Want::meta`] asks for it,
+    /// else empty.
+    pub chapter_track: pf_mp4::chapters::ChapterTrack,
     pub skipped: Vec<Skipped>,
 }
 
@@ -722,7 +725,11 @@ mod tests {
         ] {
             let b = fixture(rel);
             let want = drive_slice(&mut pf_probe::head::MkvHeadAt::new(64 << 20), &b).unwrap();
-            let passed = mkv::Passed { tags: want.tags, attachments: want.attachments };
+            let passed = mkv::Passed {
+                tags: want.tags,
+                attachments: want.attachments,
+                chapters: want.chapters,
+            };
             let at = (want.head.len(), want.first_cluster, passed);
             assert_eq!(mkv::head_in(&b, 64 << 20), Some(at), "{rel}");
             match want.attachments {
@@ -758,6 +765,7 @@ mod tests {
             arena: d.arena,
             index: Index::None,
             meta: Meta::None,
+            chapter_track: Default::default(),
             skipped: Vec::new(),
         };
         assert_eq!((o.text(s), o.bytes(s)), ("eng", &b"eng"[..]));

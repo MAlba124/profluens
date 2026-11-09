@@ -8,6 +8,7 @@ use pf_avi::{AviIndex, Idx1At, Idx1Body};
 use pf_bare::{BareHead, BareKind, RawTags};
 use pf_mkv::CuesAt;
 use pf_mkv::walk::{self, MetaOwned};
+use pf_mp4::chapters::{ChapterTrack, TextAt};
 use pf_probe::head::{AviHeadAt, MkvHead, MkvHeadAt, Mp4HeadOwned};
 use pf_probe::{Kind, PREFIX_LEN, probe};
 use profluens_core::fetch::{Fetch, Need, Step};
@@ -29,6 +30,8 @@ enum Stage {
     Cues(CuesAt),
     Meta(Box<MetaOwned<Arc<[u8]>>>),
     Mp4Head(Mp4HeadOwned),
+    /// The samples of an MP4's chapter track.
+    Chapters(Box<TextAt>),
     AviHead(AviHeadAt),
     Idx1(Idx1At),
     Bare(Box<pf_bare::OpenAt>),
@@ -44,7 +47,8 @@ struct MkvPart {
     cues_at: Option<u64>,
     /// The head parsed, the Cues joining it once read.
     parsed: pf_mkv::Parsed,
-    /// The Tags and the Attachments by the head, its SeekHead or the head walk past a cut.
+    /// The Tags, the Attachments and the Chapters by the head, its SeekHead or the head walk
+    /// past a cut.
     passed: mkv::Passed,
 }
 
@@ -66,10 +70,14 @@ pub struct OpenAt {
     tail: Vec<u8>,
     tail_at: u64,
     head: Arc<[u8]>,
+    /// Whether the head is the file's first bytes, an MP4 head read past the window has its
+    /// trailing `moov` appended.
+    head_prefix: bool,
     desc: Desc,
     duration: u64,
     index: Index,
     meta: Meta,
+    chapter_track: ChapterTrack,
     mkv: MkvPart,
     ogg: Option<ogg::Scan>,
     /// Where an AVI's `movi` lies, for the reads behind its head.
@@ -89,10 +97,12 @@ impl OpenAt {
             tail: Vec::new(),
             tail_at: 0,
             head: Arc::from(&[][..]),
+            head_prefix: true,
             desc: Desc::default(),
             duration: 0,
             index: Index::None,
             meta: Meta::None,
+            chapter_track: ChapterTrack::default(),
             mkv: MkvPart::default(),
             ogg: None,
             movi: None,
@@ -137,6 +147,14 @@ impl OpenAt {
                 Stage::Mp4Head(m) => match m.poll().map_err(OpenError::Mp4Head)? {
                     Step::Need(n) => return Ok(Some(n)),
                     Step::Done(head) => self.mp4(Arc::from(head)),
+                },
+                Stage::Chapters(m) => match m.poll() {
+                    Ok(Step::Need(n)) => return Ok(Some(n)),
+                    Ok(Step::Done(track)) => {
+                        self.chapter_track = track;
+                        self.done()
+                    }
+                    Err(e) => match e {},
                 },
                 Stage::AviHead(m) => match m.poll().map_err(OpenError::AviHead)? {
                     Step::Need(n) => return Ok(Some(n)),
@@ -225,6 +243,7 @@ impl OpenAt {
             Kind::Mp4 => match mp4::head_in(&self.window, self.len) {
                 Some(n) => self.mp4(Arc::from(&self.window[..n])),
                 None => {
+                    self.head_prefix = false;
                     self.stage =
                         Stage::Mp4Head(Mp4HeadOwned::new(take(&mut self.window), self.len));
                     Ok(None)
@@ -274,7 +293,7 @@ impl OpenAt {
     }
 
     fn mkv_head(&mut self, h: MkvHead) -> Result<Option<Need>, OpenError> {
-        let passed = mkv::Passed { tags: h.tags, attachments: h.attachments };
+        let passed = mkv::Passed { tags: h.tags, attachments: h.attachments, chapters: h.chapters };
         self.mkv_described(Arc::from(h.head), h.first_cluster, passed)
     }
 
@@ -290,17 +309,18 @@ impl OpenAt {
         if let Some(ix) = parsed.index.as_mut() {
             ix.tags = ix.tags.or(walked.tags);
             ix.attachments = ix.attachments.or(walked.attachments);
+            ix.chapters = ix.chapters.or(walked.chapters);
         }
         let (duration, uids) = mkv::describe(&parsed, &mut self.desc)?;
-        let (cues, tags, attachments) = mkv::places(&parsed);
+        let (cues, passed) = mkv::places(&parsed);
         let (len, want) = (self.len, self.want);
         let cues_at = cues.filter(|_| want.index);
-        let passed = mkv::Passed { tags, attachments };
         self.mkv = MkvPart { uids, cues_at, parsed, passed };
         (self.duration, self.head) = (duration, head);
         let held = (self.window.len() as u64).max(self.head.len() as u64);
-        let meta = [tags, attachments].map(|p| p.filter(|_| want.meta));
-        let far = [self.mkv.cues_at, meta[0], meta[1]].into_iter().flatten();
+        let meta =
+            [passed.tags, passed.attachments, passed.chapters].map(|p| p.filter(|_| want.meta));
+        let far = [self.mkv.cues_at, meta[0], meta[1], meta[2]].into_iter().flatten();
         let far = far.filter(|&p| p >= held && p < len && len - p <= self.caps.max_tail).min();
         match far {
             Some(at) => Ok(self.read_tail(at)),
@@ -339,8 +359,10 @@ impl OpenAt {
             return self.mkv_done();
         }
         let (tags, pictures) = (self.caps.max_tags, self.caps.max_picture);
+        let passed = self.mkv.passed;
         let m = MetaOwned::new(Arc::clone(&self.head), tags, pictures)
-            .with_places(self.mkv.passed.tags, self.mkv.passed.attachments);
+            .with_places(passed.tags, passed.attachments)
+            .with_chapters(passed.chapters);
         self.stage = Stage::Meta(Box::new(m));
         Ok(None)
     }
@@ -374,6 +396,12 @@ impl OpenAt {
                 pf_mp4::locate_moov(&head, head.len() as u64)
         {
             self.meta = Meta::Moov(offset..offset + len);
+            let track = head.get(offset..offset + len).and_then(pf_mp4::chapters::chapter_track);
+            if let Some(track) = track.filter(|t| !t.samples.is_empty()) {
+                self.head = head;
+                self.stage = Stage::Chapters(Box::new(TextAt::new(track)));
+                return Ok(None);
+            }
         }
         self.head = head;
         self.done()
@@ -492,10 +520,11 @@ impl OpenAt {
     /// Answers `need` from the window, the head or the tail when they hold it, for the inner
     /// machines.
     fn serve(&mut self, need: Need) -> bool {
-        let OpenAt { stage, window, head, tail, tail_at, len, .. } = self;
+        let OpenAt { stage, window, head, head_prefix, tail, tail_at, len, .. } = self;
         let buf = match stage {
             Stage::Cues(m) => m.buf(),
             Stage::Meta(m) => m.buf(),
+            Stage::Chapters(m) => m.buf(),
             Stage::Idx1(m) => m.buf(),
             _ => return false,
         };
@@ -505,7 +534,8 @@ impl OpenAt {
             let fits = need.at >= at && need.at <= b_end && (end <= b_end || b_end == *len);
             fits.then(|| (need.at - at) as usize..(end.min(b_end) - at) as usize)
         };
-        let front = if window.len() >= head.len() { &window[..] } else { &head[..] };
+        let front =
+            if window.len() >= head.len() || !*head_prefix { &window[..] } else { &head[..] };
         let (src, range) = match (held(0, front), held(*tail_at, &tail[..])) {
             (Some(r), _) => (front, r),
             (None, Some(r)) if !tail.is_empty() => (&tail[..], r),
@@ -516,6 +546,7 @@ impl OpenAt {
         match stage {
             Stage::Cues(m) => m.filled(n),
             Stage::Meta(m) => m.filled(n),
+            Stage::Chapters(m) => m.filled(n),
             Stage::Idx1(m) => m.filled(n),
             _ => {}
         }
@@ -533,6 +564,7 @@ impl OpenAt {
             arena: d.arena,
             index: take(&mut self.index),
             meta: take(&mut self.meta),
+            chapter_track: take(&mut self.chapter_track),
             skipped: d.skipped,
         }
     }
@@ -568,6 +600,7 @@ impl Fetch for OpenAt {
             Stage::Cues(m) => m.buf(),
             Stage::Meta(m) => m.buf(),
             Stage::Mp4Head(m) => m.buf(),
+            Stage::Chapters(m) => m.buf(),
             Stage::AviHead(m) => m.buf(),
             Stage::Idx1(m) => m.buf(),
             Stage::Bare(m) => m.buf(),
@@ -581,6 +614,7 @@ impl Fetch for OpenAt {
             Stage::Cues(m) => m.filled(n),
             Stage::Meta(m) => m.filled(n),
             Stage::Mp4Head(m) => m.filled(n),
+            Stage::Chapters(m) => m.filled(n),
             Stage::AviHead(m) => m.filled(n),
             Stage::Idx1(m) => m.filled(n),
             Stage::Bare(m) => m.filled(n),

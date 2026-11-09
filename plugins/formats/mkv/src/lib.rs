@@ -35,8 +35,8 @@ pub fn track_colour(track: &Track) -> profluens_video::color::StreamColor {
 pub use encoding::{Coding, Refusal};
 pub use error::{DemuxError, MkvError, MuxError, SinkPads};
 pub use extras::{
-    Attachment, Chapter, ChapterTitle, Chapters, Edition, Extras, MkvExtras, parse_attachments,
-    parse_chapters,
+    Attachment, Chapter, ChapterTagTitle, ChapterTitle, Chapters, Edition, Extras, MkvExtras,
+    chapter_tag_titles, parse_attachments, parse_chapters,
 };
 pub use index::{CAPTION_REACH, audio_lead, cue_entries, key_track};
 pub use inflate::InflateError;

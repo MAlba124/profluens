@@ -4,6 +4,7 @@
 #![deny(unsafe_code)]
 
 pub mod boxes;
+pub mod chapters;
 pub mod cmaf;
 pub mod codec;
 pub mod edit;

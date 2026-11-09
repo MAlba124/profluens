@@ -171,6 +171,70 @@ fn atoms(entry: &[u8], edition: usize, out: &mut Vec<Chapter>) {
 
 const CHAPTER_SEGMENT_UUID: &[u8] = &[0x6E, 0x67];
 
+/// A title the Tags give a chapter, a `TITLE` SimpleTag of a Tag whose Targets name its UID.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChapterTagTitle {
+    pub uid: u64,
+    pub title: ChapterTitle,
+}
+
+/// The chapter titles of a Tags element, at most [`MAX_CHAPTERS`]. A Tag naming several
+/// chapters titles each, a SimpleTag with no language is `und` as RFC 9559 defaults it.
+// Cold path, once per file.
+#[allow(clippy::disallowed_methods)]
+pub fn chapter_tag_titles(element: &[u8]) -> Vec<ChapterTagTitle> {
+    let mut out = Vec::new();
+    let Some(body) = master_body(element, id::TAGS) else {
+        return out;
+    };
+    let mut uids = [0u64; 8];
+    for_each_child(body, |h, tag| {
+        if h.id != id::TAG {
+            return;
+        }
+        let mut n = 0;
+        for_each_child(tag, |h, targets| {
+            if h.id == id::TARGETS {
+                for_each_child(targets, |h, v| {
+                    let uid = read_uint(v);
+                    if h.id == id::TAG_CHAPTER_UID && uid != 0 && n < uids.len() {
+                        uids[n] = uid;
+                        n += 1;
+                    }
+                });
+            }
+        });
+        for_each_child(tag, |h, simple| {
+            if h.id != id::SIMPLE_TAG {
+                return;
+            }
+            let Some(title) = tag_title(simple) else { return };
+            for &uid in &uids[..n] {
+                if out.len() < MAX_CHAPTERS {
+                    out.push(ChapterTagTitle { uid, title: title.clone() });
+                }
+            }
+        });
+    });
+    out
+}
+
+/// A SimpleTag's string when it is named `TITLE`, with its language.
+// Cold path, once per chapter.
+#[allow(clippy::disallowed_methods)]
+fn tag_title(simple: &[u8]) -> Option<ChapterTitle> {
+    let (mut named, mut bcp47) = (false, false);
+    let mut t = ChapterTitle { text: String::new(), language: String::from("und") };
+    for_each_child(simple, |h, v| match h.id {
+        i if i == id::TAG_NAME => named = ebml::read_string(v).eq_ignore_ascii_case(b"TITLE"),
+        i if i == id::TAG_STRING => t.text = text(v),
+        i if i == id::TAG_LANGUAGE_BCP47 => (t.language, bcp47) = (text(v), true),
+        i if i == id::TAG_LANGUAGE && !bcp47 => t.language = text(v),
+        _ => {}
+    });
+    (named && !t.text.is_empty()).then_some(t)
+}
+
 // Cold path, once per chapter.
 #[allow(clippy::disallowed_methods)]
 fn title(display: &[u8]) -> ChapterTitle {
@@ -264,6 +328,45 @@ mod tests {
         c.extend(end.map(|e| uint(id::CHAPTER_TIME_END, e)));
         c.extend(rest.iter().cloned());
         master(id::CHAPTER_ATOM, &c)
+    }
+
+    fn simple(name: &str, value: &str, lang: Option<&str>) -> Vec<u8> {
+        let mut c = vec![utf8(id::TAG_NAME, name), utf8(id::TAG_STRING, value)];
+        c.extend(lang.map(|l| utf8(id::TAG_LANGUAGE, l)));
+        master(id::SIMPLE_TAG, &c)
+    }
+
+    #[test]
+    fn titles_of_tags_naming_chapters_are_found() {
+        let targets = |uids: &[u64]| {
+            let mut c = vec![uint(id::TARGET_TYPE_VALUE, 30)];
+            c.extend(uids.iter().map(|&u| uint(id::TAG_CHAPTER_UID, u)));
+            master(id::TARGETS, &c)
+        };
+        let both = master(
+            id::TAG,
+            &[
+                targets(&[7, 9]),
+                simple("TITLE", "Vorspann", Some("ger")),
+                simple("ARTIST", "x", None),
+            ],
+        );
+        let bcp = master(
+            id::SIMPLE_TAG,
+            &[
+                utf8(id::TAG_NAME, "title"),
+                utf8(id::TAG_LANGUAGE_BCP47, "pt-BR"),
+                utf8(id::TAG_STRING, "Abertura"),
+                utf8(id::TAG_LANGUAGE, "por"),
+            ],
+        );
+        let one = master(id::TAG, &[targets(&[9]), bcp]);
+        let file = master(id::TAG, &[targets(&[]), simple("TITLE", "Album", None)]);
+        let got = chapter_tag_titles(&master(id::TAGS, &[both, one, file]));
+        let got: Vec<(u64, &str, &str)> =
+            got.iter().map(|t| (t.uid, t.title.text.as_str(), t.title.language.as_str())).collect();
+        assert_eq!(got, [(7, "Vorspann", "ger"), (9, "Vorspann", "ger"), (9, "Abertura", "pt-BR")]);
+        assert!(chapter_tag_titles(b"\x1a\x45").is_empty());
     }
 
     #[test]

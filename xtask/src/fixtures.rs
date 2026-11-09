@@ -30,12 +30,45 @@ const VA_TINY: &[&str] = &[
     "sine=frequency=440:sample_rate=16000:duration=2",
 ];
 
+/// Three chapters, the last in German, as ffmpeg's ffmetadata states them. No start's seconds
+/// round up, ffmpeg's Vorbis comment writer rounds the seconds and keeps the milliseconds.
+const CHAPTERS: &str = ";FFMETADATA1
+title=Chaptered
+
+[CHAPTER]
+TIMEBASE=1/1000
+START=0
+END=1250
+title=Intro
+
+[CHAPTER]
+TIMEBASE=1/1000
+START=1250
+END=3250
+title=Mittelstück
+
+[CHAPTER]
+TIMEBASE=1/1000
+START=3250
+END=5000
+title=Ende
+language=ger
+";
+
 const SVTAV1: &[&str] = &["-c:v", "libsvtav1", "-preset", "12", "-svtav1-params", "fast-decode=1"];
 const AOMAV1: &[&str] = &["-c:v", "libaom-av1", "-cpu-used", "8", "-usage", "realtime"];
 
 #[derive(Clone, Copy)]
 enum Build {
-    Plain { input: &'static [&'static str], args: &'static [&'static str] },
+    Plain {
+        input: &'static [&'static str],
+        args: &'static [&'static str],
+    },
+    /// [`CHAPTERS`] mapped in as a second input.
+    Chapters {
+        input: &'static [&'static str],
+        args: &'static [&'static str],
+    },
     Av1,
     Vp8Resize,
 }
@@ -270,7 +303,53 @@ const FIXTURES: &[Fixture] = &[
     plain("audio.flac", &["flac"], A, &["-c:a", "flac"]),
     plain("audio.wav", &["pcm_s16le"], A, &["-c:a", "pcm_s16le", "-f", "wav"]),
     plain("audio.aac", &["aac"], A, &["-c:a", "aac", "-b:a", "128k", "-f", "adts"]),
+    chapters("chapters.mkv", &["aac"], &["-c:a", "aac", "-b:a", "32k", "-f", "matroska"]),
+    // a chpl and a chapter track both
+    chapters(
+        "chapters.mp4",
+        &["aac"],
+        &["-c:a", "aac", "-b:a", "32k", "-movflags", "+faststart", "-f", "mp4"],
+    ),
+    // the chapter track alone, behind the mdat
+    chapters(
+        "chapters.mov",
+        &["aac"],
+        &["-c:a", "aac", "-b:a", "32k", "-movflags", "+disable_chpl", "-f", "mov"],
+    ),
+    chapters("chapters.opus", &["libopus"], &["-c:a", "libopus", "-b:a", "24k", "-f", "ogg"]),
+    // the same chapters as comments, ffmpeg's FLAC muxer writes none of its own
+    plain(
+        "chapters.flac",
+        &["flac"],
+        A,
+        &[
+            "-metadata",
+            "CHAPTER000=00:00:00.000",
+            "-metadata",
+            "CHAPTER000NAME=Intro",
+            "-metadata",
+            "CHAPTER001=00:00:01.250",
+            "-metadata",
+            "CHAPTER001NAME=Mittelstück",
+            "-metadata",
+            "CHAPTER002=00:00:03.250",
+            "-metadata",
+            "CHAPTER002NAME=Ende",
+            "-c:a",
+            "flac",
+            "-f",
+            "flac",
+        ],
+    ),
 ];
+
+const fn chapters(
+    name: &'static str,
+    needs: &'static [&'static str],
+    args: &'static [&'static str],
+) -> Fixture {
+    Fixture { name, needs, build: Build::Chapters { input: A, args } }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Status {
@@ -369,6 +448,15 @@ fn build(tools: &Tools, fixture: &Fixture, out: &Path) -> Result<bool, Error> {
     match fixture.build {
         Build::Plain { input, args } => {
             util::run("ffmpeg", ffmpeg(tools).args(input).args(args).arg(out))?;
+        }
+        Build::Chapters { input, args } => {
+            let tmp = util::temp_dir("chapters")?;
+            let meta = tmp.path.join("chapters.txt");
+            util::write(&meta, CHAPTERS.as_bytes())?;
+            let mut cmd = ffmpeg(tools);
+            cmd.args(input).arg("-i").arg(&meta);
+            cmd.args(["-map", "0", "-map_metadata", "1", "-map_chapters", "1"]);
+            util::run("ffmpeg", cmd.args(args).arg(out))?;
         }
         Build::Av1 => {
             let Some((_, av1)) = tools.av1 else {
@@ -562,6 +650,6 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), FIXTURES.len());
-        assert_eq!(FIXTURES.len(), 18);
+        assert_eq!(FIXTURES.len(), 23);
     }
 }

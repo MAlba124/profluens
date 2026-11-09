@@ -80,8 +80,9 @@ pub fn family_for(kind: boxes::FourCc) -> &'static str {
 
 pub const MAX_CUES: usize = 16;
 
-/// The cues of one text sample as ranges of `sample` into `out`, and how many.
-/// A sample that does not hold together puts out what came before the break.
+/// The cues of one text sample as ranges of `sample` into `out`, and how many, a `tx3g` cue's
+/// text, a `wvtt` cue's `vttc` body for [`vtt_cue`]. A sample that does not hold together puts
+/// out what came before the break.
 pub fn text_cues(
     kind: boxes::FourCc,
     sample: &[u8],
@@ -108,12 +109,10 @@ pub fn text_cues(
                 if &h.kind == b"vttc"
                     && let Ok(Some(payl)) =
                         boxes::find_child(h.body(sample), boxes::fourcc(b"payl"))
+                    && payl.end > payl.body_start
                 {
-                    let cue = h.body_start + payl.body_start..h.body_start + payl.end;
-                    if !cue.is_empty() {
-                        out[n] = cue;
-                        n += 1;
-                    }
+                    out[n] = h.body_start..h.end;
+                    n += 1;
                 }
                 at = h.end;
             }
@@ -121,6 +120,24 @@ pub fn text_cues(
         }
         _ => 0,
     }
+}
+
+/// A `vttc` body (ISO/IEC 14496-30 7.4) as the WebVTT cue every `subtitle/vtt` buffer holds,
+/// WebM's `D_WEBVTT` block form, the `iden` text, a line feed, the `sttg` text, a line feed,
+/// the `payl` text. A missing box is empty text.
+pub fn vtt_cue(vttc: &[u8], out: &mut Vec<u8>) {
+    let child = |k: &[u8; 4]| match boxes::find_child(vttc, boxes::fourcc(k)) {
+        Ok(Some(h)) => h.body(vttc),
+        _ => &[],
+    };
+    let (id, settings, text) = (child(b"iden"), child(b"sttg"), child(b"payl"));
+    out.clear();
+    out.reserve(id.len() + settings.len() + text.len() + 2);
+    out.extend_from_slice(id);
+    out.push(b'\n');
+    out.extend_from_slice(settings);
+    out.push(b'\n');
+    out.extend_from_slice(text);
 }
 
 pub fn is_video_family(family: &str) -> bool {
@@ -1035,9 +1052,19 @@ mod tests {
         let mut out: [core::ops::Range<usize>; MAX_CUES] = Default::default();
         let cue = |s: &[u8], k: &[u8; 4], out: &mut [core::ops::Range<usize>; MAX_CUES]| {
             let n = text_cues(*k, s, out);
+            let mut vtt = Vec::new();
             out[..n]
                 .iter()
-                .map(|r| String::from_utf8_lossy(&s[r.clone()]).into_owned())
+                .map(|r| {
+                    let text = match k {
+                        b"wvtt" => {
+                            vtt_cue(&s[r.clone()], &mut vtt);
+                            &vtt[..]
+                        }
+                        _ => &s[r.clone()],
+                    };
+                    String::from_utf8_lossy(text).into_owned()
+                })
                 .collect::<Vec<_>>()
         };
         let mut tx3g = vec![0, 9];
@@ -1054,10 +1081,19 @@ mod tests {
             )
         };
         let two = [vttc("one"), box_bytes(b"vtta", b"note"), vttc("two\nlines")].concat();
-        assert_eq!(cue(&two, b"wvtt", &mut out), ["one", "two\nlines"]);
+        assert_eq!(
+            cue(&two, b"wvtt", &mut out),
+            ["\nalign:start\none", "\nalign:start\ntwo\nlines"]
+        );
         assert!(cue(&box_bytes(b"vtte", &[]), b"wvtt", &mut out).is_empty(), "a gap");
         let broken = [vttc("kept"), vec![0, 0, 0, 3, b'v', b't', b't', b'c']].concat();
-        assert_eq!(cue(&broken, b"wvtt", &mut out), ["kept"]);
+        assert_eq!(cue(&broken, b"wvtt", &mut out), ["\nalign:start\nkept"]);
+        let named =
+            box_bytes(b"vttc", &[box_bytes(b"payl", b"hi"), box_bytes(b"iden", b"c1")].concat());
+        assert_eq!(cue(&named, b"wvtt", &mut out), ["c1\n\nhi"], "its id, no settings");
+        let silent =
+            box_bytes(b"vttc", &[box_bytes(b"iden", b"c1"), box_bytes(b"payl", b"")].concat());
+        assert!(cue(&silent, b"wvtt", &mut out).is_empty(), "no text, no cue");
         assert!(cue(b"anything", b"stpp", &mut out).is_empty(), "TTML is not read");
     }
 

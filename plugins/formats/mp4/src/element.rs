@@ -620,7 +620,7 @@ impl Mp4Demux {
                 (pad, kind),
                 (pts_ns, dur_ns),
                 s.payload.data(),
-                how,
+                (how, reframe_buf),
             );
         }
         let mut payload = s.payload;
@@ -743,13 +743,19 @@ impl Mp4Demux {
         (pad, kind): (SrcPad, FourCc),
         (pts_ns, dur_ns): (Option<u64>, Option<u64>),
         data: &[u8],
-        how: Emit,
+        (how, vtt): (Emit, &mut Vec<u8>),
     ) -> bool {
         let mut cues: [core::ops::Range<usize>; codec::MAX_CUES] = Default::default();
         let n = codec::text_cues(kind, data, &mut cues);
         let flags = BufferFlags::KEYFRAME;
         for cue in &cues[..n] {
-            let text = &data[cue.clone()];
+            let text = match &kind {
+                b"wvtt" => {
+                    codec::vtt_cue(&data[cue.clone()], vtt);
+                    &vtt[..]
+                }
+                _ => &data[cue.clone()],
+            };
             if how == Emit::Exact {
                 Self::emit_exact(ctx, pad, (pts_ns, dur_ns), flags, text, 0);
                 continue;

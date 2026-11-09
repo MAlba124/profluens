@@ -370,12 +370,16 @@ fn tx3g_cues_come_out_as_subrip_with_their_durations() {
 }
 
 #[test]
-fn wvtt_cues_come_out_as_webvtt_text() {
+fn wvtt_cues_come_out_as_webvtt_text_with_their_settings_and_ids() {
+    let named = boxed(
+        b"vttc",
+        &[boxed(b"iden", b"c7"), boxed(b"sttg", b"align:start"), boxed(b"payl", b"last")].concat(),
+    );
     let samples = [
         (400, vttc("hello")),
         (300, boxed(b"vtte", &[])),
         (600, [vttc("<i>one</i>"), boxed(b"vtta", b"NOTE"), vttc("two")].concat()),
-        (500, vttc("last")),
+        (500, named),
     ];
     let (got, family) = cues(movie(&wvtt_entry(), &samples));
     assert_eq!(family.as_deref(), Some("subtitle/vtt"));
@@ -383,10 +387,10 @@ fn wvtt_cues_come_out_as_webvtt_text() {
     assert_eq!(
         got,
         [
-            cue(0, 400, "hello"),
-            cue(700, 600, "<i>one</i>"),
-            cue(700, 600, "two"),
-            cue(1300, 500, "last")
+            cue(0, 400, "\nline:90%\nhello"),
+            cue(700, 600, "\nline:90%\n<i>one</i>"),
+            cue(700, 600, "\nline:90%\ntwo"),
+            cue(1300, 500, "c7\nalign:start\nlast")
         ]
     );
 }

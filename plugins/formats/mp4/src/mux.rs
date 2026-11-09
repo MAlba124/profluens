@@ -621,6 +621,19 @@ impl Mp4Mux {
                 mem = rest;
             }
         }
+        // a WebVTT cue's identifier and settings lines, a tx3g sample is its text
+        if lane.family == "subtitle/vtt" {
+            let d = mem.data();
+            let text = d
+                .iter()
+                .position(|&b| b == b'\n')
+                .and_then(|a| d[a + 1..].iter().position(|&b| b == b'\n').map(|b| a + b + 2));
+            if let Some(at) = text
+                && let Some(rest) = mem.slice(at, mem.len() - at)
+            {
+                mem = rest;
+            }
+        }
         if mem.is_empty() {
             return;
         }

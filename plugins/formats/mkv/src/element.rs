@@ -664,6 +664,8 @@ struct PadTrack {
     kind: Kind,
     /// Its packets are timed by their TOC, so a DiscardPadding reaches the decoder.
     opus: bool,
+    /// `S_TEXT/WEBVTT`, its cues go in `D_WEBVTT` block form with their settings and identifier.
+    webvtt: bool,
     pre_roll_ns: u64,
     gate: Gate,
     held: Vec<Out>,
@@ -1797,9 +1799,10 @@ impl MkvDemux {
     fn emit_frame(&mut self, ctx: &mut Ctx, idx: usize, frame: Out, how: Emit) {
         let Out { track_number, pts_ns, duration_ns, keyframe, mut bytes, t35, discard_ns } = frame;
         let (reframer, opus) = (self.pad_tracks[idx].reframer, self.pad_tracks[idx].opus);
+        let webvtt = self.pad_tracks[idx].webvtt;
         let mut side = std::mem::take(&mut self.side_buf);
-        let side_len = side_records(&t35, &mut side);
-        if side_len > 0
+        let side_len = if webvtt { 0 } else { side_records(&t35, &mut side) };
+        if (side_len > 0 || webvtt)
             && let Bytes::View(_, own) = &mut bytes
         {
             *own = false;
@@ -1822,8 +1825,18 @@ impl MkvDemux {
             true => codec::opus_ns(data).map(|ns| ns.saturating_sub(discard_ns)).or(duration_ns),
             false => duration_ns,
         };
-        let reframed =
-            if as_is { Ok(&data[..0]) } else { reframer.reframe_into(data, &mut reframe_buf) };
+        let reframed = if webvtt {
+            let addition = match &t35 {
+                Bytes::Owned(v) => &v[..],
+                Bytes::View(m, _) => m.data(),
+            };
+            codec::webm_vtt(data, addition, &mut reframe_buf);
+            Ok(&reframe_buf[..])
+        } else if as_is {
+            Ok(&data[..0])
+        } else {
+            reframer.reframe_into(data, &mut reframe_buf)
+        };
         match reframed {
             Ok(reframed) => {
                 self.start_pad(ctx, idx, pts_ns, how);
@@ -2763,6 +2776,7 @@ impl Element for MkvDemux {
                 started: false,
                 kind,
                 opus: family == "opus",
+                webvtt: track.codec_id == "S_TEXT/WEBVTT",
                 pre_roll_ns: codec::lead_of(track).pre_roll,
                 gate: Gate::Open,
                 held: Vec::new(),

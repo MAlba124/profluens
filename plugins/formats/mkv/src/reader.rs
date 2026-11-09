@@ -54,7 +54,9 @@ pub struct Track {
     pub hdr: profluens_video::color::HdrStatic,
     pub chroma_siting: (u8, u8),
     pub dovi: Option<profluens_video::color::DoviConfig>,
-    /// `BlockAddIDValue` of a type 4 mapping, else 4, what WebM uses unmapped for HDR10+.
+    /// The BlockAddID whose BlockAdditional a frame carries, a type 4 mapping's
+    /// `BlockAddIDValue`, else 4, what WebM uses unmapped for HDR10+. `S_TEXT/WEBVTT`'s cue
+    /// settings and identifier for that codec.
     pub t35_add_id: u64,
     pub default_duration_ns: Option<u64>,
     pub coding: Coding,
@@ -785,6 +787,9 @@ fn parse_track_entry(data: &[u8], undone: &mut usize) -> Result<Track, ReadError
             parse_addition_mapping(body, &mut track)?;
         }
         at = end;
+    }
+    if track.codec_id == "S_TEXT/WEBVTT" {
+        track.t35_add_id = crate::codec::WEBVTT_ADD_ID;
     }
     if track.track_number == 0 {
         // TrackNumber MUST NOT be 0 (RFC 9559 section 5.1.4.1.1).

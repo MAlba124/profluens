@@ -6,7 +6,7 @@ use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc};
 use crate::reader::Track;
 
 /// The announce family of each CodecID (RFC 9559 section 12), matching the decoders' sink offers.
-pub static CODEC_IDS: [(&str, &str); 33] = [
+pub static CODEC_IDS: [(&str, &str); 35] = [
     ("A_FLAC", "flac"),
     ("A_AAC", "aac"),
     ("A_AC3", "ac3"),
@@ -37,6 +37,9 @@ pub static CODEC_IDS: [(&str, &str); 33] = [
     ("S_TEXT/ASS", "subtitle/ass"),
     ("S_TEXT/SSA", "subtitle/ass"),
     ("S_TEXT/WEBVTT", "subtitle/vtt"),
+    // WebM's, the descriptions and metadata kinds show nothing.
+    ("D_WEBVTT/SUBTITLES", "subtitle/vtt"),
+    ("D_WEBVTT/CAPTIONS", "subtitle/vtt"),
     ("S_HDMV/PGS", "subtitle/pgs"),
     ("S_VOBSUB", "subtitle/vobsub"),
     ("S_DVBSUB", "subtitle/dvb"),
@@ -302,7 +305,7 @@ pub fn offers_for(codec_id: &str) -> &'static [OfferDesc] {
         "V_MS/VFW/FOURCC" => &VFW,
         "S_TEXT/UTF8" => &SRT,
         "S_TEXT/ASS" | "S_TEXT/SSA" => &ASS,
-        "S_TEXT/WEBVTT" => &VTT,
+        "S_TEXT/WEBVTT" | "D_WEBVTT/SUBTITLES" | "D_WEBVTT/CAPTIONS" => &VTT,
         "S_HDMV/PGS" => &PGS,
         "S_VOBSUB" => &VOBSUB,
         "S_DVBSUB" => &DVBSUB,
@@ -676,6 +679,27 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// The BlockAddID of an `S_TEXT/WEBVTT` block's cue settings and identifier, the default one
+/// mkvmerge leaves unwritten.
+pub const WEBVTT_ADD_ID: u64 = 1;
+
+/// A WebVTT cue in WebM's `D_WEBVTT` block form, its identifier, a line feed, its settings, a
+/// line feed, its text, which every `subtitle/vtt` buffer holds. From an `S_TEXT/WEBVTT`
+/// block's text and its BlockAdditional, which holds the settings line then the identifier
+/// line, comments after them left off.
+pub fn webm_vtt(text: &[u8], addition: &[u8], out: &mut Vec<u8>) {
+    let mut lines = addition.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let settings = lines.next().unwrap_or_default();
+    let id = lines.next().unwrap_or_default();
+    out.clear();
+    out.reserve(id.len() + settings.len() + text.len() + 2);
+    out.extend_from_slice(id);
+    out.push(b'\n');
+    out.extend_from_slice(settings);
+    out.push(b'\n');
+    out.extend_from_slice(text);
+}
+
 /// Little-endian samples of `w` octets with the sign bit of each flipped, in place.
 fn flip(block: &mut [u8], w: usize, big: bool) {
     for sample in block.chunks_exact_mut(w) {
@@ -877,6 +901,9 @@ mod tests {
         assert_eq!(family_for("S_TEXT/ASS"), "subtitle/ass");
         assert_eq!(family_for("S_TEXT/SSA"), "subtitle/ass", "legacy SSA shares the ASS family");
         assert_eq!(family_for("S_TEXT/WEBVTT"), "subtitle/vtt");
+        assert_eq!(family_for("D_WEBVTT/SUBTITLES"), "subtitle/vtt");
+        assert_eq!(family_for("D_WEBVTT/CAPTIONS"), "subtitle/vtt");
+        assert_eq!(family_for("D_WEBVTT/METADATA"), "bytes", "shows nothing");
         assert_eq!(family_for("S_HDMV/PGS"), "subtitle/pgs", "PGS bitmap subtitle");
         assert_eq!(family_for("S_VOBSUB"), "subtitle/vobsub");
         assert_eq!(family_for("S_DVBSUB"), "subtitle/dvb");
@@ -901,6 +928,7 @@ mod tests {
             ("S_TEXT/ASS", "subtitle/ass"),
             ("S_TEXT/SSA", "subtitle/ass"),
             ("S_TEXT/WEBVTT", "subtitle/vtt"),
+            ("D_WEBVTT/SUBTITLES", "subtitle/vtt"),
             ("S_HDMV/PGS", "subtitle/pgs"),
             ("S_VOBSUB", "subtitle/vobsub"),
             ("S_DVBSUB", "subtitle/dvb"),
@@ -910,6 +938,19 @@ mod tests {
             assert_eq!(offers[0].family, family, "{id} first offer is its family");
             assert_eq!(offers[1].family, "bytes", "{id} second offer is the bytes escape");
         }
+    }
+
+    /// mkvmerge's BlockAdditional holds the settings line then the identifier line, WebM's
+    /// block the identifier first.
+    #[test]
+    fn a_webvtt_block_and_its_addition_go_in_webm_form() {
+        let mut out = Vec::new();
+        webm_vtt(b"<i>Hi</i>\nthere", b"align:start line:10%\ncue-1\n", &mut out);
+        assert_eq!(out, b"cue-1\nalign:start line:10%\n<i>Hi</i>\nthere");
+        webm_vtt(b"plain", b"", &mut out);
+        assert_eq!(out, b"\n\nplain");
+        webm_vtt(b"x", b"size:50%\r\nid\r\nNOTE a comment\n", &mut out);
+        assert_eq!(out, b"id\nsize:50%\nx");
     }
 
     #[test]

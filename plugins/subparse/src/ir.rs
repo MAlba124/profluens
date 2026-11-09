@@ -1737,6 +1737,11 @@ impl CueBuilder {
         markup::parse(self, text, None, None, true);
     }
 
+    /// WebVTT cue settings folded into the layout of the cue built.
+    pub fn settings(&mut self, s: &CueSettings) {
+        apply_settings(&mut self.layout, s);
+    }
+
     /// One [`Cue`] in the flavour `output` names, its WebVTT [`CueSettings`] folded into the
     /// layout.
     pub fn cue(&mut self, cue: &Cue, output: OutputFormat, sheet: Option<&Stylesheet>) {

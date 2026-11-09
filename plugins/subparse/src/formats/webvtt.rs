@@ -287,7 +287,7 @@ fn is_scanf_space(b: u8) -> bool {
 }
 
 /// Port of `parse_webvtt_cue_settings` plus the modern `name:value` syntax the C does not know.
-fn parse_cue_settings(settings: &str) -> CueSettings {
+pub(crate) fn parse_cue_settings(settings: &str) -> CueSettings {
     let mut cs = CueSettings::default();
 
     for tok in settings.split([' ', '\t']) {
@@ -420,6 +420,18 @@ pub struct MarkupScratch {
 }
 
 /// One container-framed cue body to Pango markup, the pipeline a whole file's cue text takes.
+/// A cue in WebM's `D_WEBVTT` block form, every `subtitle/vtt` buffer's, as its identifier,
+/// settings and text. A block short of its two line feeds is all text.
+pub fn vtt_block(b: &str) -> (&str, &str, &str) {
+    fn cut(l: &str) -> &str {
+        l.strip_suffix('\r').unwrap_or(l)
+    }
+    match b.split_once('\n').and_then(|(id, r)| Some((id, r.split_once('\n')?))) {
+        Some((id, (settings, text))) => (cut(id), cut(settings), text),
+        None => ("", "", b),
+    }
+}
+
 pub fn cue_text_to_pango_markup(text: &str) -> String {
     finalize_text(text)
 }

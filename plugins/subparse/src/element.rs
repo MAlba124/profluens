@@ -3,7 +3,9 @@
 use crate::autodetect;
 use crate::encoding::{Charset, Decoder, decode_all};
 use crate::formats::ssa::framed_dialogue;
-use crate::formats::webvtt::{MarkupScratch, cue_text_to_pango_markup_into};
+use crate::formats::webvtt::{
+    MarkupScratch, cue_text_to_pango_markup_into, parse_cue_settings, vtt_block,
+};
 use crate::ir::{CUE_IR_FAMILY, CueBuilder, EncodeError};
 use crate::ssastyle::{SsaStyles, dialogue_into};
 use crate::{Cue, Format, ParseContext, ParseError, SubtitleFormat};
@@ -277,8 +279,12 @@ impl SubParse {
         match self.mode {
             Mode::Srt => self.builder.srt_text(body.trim_end_matches(['\n', '\r'])),
             Mode::Vtt => {
-                let markup = cue_text_to_pango_markup_into(body, &mut self.markup);
+                let (_, settings, text) = vtt_block(body);
+                let markup = cue_text_to_pango_markup_into(text, &mut self.markup);
                 self.builder.pango_markup(markup, None, None);
+                if !settings.is_empty() {
+                    self.builder.settings(&parse_cue_settings(settings));
+                }
             }
             Mode::Ass => {
                 let Some(d) = framed_dialogue(body) else { return false };
@@ -580,7 +586,7 @@ mod tests {
     fn each_block_dialect_becomes_a_styled_cue_with_its_timing() {
         for (family, body, text) in [
             ("subtitle/srt", "<i>hi</i> there", "hi there"),
-            ("subtitle/vtt", "<c>hi</c> <i>there</i>", "hi there"),
+            ("subtitle/vtt", "id\n\n<c>hi</c> <i>there</i>", "hi there"),
             ("subtitle/ass", "0,0,Default,,0,0,0,,{\\i1}hi{\\i0} there", "hi there"),
         ] {
             let mut h = Harness::new(SubParse::new());
@@ -603,6 +609,23 @@ mod tests {
                 .any(|s| ir.span_style(s).font_style() == Some(FontStyle::Italic));
             assert!(italic, "{family} keeps the italic span");
         }
+    }
+
+    /// A WebVTT block's settings line places its cue, its identifier is no text.
+    #[test]
+    fn a_webvtt_blocks_settings_reach_the_layout() {
+        use crate::ir::LinePosition;
+        let mut h = Harness::new(SubParse::new());
+        h.fix_sink_format(SubParse::IN, "subtitle/vtt", &[]);
+        let mut cue = h.alloc(b"c1\nline:0 align:start\nup top");
+        cue.pts = Timestamp::from_millis(0);
+        h.push(cue).expect("a cue");
+        let out = h.drain_outputs();
+        let ir = ir_of(&out[0]);
+        assert_eq!(ir.plain_text(), "up top");
+        assert_eq!(ir.layout().line(), Some(LinePosition::Line(0)));
+        assert_eq!(vtt_block("a\r\nb\r\nc\nd"), ("a", "b", "c\nd"));
+        assert_eq!(vtt_block("only text"), ("", "", "only text"));
     }
 
     #[test]

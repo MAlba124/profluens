@@ -540,7 +540,8 @@ fn the_buffers_put_out_are_unchanged() {
     if std::path::Path::new(AC3).exists() {
         let header = std::fs::read(AC3).expect("fixture")[..64 << 10].to_vec();
         let ac3 = digests(AC3, header, 32, Duration::ZERO);
-        assert_eq!(ac3, [Digest(126, 0xb468_f7a5_17ae_8dba), Digest(157, 0xe5af_5f69_17fb_71e6)]);
+        // its B-VOPs stamped in presentation order (`retime`)
+        assert_eq!(ac3, [Digest(126, 0xc8c5_57fd_7b0c_2ce2), Digest(157, 0xe5af_5f69_17fb_71e6)]);
     }
 }
 

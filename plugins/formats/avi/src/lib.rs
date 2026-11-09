@@ -6,6 +6,7 @@ pub mod codec;
 pub mod element;
 pub mod idx1;
 pub mod index;
+pub mod retime;
 pub mod riff;
 
 pub use codec::{EMITS, family_for, offers_for, vol_prefix};

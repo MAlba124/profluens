@@ -13,6 +13,8 @@ profluens-core = { path = "../../../core" }
 pf-registry = { path = "../../../lib/registry" }
 # Codec pre-roll for index restarts.
 profluens-audio = { path = "../../../lib/audio" }
+# The H.264 slice headers and POC a video's presentation order is read from.
+profluens-video = { path = "../../../lib/video" }
 
 [dev-dependencies]
 pf-reactor = { path = "../../../lib/reactor" }

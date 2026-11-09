@@ -201,6 +201,7 @@ dependencies = [
  "profluens-audio",
  "profluens-core",
  "profluens-elements",
+ "profluens-video",
 ]
 
 [[package]]

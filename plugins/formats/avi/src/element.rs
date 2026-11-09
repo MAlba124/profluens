@@ -1,9 +1,10 @@
 //! `AviDemux`, the element over the [`crate::riff`] parser with one src pad per stream.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use profluens_core::batch::Inputs;
-use profluens_core::buffer::BufferFlags;
+use profluens_core::buffer::{Buffer, BufferFlags};
 use profluens_core::bus::BusMessage;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
@@ -22,6 +23,7 @@ use profluens_core::time::Timestamp;
 
 use crate::codec;
 use crate::index::{self, AviIndex, Scan};
+use crate::retime::{Act, Order, Retime};
 use crate::riff::{self, AviError, ChunkHead, FourCc, MoviWalker, Stream, StreamKind};
 
 /// Most of `idx1` asked for at a time, its 8 octet header in the first piece.
@@ -83,6 +85,139 @@ struct PadStream {
     /// The stream's configuration sent as a HEADER buffer at each start, an MPEG-4 VOL, else
     /// empty.
     head: Vec<u8>,
+    /// Video that presents out of decode order, its units held until stamped.
+    reorder: Option<Reorder>,
+}
+
+/// A video stream's units on their way out, held in decode order until their presentation
+/// stamps are known (`Retime`), a packed B-VOP stashed for the chunk after it. Held as copies
+/// outside the pool, a pool buffer pinned while it waits would starve a small pool, the next
+/// chunk could never be taken to free it.
+struct Reorder {
+    rt: Retime,
+    /// The held units' bytes, `Span`s of it, compacted once its dead front outgrows the rest.
+    arena: Vec<u8>,
+    held: VecDeque<Span>,
+    stash: Option<Span>,
+    acts: Vec<Act>,
+}
+
+#[derive(Clone, Copy)]
+struct Span {
+    at: usize,
+    len: usize,
+    flags: BufferFlags,
+}
+
+impl Reorder {
+    // Cold path, once per stream at preroll.
+    #[allow(clippy::disallowed_methods)]
+    fn new(rt: Retime) -> Self {
+        Self {
+            rt,
+            arena: Vec::new(),
+            held: VecDeque::with_capacity(crate::retime::MOST_HELD + 4),
+            stash: None,
+            acts: Vec::with_capacity(8),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.rt.reset();
+        self.arena.clear();
+        self.held.clear();
+        self.stash = None;
+    }
+
+    /// Takes the chunk `data` at `slot` ns, its key flag in `flags`.
+    fn push(&mut self, data: &[u8], slot: u64, flags: BufferFlags) {
+        self.acts.clear();
+        self.rt.chunk(data, slot, &mut self.acts);
+        let Self { arena, held, stash, acts, .. } = self;
+        let mut keep = |from: usize, to: usize, flags: BufferFlags| {
+            let at = arena.len();
+            arena.extend_from_slice(data.get(from..to).unwrap_or_default());
+            Span { at, len: arena.len() - at, flags }
+        };
+        for act in acts.iter() {
+            match *act {
+                Act::Unit { from, to, key } => {
+                    let flags = match key {
+                        Some(true) => BufferFlags::KEYFRAME,
+                        Some(false) => BufferFlags::empty(),
+                        None => flags,
+                    };
+                    held.push_back(keep(from, to, flags));
+                }
+                Act::Unstash => held.extend(stash.take()),
+                Act::Stash { from, to } => *stash = Some(keep(from, to, BufferFlags::empty())),
+                Act::Drop => *stash = None,
+            }
+        }
+    }
+
+    /// Whether a stamped unit waits for the pool.
+    fn backed_up(&self) -> bool {
+        self.rt.peek().is_some()
+    }
+
+    /// The stream ended, every unit is stamped.
+    fn finish(&mut self) {
+        self.acts.clear();
+        self.rt.finish(&mut self.acts);
+        if self.acts.contains(&Act::Unstash) {
+            self.held.extend(self.stash.take());
+        }
+    }
+
+    /// The stamped units out on `pad` in decode order, false when the pool ran dry first. An
+    /// `exact` one takes buffers past the pool, at the end.
+    fn out(&mut self, ctx: &mut Ctx, pad: SrcPad, exact: bool) -> bool {
+        while let Some(pts) = self.rt.peek() {
+            let Some(span) = self.held.front().copied() else { break };
+            let bytes = self.arena.get(span.at..span.at + span.len).unwrap_or_default();
+            let buf = match exact {
+                true => ctx.alloc_exact(bytes.len()),
+                false => match ctx.try_alloc_sized(bytes.len()) {
+                    Ok(Some(buf)) => Some(buf),
+                    Ok(None) => return false,
+                    Err(e) => {
+                        let element = ctx.element();
+                        ctx.post(BusMessage::Warning {
+                            element,
+                            error: Error::element_failed(element, e),
+                        });
+                        None
+                    }
+                },
+            };
+            if let Some(mut buf) = buf {
+                buf.memory.as_mut_full()[..bytes.len()].copy_from_slice(bytes);
+                buf.memory.set_len(bytes.len());
+                buf.pts = Timestamp::from_nanos(pts);
+                buf.flags = span.flags;
+                ctx.out(pad).push(buf);
+            }
+            self.rt.take();
+            self.held.pop_front();
+        }
+        self.compact();
+        true
+    }
+
+    fn compact(&mut self) {
+        let live =
+            self.held.front().map(|s| s.at).into_iter().chain(self.stash.map(|s| s.at)).min();
+        let Some(live) = live else {
+            self.arena.clear();
+            return;
+        };
+        if live > 0 && live >= self.arena.len() / 2 {
+            self.arena.copy_within(live.., 0);
+            self.arena.truncate(self.arena.len() - live);
+            self.held.iter_mut().chain(self.stash.as_mut()).for_each(|s| s.at -= live);
+        }
+    }
 }
 
 impl PadStream {
@@ -117,6 +252,10 @@ struct Carry {
     flags: BufferFlags,
     spot: Spot,
     off: usize,
+}
+
+fn reorder_of(streams: &mut [PadStream], pad: SrcPad) -> Option<&mut Reorder> {
+    streams.iter_mut().find(|ps| ps.pad == pad)?.reorder.as_mut()
 }
 
 fn bytes_of<'a>(
@@ -235,9 +374,11 @@ impl AviDemux {
         self.pad_streams.iter().find(|ps| ps.stream_index == stream_index).map(|ps| ps.pad)
     }
 
+    /// Emits `bytes[off..]` on `pad`, through the stream's reorder when it has one. The offset
+    /// reached, `off` when the pool is dry.
     fn emit_bounded(
         ctx: &mut Ctx,
-        pad: SrcPad,
+        (pad, reorder): (SrcPad, Option<&mut Reorder>),
         pts_ns: Option<u64>,
         flags: BufferFlags,
         bytes: &[u8],
@@ -245,6 +386,11 @@ impl AviDemux {
     ) -> usize {
         let rest = &bytes[off..];
         if rest.is_empty() {
+            return bytes.len();
+        }
+        if let (Some(r), Some(slot)) = (reorder, pts_ns) {
+            r.push(rest, slot, flags);
+            r.out(ctx, pad, false);
             return bytes.len();
         }
         let mut buf = match ctx.try_alloc_sized(rest.len()) {
@@ -258,17 +404,21 @@ impl AviDemux {
         };
         buf.memory.as_mut_full()[..rest.len()].copy_from_slice(rest);
         buf.memory.set_len(rest.len());
+        Self::send(ctx, pad, buf, pts_ns, flags);
+        bytes.len()
+    }
+
+    fn send(ctx: &mut Ctx, pad: SrcPad, mut buf: Buffer, pts_ns: Option<u64>, flags: BufferFlags) {
         if let Some(t) = pts_ns {
             buf.pts = Timestamp::from_nanos(t);
         }
         buf.flags = flags;
         ctx.out(pad).push(buf);
-        bytes.len()
     }
 
     fn emit_exact(
         ctx: &mut Ctx,
-        pad: SrcPad,
+        (pad, reorder): (SrcPad, Option<&mut Reorder>),
         pts_ns: Option<u64>,
         flags: BufferFlags,
         bytes: &[u8],
@@ -278,6 +428,11 @@ impl AviDemux {
         if rest.is_empty() {
             return;
         }
+        if let (Some(r), Some(slot)) = (reorder, pts_ns) {
+            r.push(rest, slot, flags);
+            r.out(ctx, pad, true);
+            return;
+        }
         let Some(mut buf) = ctx.alloc_exact(rest.len()) else {
             let (element, error) = (ctx.element(), ctx.exact_refused(rest.len()));
             ctx.post(BusMessage::Warning { element, error });
@@ -285,19 +440,23 @@ impl AviDemux {
         };
         buf.memory.as_mut_full()[..rest.len()].copy_from_slice(rest);
         buf.memory.set_len(rest.len());
-        if let Some(t) = pts_ns {
-            buf.pts = Timestamp::from_nanos(t);
-        }
-        buf.flags = flags;
-        ctx.out(pad).push(buf);
+        Self::send(ctx, pad, buf, pts_ns, flags);
     }
 
     fn drain_pending(&mut self, ctx: &mut Ctx) -> bool {
+        for ps in &mut self.pad_streams {
+            if let Some(r) = &mut ps.reorder
+                && !r.out(ctx, ps.pad, false)
+            {
+                return false;
+            }
+        }
         let Some(mut c) = self.carry.take() else {
             return true;
         };
         let bytes = bytes_of(&self.walker, &self.framers, c.spot);
-        c.off = Self::emit_bounded(ctx, c.pad, c.pts_ns, c.flags, bytes, c.off);
+        let to = (c.pad, reorder_of(&mut self.pad_streams, c.pad));
+        c.off = Self::emit_bounded(ctx, to, c.pts_ns, c.flags, bytes, c.off);
         if c.off < bytes.len() {
             self.carry = Some(c);
             return false;
@@ -372,7 +531,7 @@ impl AviDemux {
     fn greet(&self, ctx: &mut Ctx, pad: SrcPad, pts_ns: Option<u64>) {
         let Some(ps) = self.pad_streams.iter().find(|ps| ps.pad == pad) else { return };
         if !ps.head.is_empty() {
-            Self::emit_exact(ctx, pad, pts_ns, BufferFlags::HEADER, &ps.head, 0);
+            Self::emit_exact(ctx, (pad, None), pts_ns, BufferFlags::HEADER, &ps.head, 0);
         }
     }
 
@@ -427,7 +586,8 @@ impl AviDemux {
             if fresh {
                 self.greet(ctx, pad, pts);
             }
-            let off = Self::emit_bounded(ctx, pad, pts, flags, data, 0);
+            let to = (pad, reorder_of(&mut self.pad_streams, pad));
+            let off = Self::emit_bounded(ctx, to, pts, flags, data, 0);
             if off < data.len() {
                 self.carry = Some(Carry { pad, pts_ns: pts, flags, spot: unit.spot, off });
                 return false; // pool dry, stop pulling walker chunks
@@ -436,6 +596,10 @@ impl AviDemux {
             if let (true, Some(pts)) = (unit.stream_index == self.key, pts) {
                 self.key_out(ctx, Timestamp::from_nanos(pts));
             }
+            // stamped units wait for the pool, no more chunks are taken in meanwhile
+            if reorder_of(&mut self.pad_streams, pad).is_some_and(|r| r.backed_up()) {
+                return false;
+            }
         }
         true
     }
@@ -443,7 +607,8 @@ impl AviDemux {
     fn flush_exact(&mut self, ctx: &mut Ctx) {
         if let Some(c) = self.carry.take() {
             let bytes = bytes_of(&self.walker, &self.framers, c.spot);
-            Self::emit_exact(ctx, c.pad, c.pts_ns, c.flags, bytes, c.off);
+            let to = (c.pad, reorder_of(&mut self.pad_streams, c.pad));
+            Self::emit_exact(ctx, to, c.pts_ns, c.flags, bytes, c.off);
             self.pass(c.spot);
         }
         while let Some(unit) = self.next_unit() {
@@ -453,9 +618,17 @@ impl AviDemux {
                 if fresh {
                     self.greet(ctx, pad, pts);
                 }
-                Self::emit_exact(ctx, pad, pts, flags, data, 0);
+                let to = (pad, reorder_of(&mut self.pad_streams, pad));
+                Self::emit_exact(ctx, to, pts, flags, data, 0);
             }
             self.pass(unit.spot);
+        }
+        for ps in &mut self.pad_streams {
+            if let Some(r) = &mut ps.reorder {
+                r.finish();
+                r.out(ctx, ps.pad, true);
+                r.reset();
+            }
         }
     }
 
@@ -755,6 +928,9 @@ impl Element for AviDemux {
             log_stream(ctx, stream, family);
             let head = self.head_of(stream, family, movi.movi_data_start);
             let framer = codec::reframes(family, stream.sample_size).then(codec::Framer::default);
+            let reorder = Order::of(family)
+                .zip(stream.sample_duration_ns())
+                .map(|(order, step)| Reorder::new(Retime::new(order, step, &head)));
             self.framers.push(framer);
             self.pad_streams.push(PadStream {
                 stream_index: stream.index,
@@ -769,6 +945,7 @@ impl Element for AviDemux {
                 junk: 0,
                 stream: stream.clone(),
                 head,
+                reorder,
             });
         }
         if self.pad_streams.is_empty() {
@@ -820,6 +997,7 @@ impl Element for AviDemux {
             (0, rate::ByteRate::default(), rate::Teller::default());
         for ps in &mut self.pad_streams {
             (ps.started, ps.ticks, ps.gate, ps.junk) = (false, 0, 0, 0);
+            ps.reorder.iter_mut().for_each(Reorder::reset);
         }
         (self.strays, self.seen) = (0, (0, 0));
         ctx.want_ranges(Self::IN);
@@ -917,6 +1095,7 @@ impl AviDemux {
                 self.framers.iter_mut().flatten().for_each(codec::Framer::clear);
                 for (n, ps) in self.pad_streams.iter_mut().enumerate() {
                     ps.started = false;
+                    ps.reorder.iter_mut().for_each(Reorder::reset);
                     let tick = ps.sample_dur_ns.filter(|ns| *ns > 0);
                     let at = to.zip(tick).map_or(0, |(to, ns)| (to + ns / 2) / ns);
                     (ps.ticks, ps.gate) = match clocks.and_then(|c| c.get(n)) {

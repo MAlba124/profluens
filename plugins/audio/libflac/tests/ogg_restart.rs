@@ -29,12 +29,19 @@ const RATE: u64 = 16_000;
 /// Mono s16.
 const FRAME: usize = 2;
 
-fn stream() -> Option<Vec<u8>> {
-    let path = std::env::temp_dir().join(format!("pf_libflac_restart_{}.oga", std::process::id()));
+/// A 60 s tone.
+const TONE: &str = "sine=frequency=440:sample_rate=16000:duration=60";
+/// A 2 s tone and silence to 120 s, most bytes in the first seconds as in a server's fixture, so
+/// an estimate by the average rate lands far behind a target in the silence.
+const UNEVEN: &str = "sine=frequency=440:sample_rate=16000:duration=2,apad=whole_dur=120";
+
+fn stream(source: &str) -> Option<Vec<u8>> {
+    let name = format!("pf_libflac_restart_{}_{}.oga", std::process::id(), source.len());
+    let path = std::env::temp_dir().join(name);
     let made = Command::new("ffmpeg")
         .env_remove("LD_LIBRARY_PATH")
         .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
-        .arg("sine=frequency=440:sample_rate=16000:duration=60")
+        .arg(source)
         .args(["-ac", "1", "-c:a", "flac", "-sample_fmt", "s16", "-f", "ogg"])
         .arg(&path)
         .status()
@@ -219,15 +226,9 @@ fn decoder(p: &mut Pipeline, demux: ElementId, pad: SrcPad, took: &Arc<Mutex<Too
     p.link(dec.src(OggFlacDec::OUT), take.sink(SinkPad(0))).expect("oggflacdec ! take");
 }
 
-/// The chain played to where the demuxer parks a packet, then a fresh decoder linked in its place
-/// restarts at an earlier target. It starts at the target, not at the packet held from before
-/// the restart, and decodes on from there with nothing the restart read again dropped.
-#[test]
-fn a_decoder_linked_with_a_restart_starts_at_its_target() {
-    let Some(data) = stream() else { return };
-    let data = Arc::new(data);
-
-    let (mut p, clock, _, demux, pad) = open(&data, true);
+/// The PCM of the whole stream, `secs` long.
+fn reference(data: &Arc<Vec<u8>>, secs: usize) -> Vec<u8> {
+    let (mut p, clock, _, demux, pad) = open(data, true);
     let whole = Arc::default();
     decoder(&mut p, demux, pad, &whole);
     let mut run = p.step(Arc::new(clock)).expect("step");
@@ -235,34 +236,71 @@ fn a_decoder_linked_with_a_restart_starts_at_its_target() {
     run.finish().expect("finish");
     let whole = std::mem::take(&mut whole.lock().unwrap().pcm);
     let samples = whole.len() / FRAME;
-    assert!(samples.abs_diff(60 * RATE as usize) < RATE as usize, "{samples} samples");
+    assert!(samples.abs_diff(secs * RATE as usize) < RATE as usize, "{samples} samples");
+    whole
+}
 
+/// The chain played to where the demuxer parks a packet, then a fresh decoder linked in its place
+/// restarts at half of what was sent, at the byte `byte` gives for the target. It plays the
+/// stream from the target to the end, nothing held or read ahead before the restart in it.
+fn restarts_at_the_target(
+    data: &Arc<Vec<u8>>,
+    whole: &[u8],
+    pull: bool,
+    byte: impl Fn(&Pipeline, ElementId, Timestamp) -> u64,
+) {
+    let (mut p, clock, src, demux, pad) = open(data, pull);
+    let last = Arc::default();
+    let hold = p.add(Hold { kept: Vec::new(), last: Arc::clone(&last) });
+    p.link(demux.src(pad), hold.sink(SinkPad(0))).expect("oggdemux ! hold");
+    let mut run = p.step(Arc::new(clock)).expect("step");
+    assert!(!step_through(&mut run), "the demuxer parks behind the held chain, pull {pull}");
+    let sent = last.lock().unwrap().expect("packets sent");
+    assert!(sent > 10_000_000_000, "sent to {sent} ns, pull {pull}");
+
+    // A target on the sample grid, well behind what was sent and read ahead.
+    let target = Timestamp(sent / 2 / 1_000_000 * 1_000_000);
+    let at = byte(&p, demux, target);
+    p.remove(hold, Leave::Cut).expect("remove the held chain");
+    let took = Arc::default();
+    decoder(&mut p, demux, pad, &took);
+    p.commit_at(target, &[(src, at, target), (demux, at, target)]).expect("commit");
+    assert!(step_through(&mut run), "the run ends, pull {pull}");
+    run.finish().expect("finish");
+
+    let took = took.lock().unwrap();
+    let ms = |ns: u64| ns / 1_000_000;
+    let first = took.first.expect("the fresh decoder played");
+    let what = format!("sent to {} ms, restart at byte {at}, pull {pull}", ms(sent));
+    assert_eq!(ms(first), ms(target.0), "placed at the target, {what}");
+    let from = (target.0 * RATE / 1_000_000_000) as usize * FRAME;
+    assert_eq!(took.pcm.len(), whole.len() - from, "on from the target to the end, {what}");
+    assert!(took.pcm == whole[from..], "the stream from the target, nothing dropped, {what}");
+}
+
+/// A fresh decoder linked with a restart from the head starts at its target, not at the packet
+/// held from before the restart, and decodes on from there with nothing read again dropped.
+#[test]
+fn a_decoder_linked_with_a_restart_starts_at_its_target() {
+    let Some(data) = stream(TONE) else { return };
+    let data = Arc::new(data);
+    let whole = reference(&data, 60);
     for pull in [true, false] {
-        let (mut p, clock, src, demux, pad) = open(&data, pull);
-        let last = Arc::default();
-        let hold = p.add(Hold { kept: Vec::new(), last: Arc::clone(&last) });
-        p.link(demux.src(pad), hold.sink(SinkPad(0))).expect("oggdemux ! hold");
-        let mut run = p.step(Arc::new(clock)).expect("step");
-        assert!(!step_through(&mut run), "the demuxer parks behind the held chain, pull {pull}");
-        let sent = last.lock().unwrap().expect("packets sent");
-        assert!(sent > 10_000_000_000, "sent to {sent} ns, pull {pull}");
-
-        // A target on the sample grid, well behind what was sent and read ahead.
-        let target = Timestamp(sent / 2 / 1_000_000 * 1_000_000);
-        p.remove(hold, Leave::Cut).expect("remove the held chain");
-        let took = Arc::default();
-        decoder(&mut p, demux, pad, &took);
-        p.commit_at(target, &[(src, 0, target), (demux, 0, target)]).expect("commit");
-        assert!(step_through(&mut run), "the run ends, pull {pull}");
-        run.finish().expect("finish");
-
-        let took = took.lock().unwrap();
-        let ms = |ns: u64| ns / 1_000_000;
-        let first = took.first.expect("the fresh decoder played");
-        let what = format!("sent to {} ms, pull {pull}", ms(sent));
-        assert_eq!(ms(first), ms(target.0), "placed at the target, {what}");
-        let from = (target.0 * RATE / 1_000_000_000) as usize * FRAME;
-        assert_eq!(took.pcm.len(), whole.len() - from, "on from the target to the end, {what}");
-        assert!(took.pcm == whole[from..], "the stream from the target, nothing dropped, {what}");
+        restarts_at_the_target(&data, &whole, pull, |_, _, _| 0);
     }
+}
+
+/// A restart at the byte the demuxer's index estimates, as a server asks one of an index with
+/// no entries, starts at its target where the estimate lands seconds away from it.
+#[test]
+fn a_restart_at_the_estimate_of_an_index_without_entries_starts_at_its_target() {
+    let Some(data) = stream(UNEVEN) else { return };
+    let data = Arc::new(data);
+    let whole = reference(&data, 120);
+    restarts_at_the_target(&data, &whole, true, |p, demux, target| {
+        let ix = p.index(demux).expect("an index");
+        assert!(ix.entries.is_empty(), "no entries");
+        let (at, _) = ix.resolve(target).expect("an estimate by length and duration");
+        at
+    });
 }

@@ -1,4 +1,4 @@
-use profluens_core::pipeline::{Caption, Index, IndexEntry, Reach, SeekMode, SeekPlan};
+use profluens_core::pipeline::{Caption, Index, IndexEntry, Reach, Rejoin, SeekMode, SeekPlan};
 use profluens_core::time::Timestamp;
 
 const MS: fn(u64) -> Timestamp = Timestamp::from_millis;
@@ -309,6 +309,39 @@ fn past_the_last_entry_of_an_incomplete_index_the_byte_is_estimated() {
     assert_eq!(plan(&Index::default(), 15_000, 20_000, None), SeekPlan::Unseekable);
 }
 
+/// A growing index knows no keyframe past its last entry whatever the estimate says, a link
+/// there is told so and a keyframe seek is presented from its target, not from the entry.
+#[test]
+fn past_the_last_entry_of_an_incomplete_index_the_keyframe_is_unknown() {
+    let dense = read_so_far(30_000);
+    let timeless = Index { duration: Timestamp::NONE, ..read_so_far(10_000) };
+    for (index, what) in
+        [(read_so_far(10_000), "estimated"), (dense, "dense"), (timeless, "timeless")]
+    {
+        assert_eq!(index.keyframe(MS(15_000)), None, "{what}");
+        assert_eq!(index.keyframe(MS(10_000)), Some(&index.entries[1]), "{what}: on the entry");
+        assert_eq!(index.restart_for(7, MS(15_000)), Rejoin::Unknown, "{what}");
+        assert_eq!(index.restart_for(7, MS(10_000)), Rejoin::At(index.entries[1].byte, MS(10_000)));
+        let key = index.plan(MS(15_000), SeekMode::Keyframe, MS(2_000), None, Reach::Group);
+        let SeekPlan::Seek { to_time, .. } = key else { panic!("{what}: {key:?}") };
+        assert_eq!(to_time, MS(15_000), "{what}: from the target");
+        let whole = Index { complete: true, ..index.clone() };
+        let entry = Rejoin::At(index.entries[1].byte, MS(10_000));
+        assert_eq!(whole.restart_for(7, MS(15_000)), entry, "{what}: a whole index floors");
+        assert_eq!(whole.keyframe(MS(15_000)), Some(&index.entries[1]), "{what}");
+    }
+    let key =
+        |index: &Index| index.plan(MS(15_000), SeekMode::Keyframe, MS(2_000), None, Reach::Group);
+    assert_eq!(key(&read_so_far(30_000)), seek(30_000, 10_000, 15_000), "the entry's byte");
+    let timeless = Index { duration: Timestamp::NONE, ..read_so_far(10_000) };
+    assert_eq!(key(&timeless), seek(10_000, 10_000, 15_000), "no estimate, the entry's byte");
+    assert_eq!(key(&read_so_far(10_000)), seek(15_000, 15_000, 15_000), "the estimate");
+    // What the demuxer put out decides a skip past the entry, not the entry.
+    let dense = read_so_far(30_000);
+    assert_eq!(video(&dense, 15_000, 9_000, Some(16_000)), skip(15_000));
+    assert_eq!(video(&dense, 15_000, 9_000, Some(12_000)), seek(30_000, 10_000, 15_000));
+}
+
 #[test]
 fn a_seek_restarts_the_source_where_its_keyframe_entry_says() {
     let mut index = gops();
@@ -546,9 +579,9 @@ fn caption(stream: u32, start_ms: u64, end_ms: u64, byte: u64) -> Caption {
 #[test]
 fn a_link_restarts_at_the_key_before_the_point() {
     let index = gops();
-    assert_eq!(index.restart_for(7, MS(25_000)), Some((20_000, MS(20_000))));
-    assert_eq!(index.restart_for(7, MS(5_000)), Some((0, MS(0))), "before the second key");
-    assert_eq!(Index::default().restart_for(7, MS(5_000)), None, "no entry");
+    assert_eq!(index.restart_for(7, MS(25_000)), Rejoin::At(20_000, MS(20_000)));
+    assert_eq!(index.restart_for(7, MS(5_000)), Rejoin::At(0, MS(0)), "before the second key");
+    assert_eq!(Index::default().restart_for(7, MS(5_000)), Rejoin::Unindexed, "no entry");
 }
 
 #[test]
@@ -561,29 +594,33 @@ fn a_link_goes_back_for_the_stream_s_caption_up_at_the_point() {
         caption(7, 21_000, 22_000, 19_700),
         caption(7, 23_000, 24_000, 23_500),
     ];
-    assert_eq!(index.restart_for(7, MS(11_000)), Some((0, MS(0))), "up from the GOP before");
-    assert_eq!(index.restart_for(7, MS(12_000)), Some((10_000, MS(10_000))), "ended at the point");
+    assert_eq!(index.restart_for(7, MS(11_000)), Rejoin::At(0, MS(0)), "up from the GOP before");
+    assert_eq!(
+        index.restart_for(7, MS(12_000)),
+        Rejoin::At(10_000, MS(10_000)),
+        "ended at the point"
+    );
     assert_eq!(
         index.restart_for(7, MS(25_000)),
-        Some((20_000, MS(20_000))),
+        Rejoin::At(20_000, MS(20_000)),
         "the later one is past"
     );
-    assert_eq!(index.restart_for(8, MS(25_000)), Some((0, MS(0))), "another stream's long one");
+    assert_eq!(index.restart_for(8, MS(25_000)), Rejoin::At(0, MS(0)), "another stream's long one");
     assert_eq!(
         index.restart_for(7, MS(20_500)),
-        Some((10_000, MS(10_000))),
+        Rejoin::At(10_000, MS(10_000)),
         "stored below the key, starting before the next"
     );
-    assert_eq!(index.restart_for(9, MS(25_000)), Some((20_000, MS(20_000))), "no caption");
+    assert_eq!(index.restart_for(9, MS(25_000)), Rejoin::At(20_000, MS(20_000)), "no caption");
 }
 
 #[test]
 fn a_link_of_an_uncued_stream_goes_back_the_reach() {
     let mut index = gops();
     index.uncued = vec![7];
-    assert_eq!(index.restart_for(7, MS(25_000)), Some((0, MS(0))));
-    assert_eq!(index.restart_for(7, MS(35_000)), Some((10_000, MS(10_000))));
-    assert_eq!(index.restart_for(8, MS(35_000)), Some((30_000, MS(30_000))), "a cued stream");
+    assert_eq!(index.restart_for(7, MS(25_000)), Rejoin::At(0, MS(0)));
+    assert_eq!(index.restart_for(7, MS(35_000)), Rejoin::At(10_000, MS(10_000)));
+    assert_eq!(index.restart_for(8, MS(35_000)), Rejoin::At(30_000, MS(30_000)), "a cued stream");
 }
 
 mod warm {

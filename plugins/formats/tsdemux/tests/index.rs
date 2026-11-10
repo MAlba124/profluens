@@ -8,8 +8,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use pf_tsdemux::TsDemux;
+use pf_tsdemux::index::GROWN_EVERY;
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::BufferFlags;
+use profluens_core::clock::MockClock;
 use profluens_core::counters::TapHandle;
 use profluens_core::ctx::{Ctx, StreamKind};
 use profluens_core::element::{
@@ -17,8 +19,10 @@ use profluens_core::element::{
 };
 use profluens_core::error::Error;
 use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc};
-use profluens_core::id::{ElementId, SinkPad};
-use profluens_core::pipeline::Index;
+use profluens_core::id::{ElementId, SinkPad, SrcPad};
+use profluens_core::log::DebugSpec;
+use profluens_core::pipeline::{Index, Pipeline, Reach, Rejoin, SeekMode, SeekPlan};
+use profluens_core::sched::{Outcome, Stepped};
 use profluens_core::time::Timestamp;
 use profluens_elements::io::FileSrc;
 
@@ -264,6 +268,80 @@ fn behind_a_seek_bytes_count_from_its_target_and_nothing_doubles() {
     let lens: Vec<usize> = seen.published.iter().map(|i| i.entries.len()).collect();
     let jumped = jumped.unwrap_or_else(|| panic!("no publication between the seeks in {lens:?}"));
     check(s, jumped, &seen, false);
+}
+
+fn pass(run: &mut Stepped) -> bool {
+    run.service();
+    let ready: Vec<usize> = (0..run.groups()).filter(|g| run.ready(*g)).collect();
+    for g in &ready {
+        run.pass(*g).expect("pass");
+    }
+    !ready.is_empty()
+}
+
+/// The keyframe ffprobe lists at or before `ns`.
+fn floor(s: &Stream, ns: u64) -> Key {
+    *s.keys.iter().rev().find(|k| k.ns <= ns).expect("a keyframe before")
+}
+
+/// Past the last entry published the keyframe is unknown, a link there is told so and a seek
+/// there is estimated from the target. Once the end is read the index is whole and names it.
+#[test]
+fn past_the_published_entries_the_keyframe_is_unknown_until_read() {
+    let Some(s) = stream() else { return };
+    assert!(s.keys.len() > 2 * GROWN_EVERY, "{} keyframes", s.keys.len());
+    let clock = MockClock::starting_at(Timestamp::from_secs(1));
+    let mut p = Pipeline::with(DebugSpec::default(), false, Arc::new(clock.clone()));
+    p.set_pool(32 * 1024, 32);
+    let src = p.add(Told { data: s.bytes.clone(), pos: 0, rates: Arc::default() });
+    let head = s.bytes[..s.bytes.len().min(64 * 1024)].to_vec();
+    let demux = TsDemux::new(head).with_len(s.bytes.len() as u64).with_duration(24_000_000_000);
+    let demux = p.add(demux);
+    p.link(src.src(SrcPad(0)), demux.sink(TsDemux::IN)).unwrap();
+    p.set_select_all(true);
+    for pad in p.preroll().unwrap().srcs {
+        let sink = p.add(Rec { seen: Arc::default(), tap: None, pace: Duration::ZERO });
+        p.link(pad.element.src(pad.pad), sink.sink(SinkPad(0))).unwrap();
+    }
+    let (tap, control) = (p.tap_handle(), p.control());
+    let mut run = p.step(Arc::new(clock)).unwrap();
+    let grown = loop {
+        if let Some(ix) = tap.index(demux).filter(|ix| !ix.entries.is_empty()) {
+            break ix;
+        }
+        assert!(pass(&mut run), "the run ends before the index is published");
+    };
+    assert_eq!((grown.entries.len(), grown.complete), (GROWN_EVERY, false));
+    let last = *grown.entries.last().unwrap();
+    let ahead = s.keys[GROWN_EVERY + 40];
+    let target = Timestamp(ahead.ns + 10_000_000);
+    assert_eq!(grown.restart_for(0, target), Rejoin::Unknown);
+    assert_eq!(grown.keyframe(target), None);
+    let key = |ix: &Index| ix.plan(target, SeekMode::Keyframe, Timestamp::NONE, None, Reach::Group);
+    let SeekPlan::Seek { to_byte, key: at, to_time } = key(&grown) else { panic!("a seek") };
+    assert_eq!((at, to_time), (target, target), "estimated, not the last entry");
+    assert!(to_byte > last.byte && to_byte < s.bytes.len() as u64, "{to_byte}");
+    assert_eq!(control.plan_from(Timestamp::NONE, target, SeekMode::Keyframe), key(&grown));
+    let timeless = Index { duration: Timestamp::NONE, ..(*grown).clone() };
+    let from_entry = SeekPlan::Seek { to_byte: last.byte, key: Timestamp(last.time_ns), to_time };
+    assert_eq!(key(&timeless), from_entry, "no estimate, read on from the entry");
+    let within = Timestamp(s.keys[GROWN_EVERY / 2].ns);
+    let half = Rejoin::At(s.keys[GROWN_EVERY / 2].byte, within);
+    assert_eq!(grown.restart_for(0, within), half, "inside what was published");
+
+    while pass(&mut run) {}
+    assert!((0..run.groups()).all(|g| run.outcome(g) == Some(Outcome::Exit)), "the run ends");
+    run.finish().unwrap();
+    let whole = tap.index(demux).expect("published");
+    assert_eq!((whole.entries.len(), whole.complete), (s.keys.len(), true));
+    let real = Rejoin::At(ahead.byte, Timestamp(ahead.ns));
+    assert_eq!(whole.restart_for(0, target), real);
+    let to = Timestamp(ahead.ns);
+    assert_eq!(key(&whole), SeekPlan::Seek { to_byte: ahead.byte, key: to, to_time: to });
+    let end = s.keys.last().unwrap();
+    let past = Timestamp(end.ns + 50_000_000);
+    assert_eq!(floor(s, past.0), *end);
+    assert_eq!(whole.restart_for(0, past), Rejoin::At(end.byte, Timestamp(end.ns)), "the last");
 }
 
 static TOLD_OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];

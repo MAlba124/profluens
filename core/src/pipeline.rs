@@ -299,8 +299,8 @@ pub struct Index {
     /// Total source length in bytes, for the proportional fallback.
     pub file_len: Option<u64>,
     pub duration: Timestamp,
-    /// Every keyframe is in `entries`. False while reading, a target past the last is then
-    /// estimated.
+    /// Every keyframe is in `entries`. False while reading, the keyframe past the last entry is
+    /// then unknown and a target there estimated.
     pub complete: bool,
     /// The stream the entries are keyframes of, `None` for an element with one src pad.
     pub stream: Option<u32>,
@@ -347,39 +347,39 @@ impl Index {
         }
     }
 
-    fn known(&self, ns: u64) -> Option<&IndexEntry> {
-        let (floor, last) = (self.floor(ns)?, self.entries.last()?);
-        let past =
-            !self.complete && ns > last.time_ns && self.estimate(ns).is_some_and(|b| b > last.byte);
-        (!past).then_some(floor)
+    /// Past the last entry of an index still growing, where its keyframe is not known yet.
+    fn past(&self, ns: u64) -> bool {
+        !self.complete && self.entries.last().is_some_and(|last| ns > last.time_ns)
     }
 
-    /// The keyframe a seek to `target` restarts at, `None` where the byte is estimated.
+    /// The keyframe at or before `target`, `None` before the first entry and where it is unknown.
     pub fn keyframe(&self, target: Timestamp) -> Option<&IndexEntry> {
-        self.known(target.nanos()?)
+        target.nanos().and_then(|ns| self.floor(ns).filter(|_| !self.past(ns)))
     }
 
     /// The byte to resume reading from and the stream time it lands on, `None` if unseekable.
     pub fn resolve(&self, target: Timestamp) -> Option<(u64, Timestamp)> {
+        let ns = target.nanos()?;
         // Before the first keyframe an estimate lands past it, so the first is where to start.
-        if let Some(first) =
-            self.entries.first().filter(|e| target.nanos().is_some_and(|t| t < e.time_ns))
-        {
-            return Some((first.byte, Timestamp(first.time_ns)));
-        }
-        match self.keyframe(target) {
+        let first = self.entries.first().filter(|e| ns < e.time_ns);
+        // Past a growing index an estimate behind its last entry would read more than the entry.
+        let last = self.entries.last().filter(|e| self.estimate(ns).is_none_or(|b| b <= e.byte));
+        match first.or(self.keyframe(target)).or(last) {
             Some(e) => Some((e.byte, Timestamp(e.time_ns))),
-            None => self.estimate(target.nanos()?).map(|byte| (byte, target)),
+            None => self.estimate(ns).map(|byte| (byte, target)),
         }
     }
 
-    /// Where the source restarts to link caption stream `stream` at `at`, the entry at or before
-    /// `at`, or the one below the block of a caption of the stream up at `at` or stored between
-    /// that entry and the next. None without an entry.
-    pub fn restart_for(&self, stream: u32, at: Timestamp) -> Option<(u64, Timestamp)> {
-        let ns = at.nanos()?;
+    /// Where the source restarts to link stream `stream` at `at`, the entry at or before `at`, or
+    /// for a caption stream the one below the block of a caption of the stream up at `at` or
+    /// stored between that entry and the next.
+    pub fn restart_for(&self, stream: u32, at: Timestamp) -> Rejoin {
+        let Some(ns) = at.nanos() else { return Rejoin::Unindexed };
+        if self.past(ns) {
+            return Rejoin::Unknown;
+        }
         let k = self.entries.partition_point(|e| e.time_ns <= ns).saturating_sub(1);
-        let key = self.entries.get(k)?;
+        let Some(key) = self.entries.get(k) else { return Rejoin::Unindexed };
         let until = self.entries.get(k + 1).map_or(u64::MAX, |e| e.time_ns);
         let reach = ns.saturating_sub(CAPTION_REACH);
         let mut earliest = (key.time_ns, key.byte);
@@ -397,7 +397,7 @@ impl Index {
         {
             earliest = earliest.min((e.time_ns, e.byte));
         }
-        Some((earliest.1, Timestamp(earliest.0)))
+        Rejoin::At(earliest.1, Timestamp(earliest.0))
     }
 
     /// Where the source restarts for `plan`, `None` for a plan that restarts nothing.
@@ -424,7 +424,9 @@ impl Index {
         let Some((to_byte, key)) = self.resolve(target) else {
             return SeekPlan::Unseekable;
         };
-        let read = demuxed.is_some_and(|out| out.is_some() && key <= out);
+        // Past a growing index the keyframe is unknown, presentation starts at the target.
+        let lands = if target.nanos().is_some_and(|ns| self.past(ns)) { target } else { key };
+        let read = demuxed.is_some_and(|out| out.is_some() && lands <= out);
         // An estimated byte names no keyframe, and only what was read is skipped to.
         let known = self.keyframe(target).is_some();
         let held = match reach {
@@ -432,7 +434,7 @@ impl Index {
             Reach::Group => !known || key <= position,
         };
         match mode {
-            SeekMode::Keyframe => SeekPlan::Seek { to_byte, key, to_time: key },
+            SeekMode::Keyframe => SeekPlan::Seek { to_byte, key, to_time: lands },
             SeekMode::Accurate | SeekMode::Preview if read && held && position < target => {
                 SeekPlan::Skip { to_time: target }
             }
@@ -441,6 +443,17 @@ impl Index {
             }
         }
     }
+}
+
+/// Where the source restarts for a stream linked while running, by [`Index::restart_for`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rejoin {
+    /// The byte and the stream time there.
+    At(u64, Timestamp),
+    /// Past the last entry of an incomplete index. [`Index::resolve`] serves it as a seek there.
+    Unknown,
+    /// No entry or no time to restart by.
+    Unindexed,
 }
 
 /// How far ahead a skip may reach, by what the decoder costs on the way.

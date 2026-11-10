@@ -12,6 +12,7 @@ pub mod pipeline;
 mod ps;
 mod sps;
 mod ts;
+mod wav;
 
 use std::fmt;
 use std::ops::Range;
@@ -47,7 +48,8 @@ pub struct Caps {
     pub max_head: u64,
     /// Matroska Cues past it are not read.
     pub max_cues: u64,
-    /// A Matroska Tags element past it is left out, an Ogg comment packet grows the head to it.
+    /// A Matroska Tags element past it is left out, an Ogg comment packet grows the head to it,
+    /// the chunks behind a WAV file's data are read to it.
     pub max_tags: u64,
     /// A larger attached picture is left out.
     pub max_picture: u64,
@@ -255,10 +257,13 @@ pub enum Meta {
     #[default]
     None,
     Mkv(pf_mkv::walk::Meta),
-    /// A FLAC file's blocks or an MPEG audio or ADTS file's ID3 and APE tags.
+    /// A FLAC file's blocks, an MPEG audio or ADTS file's ID3 and APE tags or a WAV file's INFO.
     Bare {
         raw: pf_bare::RawTags,
         flac: bool,
+        /// A WAV file's `LIST INFO` chunk behind its form, from before or behind the data, in
+        /// [`Opened::arena`].
+        info: Span,
     },
     /// The `moov` box in [`Opened::head`].
     Moov(Range<usize>),

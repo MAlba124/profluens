@@ -2,6 +2,7 @@
 
 use profluens_core::event::TagSink;
 
+use pf_mkv::ebml::{self, id};
 use pf_mkv::tags::{self, Extent, SegmentIndex};
 
 use crate::Props;
@@ -10,6 +11,9 @@ use crate::Props;
 const REACH: u64 = 64 * 1024;
 
 const MAX_META: u64 = 32 << 20;
+
+/// The Info Title, RFC 9559 section 5.1.2.12.
+const TITLE: &[u8] = &[0x7B, 0xA9];
 
 type View<'a> = (&'a [u8], u64);
 
@@ -80,13 +84,60 @@ pub(crate) fn parse(views: &[View<'_>], sink: &mut impl TagSink) -> Props {
         props.sample_rate = (rate != 0).then_some(rate);
         props.channels = (channels != 0).then_some(channels);
     }
+    let mut sink = Titled { sink, title: false };
     if let Some(t) = index.tags.and_then(|at| view_at(views, at)) {
-        tags::parse_tags(t, sink);
+        tags::parse_tags(t, &mut sink);
+    }
+    if !sink.title
+        && let Some(title) = index.info.and_then(|at| view_at(views, at)).and_then(info_title)
+    {
+        sink.sink.text("TITLE", title);
     }
     if let Some(a) = index.attachments.and_then(|at| view_at(views, at)) {
-        tags::parse_attachments(a, sink);
+        tags::parse_attachments(a, sink.sink);
     }
     props
+}
+
+/// The Segment's title, `info` the Info element from its head on.
+pub(crate) fn info_title(info: &[u8]) -> Option<&str> {
+    let h = ebml::read_element_header(info, 0).ok()?;
+    if h.id != id::INFO {
+        return None;
+    }
+    let body = info.get(h.data_start..h.data_end().ok()??.min(info.len()))?;
+    let mut at = 0;
+    while at < body.len() {
+        let c = ebml::read_element_header(body, at).ok()?;
+        let end = c.data_end().ok()??;
+        if c.id == TITLE {
+            let t = std::str::from_utf8(ebml::read_string(body.get(c.data_start..end)?)).ok()?;
+            return Some(t.trim()).filter(|t| !t.is_empty());
+        }
+        at = end;
+    }
+    None
+}
+
+/// Passes tags on and notes whether one was a TITLE.
+struct Titled<'s, S> {
+    sink: &'s mut S,
+    title: bool,
+}
+
+impl<S: TagSink> TagSink for Titled<'_, S> {
+    fn text(&mut self, key: &str, value: &str) {
+        self.title |= key == "TITLE";
+        self.sink.text(key, value);
+    }
+
+    fn picture(&mut self, mime: &str, data: &[u8]) {
+        self.sink.picture(mime, data);
+    }
+
+    fn picture_typed(&mut self, kind: u8, mime: &str, data: &[u8]) {
+        self.sink.picture_typed(kind, mime, data);
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +246,50 @@ mod tests {
         let (next_at, next_len) = plan(&[prefix, stub], f.len() as u64).expect("more is needed");
         assert_eq!(next_at, at, "the same range, measured rather than guessed");
         assert_eq!(next_len, len);
+    }
+
+    /// A file of `tags` whose Info states `title`, no SeekHead, the masters in the prefix.
+    fn titled(title: &[u8], tags: &[(&str, &str)]) -> Vec<u8> {
+        use crate::fixture::{mkv_cluster, mkv_master, mkv_segment, mkv_tags, mkv_tracks};
+        let info = mkv_master(id::INFO, &[mkv_master(TITLE, &[title.to_vec()])]);
+        let mut level1 = vec![info, mkv_tracks(48_000.0, 2)];
+        level1.extend((!tags.is_empty()).then(|| mkv_tags(tags)));
+        level1.push(mkv_cluster(16));
+        mkv_segment("matroska", &level1).0
+    }
+
+    #[test]
+    fn the_info_title_is_the_title_no_tag_states() {
+        let f = titled(b"Segment", &[("ARTIST", "Band")]);
+        let (_, tags) = run(&[(&f[..], 0)]);
+        assert_eq!((tags.get("TITLE"), tags.get("ARTIST")), (Some("Segment"), Some("Band")));
+        let f = titled(b"Segment", &[("title", "Tagged")]);
+        let (_, tags) = run(&[(&f[..], 0)]);
+        assert_eq!(tags.iter().filter(|(k, _)| *k == "TITLE").count(), 1);
+        assert_eq!(tags.get("TITLE"), Some("Tagged"));
+        let f = titled(b" Padded \0\0", &[]);
+        assert_eq!(run(&[(&f[..], 0)]).1.get("TITLE"), Some("Padded"), "NUL padded and trimmed");
+        let f = titled(b"  ", &[]);
+        assert_eq!(run(&[(&f[..], 0)]).1.get("TITLE"), None, "blank");
+    }
+
+    #[test]
+    fn info_title_reads_the_info_alone() {
+        let info = mkv_master_bytes(id::INFO, &[(TITLE, b"T")]);
+        assert_eq!(info_title(&info), Some("T"));
+        assert_eq!(info_title(&mkv_master_bytes(id::TRACKS, &[(TITLE, b"T")])), None, "not Info");
+        let scale = mkv_master_bytes(id::INFO, &[(id::TIMESTAMP_SCALE, &[0x0F, 0x42, 0x40])]);
+        assert_eq!(info_title(&scale), None);
+        for n in 0..info.len() {
+            let _ = info_title(&info[..n]);
+        }
+        assert_eq!(info_title(&info[..info.len() - 1]), None, "the title cut");
+    }
+
+    fn mkv_master_bytes(master: &[u8], kids: &[(&[u8], &[u8])]) -> Vec<u8> {
+        use crate::fixture::mkv_master;
+        let kids: Vec<Vec<u8>> = kids.iter().map(|(i, v)| mkv_master(i, &[v.to_vec()])).collect();
+        mkv_master(master, &kids)
     }
 
     #[test]

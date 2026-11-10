@@ -1,11 +1,12 @@
 #![allow(clippy::disallowed_methods, clippy::unwrap_used)]
 
 use std::path::PathBuf;
+use std::process::Command;
 
 use pf_open::{Caps, OpenAt, Opened, Want};
 use pf_tags::item::{FRONT_COVER, ItemTags, KIND_UNKNOWN, taken};
 use pf_tags::{ScanConfig, Scanner};
-use profluens_core::fetch::drive_slice;
+use profluens_core::fetch::{Need, drive_slice, drive_slice_log};
 
 fn path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
@@ -90,6 +91,153 @@ fn a_matroskas_tags_are_the_scanners() {
     );
     assert_eq!(read.pictures.len(), 1, "the cover, not the font");
     assert_eq!(read.pictures, scanned.pictures);
+    assert_eq!(read.get("TITLE"), Some("Tagged tones"), "the Info Title, no tag states one");
+}
+
+/// What ffmpeg writes from `args` as `name`, None when it cannot, the test then skips.
+fn ffmpeg(name: &str, args: &[&str]) -> Option<Vec<u8>> {
+    let path = std::env::temp_dir().join(format!("pf_tags_opened_{}_{name}", std::process::id()));
+    let ok = Command::new("ffmpeg")
+        .env_remove("LD_LIBRARY_PATH")
+        .args(["-v", "error", "-y"])
+        .args(args)
+        .arg(&path)
+        .status()
+        .is_ok_and(|s| s.success());
+    let got = std::fs::read(&path).ok().filter(|_| ok);
+    let _ = std::fs::remove_file(&path);
+    if got.is_none() {
+        eprintln!("skipped: ffmpeg could not write {name}");
+    }
+    got
+}
+
+/// The tags an open of `b` reads and its reads.
+fn of_bytes(b: &[u8], caps: Caps) -> (ItemTags, Vec<Need>) {
+    let mut log = Vec::new();
+    let o = drive_slice_log(&mut OpenAt::new(b.len() as u64, Want::ALL, caps), b, &mut log);
+    (pf_tags::of(&o.unwrap()), log)
+}
+
+/// What the scanner finds in `b` written as `name`.
+fn scanned_bytes(name: &str, b: &[u8]) -> ItemTags {
+    let p = pf_tags::fixture::scratch_dir("opened").join(name);
+    std::fs::write(&p, b).unwrap();
+    let mut out = ItemTags::default();
+    let mut sc = Scanner::new(ScanConfig { in_flight: 1, ..ScanConfig::default() });
+    sc.scan([p.clone()], |r| {
+        if let Ok(r) = r.result {
+            out = pf_tags::item::scanned(&r.tags);
+        }
+    });
+    let _ = std::fs::remove_file(&p);
+    out
+}
+
+/// `b` with its `LIST` chunk moved behind the rest, the chunk's length.
+fn list_last(b: &[u8]) -> (Vec<u8>, usize) {
+    let at = b.windows(4).position(|w| w == b"LIST").unwrap();
+    let size = u32::from_le_bytes(b[at + 4..at + 8].try_into().unwrap()) as usize;
+    let n = 8 + size + (size & 1);
+    let mut moved = b.to_vec();
+    let list: Vec<u8> = moved.drain(at..at + n).collect();
+    moved.extend(list);
+    (moved, n)
+}
+
+/// A WAV file's RIFF INFO as ffmpeg writes it ahead of the data, and moved behind the data past
+/// the window, reads as the scanner reads it. Behind the data it takes one read of the chunks.
+#[test]
+fn wav_info_before_or_behind_the_data() {
+    let meta = [
+        "title=Tone T",
+        "album=Alb",
+        "date=2024",
+        "genre=Ambient",
+        "artist=Art",
+        "track=7",
+        "comment=odd",
+    ];
+    let mut args = vec!["-f", "lavfi", "-i", "sine=duration=3:sample_rate=48000", "-ac", "2"];
+    meta.iter().for_each(|m| args.extend(["-metadata", m]));
+    let Some(front) = ffmpeg("info.wav", &args) else { return };
+    assert!(front.len() > Caps::default().window, "the data past the window");
+    let (t, log) = of_bytes(&front, Caps::default());
+    let want = [
+        ("TITLE", "Tone T"),
+        ("ARTIST", "Art"),
+        ("ALBUM", "Alb"),
+        ("TRACKNUMBER", "7"),
+        ("DATE", "2024"),
+        ("GENRE", "Ambient"),
+    ];
+    let got: Vec<_> = t.tags.iter().take(6).map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    assert_eq!(got, want);
+    assert_eq!(t.get("COMMENT"), Some("odd"));
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!(t, scanned_bytes("front.wav", &front));
+    let (back, n) = list_last(&front);
+    let (moved, log) = of_bytes(&back, Caps::default());
+    assert_eq!(moved, t);
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert_eq!(log[1], Need { at: (back.len() - n) as u64, len: n }, "the chunks behind the data");
+    let (small, _) = of_bytes(&back, Caps { window: 4096, ..Caps::default() });
+    assert_eq!(small, t);
+    assert_eq!(scanned_bytes("back.wav", &back), t);
+    let (none, _) = of_bytes(&back, Caps { max_tags: 8, ..Caps::default() });
+    assert_eq!(none, ItemTags::default(), "the chunks past the cap are not read");
+}
+
+/// An odd sized data chunk and its pad byte ahead of the INFO, a whole small file and one past
+/// the window.
+#[test]
+fn wav_info_behind_an_odd_data_chunk() {
+    use pf_tags::fixture::{fmt_chunk, info_chunk, riff, riff_chunk};
+    let info = info_chunk(&[("INAM", "ab"), ("IART", "Art")]);
+    for frames in [7, 300_001] {
+        let f =
+            riff(&[fmt_chunk(8_000, 1, 8), riff_chunk(b"data", &vec![0x80; frames]), info.clone()]);
+        let (t, log) = of_bytes(&f, Caps::default());
+        assert_eq!((t.get("TITLE"), t.get("ARTIST")), (Some("ab"), Some("Art")), "{frames}");
+        assert_eq!(log.len(), if frames == 7 { 1 } else { 2 }, "{log:?}");
+    }
+}
+
+/// A Matroska file's Info Title is its TITLE when no tag states one, the tag's when one does,
+/// read with the head as the scanner reads it.
+#[test]
+fn a_matroska_segment_title_is_the_title_no_tag_states() {
+    let args = [
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=duration=1",
+        "-c:a",
+        "pcm_s16le",
+        "-metadata",
+        "title=Segment title",
+        "-metadata",
+        "artist=Tag title",
+    ];
+    let Some(b) = ffmpeg("title.mkv", &args) else { return };
+    // the scanner keeps the track's DURATION, the open leaves the statistics out
+    let scanned = |name: &str, b: &[u8]| {
+        let mut t = scanned_bytes(name, b).tags;
+        t.retain(|t| t.0 != "DURATION");
+        t
+    };
+    let (t, _) = of_bytes(&b, Caps::default());
+    assert_eq!((t.get("TITLE"), t.get("ARTIST")), (Some("Segment title"), Some("Tag title")));
+    assert_eq!(scanned("title.mkv", &b), t.tags);
+    // the ARTIST tag renamed TITLE, NUL padded to the same length
+    let name = [&[0x45, 0xA3, 0x86][..], b"ARTIST"].concat();
+    let at = b.windows(name.len()).position(|w| w == name).unwrap() + 3;
+    let mut tagged = b.clone();
+    tagged[at..at + 6].copy_from_slice(b"TITLE\0");
+    let (t, _) = of_bytes(&tagged, Caps::default());
+    assert_eq!(t.get("TITLE"), Some("Tag title"));
+    assert_eq!(t.tags.iter().filter(|(k, _)| k == "TITLE").count(), 1, "{:?}", t.tags);
+    assert_eq!(scanned("tagged.mkv", &tagged), t.tags);
 }
 
 #[test]

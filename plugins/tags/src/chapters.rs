@@ -546,7 +546,7 @@ pub fn chapters(o: &pf_open::Opened) -> ItemChapters {
             moov_chapters(m, &o.chapter_track, o.duration_ns)
         }),
         Meta::Ogg(s) => vorbis_chapters(Some(o.bytes(*s)), [], o.duration_ns),
-        Meta::Bare { raw, flac: true } => {
+        Meta::Bare { raw, flac: true, .. } => {
             vorbis_chapters(None, raw.comments.iter().map(|r| raw.span(r)), o.duration_ns)
         }
         Meta::Bare { flac: false, .. } => ItemChapters::default(),

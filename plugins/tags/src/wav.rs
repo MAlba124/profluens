@@ -98,7 +98,8 @@ pub(crate) fn walk_carrying(
     resume.filter(|at| *at < file_len)
 }
 
-fn info(body: &[u8], sink: &mut impl TagSink) {
+/// The subchunks of a `LIST INFO` body behind its form.
+pub(crate) fn info(body: &[u8], sink: &mut impl TagSink) {
     let mut p = 0usize;
     let mut scratch = [0u8; TEXT_SCRATCH];
     while let Some(h) = body.get(p..p + 8) {

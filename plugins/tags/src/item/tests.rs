@@ -443,6 +443,62 @@ fn matroska_tags_and_attachments_read_all_or_nothing() {
     assert_eq!(mkv(broken), ItemTags::default());
 }
 
+/// The Segment's title stands in for the TITLE no tag states, a broken walk keeps it.
+#[test]
+fn a_matroska_segment_title_is_the_title_no_tag_states() {
+    let meta = |tags: &[(&str, &str)]| pf_mkv::walk::Meta {
+        tags: mkv_tags(tags),
+        ..pf_mkv::walk::Meta::default()
+    };
+    let t = mkv_titled(meta(&[("ARTIST", "Band")]), Some("Segment"));
+    assert_eq!(t.tags, [pair("TITLE", "Segment"), pair("ARTIST", "Band")]);
+    let t = mkv_titled(meta(&[("title", "Tagged"), ("ARTIST", "Band")]), Some("Segment"));
+    assert_eq!(t.tags, [pair("TITLE", "Tagged"), pair("ARTIST", "Band")]);
+    assert_eq!(mkv_titled(meta(&[]), None), ItemTags::default());
+    let broken = pf_mkv::walk::Meta {
+        error: Some(pf_mkv::walk::WalkError::Malformed { at: 7 }),
+        ..meta(&[("TITLE", "Tagged")])
+    };
+    assert_eq!(mkv_titled(broken, Some("Segment")).tags, [pair("TITLE", "Segment")]);
+}
+
+/// INFO subchunks with and without their NUL, of odd size with the pad byte, Latin-1 text.
+#[test]
+fn riff_info_reads_each_subchunk() {
+    let sub = |id: &[u8; 4], v: &[u8]| {
+        let mut c = id.to_vec();
+        c.extend((v.len() as u32).to_le_bytes());
+        c.extend(v);
+        if v.len() % 2 == 1 {
+            c.push(0);
+        }
+        c
+    };
+    let body = [
+        sub(b"INAM", b"abc"),
+        sub(b"IART", b"Bj\xf6rk\0"),
+        sub(b"ICRD", b"2020\0\0"),
+        sub(b"IXYZ", b"unknown"),
+        sub(b"IPRD", b"Al"),
+        sub(b"ITRK", b"3\0"),
+        sub(b"IGNR", b"\0"),
+    ]
+    .concat();
+    let t = riff_info(&body);
+    assert_eq!(
+        t.tags,
+        [
+            pair("TITLE", "abc"),
+            pair("ARTIST", "Bj\u{f6}rk"),
+            pair("ALBUM", "Al"),
+            pair("TRACKNUMBER", "3"),
+            pair("DATE", "2020"),
+        ]
+    );
+    assert_eq!(riff_info(&body[..body.len() - 13]).tags.len(), 4, "a cut subchunk");
+    assert_eq!(riff_info(b""), ItemTags::default());
+}
+
 fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
     b.extend(kind);

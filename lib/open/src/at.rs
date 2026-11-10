@@ -14,7 +14,8 @@ use pf_probe::{Kind, PREFIX_LEN, probe};
 use profluens_core::fetch::{Fetch, Need, Step};
 
 use crate::{
-    Caps, Desc, Index, Meta, OpenError, Opened, Want, avi, bare, flv, mkv, mp4, ogg, ps, ts,
+    Caps, Desc, Index, Meta, OpenError, Opened, Span, Want, avi, bare, flv, mkv, mp4, ogg, ps, ts,
+    wav,
 };
 
 /// The read in flight, or the inner machine that asks the next one.
@@ -134,6 +135,7 @@ impl OpenAt {
                         Kind::Ogg => self.ogg_done(),
                         Kind::Ts => self.ts_done(),
                         Kind::Ps => self.ps_done(),
+                        Kind::Wav => self.wav_done(),
                         _ => self.mkv_cues(),
                     }
                 }
@@ -207,7 +209,11 @@ impl OpenAt {
 
     /// The file from `at` to its end into the tail.
     fn read_tail(&mut self, at: u64) -> Option<Need> {
-        let n = (self.len - at) as usize;
+        self.read_tail_n(at, (self.len - at) as usize)
+    }
+
+    /// `n` bytes of the file from `at` into the tail.
+    fn read_tail_n(&mut self, at: u64, n: usize) -> Option<Need> {
         (self.tail_at, self.stage) = (at, Stage::Tail);
         self.tail.clear();
         self.tail.resize(n, 0);
@@ -589,13 +595,36 @@ impl OpenAt {
         self.done()
     }
 
+    /// The track, then a WAV file's chunks behind its data when its INFO is not in the head.
     fn bare(&mut self, h: BareHead, raw: RawTags) -> Result<Option<Need>, OpenError> {
         bare::describe(&h, &mut self.desc);
         self.duration = h.duration_ns.max(0) as u64;
-        if self.want.meta {
-            self.meta = Meta::Bare { raw, flac: self.kind == Kind::Flac };
-        }
         self.index = Index::Bare(Arc::new(h));
+        if !self.want.meta {
+            return self.done();
+        }
+        let (mut info, mut past) = (Span::default(), None);
+        if self.kind == Kind::Wav {
+            match wav::info(&raw.head, 0, self.len) {
+                wav::Info::At(r) => info = self.desc.put(&raw.head[r]),
+                wav::Info::Past(at) => past = Some(at),
+                wav::Info::None => {}
+            }
+        }
+        self.meta = Meta::Bare { raw, flac: self.kind == Kind::Flac, info };
+        // a chunk header and the form at least
+        match past.map(|at| (at, (self.len - at).min(self.caps.max_tags))).filter(|p| p.1 >= 12) {
+            Some((at, n)) => Ok(self.read_tail_n(at, n as usize)),
+            None => self.done(),
+        }
+    }
+
+    fn wav_done(&mut self) -> Result<Option<Need>, OpenError> {
+        if let wav::Info::At(r) = wav::info(&self.tail, self.tail_at, self.len)
+            && let Meta::Bare { info, .. } = &mut self.meta
+        {
+            *info = self.desc.put(&self.tail[r]);
+        }
         self.done()
     }
 

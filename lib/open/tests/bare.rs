@@ -59,7 +59,7 @@ fn flac_is_one_track_with_its_blocks() {
         mkv_head(&bare("flac.mka")),
         "fLaC and STREAMINFO as Matroska holds them"
     );
-    let Meta::Bare { raw, flac: true } = &o.meta else { panic!("{:?}", o.meta) };
+    let Meta::Bare { raw, flac: true, .. } = &o.meta else { panic!("{:?}", o.meta) };
     assert_eq!((raw.comments.len(), raw.pictures.len()), (1, 1));
     assert!(o.head.is_empty(), "baresrc reads from the BareHead");
 }
@@ -72,7 +72,7 @@ fn mp3_is_one_track_with_its_id3_tag() {
     assert_eq!((t.family, t.channels, t.rate, t.bitrate, t.depth), ("mp3", 2, 44_100, 128_000, 16));
     assert!(o.codec_head(t).is_empty(), "no head for MPEG audio");
     assert!((o.duration_ns as i64 - 78 * 26_122_448).abs() < MS as i64, "{}", o.duration_ns);
-    let Meta::Bare { raw, flac: false } = &o.meta else { panic!("{:?}", o.meta) };
+    let Meta::Bare { raw, flac: false, .. } = &o.meta else { panic!("{:?}", o.meta) };
     assert!(!raw.id3v2().is_empty());
 }
 

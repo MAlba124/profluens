@@ -334,21 +334,46 @@ pub fn ogg(comment: &[u8], scratch: &Arena) -> ItemTags {
 /// The tags and image attachments of a Matroska file as its [`pf_mkv::walk::MetaAt`] read them.
 /// All or nothing, a walk that stopped on an error gives none.
 pub fn mkv(meta: pf_mkv::walk::Meta) -> ItemTags {
-    if meta.error.is_some() {
-        return ItemTags::default();
-    }
+    mkv_titled(meta, None)
+}
+
+/// [`mkv`] with the Segment's `title` as the TITLE no tag states, whether the walk failed or not.
+fn mkv_titled(meta: pf_mkv::walk::Meta, title: Option<&str>) -> ItemTags {
     let mut c = Collect::default();
-    pf_mkv::tags::parse_tags(&meta.tags, &mut MkvText(&mut c));
-    c.pictures =
-        meta.pictures.into_iter().map(|a| picture(KIND_UNKNOWN, &a.media_type, a.data)).collect();
+    if meta.error.is_none() {
+        pf_mkv::tags::parse_tags(&meta.tags, &mut MkvText(&mut c));
+        c.pictures = meta
+            .pictures
+            .into_iter()
+            .map(|a| picture(KIND_UNKNOWN, &a.media_type, a.data))
+            .collect();
+    }
+    if let Some(t) = title.filter(|_| !c.text.iter().any(|t| t.0 == "TITLE")) {
+        c.text("TITLE", t);
+    }
+    c.finish()
+}
+
+/// The Info Title of a Matroska file's head.
+fn segment_title(o: &pf_open::Opened) -> Option<&str> {
+    let pf_open::Index::Mkv(p) = &o.index else { return None };
+    let at = usize::try_from(p.index?.info?).ok()?;
+    crate::mkv::info_title(o.head.get(at..)?)
+}
+
+/// The tags of a RIFF `LIST INFO` chunk body behind its form.
+pub fn riff_info(body: &[u8]) -> ItemTags {
+    let mut c = Collect::default();
+    crate::wav::info(body, &mut c);
     c.finish()
 }
 
 /// The tags and pictures of a file as its open read them, none when they were not wanted. A
-/// Matroska file's pictures are copied, [`taken`] moves them.
+/// Matroska file's pictures are copied, [`taken`] moves them, its Info Title is the TITLE no tag
+/// states.
 pub fn of(o: &pf_open::Opened) -> ItemTags {
     match &o.meta {
-        pf_open::Meta::Mkv(m) => mkv(m.clone()),
+        pf_open::Meta::Mkv(m) => mkv_titled(m.clone(), segment_title(o)),
         meta => read(o, meta),
     }
 }
@@ -356,7 +381,7 @@ pub fn of(o: &pf_open::Opened) -> ItemTags {
 /// [`of`] with the tag bytes moved out of the open.
 pub fn taken(o: &mut pf_open::Opened) -> ItemTags {
     match std::mem::take(&mut o.meta) {
-        pf_open::Meta::Mkv(m) => mkv(m),
+        pf_open::Meta::Mkv(m) => mkv_titled(m, segment_title(o)),
         meta => read(o, &meta),
     }
 }
@@ -372,11 +397,13 @@ fn read(o: &pf_open::Opened, meta: &pf_open::Meta) -> ItemTags {
     let scratch = Arena::default();
     match meta {
         Meta::None | Meta::Mkv(_) => ItemTags::default(),
-        Meta::Bare { raw, flac: true } => {
+        Meta::Bare { raw, flac: true, .. } => {
             let span = |r| raw.span(r);
             flac(raw.comments.iter().map(span), raw.pictures.iter().map(span))
         }
-        Meta::Bare { raw, flac: false } => id3(raw.id3v2(), &raw.ape, &raw.v1, &scratch),
+        // only a WAV file has one, and no ID3 beside it
+        Meta::Bare { info, .. } if !info.is_empty() => riff_info(o.bytes(*info)),
+        Meta::Bare { raw, flac: false, .. } => id3(raw.id3v2(), &raw.ape, &raw.v1, &scratch),
         Meta::Moov(r) => {
             o.head.get(r.clone()).map_or_else(ItemTags::default, |m| moov(m, &scratch))
         }

@@ -201,7 +201,13 @@ fn wav_opens_as_one_pcm_track() {
     let b = wav_file(44_100, 6, 24, false, 44_100 * 2, Some(0x60F), 100);
     let (o, log) = open_with(&b, Want::ALL, Caps::default());
     let o = o.unwrap();
-    assert_eq!(log.len(), 1);
+    // the LIST INFO behind the data past the window in one more read
+    let at = b.len() as u64 - 16;
+    assert_eq!(log[1..], [profluens_core::fetch::Need { at, len: 16 }], "{log:?}");
+    let Meta::Bare { info, .. } = &o.meta else { panic!("{:?}", o.meta) };
+    assert_eq!(o.bytes(*info), b"tail");
+    let (_, log) = open_with(&b, Want::TRACKS, Caps::default());
+    assert_eq!(log.len(), 1, "no meta wanted");
     assert_eq!(o.kind, Kind::Wav);
     let t = &o.tracks[0];
     assert_eq!((t.family, t.rate, t.channels, t.depth), ("audio/raw", 44_100, 6, 24));

@@ -176,12 +176,16 @@ pub fn vfw_extradata(bitmapinfoheader: &[u8]) -> &[u8] {
 }
 
 /// The `audio/raw` sample name of a PCM track. Integer samples are signed but for 8 bits.
+/// An integer sample of any depth up to 32 is named by the octets it takes. A depth short of
+/// them, 20 in 3, is taken left aligned in them, as a WAV's samples are and mkvmerge copies them.
 pub fn pcm_sample(track: &Track) -> Option<&'static str> {
     match (track.codec_id.as_str(), track.bit_depth) {
-        ("A_PCM/INT/LIT" | "A_PCM/INT/BIG", 8) => Some("u8"),
-        ("A_PCM/INT/LIT" | "A_PCM/INT/BIG", 16) => Some("s16"),
-        ("A_PCM/INT/LIT" | "A_PCM/INT/BIG", 24) => Some("s24"),
-        ("A_PCM/INT/LIT" | "A_PCM/INT/BIG", 32) => Some("s32"),
+        ("A_PCM/INT/LIT" | "A_PCM/INT/BIG", 1..=32) => match track.bit_depth.div_ceil(8) {
+            1 => Some("u8"),
+            2 => Some("s16"),
+            3 => Some("s24"),
+            _ => Some("s32"),
+        },
         ("A_PCM/FLOAT/IEEE", 32 | 64) => Some("f32"),
         _ => None,
     }
@@ -189,7 +193,7 @@ pub fn pcm_sample(track: &Track) -> Option<&'static str> {
 
 pub fn pcm_reframer(track: &Track) -> Reframer {
     match (track.codec_id.as_str(), track.bit_depth) {
-        ("A_PCM/INT/BIG", 16 | 24 | 32) => Reframer::Swap { width: (track.bit_depth / 8) as u8 },
+        ("A_PCM/INT/BIG", 9..=32) => Reframer::Swap { width: track.bit_depth.div_ceil(8) as u8 },
         ("A_PCM/FLOAT/IEEE", 64) => Reframer::Narrow { big: false },
         _ => Reframer::Passthrough,
     }
@@ -381,7 +385,7 @@ pub enum ReframeError {
     Malformed(&'static str),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reframer {
     Passthrough,
     Nal {
@@ -789,6 +793,27 @@ mod tests {
         assert_eq!(Reframer::Narrow { big: false }.reframe_into(&le, &mut out).expect("le"), f32le);
         assert_eq!(Reframer::Narrow { big: true }.reframe_into(&be, &mut out).expect("be"), f32le);
         assert!(Reframer::Narrow { big: true }.reframe_into(&be[..9], &mut out).is_err());
+    }
+
+    #[test]
+    fn pcm_of_a_depth_between_named_samples_is_named_by_its_octets() {
+        let pcm = |codec: &str, depth: u32| {
+            let mut t = track(codec, 48_000.0, 0, &[]);
+            t.bit_depth = depth;
+            (track_family(&t), pcm_sample(&t), pcm_reframer(&t))
+        };
+        let lit = pcm("A_PCM/INT/LIT", 20);
+        assert_eq!(lit, ("audio/raw", Some("s24"), Reframer::Passthrough));
+        assert_eq!(
+            pcm("A_PCM/INT/BIG", 20),
+            ("audio/raw", Some("s24"), Reframer::Swap { width: 3 })
+        );
+        assert_eq!(pcm("A_PCM/INT/LIT", 12).1, Some("s16"));
+        assert_eq!(pcm("A_PCM/INT/BIG", 12).2, Reframer::Swap { width: 2 });
+        assert_eq!(pcm("A_PCM/INT/LIT", 8), ("audio/raw", Some("u8"), Reframer::Passthrough));
+        assert_eq!(pcm("A_PCM/INT/LIT", 0).0, "pcm", "no depth");
+        assert_eq!(pcm("A_PCM/INT/LIT", 40).0, "pcm", "past 32 bits");
+        assert_eq!(pcm("A_PCM/FLOAT/IEEE", 24).0, "pcm", "no float of 24 bits");
     }
 
     fn track(codec_id: &str, rate: f64, pre_roll_ns: u64, private: &[u8]) -> Track {

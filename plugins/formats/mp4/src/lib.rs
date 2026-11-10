@@ -22,8 +22,8 @@ pub use element::{EMITS, Mp4Demux};
 pub use ilst::{MoovExtent, Mp4Props, locate_moov, parse_moov_tags, props_from_moov};
 pub use mux::{Mode, Mp4Mux};
 pub use reader::{
-    Limits, Mp4Error, Mp4Reader, RemuxPool, ResolvedSample, Restart, Sample, SamplePayload, Tables,
-    Track, TrackKind,
+    Keyed, Limits, Mp4Error, Mp4Reader, RemuxPool, ResolvedSample, Restart, Sample, SamplePayload,
+    Tables, Track, TrackKind,
 };
 
 pub use pf_mkv::{ReframeError, Reframer, nal_head_from_config};

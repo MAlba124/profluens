@@ -716,7 +716,9 @@ fn a_source_that_goes_back_for_one_track_of_a_fragmented_movie_puts_nothing_out_
 
 /// What ffmpeg writes for `args`, None without it.
 fn ffmpeg(name: &str, args: &[&str]) -> Option<Vec<u8>> {
-    let path = std::env::temp_dir().join(format!("pf_mp4_frag_{}_{name}", std::process::id()));
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("pf_mp4_frag_{}_{n}_{name}", std::process::id()));
     let ok = std::process::Command::new("ffmpeg")
         .env_remove("LD_LIBRARY_PATH")
         .args(["-v", "error", "-y"])

@@ -24,7 +24,7 @@ use profluens_video::format::COLOR_OFFER_FIELDS;
 use crate::boxes::FourCc;
 use crate::codec::{self, Reframer};
 use crate::pull::{Plan, RUN, SMALL, State};
-use crate::reader::{Limits, Mp4Error, Mp4Reader, ResolvedSample, SamplePayload};
+use crate::reader::{Keyed, Limits, Mp4Error, Mp4Reader, ResolvedSample, SamplePayload};
 
 static SINK_OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
 
@@ -536,7 +536,37 @@ impl Mp4Demux {
         Ok(())
     }
 
-    fn next_sample(&mut self, ctx: &Ctx, pulled: bool) -> Option<(ResolvedSample, Own)> {
+    /// The next sample out, its keyframe flag from its NAL types.
+    fn next_sample(
+        &mut self,
+        ctx: &Ctx,
+        pulled: bool,
+        back: bool,
+    ) -> Option<(ResolvedSample, Own)> {
+        loop {
+            let (mut s, own, index) = self.read_sample(ctx, pulled)?;
+            let Some(reader) = self.reader.as_mut() else { return Some((s, own)) };
+            match reader.keyed(s.track_index, index, s.sync, s.payload.data(), back) {
+                Keyed::Put { key } => {
+                    s.sync = key;
+                    return Some((s, own));
+                }
+                Keyed::Skip => log!(ctx, Level::Debug, "key_wait", track = s.track_index),
+                Keyed::Back => {
+                    let sample = index.unwrap_or(usize::MAX);
+                    log!(ctx, Level::Debug, "key_back", track = s.track_index, sample = sample);
+                    self.unplan_all();
+                }
+            }
+        }
+    }
+
+    /// The next sample read and its index in the tables, None for a fragment's.
+    fn read_sample(
+        &mut self,
+        ctx: &Ctx,
+        pulled: bool,
+    ) -> Option<(ResolvedSample, Own, Option<usize>)> {
         if pulled {
             return loop {
                 let p = self.plan.pop_ready()?;
@@ -553,6 +583,7 @@ impl Mp4Demux {
                 break Some((
                     ResolvedSample { track_index, pts, dts, sync, hidden, span, payload },
                     own,
+                    Some(p.index),
                 ));
             };
         }
@@ -563,7 +594,7 @@ impl Mp4Demux {
             log!(ctx, Level::Debug, "init_changed", epoch = self.epoch);
             Self::rewire(ctx, &mut self.pad_tracks, reader.tracks(), self.passthrough);
         }
-        Some((s, Own::Pushed))
+        Some((s, Own::Pushed, reader.last_index()))
     }
 
     fn drain(&mut self, ctx: &mut Ctx) -> bool {
@@ -571,7 +602,7 @@ impl Mp4Demux {
             return false;
         }
         let pulled = ctx.pulls(Self::IN);
-        while let Some((s, own)) = self.next_sample(ctx, pulled) {
+        while let Some((s, own)) = self.next_sample(ctx, pulled, pulled) {
             if !self.put_sample(ctx, s, own, Emit::Bounded) {
                 return false;
             }
@@ -801,8 +832,9 @@ impl Mp4Demux {
                 }
             }
         }
+        // nothing more is read at the end, a landing cannot go back
         let pulled = ctx.pulls(Self::IN);
-        while let Some((s, own)) = self.next_sample(ctx, pulled) {
+        while let Some((s, own)) = self.next_sample(ctx, pulled, false) {
             self.put_sample(ctx, s, own, Emit::Exact);
         }
     }
@@ -821,7 +853,10 @@ impl Mp4Demux {
         };
         while ctx.asks_left(Self::IN) > 0 && self.plan.held < bytes && self.plan.ranges < ranges {
             let Some((index, first)) = reader.next_wanted() else {
-                if !self.plan.asked_all {
+                // a landing may go back for an earlier sample while one is planned
+                let held = reader.is_landing() && !self.plan.items.is_empty();
+                if !self.plan.asked_all && !held {
+                    reader.landed();
                     self.plan.asked_all = true;
                     ctx.end_asks(Self::IN);
                 }
@@ -994,13 +1029,11 @@ impl Mp4Demux {
 }
 
 impl Mp4Demux {
-    /// The seek index going back for the caption tracks `on`, kept for the rate teller.
+    /// A seek index of the tables named by stream, kept for the rate teller.
     fn indexed(
         &mut self,
-        tables: &crate::reader::Tables,
-        on: &dyn Fn(usize) -> bool,
+        mut index: profluens_core::pipeline::Index,
     ) -> profluens_core::pipeline::Index {
-        let mut index = tables.seek_index(on);
         let stream = |track: u32| self.pad_tracks.get(track as usize).map(|pt| pt.stream);
         index.stream = index.stream.and_then(stream);
         index.captions.retain_mut(|c| match stream(c.stream) {
@@ -1014,14 +1047,21 @@ impl Mp4Demux {
         index
     }
 
+    /// A sync sample read was no random access point, the index goes without it from now on.
+    fn keys_found(&mut self, ctx: &Ctx) {
+        if self.reader.as_mut().is_some_and(Mp4Reader::keys_changed) {
+            self.republish(ctx);
+        }
+    }
+
     /// Publishes the index again for the tracks selected now.
     fn republish(&mut self, ctx: &Ctx) {
         let Some(reader) = self.reader.as_ref() else {
             return;
         };
         let on: Vec<bool> = (0..self.pad_tracks.len()).map(|i| reader.is_on(i)).collect();
-        let tables = reader.tables();
-        let index = self.indexed(&tables, &|i| on.get(i).is_some_and(|on| *on));
+        let index = reader.seek_index(&|i| on.get(i).is_some_and(|on| *on));
+        let index = self.indexed(index);
         ctx.publish_index(index);
     }
 
@@ -1147,7 +1187,7 @@ impl Element for Mp4Demux {
             log!(&*ctx, Level::Warn, "tracks_skipped", count = tables.skipped_tracks());
         }
         // No pad is linked at the open, the start publishes again for the caption tracks that are
-        let index = self.indexed(&tables, &|_| false);
+        let index = self.indexed(reader.seek_index(&|_| false));
         log!(
             &*ctx,
             Level::Info,
@@ -1199,6 +1239,7 @@ impl Element for Mp4Demux {
         if ctx.pulls(Self::IN) {
             let flow = self.pull(ctx, &mut inputs);
             self.check(ctx)?;
+            self.keys_found(ctx);
             self.tell_rate(ctx);
             return flow;
         }
@@ -1226,6 +1267,7 @@ impl Element for Mp4Demux {
                 break;
             }
         }
+        self.keys_found(ctx);
         self.tell_rate(ctx);
         Ok(Flow::Ok)
     }

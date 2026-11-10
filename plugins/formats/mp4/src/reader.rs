@@ -11,6 +11,7 @@ use profluens_core::memory::{Demand, IO_DEPTH_BYTES, Known, Memory};
 pub use profluens_core::pipeline::CAPTION_REACH as CAPTION_REACH_NS;
 use profluens_core::pipeline::{Caption, Index, IndexEntry};
 use profluens_core::time::Timestamp;
+use profluens_video::rap::{self, NalSyntax};
 
 use crate::boxes::{self, BoxError, BoxHeader};
 use crate::codec::{self, Reframer, SampleEntry};
@@ -350,6 +351,13 @@ struct Rule {
     delay_ticks: i64,
     pre_roll_ns: u64,
     media_time: i64,
+    /// The NAL syntax and length size a sample's random access is read by.
+    rap: Option<(NalSyntax, u8)>,
+}
+
+/// Whether sample `i` is a sync sample its NAL types said is no random access point.
+fn false_key(false_keys: &[u32], i: usize) -> bool {
+    u32::try_from(i).is_ok_and(|i| false_keys.binary_search(&i).is_ok())
 }
 
 #[derive(Clone, Copy)]
@@ -496,7 +504,7 @@ impl Tables {
             return frag.restart(point, video_from, &self.rules);
         }
         let mut gates = [0u64; MAX_TRACKS];
-        self.gates(Some(point), video_from, 0, on, &mut gates)
+        self.gates(Some(point), video_from, 0, on, &[], &mut gates)
     }
 
     /// `track` is a caption track the restart goes back for.
@@ -560,9 +568,15 @@ impl Tables {
     /// video track, else the first audio track thinned to [`MAX_INDEX_ENTRIES`], or one entry
     /// per indexed fragment. An entry restarts ahead for audio pre-roll and for the sample up
     /// on a caption track `on`.
-    // Cold path, once per open and link change.
-    #[allow(clippy::disallowed_methods)]
     pub fn seek_index(&self, on: &dyn Fn(usize) -> bool) -> Index {
+        self.index_without(on, &[])
+    }
+
+    /// [`Self::seek_index`] without the sync samples `false_keys` names, see
+    /// [`Mp4Reader::keyed`].
+    // Cold path, once per open, link change and false key found.
+    #[allow(clippy::disallowed_methods)]
+    fn index_without(&self, on: &dyn Fn(usize) -> bool, false_keys: &[u32]) -> Index {
         let longest = self.tracks.iter().map(|t| t.duration_ns).max().unwrap_or(0);
         let ns = match (longest, &self.frag) {
             (0, Some(frag)) => frag.duration_ns,
@@ -604,10 +618,13 @@ impl Tables {
                 ..Index::default()
             };
         }
-        let keys = |s: &&Sample| s.track() == track && s.sync;
-        let stride = self.samples.iter().filter(keys).count().div_ceil(MAX_INDEX_ENTRIES).max(1);
-        let mut sweep = Sweep { tables: self, cursors: vec![Swept::default(); self.tracks.len()] };
-        for s in self.samples.iter().filter(keys).step_by(stride) {
+        let keys =
+            |(i, s): &(usize, &Sample)| s.track() == track && s.sync && !false_key(false_keys, *i);
+        let stride =
+            self.samples.iter().enumerate().filter(keys).count().div_ceil(MAX_INDEX_ENTRIES).max(1);
+        let cursors = vec![Swept::default(); self.tracks.len()];
+        let mut sweep = Sweep { tables: self, cursors, false_keys };
+        for (_, s) in self.samples.iter().enumerate().filter(keys).step_by(stride) {
             let time_ns = self.tracks[track].stamp_ns(s.pts);
             if ascends(&entries, time_ns, s.offset) {
                 let r = sweep.restart(time_ns, on);
@@ -661,7 +678,7 @@ impl Tables {
             return frag.restart(point, point, &self.rules);
         }
         let mut gates = [0u64; MAX_TRACKS];
-        self.gates(Some(point), point, 0, on, &mut gates);
+        self.gates(Some(point), point, 0, on, &[], &mut gates);
         let to_byte = gates.get(track).copied().unwrap_or(0);
         let at = self.samples.partition_point(|s| s.offset < to_byte);
         let sample = self.samples[at..].iter().find(|s| s.track() == track);
@@ -679,6 +696,7 @@ impl Tables {
         video_from: u64,
         floor: u64,
         on: &dyn Fn(usize) -> bool,
+        false_keys: &[u32],
         gates: &mut [u64; MAX_TRACKS],
     ) -> Restart {
         const NONE: (u64, i64) = (u64::MAX, 0);
@@ -695,12 +713,13 @@ impl Tables {
             open += 1;
         }
         let from = self.samples.partition_point(|s| s.offset < floor);
-        for s in &self.samples[from..] {
+        for (i, s) in self.samples[from..].iter().enumerate() {
             if open == 0 {
                 break;
             }
             let (pick, rule) = (&mut picks[s.track()], &self.rules[s.track()]);
-            if pick.done || (rule.kind == TrackKind::Video && !s.sync) {
+            let key = s.sync && !false_key(false_keys, from + i);
+            if pick.done || (rule.kind == TrackKind::Video && !key) {
                 continue;
             }
             if pick.first == NONE {
@@ -752,6 +771,7 @@ struct Swept {
 struct Sweep<'a> {
     tables: &'a Tables,
     cursors: Vec<Swept>,
+    false_keys: &'a [u32],
 }
 
 impl Sweep<'_> {
@@ -769,7 +789,8 @@ impl Sweep<'_> {
             };
             let bound = ticks_at_or_before(bound_ns, rule.timescale);
             while let Some(s) = tables.samples.get(cursor.at) {
-                if s.track() != i || (rule.kind == TrackKind::Video && !s.sync) {
+                let key = s.sync && !false_key(self.false_keys, cursor.at);
+                if s.track() != i || (rule.kind == TrackKind::Video && !key) {
                     cursor.at += 1;
                     continue;
                 }
@@ -860,9 +881,36 @@ pub struct Mp4Reader {
     gates: [u64; MAX_TRACKS],
     off: [bool; MAX_TRACKS],
     walk: Option<Walk>,
+    /// The sync samples whose NAL types said no random access point, ascending. The tables are
+    /// shared and stay as read.
+    false_keys: Vec<u32>,
+    landing: [Land; MAX_TRACKS],
+    /// A false key was found since [`Self::keys_changed`] last said so.
+    found: bool,
 }
 
 const SHUT: u64 = u64::MAX;
+
+/// Where a track stands on the random access point its next sample out must be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Land {
+    Off,
+    /// A restart landed, its first sample is read for one.
+    On,
+    /// Its first sample was none and nothing earlier is read, it waits for the next.
+    Waiting,
+}
+
+/// What the demuxer does with a sample whose NAL types were read, see [`Mp4Reader::keyed`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Keyed {
+    /// Put out, a random access point or not.
+    Put { key: bool },
+    /// Not put out, its track restarts at the sync sample before it, read next.
+    Back,
+    /// Not put out, its track waits for a random access point.
+    Skip,
+}
 
 enum Chunk {
     Retained(Memory),
@@ -922,6 +970,9 @@ impl Mp4Reader {
             gates: [0; MAX_TRACKS],
             off: [false; MAX_TRACKS],
             walk,
+            false_keys: Vec::new(),
+            landing: [Land::Off; MAX_TRACKS],
+            found: false,
         };
         reader.reset_stream();
         reader
@@ -945,6 +996,7 @@ impl Mp4Reader {
         self.chunks.clear();
         self.buffered = 0;
         self.gates = self.off.map(|off| if off { SHUT } else { 0 });
+        self.landing = [Land::Off; MAX_TRACKS];
         let Self { walk, tables, off, .. } = self;
         if let Some(walk) = walk {
             walk.restart(0);
@@ -968,14 +1020,37 @@ impl Mp4Reader {
             return;
         };
         *off = !on;
+        self.land(track, on);
         if let Some(gate) = self.walk.as_mut().and_then(|walk| walk.gates.get_mut(track)) {
             *gate = if on { Gate::NextSync } else { Gate::Shut };
             return;
         }
         let video = self.tables.rules.get(track).is_some_and(|rule| rule.kind == TrackKind::Video);
-        let next = |s: &&Sample| s.track() == track && (s.sync || !video);
-        let from = self.tables.samples.get(self.next..).and_then(|rest| rest.iter().find(next));
+        let (at, keys) = (self.next, &self.false_keys);
+        let next = |(i, s): &(usize, &Sample)| {
+            s.track() == track && ((s.sync && !false_key(keys, at + i)) || !video)
+        };
+        let rest = self.tables.samples.get(at..).unwrap_or_default();
+        let from = rest.iter().enumerate().find(next).map(|(_, s)| s);
         self.gates[track] = if on { from.map_or(SHUT, |s| s.offset) } else { SHUT };
+    }
+
+    /// `track`'s next sample out is read for a random access point, where its samples can say.
+    fn land(&mut self, track: usize, on: bool) {
+        let read = self.tables.rules.get(track).is_some_and(|rule| rule.rap.is_some());
+        if let Some(land) = self.landing.get_mut(track) {
+            *land = if on && read { Land::On } else { Land::Off };
+        }
+    }
+
+    /// Whether a track waits to read its first sample out for a random access point.
+    pub fn is_landing(&self) -> bool {
+        self.landing.iter().any(|land| *land != Land::Off)
+    }
+
+    /// No track waits for a random access point, nothing is left to read for one.
+    pub fn landed(&mut self) {
+        self.landing = [Land::Off; MAX_TRACKS];
     }
 
     pub fn rejoin(&mut self, track: usize, to_byte: u64, point: u64) {
@@ -999,6 +1074,7 @@ impl Mp4Reader {
                 };
             }
             self.off[track] = false;
+            self.land(track, true);
             self.chunks.clear();
             (self.buffered, self.stream_base) = (0, to_byte);
             return;
@@ -1007,8 +1083,10 @@ impl Mp4Reader {
         self.gates.iter_mut().for_each(|gate| *gate = (*gate).max(resume));
         let mut fresh = [0u64; MAX_TRACKS];
         let off = self.off;
-        self.tables.gates(Some(point), point, to_byte, &|i| !off[i], &mut fresh);
+        let keys = &self.false_keys;
+        self.tables.gates(Some(point), point, to_byte, &|i| !off[i], keys, &mut fresh);
         (self.gates[track], self.off[track]) = (fresh[track], false);
+        self.land(track, true);
         self.chunks.clear();
         self.buffered = 0;
         self.stream_base = to_byte;
@@ -1022,6 +1100,9 @@ impl Mp4Reader {
         self.chunks.clear();
         self.buffered = 0;
         self.stream_base = to_byte;
+        for track in 0..self.tables.rules.len().min(MAX_TRACKS) {
+            self.land(track, !self.off[track]);
+        }
         if let Some(walk) = self.walk.as_mut() {
             walk.restart(to_byte);
             for ((gate, rule), off) in walk.gates.iter_mut().zip(&self.tables.rules).zip(self.off) {
@@ -1039,7 +1120,9 @@ impl Mp4Reader {
             return Restart { to_byte, at_ns: point.unwrap_or(video_from) };
         }
         let off = self.off;
-        let restart = self.tables.gates(point, video_from, to_byte, &|i| !off[i], &mut self.gates);
+        let keys = &self.false_keys;
+        let restart =
+            self.tables.gates(point, video_from, to_byte, &|i| !off[i], keys, &mut self.gates);
         for (gate, off) in self.gates.iter_mut().zip(self.off) {
             *gate = if off { SHUT } else { *gate };
         }
@@ -1147,6 +1230,85 @@ impl Mp4Reader {
 
     pub fn span_at(&self, index: usize) -> Option<i64> {
         self.tables.span(index)
+    }
+
+    /// The index of the sample [`Self::next_sample`] gave last, None for a fragment's.
+    pub(crate) fn last_index(&self) -> Option<usize> {
+        self.walk.is_none().then(|| self.next.checked_sub(1)).flatten()
+    }
+
+    /// Whether sample `index` of `track`, `sync` by its tables, goes out as a keyframe, by the
+    /// NAL types of its `data` for H.264 and H.265. A sync sample that is no random access point
+    /// leaves the index [`Self::seek_index`] gives. The first a restart lands on steps its
+    /// track back to the sync sample before it where the bytes before can be read again,
+    /// `back`, else the track waits for the next sync sample.
+    pub fn keyed(
+        &mut self,
+        track: usize,
+        index: Option<usize>,
+        sync: bool,
+        data: &[u8],
+        back: bool,
+    ) -> Keyed {
+        let Some((syntax, len)) = self.tables.rules.get(track).and_then(|rule| rule.rap) else {
+            return Keyed::Put { key: sync };
+        };
+        let read = rap::random_access(syntax, len, data);
+        let key = read.unwrap_or(sync);
+        let false_sync = sync && read == Some(false);
+        if let Some(i) = index.filter(|_| false_sync).and_then(|i| u32::try_from(i).ok())
+            && let Err(at) = self.false_keys.binary_search(&i)
+        {
+            self.false_keys.insert(at, i);
+            self.found = true;
+        }
+        let land = self.landing.get(track).copied().unwrap_or(Land::Off);
+        let step = match (land, key, false_sync) {
+            (Land::Off, ..) => return Keyed::Put { key },
+            (Land::On, false, true) if back => {
+                match index.is_some_and(|i| self.step_back(track, i)) {
+                    true => return Keyed::Back,
+                    false => Keyed::Put { key },
+                }
+            }
+            (Land::On, false, true) => {
+                self.landing[track] = Land::Waiting;
+                return Keyed::Skip;
+            }
+            (Land::Waiting, false, false) => return Keyed::Skip,
+            _ => Keyed::Put { key },
+        };
+        self.landing[track] = Land::Off;
+        step
+    }
+
+    /// Restarts `track` at the last sync sample before sample `from` its NAL types did not
+    /// refuse, the other tracks going on past `from`. False when there is none.
+    fn step_back(&mut self, track: usize, from: usize) -> bool {
+        let samples = &self.tables.samples;
+        let (Some(cur), true) = (samples.get(from), self.walk.is_none()) else {
+            return false;
+        };
+        let keys = &self.false_keys;
+        let earlier = samples.get(..from).unwrap_or_default().iter().enumerate().rev();
+        let mut keyed = earlier.filter(|(_, s)| s.track() == track && s.sync);
+        let Some((at, s)) = keyed.find(|(i, _)| !false_key(keys, *i)) else {
+            return false;
+        };
+        let past = cur.offset.saturating_add(1);
+        self.gates.iter_mut().for_each(|gate| *gate = (*gate).max(past));
+        (self.gates[track], self.next) = (s.offset, at);
+        true
+    }
+
+    /// Whether a false key was found since last asked, so the index is published again.
+    pub fn keys_changed(&mut self) -> bool {
+        std::mem::take(&mut self.found)
+    }
+
+    /// The seek index of the tables without the false keys found so far.
+    pub fn seek_index(&self, on: &dyn Fn(usize) -> bool) -> Index {
+        self.tables.index_without(on, &self.false_keys)
     }
 
     pub fn next_wanted(&mut self) -> Option<(usize, Sample)> {
@@ -1754,8 +1916,18 @@ fn rules_of(tracks: &[Track]) -> Vec<Rule> {
             delay_ticks: track.delay_ticks(),
             pre_roll_ns: track.pre_roll_ns(),
             media_time: track.media_time,
+            rap: rap_of(track),
         })
         .collect()
+}
+
+fn rap_of(track: &Track) -> Option<(NalSyntax, u8)> {
+    let syntax = match track.entry.family {
+        "h264/annexb" => NalSyntax::Avc,
+        "h265/annexb" => NalSyntax::Hevc,
+        _ => return None,
+    };
+    Some((syntax, rap::length_size(syntax, &track.entry.config_record)))
 }
 
 /// The fragments the `sidx` atoms behind the `moov` index, and the end of the last.

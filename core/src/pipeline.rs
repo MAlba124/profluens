@@ -372,14 +372,15 @@ impl Index {
 
     /// Where the source restarts to link stream `stream` at `at`, the entry at or before `at`, or
     /// for a caption stream the one below the block of a caption of the stream up at `at` or
-    /// stored between that entry and the next.
-    pub fn restart_for(&self, stream: u32, at: Timestamp) -> Rejoin {
-        let Some(ns) = at.nanos() else { return Rejoin::Unindexed };
+    /// stored between that entry and the next. Past a growing index, where [`Self::keyframe`] is
+    /// unknown, it is resolved as a seek there. None without an entry.
+    pub fn restart_for(&self, stream: u32, at: Timestamp) -> Option<(u64, Timestamp)> {
+        let ns = at.nanos()?;
         if self.past(ns) {
-            return Rejoin::Unknown;
+            return self.resolve(at);
         }
         let k = self.entries.partition_point(|e| e.time_ns <= ns).saturating_sub(1);
-        let Some(key) = self.entries.get(k) else { return Rejoin::Unindexed };
+        let key = self.entries.get(k)?;
         let until = self.entries.get(k + 1).map_or(u64::MAX, |e| e.time_ns);
         let reach = ns.saturating_sub(CAPTION_REACH);
         let mut earliest = (key.time_ns, key.byte);
@@ -397,7 +398,7 @@ impl Index {
         {
             earliest = earliest.min((e.time_ns, e.byte));
         }
-        Rejoin::At(earliest.1, Timestamp(earliest.0))
+        Some((earliest.1, Timestamp(earliest.0)))
     }
 
     /// Where the source restarts for `plan`, `None` for a plan that restarts nothing.
@@ -443,17 +444,6 @@ impl Index {
             }
         }
     }
-}
-
-/// Where the source restarts for a stream linked while running, by [`Index::restart_for`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Rejoin {
-    /// The byte and the stream time there.
-    At(u64, Timestamp),
-    /// Past the last entry of an incomplete index. [`Index::resolve`] serves it as a seek there.
-    Unknown,
-    /// No entry or no time to restart by.
-    Unindexed,
 }
 
 /// How far ahead a skip may reach, by what the decoder costs on the way.

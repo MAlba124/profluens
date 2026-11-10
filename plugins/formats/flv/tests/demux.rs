@@ -21,7 +21,7 @@ use profluens_core::element::{
 use profluens_core::error::Error;
 use profluens_core::format::OfferDesc;
 use profluens_core::id::{SinkPad, SrcPad};
-use profluens_core::pipeline::{Pipeline, Rejoin};
+use profluens_core::pipeline::Pipeline;
 
 fn whole(name: &str, chunk: usize) -> common::Out {
     let data = fixture(name);
@@ -318,9 +318,7 @@ fn a_restart_drops_what_the_track_parked_and_the_other_track_keeps_its_own() {
         assert!(!step_through(&mut run), "the pool runs dry, {case}");
 
         let position = held.lock().unwrap().units.last().and_then(|u| u.0).expect("held");
-        let Rejoin::At(byte, at) = index.restart_for(1, Timestamp(position)) else {
-            panic!("a keyframe, {case}")
-        };
+        let (byte, at) = index.restart_for(1, Timestamp(position)).expect("a restart");
         p.remove(hold, Leave::Cut).expect("remove");
         let sink = p.add(RecSink { rec: Arc::clone(&moved) });
         p.link(demux.src(pad), sink.sink(RecSink::IN)).expect("pad to sink");

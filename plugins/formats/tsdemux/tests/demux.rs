@@ -17,7 +17,7 @@ use profluens_core::error::Error;
 use profluens_core::event::Event;
 use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value};
 use profluens_core::id::{ElementId, SinkPad, SrcPad};
-use profluens_core::pipeline::{Pipeline, Rejoin};
+use profluens_core::pipeline::Pipeline;
 use profluens_core::time::Timestamp;
 use profluens_elements::flow::Queue;
 
@@ -861,9 +861,7 @@ fn a_restart_drops_what_the_track_parked_and_the_other_tracks_keep_theirs() {
         assert!(!step_through(&mut run), "the pool runs dry, {case}");
 
         let position = held.lock().unwrap().units.last().and_then(|u| u.0).expect("held");
-        let Rejoin::At(byte, at) = index.restart_for(1, Timestamp(position)) else {
-            panic!("a keyframe, {case}")
-        };
+        let (byte, at) = index.restart_for(1, Timestamp(position)).expect("a restart");
         p.remove(hold, Leave::Cut).expect("remove");
         let sink = p.add(RecSink { rec: Arc::clone(&moved) });
         p.link(demux.src(pad), sink.sink(RecSink::IN)).expect("pad to sink");

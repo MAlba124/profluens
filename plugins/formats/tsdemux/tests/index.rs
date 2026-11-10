@@ -21,7 +21,7 @@ use profluens_core::error::Error;
 use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc};
 use profluens_core::id::{ElementId, SinkPad, SrcPad};
 use profluens_core::log::DebugSpec;
-use profluens_core::pipeline::{Index, Pipeline, Reach, Rejoin, SeekMode, SeekPlan};
+use profluens_core::pipeline::{Index, Pipeline, Reach, SeekMode, SeekPlan};
 use profluens_core::sched::{Outcome, Stepped};
 use profluens_core::time::Timestamp;
 use profluens_elements::io::FileSrc;
@@ -315,7 +315,7 @@ fn past_the_published_entries_the_keyframe_is_unknown_until_read() {
     let last = *grown.entries.last().unwrap();
     let ahead = s.keys[GROWN_EVERY + 40];
     let target = Timestamp(ahead.ns + 10_000_000);
-    assert_eq!(grown.restart_for(0, target), Rejoin::Unknown);
+    assert_eq!(grown.restart_for(0, target), grown.resolve(target), "resolved as a seek there");
     assert_eq!(grown.keyframe(target), None);
     let key = |ix: &Index| ix.plan(target, SeekMode::Keyframe, Timestamp::NONE, None, Reach::Group);
     let SeekPlan::Seek { to_byte, key: at, to_time } = key(&grown) else { panic!("a seek") };
@@ -326,7 +326,7 @@ fn past_the_published_entries_the_keyframe_is_unknown_until_read() {
     let from_entry = SeekPlan::Seek { to_byte: last.byte, key: Timestamp(last.time_ns), to_time };
     assert_eq!(key(&timeless), from_entry, "no estimate, read on from the entry");
     let within = Timestamp(s.keys[GROWN_EVERY / 2].ns);
-    let half = Rejoin::At(s.keys[GROWN_EVERY / 2].byte, within);
+    let half = Some((s.keys[GROWN_EVERY / 2].byte, within));
     assert_eq!(grown.restart_for(0, within), half, "inside what was published");
 
     while pass(&mut run) {}
@@ -334,14 +334,14 @@ fn past_the_published_entries_the_keyframe_is_unknown_until_read() {
     run.finish().unwrap();
     let whole = tap.index(demux).expect("published");
     assert_eq!((whole.entries.len(), whole.complete), (s.keys.len(), true));
-    let real = Rejoin::At(ahead.byte, Timestamp(ahead.ns));
+    let real = Some((ahead.byte, Timestamp(ahead.ns)));
     assert_eq!(whole.restart_for(0, target), real);
     let to = Timestamp(ahead.ns);
     assert_eq!(key(&whole), SeekPlan::Seek { to_byte: ahead.byte, key: to, to_time: to });
     let end = s.keys.last().unwrap();
     let past = Timestamp(end.ns + 50_000_000);
     assert_eq!(floor(s, past.0), *end);
-    assert_eq!(whole.restart_for(0, past), Rejoin::At(end.byte, Timestamp(end.ns)), "the last");
+    assert_eq!(whole.restart_for(0, past), Some((end.byte, Timestamp(end.ns))), "the last");
 }
 
 static TOLD_OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];

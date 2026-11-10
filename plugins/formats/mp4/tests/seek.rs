@@ -19,7 +19,7 @@ use profluens_core::error::Error;
 use profluens_core::event::Event;
 use profluens_core::format::OfferDesc;
 use profluens_core::id::{ElementId, SinkPad, SrcPad};
-use profluens_core::pipeline::{IndexEntry, Pipeline, Rejoin};
+use profluens_core::pipeline::{IndexEntry, Pipeline};
 use profluens_core::time::Timestamp;
 
 static SRC_OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
@@ -915,9 +915,7 @@ fn a_restart_drops_what_the_track_parked_and_the_other_track_keeps_its_own() {
 
         let position = held.lock().unwrap().bufs.last().and_then(|b| b.pts).expect("held");
         let index = p.index(demux).expect("an index");
-        let Rejoin::At(byte, at) = index.restart_for(1, Timestamp(position)) else {
-            panic!("a sync sample, {slots} slots")
-        };
+        let (byte, at) = index.restart_for(1, Timestamp(position)).expect("a restart");
         p.remove(hold, Leave::Cut).expect("remove");
         let sink = p.add(RecSink { rec: Arc::clone(&moved) });
         p.link(demux.src(pad), sink.sink(RecSink::IN)).expect("pad -> sink");

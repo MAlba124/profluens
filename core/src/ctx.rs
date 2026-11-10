@@ -1339,8 +1339,7 @@ impl Ctx {
         self.out_slot(pad).push_event(event);
     }
 
-    /// Nothing more goes out of src pad `pad` until a seek or a relink, its links end behind
-    /// what it holds while the other pads run on.
+    /// Src pad `pad` ends until a seek or relink, its links end while the other pads run on.
     pub fn end_src(&mut self, pad: SrcPad) {
         self.out_slot(pad).eos = true;
     }

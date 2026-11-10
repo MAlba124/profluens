@@ -23,7 +23,7 @@ use profluens_core::event::Event;
 use profluens_core::format::OfferDesc;
 use profluens_core::id::{SinkPad, SrcPad};
 use profluens_core::log::DebugSpec;
-use profluens_core::pipeline::{Index, Pipeline, Rejoin, SeekMode, Serves};
+use profluens_core::pipeline::{Index, Pipeline, SeekMode, Serves};
 use profluens_core::sched::Outcome;
 use profluens_core::time::Timestamp;
 
@@ -387,9 +387,7 @@ fn restart(file: &Arc<[u8]>, sound: u16, skip: usize, cases: &[(bool, u32)]) -> 
         assert!(!step_through(&mut run), "the pool runs dry, {case}");
 
         let position = held.lock().unwrap().last().and_then(|u| u.0).expect("held");
-        let Rejoin::At(byte, at) = index.restart_for(1, Timestamp(position)) else {
-            panic!("a keyframe, {case}")
-        };
+        let (byte, at) = index.restart_for(1, Timestamp(position)).expect("a restart");
         p.remove(hold, Leave::Cut).expect("remove");
         let sink = p.add(RecSink { seen: Arc::clone(&moved) });
         p.link(demux.src(pad), sink.sink(SinkPad(0))).expect("demux to sink");

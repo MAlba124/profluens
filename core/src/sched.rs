@@ -348,7 +348,6 @@ enum Sent {
 fn fed(d: &DownLink, (bytes, from, to): (u64, Timestamp, Timestamp), eos: bool, bus: &BusSender) {
     d.level.feed(bytes, from, to);
     d.peer.signal();
-    // An ended link starves no sibling, the weave rests on none for it.
     if eos {
         d.level.end();
     }

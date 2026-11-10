@@ -9,6 +9,7 @@ use pf_bare::{BareHead, BareKind, RawTags};
 use pf_mkv::CuesAt;
 use pf_mkv::walk::{self, MetaOwned};
 use pf_mp4::chapters::{ChapterTrack, TextAt};
+use pf_mp4::frag::{Tail, TailAt};
 use pf_probe::head::{AviHeadAt, MkvHead, MkvHeadAt, Mp4HeadOwned};
 use pf_probe::{Kind, PREFIX_LEN, probe};
 use profluens_core::fetch::{Fetch, Need, Step};
@@ -33,6 +34,8 @@ enum Stage {
     Cues(CuesAt),
     Meta(Box<MetaOwned<Arc<[u8]>>>),
     Mp4Head(Mp4HeadOwned),
+    /// The `mfra` and the last `moof` of a fragmented MP4 whose head states no length.
+    Mp4Tail(Box<TailAt>),
     /// The samples of an MP4's chapter track.
     Chapters(Box<TextAt>),
     AviHead(AviHeadAt),
@@ -156,6 +159,11 @@ impl OpenAt {
                 Stage::Mp4Head(m) => match m.poll().map_err(OpenError::Mp4Head)? {
                     Step::Need(n) => return Ok(Some(n)),
                     Step::Done(head) => self.mp4(Arc::from(head)),
+                },
+                Stage::Mp4Tail(m) => match m.poll() {
+                    Ok(Step::Need(n)) => return Ok(Some(n)),
+                    Ok(Step::Done(tail)) => self.mp4_described(&tail),
+                    Err(e) => match e {},
                 },
                 Stage::Chapters(m) => match m.poll() {
                     Ok(Step::Need(n)) => return Ok(Some(n)),
@@ -425,8 +433,18 @@ impl OpenAt {
         if head.len() as u64 > self.caps.max_head {
             return Err(OpenError::TooLarge);
         }
+        self.head = head;
+        if pf_mp4::frag::length_stated(&self.head) == Some(false) {
+            self.stage = Stage::Mp4Tail(Box::new(TailAt::new(self.len)));
+            return Ok(None);
+        }
+        self.mp4_described(&Tail::default())
+    }
+
+    fn mp4_described(&mut self, tail: &Tail) -> Result<Option<Need>, OpenError> {
+        let head = Arc::clone(&self.head);
         (self.duration, self.index) =
-            mp4::describe(&head, self.len, self.want.index, &mut self.desc)?;
+            mp4::describe(&head, self.len, self.want.index, tail, &mut self.desc)?;
         if self.want.meta
             && let pf_mp4::MoovExtent::InPrefix { offset, len } =
                 pf_mp4::locate_moov(&head, head.len() as u64)
@@ -434,12 +452,10 @@ impl OpenAt {
             self.meta = Meta::Moov(offset..offset + len);
             let track = head.get(offset..offset + len).and_then(pf_mp4::chapters::chapter_track);
             if let Some(track) = track.filter(|t| !t.samples.is_empty()) {
-                self.head = head;
                 self.stage = Stage::Chapters(Box::new(TextAt::new(track)));
                 return Ok(None);
             }
         }
-        self.head = head;
         self.done()
     }
 
@@ -636,6 +652,7 @@ impl OpenAt {
             Stage::Cues(m) => m.buf(),
             Stage::Meta(m) => m.buf(),
             Stage::Chapters(m) => m.buf(),
+            Stage::Mp4Tail(m) => m.buf(),
             Stage::Idx1(m) => m.buf(),
             _ => return false,
         };
@@ -658,6 +675,7 @@ impl OpenAt {
             Stage::Cues(m) => m.filled(n),
             Stage::Meta(m) => m.filled(n),
             Stage::Chapters(m) => m.filled(n),
+            Stage::Mp4Tail(m) => m.filled(n),
             Stage::Idx1(m) => m.filled(n),
             _ => {}
         }
@@ -711,6 +729,7 @@ impl Fetch for OpenAt {
             Stage::Cues(m) => m.buf(),
             Stage::Meta(m) => m.buf(),
             Stage::Mp4Head(m) => m.buf(),
+            Stage::Mp4Tail(m) => m.buf(),
             Stage::Chapters(m) => m.buf(),
             Stage::AviHead(m) => m.buf(),
             Stage::Idx1(m) => m.buf(),
@@ -725,6 +744,7 @@ impl Fetch for OpenAt {
             Stage::Cues(m) => m.filled(n),
             Stage::Meta(m) => m.filled(n),
             Stage::Mp4Head(m) => m.filled(n),
+            Stage::Mp4Tail(m) => m.filled(n),
             Stage::Chapters(m) => m.filled(n),
             Stage::AviHead(m) => m.filled(n),
             Stage::Idx1(m) => m.filled(n),

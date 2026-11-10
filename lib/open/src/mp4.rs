@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use pf_mp4::frag::{self, Tail};
 use pf_mp4::{Limits, Reframer, Tables, Track, TrackKind as Mp4Kind};
 
 use crate::{Brand, Desc, Index, OpenError, TrackDesc, TrackKind};
@@ -16,22 +17,27 @@ fn ns(ticks: i64, timescale: u32) -> u64 {
         as u64
 }
 
-/// The tracks of the head through `moov`, the longest track's duration, and with `index` the
-/// sample tables folded once for every run's demuxer, held to a file of `len` bytes.
+/// The tracks of the head through `moov`, the movie's duration, and with `index` the sample
+/// tables folded once for every run's demuxer, held to a file of `len` bytes. A fragmented
+/// movie's fragments and length come from its `sidx` and the `tail` too.
 pub(crate) fn describe(
     head: &[u8],
     len: u64,
     index: bool,
+    tail: &Tail,
     d: &mut Desc,
 ) -> Result<(u64, Index), OpenError> {
-    if !index {
+    // a fragmented moov holds few samples, folded for the length its fragments state
+    if !index && frag::length_stated(head).is_none() {
         let tracks = Tables::tracks_of(head).map_err(OpenError::Mp4)?;
         return Ok((tracks_into(&tracks, d)?, Index::None));
     }
     // the file's length bounds the index a small hostile table can declare
     let limits = Limits { file_len: Some(len), ..Limits::default() };
-    let tables = Arc::new(Tables::resolve(head, &[], limits).map_err(OpenError::Mp4)?);
-    Ok((tracks_into(tables.tracks(), d)?, Index::Mp4(tables)))
+    let mut tables = Tables::resolve(head, &tail.mfra, limits).map_err(OpenError::Mp4)?;
+    tables.last_fragment(&tail.moof);
+    let duration = tracks_into(tables.tracks(), d)?.max(tables.fragmented_duration_ns());
+    Ok((duration, if index { Index::Mp4(Arc::new(tables)) } else { Index::None }))
 }
 
 fn tracks_into(tracks: &[Track], d: &mut Desc) -> Result<u64, OpenError> {

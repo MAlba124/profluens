@@ -713,3 +713,106 @@ fn a_source_that_goes_back_for_one_track_of_a_fragmented_movie_puts_nothing_out_
         assert_eq!(of(&out, 1), audio[from..], "from the restart point, cut at {cut}");
     }
 }
+
+/// What ffmpeg writes for `args`, None without it.
+fn ffmpeg(name: &str, args: &[&str]) -> Option<Vec<u8>> {
+    let path = std::env::temp_dir().join(format!("pf_mp4_frag_{}_{name}", std::process::id()));
+    let ok = std::process::Command::new("ffmpeg")
+        .env_remove("LD_LIBRARY_PATH")
+        .args(["-v", "error", "-y"])
+        .args(args)
+        .arg(&path)
+        .status()
+        .is_ok_and(|s| s.success());
+    let file = ok.then(|| std::fs::read(&path).ok()).flatten();
+    let _ = std::fs::remove_file(&path);
+    if file.is_none() {
+        eprintln!("ffmpeg could not make {name}, skipped");
+    }
+    file
+}
+
+/// ffmpeg's fragmented form the sweep found, 6 s at 25 fps in 1 s fragments, the video 80 ms
+/// late as an empty edit in a `moov` whose durations are 0, the edit to the media's end.
+fn late_fragments(name: &str, flags: &str) -> Option<Vec<u8>> {
+    let movflags = format!("frag_keyframe+empty_moov+default_base_moof+delay_moov{flags}");
+    ffmpeg(
+        name,
+        &[
+            "-itsoffset",
+            "0.08",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=d=6:s=160x96:r=25",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=d=6:r=48000",
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "libx264",
+            "-g",
+            "25",
+            "-c:a",
+            "aac",
+            "-use_editlist",
+            "1",
+            "-movflags",
+            &movflags,
+        ],
+    )
+}
+
+/// The file up to its first `mdat`, the head an open hands the demuxer.
+fn head_of(file: &[u8]) -> &[u8] {
+    let mut at = 0usize;
+    while &file[at + 4..at + 8] != b"mdat" {
+        at += u32::from_be_bytes(file[at..at + 4].try_into().unwrap()) as usize;
+    }
+    &file[..at]
+}
+
+#[test]
+fn an_empty_edit_is_no_length_and_the_last_fragment_ends_the_movie() {
+    let Some(file) = late_fragments("dash.mp4", "+dash") else { return };
+    let elst = file.windows(4).position(|w| w == b"elst").unwrap() + 4;
+    assert_eq!(&file[elst..elst + 8], [0, 0, 0, 0, 0, 0, 0, 2], "version 0, two edits");
+    assert_eq!(&file[elst + 8..elst + 16], [0, 0, 0, 80, 0xFF, 0xFF, 0xFF, 0xFF], "80 ms empty");
+    let head = head_of(&file);
+    assert_eq!(frag::length_stated(head), Some(false), "no mehd");
+    let first = pf_mp4::Tables::resolve(head, &[], pf_mp4::Limits::default()).unwrap();
+    assert!(first.tracks().iter().all(|t| t.duration_ns == 0), "{:?}", first.tracks());
+    let video = &first.tracks()[0];
+    assert_eq!((video.frame_ticks, video.timescale), (512, 12_800), "25 fps from the trun rows");
+    let one = first.fragmented_duration_ns();
+    assert!(one.abs_diff(SECOND) < SECOND / 10, "the first sidx ends at {one}");
+
+    let mut log = Vec::new();
+    let mut at = frag::TailAt::new(file.len() as u64);
+    let tail = profluens_core::fetch::drive_slice_log(&mut at, &file, &mut log).unwrap();
+    assert_eq!(log.len(), 3, "the mfro, the mfra and the last moof, {log:?}");
+    assert_eq!(&tail.moof[4..8], b"moof");
+    let mut tables = pf_mp4::Tables::resolve(head, &tail.mfra, pf_mp4::Limits::default()).unwrap();
+    tables.last_fragment(&tail.moof);
+    for t in tables.tracks() {
+        assert!(t.duration_ns.abs_diff(6 * SECOND) < SECOND / 10, "{}", t.duration_ns);
+    }
+    let index = tables.seek_index(&|_| false);
+    let times: Vec<u64> = index.entries.iter().map(|e| e.time_ns / (SECOND / 10)).collect();
+    assert_eq!(times, [0, 10, 20, 30, 40, 50], "a fragment a second");
+    let length = index.duration.nanos().unwrap();
+    assert!(length.abs_diff(6 * SECOND) < SECOND / 10, "{length}");
+}
+
+#[test]
+fn the_tail_of_a_file_without_an_mfra_reads_once() {
+    let mut log = Vec::new();
+    let file = vec![0u8; 100];
+    let mut at = frag::TailAt::new(file.len() as u64);
+    let tail = profluens_core::fetch::drive_slice_log(&mut at, &file, &mut log).unwrap();
+    assert_eq!((tail, log.len()), (frag::Tail::default(), 1));
+}

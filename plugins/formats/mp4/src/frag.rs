@@ -2,8 +2,12 @@
 //! A `trun` can declare four billion samples in twenty octets, so rows are bounded by the `mdat`
 //! octets and [`MAX_FRAGMENT_SAMPLES`].
 
+use std::convert::Infallible;
+
+use profluens_core::fetch::{Fetch, Need, Step};
+
 use crate::boxes::{self, BoxError, Cursor, boxtype, read_full_box_head};
-use crate::reader::{Mp4Error, Sample, Track};
+use crate::reader::{Mp4Error, Sample, Tally, Track, ticks_to_ns};
 
 pub const MAX_FRAGMENT_SAMPLES: usize = 1 << 20;
 
@@ -147,6 +151,8 @@ impl Trun<'_> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sidx {
+    /// The track_ID of the stream the index times.
+    pub reference_id: u32,
     pub timescale: u32,
     pub earliest: u64,
     pub first_offset: u64,
@@ -166,7 +172,7 @@ pub struct SidxRef {
 pub fn parse_sidx(body: &[u8]) -> Result<Sidx, BoxError> {
     let mut r = Cursor::new(body);
     let version = read_full_box_head(&mut r)?.version;
-    r.skip(4, "sidx reference_ID")?;
+    let reference_id = r.u32("sidx reference_ID")?;
     let timescale = r.u32("sidx timescale")?;
     let (earliest, first_offset) = match version {
         0 => (
@@ -190,7 +196,7 @@ pub fn parse_sidx(body: &[u8]) -> Result<Sidx, BoxError> {
             starts_with_sap: sap >> 31 != 0,
         });
     }
-    Ok(Sidx { timescale, earliest, first_offset, refs })
+    Ok(Sidx { reference_id, timescale, earliest, first_offset, refs })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -199,21 +205,32 @@ pub struct FragmentRef {
     pub offset: u64,
 }
 
-pub fn sidx_fragments(sidx: &Sidx, anchor: u64, out: &mut Vec<FragmentRef>) {
+/// The fragments a `sidx` anchored at `anchor` indexes, stamped as `track`'s samples are.
+pub fn sidx_fragments(sidx: &Sidx, anchor: u64, track: Option<&Track>, out: &mut Vec<FragmentRef>) {
     let (mut time, mut offset) = (sidx.earliest, anchor.saturating_add(sidx.first_offset));
     for r in &sidx.refs {
         if !r.index {
-            out.push(FragmentRef {
-                time_ns: crate::reader::ticks_to_ns(
-                    time.min(i64::MAX as u64) as i64,
-                    sidx.timescale,
-                ),
-                offset,
-            });
+            out.push(FragmentRef { time_ns: sidx_ns(sidx, track, time), offset });
         }
         time = time.saturating_add(u64::from(r.duration));
         offset = offset.saturating_add(u64::from(r.size));
     }
+}
+
+/// `ticks` of a `sidx` in ns, on the timeline of `track` where it is the stream the index times
+/// in its own timescale, its edit's media time taken off as a fragment's samples have it.
+pub fn sidx_ns(sidx: &Sidx, track: Option<&Track>, ticks: u64) -> u64 {
+    let t = ticks.min(i64::MAX as u64) as i64;
+    let named = |tr: &&Track| tr.track_id == sidx.reference_id && tr.timescale == sidx.timescale;
+    match track.filter(named) {
+        Some(tr) => tr.stamp_ns(t.saturating_sub(tr.media_time)),
+        None => ticks_to_ns(t, sidx.timescale),
+    }
+}
+
+/// The end of a `sidx`'s last reference in its ticks.
+pub fn sidx_end(sidx: &Sidx) -> u64 {
+    sidx.refs.iter().fold(sidx.earliest, |t, r| t.saturating_add(u64::from(r.duration)))
 }
 
 // Cold path, once per index.
@@ -368,6 +385,254 @@ pub fn expand(
     Ok(first)
 }
 
+/// None for a head through `moov` that is not a fragmented movie, else whether its `mehd`
+/// states the length.
+pub fn length_stated(head: &[u8]) -> Option<bool> {
+    let mut at = 0usize;
+    while let Ok(h) = boxes::read_box_header(head, at) {
+        if h.kind == boxtype::MOOV {
+            let moov = h.body(head);
+            let mvex = boxes::find_child(moov, boxtype::MVEX).ok().flatten()?;
+            let mvex = mvex.body(moov);
+            let mehd = boxes::find_child(mvex, boxtype::MEHD).ok().flatten();
+            return Some(mehd.and_then(|m| parse_mehd(m.body(mvex)).ok()).is_some_and(|d| d != 0));
+        }
+        at = h.end;
+    }
+    None
+}
+
+/// Each track's presentation end in media ticks into `ends`, where a `tfdt` places its rows, and
+/// its rows' durations into `deltas`, from the body of one `moof`. Rows past
+/// [`MAX_FRAGMENT_SAMPLES`] are not read.
+pub(crate) fn summarize(
+    moof: &[u8],
+    movie: &Movie<'_>,
+    ends: &mut [Option<i64>],
+    deltas: &mut [Tally],
+) -> Result<(), BoxError> {
+    let mut rows = 0usize;
+    let mut at = 0usize;
+    while at + 8 <= moof.len() {
+        let h = boxes::read_box_header(moof, at)?;
+        at = h.end;
+        if h.kind != boxtype::TRAF {
+            continue;
+        }
+        let traf = h.body(moof);
+        let Some(tfhd) = boxes::find_child(traf, boxtype::TFHD)? else { continue };
+        let tfhd = parse_tfhd(tfhd.body(traf))?;
+        let Some(index) = movie.tracks.iter().position(|t| t.track_id == tfhd.track_id) else {
+            continue;
+        };
+        let trex = movie.trex.get(index).copied().unwrap_or_default();
+        let mut dts = match boxes::find_child(traf, boxtype::TFDT)? {
+            Some(tfdt) => Some(i128::from(parse_tfdt(tfdt.body(traf))?)),
+            None => None,
+        };
+        let mut child = 0usize;
+        while child + 8 <= traf.len() && !tfhd.empty {
+            let h = boxes::read_box_header(traf, child)?;
+            child = h.end;
+            if h.kind != boxtype::TRUN {
+                continue;
+            }
+            let mut run = parse_trun(h.body(traf))?;
+            for _ in 0..run.count {
+                rows += 1;
+                if rows > MAX_FRAGMENT_SAMPLES {
+                    return Ok(());
+                }
+                let row = run.row()?;
+                let duration = row.duration.or(tfhd.duration).unwrap_or(trex.duration);
+                if let Some(t) = deltas.get_mut(index) {
+                    t.add(duration, 1);
+                }
+                let Some(at) = dts else { continue };
+                let end = at + i128::from(row.offset) + i128::from(duration);
+                let end = end.clamp(0, i128::from(i64::MAX)) as i64;
+                if let Some(e) = ends.get_mut(index) {
+                    *e = Some(e.map_or(end, |e| e.max(end)));
+                }
+                dts = Some(at + i128::from(duration));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The most an `mfra` is read to, as `pf_probe` reads it.
+const MAX_MFRA: u64 = 16 << 20;
+/// The first read at the last `moof`, most hold the whole atom.
+const MOOF_FIRST: u64 = 64 << 10;
+
+/// What [`TailAt`] read, each empty where the file has none.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Tail {
+    pub mfra: Vec<u8>,
+    /// The last `moof` atom the `mfra` names, header and all.
+    pub moof: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TailStep {
+    Start,
+    Mfro,
+    Mfra,
+    /// The first read at `at`, the `moof` there or behind the atoms a segment leads with.
+    Moof {
+        at: u64,
+    },
+    Whole,
+}
+
+/// Reads the `mfra` a fragmented file of `len` bytes ends in (8.8.9), then the last `moof` its
+/// rows name, where the length of a movie its `mehd` does not state ends.
+#[derive(Debug)]
+pub struct TailAt {
+    len: u64,
+    step: TailStep,
+    mfro: [u8; 16],
+    tail: Tail,
+    got: usize,
+}
+
+impl TailAt {
+    pub fn new(len: u64) -> Self {
+        TailAt { len, step: TailStep::Start, mfro: [0; 16], tail: Tail::default(), got: 0 }
+    }
+
+    // Cold path, once per open.
+    #[allow(clippy::disallowed_methods)]
+    fn read(&mut self, step: TailStep, at: u64, len: u64, into_moof: bool) -> Step<Tail> {
+        let buf = vec![0; len as usize];
+        match into_moof {
+            true => self.tail.moof = buf,
+            false => self.tail.mfra = buf,
+        }
+        self.step = step;
+        Step::Need(Need { at, len: len as usize })
+    }
+
+    fn done(&mut self) -> Step<Tail> {
+        self.step = TailStep::Start;
+        Step::Done(std::mem::take(&mut self.tail))
+    }
+
+    /// The `moof` the first read at `at` holds, whole or read again by its size.
+    // Cold path, once per open.
+    #[allow(clippy::disallowed_methods)]
+    fn moof_at(&mut self, at: u64) -> Step<Tail> {
+        let held = std::mem::take(&mut self.tail.moof);
+        let mut from = 0usize;
+        while let Some((kind, header, size)) =
+            held.get(from..).and_then(|rest| box_head(rest, self.len - at - from as u64))
+        {
+            if kind == boxtype::MOOF {
+                if size - header > MAX_FRAGMENT_HEAD {
+                    break;
+                }
+                let end = from as u64 + size;
+                if end <= held.len() as u64 {
+                    self.tail.moof = held[from..end as usize].to_vec();
+                    return self.done();
+                }
+                return self.read(TailStep::Whole, at + from as u64, size, true);
+            }
+            from = match usize::try_from(size).ok().and_then(|n| from.checked_add(n)) {
+                Some(next) => next,
+                None => break,
+            };
+        }
+        self.done()
+    }
+}
+
+/// The type, header length and size of the atom `b` starts with, `left` the bytes to the end of
+/// the file. None where the header is cut or does not hold together.
+fn box_head(b: &[u8], left: u64) -> Option<(boxes::FourCc, u64, u64)> {
+    let h = b.get(..8)?;
+    let kind = [h[4], h[5], h[6], h[7]];
+    let (header, size) = match u32::from_be_bytes([h[0], h[1], h[2], h[3]]) {
+        0 => (8, left),
+        1 => (16, u64::from_be_bytes(b.get(8..16)?.try_into().ok()?)),
+        n => (8, u64::from(n)),
+    };
+    (size >= header && size <= left).then_some((kind, header, size))
+}
+
+/// The largest `moof` offset any `tfra` of an `mfra` atom names, below `len`.
+fn last_moof(mfra: &[u8], len: u64) -> Option<u64> {
+    let h = boxes::read_box_header(mfra, 0).ok().filter(|h| h.kind == boxtype::MFRA)?;
+    let body = h.body(mfra);
+    let mut last = None;
+    let _ = boxes::for_each_child(body, |child| {
+        if child.kind == boxtype::TFRA {
+            let (_, rows) = parse_tfra(child.body(body))?;
+            let most = rows.iter().map(|r| r.1).filter(|&at| at < len).max();
+            last = last.max(most);
+        }
+        Ok(())
+    });
+    last
+}
+
+impl Fetch for TailAt {
+    type Out = Tail;
+    type Err = Infallible;
+
+    fn poll(&mut self) -> Result<Step<Tail>, Infallible> {
+        let len = self.len;
+        Ok(match self.step {
+            TailStep::Start => match len.checked_sub(16) {
+                Some(at) => {
+                    self.step = TailStep::Mfro;
+                    Step::Need(Need { at, len: 16 })
+                }
+                None => Step::Done(Tail::default()),
+            },
+            TailStep::Mfro => match mfra_size(&self.mfro[..self.got]) {
+                Some(size) if (16..=MAX_MFRA.min(len)).contains(&size) => {
+                    self.read(TailStep::Mfra, len - size, size, false)
+                }
+                _ => self.done(),
+            },
+            TailStep::Mfra => {
+                self.tail.mfra.truncate(self.got);
+                match last_moof(&self.tail.mfra, len) {
+                    Some(at) => {
+                        self.read(TailStep::Moof { at }, at, MOOF_FIRST.min(len - at), true)
+                    }
+                    None => self.done(),
+                }
+            }
+            TailStep::Moof { at } => {
+                self.tail.moof.truncate(self.got);
+                self.moof_at(at)
+            }
+            TailStep::Whole => {
+                if self.got < self.tail.moof.len() {
+                    self.tail.moof.clear();
+                }
+                self.done()
+            }
+        })
+    }
+
+    fn buf(&mut self) -> &mut [u8] {
+        match self.step {
+            TailStep::Mfro => &mut self.mfro,
+            TailStep::Mfra => &mut self.tail.mfra,
+            TailStep::Moof { .. } | TailStep::Whole => &mut self.tail.moof,
+            TailStep::Start => &mut [],
+        }
+    }
+
+    fn filled(&mut self, n: usize) {
+        self.got = n.min(self.buf().len());
+    }
+}
+
 #[cfg(test)]
 // Test code builds its inputs on the heap.
 #[allow(clippy::disallowed_methods)]
@@ -420,7 +685,7 @@ mod tests {
         body.extend(be32(&[300, 2000, 0x9000_0000, 400, 1000, 0x9000_0000]));
         let sidx = parse_sidx(&body).expect("a whole sidx");
         let mut out = Vec::new();
-        sidx_fragments(&sidx, 1000, &mut out);
+        sidx_fragments(&sidx, 1000, None, &mut out);
         assert_eq!(
             out,
             [

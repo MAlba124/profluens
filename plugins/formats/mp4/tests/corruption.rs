@@ -468,7 +468,7 @@ fn drive_boxes(case: &Case) -> Result<(), Violation> {
     if let Ok(sidx) = frag::parse_sidx(body) {
         rows(sidx.refs.len(), 12)?;
         let mut fragments = Vec::new();
-        frag::sidx_fragments(&sidx, case.knob, &mut fragments);
+        frag::sidx_fragments(&sidx, case.knob, None, &mut fragments);
         check_output(fragments.len(), sidx.refs.len())?;
     }
     if let Ok((_, table)) = frag::parse_tfra(body) {

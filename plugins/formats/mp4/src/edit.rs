@@ -57,6 +57,8 @@ impl Edit {
 pub struct EditList {
     pub edits: Vec<Edit>,
     pub refused: Option<EditRefusal>,
+    /// The movie ticks the list spans, 0 where it states no length, as empty edits alone or an
+    /// edit open to the end of the media, the form a fragmented movie uses.
     pub movie_len: u64,
 }
 
@@ -84,7 +86,7 @@ pub fn follow(entries: &[ElstEntry], media: u32, movie: u32) -> Option<EditList>
     }
     let mut list = EditList::default();
     // Movie ticks so the starts do not drift by rounding.
-    let mut at = 0u64;
+    let (mut at, mut open) = (0u64, false);
     for (n, e) in entries.iter().enumerate() {
         let seg = e.segment_duration;
         let start = if movie == 0 { 0 } else { to_media(at, media, movie) };
@@ -110,9 +112,10 @@ pub fn follow(entries: &[ElstEntry], media: u32, movie: u32) -> Option<EditList>
             list.refused = Some(EditRefusal::Backwards);
             continue;
         }
+        open |= len == i64::MAX;
         list.edits.push(edit);
     }
-    list.movie_len = at;
+    list.movie_len = if open || list.edits.is_empty() { 0 } else { at };
     Some(list)
 }
 
@@ -248,6 +251,16 @@ mod tests {
         assert_eq!(follow(&[entry(1, 0)], 44_100, 1000).unwrap().edits[0].len, 45);
         assert_eq!(follow(&[entry(0, 7)], 1000, 1000).unwrap().edits[0].len, i64::MAX);
         assert!(follow(&[], 1000, 1000).is_none());
+    }
+
+    #[test]
+    fn an_empty_edit_or_one_open_to_the_end_states_no_length() {
+        // ffmpeg's fragmented form, 80 ms empty, then the media to its end
+        let list = follow(&[entry(80, -1), entry(0, 1024)], 12_800, 1000).unwrap();
+        assert_eq!(list.edits, [Edit { start: 1024, media: 1024, len: i64::MAX }]);
+        assert_eq!(list.movie_len, 0);
+        assert_eq!(follow(&[entry(80, -1)], 12_800, 1000).unwrap().movie_len, 0);
+        assert_eq!(follow(&[entry(80, -1), entry(920, 0)], 12_800, 1000).unwrap().movie_len, 1000);
     }
 
     #[test]

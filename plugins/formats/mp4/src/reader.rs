@@ -376,11 +376,14 @@ impl Tables {
     #[allow(clippy::disallowed_methods)]
     pub fn resolve(head: &[u8], mfra: &[u8], limits: Limits) -> Result<Tables, Mp4Error> {
         let moov = find_moov(head)?.ok_or(Mp4Error::Missing("moov"))?;
-        let movie = resolve_moov(moov.body(head), Some(limits))?;
+        let mut movie = resolve_moov(moov.body(head), Some(limits))?;
+        if let Some(trex) = &movie.trex {
+            fragment_rates(head, moov.end, &mut movie.tracks, trex);
+        }
         let rules = rules_of(&movie.tracks);
         let frag = movie.trex.map(|trex| {
             let mut fragments = Vec::new();
-            let indexed_to = index_head(head, moov.end, &mut fragments);
+            let indexed_to = index_head(head, moov.end, &movie.tracks, &mut fragments);
             index_mfra(mfra, &movie.tracks, &mut fragments);
             fragments.sort_unstable();
             fragments.dedup_by_key(|f| f.offset);
@@ -395,7 +398,11 @@ impl Tables {
     /// describes them. A table the fold refuses is not seen here.
     pub fn tracks_of(head: &[u8]) -> Result<Vec<Track>, Mp4Error> {
         let moov = find_moov(head)?.ok_or(Mp4Error::Missing("moov"))?;
-        Ok(resolve_moov(moov.body(head), None)?.tracks)
+        let mut movie = resolve_moov(moov.body(head), None)?;
+        if let Some(trex) = &movie.trex {
+            fragment_rates(head, moov.end, &mut movie.tracks, trex);
+        }
+        Ok(movie.tracks)
     }
 
     pub fn tracks(&self) -> &[Track] {
@@ -522,6 +529,31 @@ impl Tables {
 
     pub fn fragmented_duration_ns(&self) -> u64 {
         self.frag.as_ref().map_or(0, |frag| frag.duration_ns)
+    }
+
+    /// Raises a fragmented movie's length and each track's to where the `moof` atom `moof`, the
+    /// file's last, ends them. See [`frag::TailAt`].
+    // Cold path, once per open.
+    #[allow(clippy::disallowed_methods)]
+    pub fn last_fragment(&mut self, moof: &[u8]) {
+        let Some(frag) = self.frag.as_mut() else { return };
+        let Some(h) =
+            boxes::read_box_header(moof, 0).ok().filter(|h| h.kind == boxes::boxtype::MOOF)
+        else {
+            return;
+        };
+        let mut ends = vec![None; self.tracks.len()];
+        let mut deltas = vec![Tally::NEW; self.tracks.len()];
+        let movie = frag::Movie { tracks: &self.tracks, trex: &frag.trex };
+        if frag::summarize(h.body(moof), &movie, &mut ends, &mut deltas).is_err() {
+            return;
+        }
+        for (track, end) in self.tracks.iter_mut().zip(ends) {
+            let Some(end) = end else { continue };
+            let ns = track.stamp_ns(end.saturating_sub(track.media_time));
+            track.duration_ns = track.duration_ns.max(ns);
+            frag.duration_ns = frag.duration_ns.max(ns);
+        }
     }
 
     /// The time to byte map of the movie. Sync samples of the first
@@ -1634,10 +1666,6 @@ fn resolve_moov(moov_body: &[u8], limits: Option<Limits>) -> Result<Movie, Mp4Er
     for track in tracks.iter_mut().filter(|track| track.duration_ns == 0) {
         track.duration_ns = duration_ns;
     }
-    // a fragment's samples are not in the head, their default duration stands for them
-    for (track, x) in tracks.iter_mut().zip(&trex).filter(|(t, _)| t.frame_ticks == 0) {
-        track.frame_ticks = x.duration;
-    }
     Ok(Movie { tracks, samples, trex: Some(trex), duration_ns, skipped })
 }
 
@@ -1730,7 +1758,8 @@ fn rules_of(tracks: &[Track]) -> Vec<Rule> {
         .collect()
 }
 
-fn index_head(head: &[u8], mut at: usize, out: &mut Vec<FragmentRef>) -> u64 {
+/// The fragments the `sidx` atoms behind the `moov` index, and the end of the last.
+fn index_head(head: &[u8], mut at: usize, tracks: &[Track], out: &mut Vec<FragmentRef>) -> u64 {
     let mut end_ns = 0u64;
     while let Ok(h) = boxes::read_box_header(head, at) {
         if h.kind == boxes::boxtype::MOOF || h.kind == boxes::boxtype::MDAT {
@@ -1739,16 +1768,41 @@ fn index_head(head: &[u8], mut at: usize, out: &mut Vec<FragmentRef>) -> u64 {
         if let Some(sidx) =
             (h.kind == boxes::boxtype::SIDX).then(|| frag::parse_sidx(h.body(head)).ok()).flatten()
         {
-            frag::sidx_fragments(&sidx, h.end as u64, out);
-            let ticks = sidx
-                .refs
-                .iter()
-                .fold(sidx.earliest, |t, r| t.saturating_add(u64::from(r.duration)));
-            end_ns = end_ns.max(ticks_to_ns(ticks.min(i64::MAX as u64) as i64, sidx.timescale));
+            let track = tracks.iter().find(|t| t.track_id == sidx.reference_id);
+            frag::sidx_fragments(&sidx, h.end as u64, track, out);
+            end_ns = end_ns.max(frag::sidx_ns(&sidx, track, frag::sidx_end(&sidx)));
         }
         at = h.end;
     }
     end_ns
+}
+
+/// A fragmented track's frame delta, its `stts`'s, else the one most rows of the first `moof`
+/// behind the `moov` take, else its `trex` default.
+// Cold path, once per movie.
+#[allow(clippy::disallowed_methods)]
+fn fragment_rates(head: &[u8], mut at: usize, tracks: &mut [Track], trex: &[Trex]) {
+    let mut deltas = vec![Tally::NEW; tracks.len()];
+    while let Ok(h) = boxes::read_box_header(head, at) {
+        if h.kind == boxes::boxtype::MDAT {
+            break;
+        }
+        if h.kind == boxes::boxtype::MOOF {
+            let mut ends = vec![None; tracks.len()];
+            let movie = frag::Movie { tracks, trex };
+            let _ = frag::summarize(h.body(head), &movie, &mut ends, &mut deltas);
+            break;
+        }
+        at = h.end;
+    }
+    for ((track, tally), x) in tracks.iter_mut().zip(&deltas).zip(trex) {
+        if track.frame_ticks == 0 {
+            track.frame_ticks = match tally.most() {
+                0 => x.duration,
+                most => most,
+            };
+        }
+    }
 }
 
 fn index_mfra(mfra: &[u8], tracks: &[Track], out: &mut Vec<FragmentRef>) {
@@ -2053,48 +2107,69 @@ fn sizes_total(body: &[u8], stz2: bool) -> Option<u64> {
     })
 }
 
-/// Distinct deltas `frame_ticks` tallies, a table with more takes the mean.
+/// Distinct deltas a [`Tally`] keeps, a table with more takes the mean.
 const DELTAS: usize = 16;
 
-/// The delta most samples of an `stts` body take, walked in place. A variable rate table of more
-/// than `DELTAS` distinct deltas gives the mean instead, 0 for a table of no timed sample.
+/// The delta most samples take, of up to [`DELTAS`] distinct ones, the mean past them.
+#[derive(Clone, Copy)]
+pub(crate) struct Tally {
+    seen: [(u32, u64); DELTAS],
+    used: usize,
+    over: bool,
+    ticks: u128,
+    samples: u64,
+}
+
+impl Tally {
+    pub(crate) const NEW: Tally =
+        Tally { seen: [(0, 0); DELTAS], used: 0, over: false, ticks: 0, samples: 0 };
+
+    pub(crate) fn add(&mut self, delta: u32, count: u64) {
+        if count == 0 || delta == 0 {
+            return;
+        }
+        self.ticks += u128::from(count) * u128::from(delta);
+        self.samples = self.samples.saturating_add(count);
+        match self.seen[..self.used].iter_mut().find(|t| t.0 == delta) {
+            Some(t) => t.1 += count,
+            None if self.used < DELTAS => {
+                self.seen[self.used] = (delta, count);
+                self.used += 1;
+            }
+            None => self.over = true,
+        }
+    }
+
+    /// 0 for no timed sample.
+    pub(crate) fn most(&self) -> u32 {
+        if self.samples == 0 {
+            return 0;
+        }
+        if self.over {
+            return u32::try_from(self.ticks / u128::from(self.samples)).unwrap_or(0);
+        }
+        // the first of equal counts, a table's leading run
+        let mut best = self.seen[0];
+        for t in &self.seen[1..self.used] {
+            if t.1 > best.1 {
+                best = *t;
+            }
+        }
+        best.0
+    }
+}
+
+/// The delta most samples of an `stts` body take, walked in place, see [`Tally`].
 fn frame_ticks(body: &[u8]) -> u32 {
     let be32 = |o: usize| body.get(o..o + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
     let Some(n) = be32(4) else { return 0 };
-    let mut tally = [(0u32, 0u64); DELTAS];
-    let (mut used, mut over) = (0, false);
-    let (mut ticks, mut samples) = (0u128, 0u64);
+    let mut tally = Tally::NEW;
     for i in 0..n as usize {
         let at = 8 + i * 8;
         let (Some(count), Some(delta)) = (be32(at), be32(at + 4)) else { break };
-        if count == 0 || delta == 0 {
-            continue;
-        }
-        ticks += u128::from(count) * u128::from(delta);
-        samples += u64::from(count);
-        match tally[..used].iter_mut().find(|t| t.0 == delta) {
-            Some(t) => t.1 += u64::from(count),
-            None if used < DELTAS => {
-                tally[used] = (delta, u64::from(count));
-                used += 1;
-            }
-            None => over = true,
-        }
+        tally.add(delta, u64::from(count));
     }
-    if samples == 0 {
-        return 0;
-    }
-    if over {
-        return u32::try_from(ticks / u128::from(samples)).unwrap_or(0);
-    }
-    // the first of equal counts, a table's leading run
-    let mut best = tally[0];
-    for t in &tally[1..used] {
-        if t.1 > best.1 {
-            best = *t;
-        }
-    }
-    best.0
+    tally.most()
 }
 
 /// `bytes` over `duration` ticks of `timescale` a second, as bits a second.

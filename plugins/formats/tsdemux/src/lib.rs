@@ -795,6 +795,7 @@ impl TsDemux {
         if let Some(demux) = self.demux.as_mut() {
             demux.discontinuity();
             if self.grown.placed != Placed::Segments {
+                self.grown.jump(demux.position(), Some(target.to_byte));
                 demux.set_position(target.to_byte);
             }
         }
@@ -1001,6 +1002,7 @@ impl Element for TsDemux {
         self.demux = Some(demux);
         self.grown.placed = Placed::File;
         self.grown.rekey(key_of(&self.tracks));
+        self.grown.open();
         self.clock.unwrap.reset();
         (self.clock.shift, self.clock.anchor, self.clock.origin) = (0, Some(0), None);
         if let Some((first, least)) = self.opening {
@@ -1081,6 +1083,7 @@ impl TsDemux {
                         let segment = buf.flags.contains(BufferFlags::SEGMENT);
                         log!(&*ctx, Level::Debug, "discont", segment = segment);
                         self.break_stream(segment.then_some(&mut *ctx));
+                        self.grown.jump(0, None);
                     }
                     if buf.flags.contains(BufferFlags::SEGMENT) {
                         log!(&*ctx, Level::Debug, "segment", pts = buf.pts);
@@ -1112,7 +1115,7 @@ impl TsDemux {
                 }
                 self.feed(ctx, &[], true);
                 self.unpark(ctx);
-                if self.grown.unpublished() {
+                if self.grown.end() {
                     Self::publish(ctx, &mut self.grown);
                 }
                 self.log_end(ctx);
@@ -1129,6 +1132,8 @@ impl TsDemux {
                     let at = target.map_or(0, |t| t.to_byte);
                     log!(&*ctx, Level::Debug, "flush", seek = target.is_some(), at = at);
                     self.grown.placed = if target.is_some() { Placed::File } else { Placed::Lost };
+                    let from = self.demux.as_ref().map_or(0, Demux::position);
+                    self.grown.jump(from, target.map(|t| t.to_byte));
                     if let (Some(demux), Some(target)) = (self.demux.as_mut(), target) {
                         demux.set_position(target.to_byte);
                     }

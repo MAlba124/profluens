@@ -202,7 +202,6 @@ fn keyframe_at(bytes: &[u8], byte: u64) -> bool {
 }
 
 fn check(s: &Stream, index: &Index, seen: &Seen, stamped: bool) {
-    assert!(!index.complete);
     assert_eq!((index.duration, index.stream, index.grouped), (Timestamp::NONE, Some(0), true));
     let keys: std::collections::HashMap<u64, u64> = s.keys.iter().map(|k| (k.byte, k.ns)).collect();
     for e in &index.entries {
@@ -223,6 +222,8 @@ fn every_keyframe_read_is_an_entry_published_every_64() {
     let (seen, index) = run(s, Duration::ZERO, &[]);
     let index = index.expect("published");
     check(s, &index, &seen, true);
+    assert!(index.complete, "read whole from the start");
+    assert!(seen.published.iter().all(|i| !i.complete || i.entries.len() == s.keys.len()));
     let got: Vec<Key> = index.entries.iter().map(|e| Key { byte: e.byte, ns: e.time_ns }).collect();
     assert_eq!(got, s.keys, "every keyframe, in order");
     let mut lens: Vec<usize> = seen.published.iter().map(|i| i.entries.len()).collect();
@@ -250,6 +251,7 @@ fn behind_a_seek_bytes_count_from_its_target_and_nothing_doubles() {
     let (seen, index) = run(s, Duration::from_millis(1), &seeks);
     let index = index.expect("published");
     check(s, &index, &seen, false);
+    assert!(!index.complete, "a stretch was skipped");
     let got: std::collections::HashSet<Key> =
         index.entries.iter().map(|e| Key { byte: e.byte, ns: e.time_ns }).collect();
     assert!(k[10..].iter().all(|key| got.contains(key)), "{} of {}", got.len(), k.len());

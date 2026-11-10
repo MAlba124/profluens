@@ -1,5 +1,6 @@
-//! Seek index grown from keyframes read. Entries ascend in time and bytes,
-//! it is never `complete` and is published every [`GROWN_EVERY`] entries, at a flush and the end.
+//! Seek index grown from keyframes read. Entries ascend in time and bytes, it is published every
+//! [`GROWN_EVERY`] entries, at a flush and the end. Past its last entry the keyframe is unknown
+//! until it is `complete`, the end read with no stretch skipped since the start.
 
 use profluens_core::pipeline::{Index, IndexEntry};
 use profluens_core::time::Timestamp;
@@ -39,6 +40,11 @@ pub struct Grown {
     pub file_len: Option<u64>,
     /// What the opener of the file found it lasts, for the estimate past the last entry.
     pub duration: Option<u64>,
+    /// Every keyframe from the start on is in `entries`, none skipped over or refused.
+    pub gapless: bool,
+    /// The furthest byte read while gapless.
+    pub reached: u64,
+    pub complete: bool,
 }
 
 impl Grown {
@@ -51,17 +57,42 @@ impl Grown {
             published: 0,
             file_len: None,
             duration: None,
+            gapless: true,
+            reached: 0,
+            complete: false,
         }
+    }
+
+    /// A run reads the file from its start.
+    pub fn open(&mut self) {
+        (self.gapless, self.reached) = (true, 0);
+    }
+
+    /// Reading goes on at `to` from `at`, `to` being `None` for no file byte. Ahead of what was
+    /// read it skips a stretch.
+    pub fn jump(&mut self, at: u64, to: Option<u64>) {
+        self.reached = self.reached.max(at);
+        self.gapless &= to.is_some_and(|to| to <= self.reached);
+    }
+
+    /// At the end of the input, true when the index is due again.
+    pub fn end(&mut self) -> bool {
+        let whole = self.gapless && self.placed == Placed::File && self.key.is_some();
+        let due = self.unpublished() || (whole && !self.complete);
+        self.complete |= whole;
+        due
     }
 
     pub fn keys(&self, pid: u16) -> bool {
         self.placed == Placed::File && self.key.is_some_and(|key| key.pid == pid)
     }
 
-    /// What was grown belongs to the old key and goes.
+    /// What was grown belongs to the old key and goes, the new one's keyframes read so far are
+    /// not in it.
     pub fn rekey(&mut self, key: Option<Key>) {
         if self.key != key {
             (self.key, self.published) = (key, 0);
+            (self.gapless, self.complete) = (false, false);
             self.entries.clear();
         }
     }
@@ -80,7 +111,11 @@ impl Grown {
             .is_some_and(|e| e.time_ns - time_ns < spacing.max(1) || e.byte <= byte);
         let prev = at.checked_sub(1).map(|n| &self.entries[n]);
         let prev = prev.is_some_and(|e| time_ns - e.time_ns < spacing || e.byte >= byte);
-        if next || prev || self.entries.len() >= MAX_GROWN {
+        if next || prev {
+            return false;
+        }
+        if self.entries.len() >= MAX_GROWN {
+            self.gapless = false;
             return false;
         }
         self.entries.insert(at, IndexEntry::key(time_ns, byte));
@@ -99,7 +134,7 @@ impl Grown {
             entries: self.entries.clone(),
             file_len: self.file_len,
             duration: self.duration.map_or(Timestamp::NONE, Timestamp),
-            complete: false,
+            complete: self.complete,
             stream: self.key.map(|key| key.stream),
             grouped: self.key.is_some_and(|key| key.video),
             ..Index::default()
@@ -180,6 +215,34 @@ mod tests {
         assert_eq!((index.entries.len(), index.stream, index.grouped), (130, Some(0), true));
         assert!(!g.unpublished());
         assert!(!g.keyframe(130 * S, 130 * 188) && g.unpublished());
+    }
+
+    #[test]
+    fn the_end_read_with_nothing_skipped_since_the_start_is_complete() {
+        let read = |jumps: &[(u64, Option<u64>)]| {
+            let mut g = video();
+            g.open();
+            g.keyframe(0, 0);
+            jumps.iter().for_each(|&(at, to)| g.jump(at, to));
+            g.keyframe(S, 9_400);
+            let due = g.end();
+            (due, g.index().complete)
+        };
+        assert_eq!(read(&[]), (true, true));
+        assert_eq!(read(&[(9_000, Some(400)), (2_000, Some(8_000))]), (true, true), "back");
+        assert_eq!(read(&[(9_000, Some(9_001))]), (true, false), "ahead of the read");
+        assert_eq!(read(&[(9_000, None)]), (true, false), "no file byte");
+        let mut g = video();
+        g.open();
+        g.keyframe(0, 0);
+        assert!(g.end() && g.index().complete);
+        assert!(!g.end(), "published whole already");
+        g.rekey(Some(Key { pid: 257, stream: 1, video: false }));
+        assert!(!g.end() && !g.index().complete, "the new key's keyframes read are not in it");
+        let mut g = video();
+        g.open();
+        g.placed = Placed::Lost;
+        assert!(!g.end() && !g.index().complete);
     }
 
     #[test]

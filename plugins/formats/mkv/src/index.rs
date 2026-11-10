@@ -8,16 +8,24 @@ pub use profluens_core::pipeline::CAPTION_REACH;
 use profluens_core::pipeline::IndexEntry;
 
 use crate::codec::{family_for, is_audio_family, is_video_family, lead_of};
+use crate::element::LEAD_MIN;
 use crate::reader::{Cue, Track};
 
 /// A caption track's cue as `(track, start, end, byte)`.
 pub type CaptionSpan = (u64, u64, u64, u64);
 
 /// The longest pre-roll an audio track may go without beside linked video, its restart then the
-/// video keyframe's own Cluster: AC3, E-AC3, AAC, DTS and FLAC under it, MP3, Vorbis and Opus
-/// over. Audio may then start up to a packet after the picture, the read saved is the whole group
-/// before (megabytes, a cold disk seek). An audio only run keeps every lead.
+/// video keyframe's own Cluster. AC3, E-AC3, AAC, DTS and FLAC are under it. MP3, Vorbis and Opus
+/// are over and go back only within `PRE_ROLL_BYTES`. Audio may then start up to a packet after
+/// the picture, the read saved is the whole group before (megabytes, a cold disk seek). An audio
+/// only run keeps every lead.
 pub const SHORT_PRE_ROLL: u64 = 25_000_000;
+
+/// The most a long pre-roll steps back of the keyframe's Cluster beside linked video, the first
+/// read of a seek before any keyframe sized it, so the step costs about no read. The step back
+/// over it was a whole group for a few KB of audio. Audio then starts without pre-roll, as in
+/// ffmpeg.
+pub const PRE_ROLL_BYTES: u64 = LEAD_MIN as u64;
 
 /// The first video track the Cues name (RFC 9559 section 22.1), else the first audio track.
 pub fn key_track(cues: &[Cue], tracks: &[Track]) -> Option<u64> {
@@ -123,9 +131,11 @@ pub fn cue_entries_of(
         .zip(text)
         .map(|(&(time, byte), text)| {
             let mut earliest = (time, byte);
+            // A cue past the key's byte, Cues out of byte order, adds nothing to read.
+            let near = |at: &(u64, u64)| !video || byte.saturating_sub(at.1) <= PRE_ROLL_BYTES;
             for (own, lead) in &audio {
                 let list = if own.is_empty() { &keys[..] } else { &own[..] };
-                if let Some(at) = floor(list, time.saturating_sub(*lead)) {
+                if let Some(at) = floor(list, time.saturating_sub(*lead)).filter(near) {
                     earliest = earliest.min(at);
                 }
             }
@@ -358,6 +368,110 @@ mod tests {
             let entries = cue_entries(&cues, &tracks, &|_| true, 1_000_000);
             assert_ne!(restarts(&entries), keys, "{codec} keeps its pre-roll");
         }
+    }
+
+    /// Video keys 2 s apart at `bytes` beside an uncued audio track of `codec`.
+    fn spaced(bytes: &[u64], codec: &str) -> (Vec<Cue>, Vec<Track>) {
+        let cues = bytes.iter().zip(0..).map(|(&b, n)| cue(1, n * 2 * S, b, None)).collect();
+        (cues, vec![track(1, "V_VP9"), track(2, codec)])
+    }
+
+    fn own(entries: &[IndexEntry]) -> Vec<(u64, u64)> {
+        entries.iter().map(|e| (e.byte, e.time_ns)).collect()
+    }
+
+    fn back(entries: &[IndexEntry]) -> Vec<(u64, u64)> {
+        entries.iter().map(|e| (e.restart, e.restart_ns)).collect()
+    }
+
+    const LONG: [&str; 3] = ["A_OPUS", "A_VORBIS", "A_MPEG/L3"];
+
+    #[test]
+    fn long_pre_roll_beside_video_goes_back_only_within_the_cap() {
+        for (gap, steps) in [(PRE_ROLL_BYTES + 1, false), (PRE_ROLL_BYTES, true), (8 << 20, false)]
+        {
+            let bytes: Vec<u64> = (0..6).map(|n| 4_000 + n * gap).collect();
+            for codec in LONG {
+                let (cues, tracks) = spaced(&bytes, codec);
+                let entries = cue_entries(&cues, &tracks, &|_| true, 1_000_000);
+                let want: Vec<(u64, u64)> = match steps {
+                    false => own(&entries),
+                    true => (0..6).map(|n: usize| own(&entries)[n.saturating_sub(1)]).collect(),
+                };
+                assert_eq!(back(&entries), want, "{codec}, keys {gap} bytes apart");
+            }
+        }
+    }
+
+    #[test]
+    fn entries_under_the_cap_step_back_and_those_over_it_do_not() {
+        let gaps = [1_000, PRE_ROLL_BYTES + 1, 300_000, 3 << 20, PRE_ROLL_BYTES];
+        let mut bytes = vec![4_000];
+        for g in gaps {
+            bytes.push(bytes[bytes.len() - 1] + g);
+        }
+        for codec in LONG {
+            let (cues, tracks) = spaced(&bytes, codec);
+            let entries = cue_entries(&cues, &tracks, &|_| true, 1_000_000);
+            let keys = own(&entries);
+            let want = [keys[0], keys[0], keys[2], keys[2], keys[4], keys[4]];
+            assert_eq!(back(&entries), want, "{codec}");
+        }
+    }
+
+    #[test]
+    fn audio_alone_keeps_its_lead_past_the_cap() {
+        let bytes: Vec<u64> = (0..4).map(|n| 4_000 + n * (8 << 20)).collect();
+        for codec in LONG {
+            let (cues, tracks) = spaced(&bytes, codec);
+            let entries = cue_entries(&cues, &tracks, &|n| n == 2, 1_000_000);
+            let keys = own(&entries);
+            assert_eq!(back(&entries), [keys[0], keys[0], keys[1], keys[2]], "{codec}");
+        }
+    }
+
+    /// An audio cue in the cap is gone back to, one past it is not.
+    #[test]
+    fn an_audio_cue_of_its_own_beside_video_is_taken_within_the_cap() {
+        let gap = 4 * PRE_ROLL_BYTES;
+        let (mut cues, tracks) =
+            spaced(&(0..6).map(|n| 4_000 + n * gap).collect::<Vec<_>>(), "A_OPUS");
+        let near = |n: u64| if n.is_multiple_of(2) { 1_000 } else { PRE_ROLL_BYTES + 1 };
+        cues.extend((1..6).map(|n| cue(2, n * 2 * S - S / 2, 4_000 + n * gap - near(n), None)));
+        cues.sort_by_key(|c| c.time_ns);
+        let entries = cue_entries(&cues, &tracks, &|_| true, 1_000_000);
+        let want: Vec<(u64, u64)> = (0..6u64)
+            .map(|n| match n {
+                0 | 1 | 3 | 5 => (4_000 + n * gap, n * 2 * S),
+                n => (4_000 + n * gap - 1_000, n * 2 * S - S / 2),
+            })
+            .collect();
+        assert_eq!(back(&entries), want);
+    }
+
+    /// The cap is the audio's alone, a caption goes back as far as its block lies.
+    #[test]
+    fn a_caption_goes_back_past_the_audio_cap() {
+        let gap = 8 << 20;
+        let (mut cues, mut tracks) =
+            spaced(&(0..8).map(|n| 4_000 + n * gap).collect::<Vec<_>>(), "A_OPUS");
+        tracks.push(track(3, "S_TEXT/UTF8"));
+        cues.push(cue(3, 55 * S / 10, 4_000 + 2 * gap + 10, Some(4 * S)));
+        cues.sort_by_key(|c| c.time_ns);
+        let entries = cue_entries(&cues, &tracks, &|_| true, 1_000_000);
+        let keys = own(&entries);
+        let want = [keys[0], keys[1], keys[2], keys[2], keys[2], keys[5], keys[6], keys[7]];
+        assert_eq!(back(&entries), want);
+
+        let (cues, mut tracks) =
+            spaced(&(0..20).map(|n| 4_000 + n * gap).collect::<Vec<_>>(), "A_OPUS");
+        tracks.push(track(3, "S_TEXT/UTF8"));
+        let entries = cue_entries(&cues, &tracks, &|_| true, 1_000_000);
+        let keys = own(&entries);
+        let want: Vec<(u64, u64)> = (0..20u64)
+            .map(|n| keys[((n * 2 * S).saturating_sub(CAPTION_REACH) / (2 * S)) as usize])
+            .collect();
+        assert_eq!(back(&entries), want, "an uncued caption track goes back the reach");
     }
 
     #[test]

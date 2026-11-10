@@ -1028,7 +1028,7 @@ enum Hold {
 /// A seek's first read holds the Cluster's head and its keyframe, so the kernel reads them as
 /// one random read instead of ramping its readahead behind a small window. The keyframes seen
 /// size it, or the stream's rate over [`LEAD_NS`] before any was.
-const LEAD_MIN: u32 = 512 << 10;
+pub(crate) const LEAD_MIN: u32 = 512 << 10;
 const LEAD_MAX: u32 = 4 << 20;
 const LEAD_NS: u64 = 150_000_000;
 /// Room past a seen keyframe for the Cluster's head and blocks before it.

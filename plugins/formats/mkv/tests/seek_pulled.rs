@@ -6,6 +6,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use pf_mkv::ebml::id;
+use pf_mkv::index::PRE_ROLL_BYTES;
 use pf_mkv::{
     MatroskaReader, MatroskaWriter, MkvDemux, Parsed, TrackConfig, parse_cue_tracks,
     parse_seek_head,
@@ -59,8 +60,12 @@ static SRC: ElementDesc = desc("memsrc", &[], &SRC_PADS);
 static SINK: ElementDesc = desc("recsink", &SINK_PADS, &[]);
 const OUT: SrcPad = SrcPad(0);
 
+/// The source's place in what was seen, its asks and flushes.
+const SOURCE: usize = usize::MAX;
+
 struct MemSrc {
     file: Arc<[u8]>,
+    out: Arc<Mutex<Vec<(usize, Seen)>>>,
 }
 
 impl Element for MemSrc {
@@ -76,6 +81,7 @@ impl Element for MemSrc {
     fn process(&mut self, ctx: &mut Ctx, _inputs: Inputs<'_>) -> Result<Flow, Error> {
         while let Some(ask) = ctx.next_ask(OUT) {
             let profluens_core::pull::Ask { offset, len, tag, mut buf } = ask;
+            self.out.lock().unwrap().push((SOURCE, Seen::Ask { offset, len }));
             let from = offset.min(self.file.len() as u64) as usize;
             let n = (len as usize).min(self.file.len() - from).min(buf.memory.capacity());
             buf.memory.as_mut_full()[..n].copy_from_slice(&self.file[from..from + n]);
@@ -84,6 +90,13 @@ impl Element for MemSrc {
         }
         Ok(if ctx.asks_over(OUT) { Flow::Eos } else { Flow::Ok })
     }
+
+    fn event(&mut self, _ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        if matches!(event, Event::FlushStart) {
+            self.out.lock().unwrap().push((SOURCE, Seen::Flush));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +104,7 @@ enum Seen {
     Frame { pts: Option<u64>, key: bool, len: usize },
     Flush,
     Eos,
+    Ask { offset: u64, len: u32 },
 }
 
 struct RecSink {
@@ -191,13 +205,13 @@ fn play_seeks(
     let clock = MockClock::new();
     let shared: Arc<dyn Clock> = Arc::new(clock.clone());
     let mut p = Pipeline::with(DebugSpec::default(), false, Arc::clone(&shared));
-    let src = p.add(MemSrc { file: Arc::from(file) });
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let src = p.add(MemSrc { file: Arc::from(file), out: Arc::clone(&out) });
     let demux = p.add(MkvDemux::with_parsed(Arc::new(parsed(file))).without_extras());
     p.set_element_pool(src, 1 << 20, 8);
     p.set_element_pool_bytes(demux, 128 << 10, 1024, 64 << 20);
     p.link(src.src(OUT), demux.sink(MkvDemux::IN)).unwrap();
     let added = p.preroll().unwrap();
-    let out = Arc::new(Mutex::new(Vec::new()));
     for (n, a) in added.srcs.iter().enumerate().filter(|(n, _)| link(*n)) {
         let sink = p.add(RecSink { pad: n, out: Arc::clone(&out) });
         p.link(demux.src(a.pad), sink.sink(SinkPad(0))).unwrap();
@@ -451,4 +465,62 @@ fn a_seek_back_after_a_track_ended_plays_it_again() {
     assert_eq!(video.first(), Some(&(4 * S, true)), "the video again from its keyframe");
     assert!(video.last().is_some_and(|f| f.0 >= 9_900 * MS), "to its end");
     assert!(ran.after_flush(1).last().is_some_and(|f| f.0 >= 119 * S));
+}
+
+/// 10 s of 32 KiB pictures, a keyframe each 2 s, beside 20 ms Opus packets, so a group is far
+/// over what a long pre-roll may step back.
+fn wide_groups() -> Vec<u8> {
+    const OPUS_HEAD: &[u8; 19] = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00";
+    let mut opus = TrackConfig::audio(2, "A_OPUS", OPUS_HEAD.to_vec(), 48_000.0, 2, 0);
+    opus.seek_pre_roll_ns = 80 * MS;
+    let mut w = MatroskaWriter::new(vec![TrackConfig::vp8(1, 320, 240), opus]);
+    w.enable_cues();
+    let mut out = Vec::new();
+    w.write_header(&mut out).unwrap();
+    let picture = vec![0x5A; 32 << 10];
+    for ms in (0..10_000u64).step_by(20) {
+        if ms % 40 == 0 {
+            w.write_frame(&mut out, 1, ms * MS, &picture, ms % 2_000 == 0).unwrap();
+        }
+        w.write_frame(&mut out, 2, ms * MS, &[0xFC, (ms / 20) as u8], true).unwrap();
+    }
+    w.finalize(&mut out);
+    out
+}
+
+/// A seek beside Opus reads from the keyframe's Cluster, not the group before it, and the
+/// sound starts at the picture.
+#[test]
+fn a_seek_beside_opus_reads_from_the_keyframes_cluster() {
+    let file = wide_groups();
+    let playing: &When = &|seen| seen.iter().any(|(p, s)| *p == 0 && *s != Seen::Flush);
+    let ran = play(&file, &|_| true, Some((Timestamp(5_300 * MS), SeekMode::Keyframe)), playing);
+    let &(key, flagged) = ran.after_flush(0).first().expect("pictures after the seek");
+    assert!(flagged, "a keyframe first");
+    let index = ran.index.as_ref().expect("an index");
+    let at = index.entries.iter().position(|e| e.time_ns == key).expect("the keyframe's entry");
+    let (e, before) = (index.entries[at], index.entries[at.checked_sub(1).expect("one before")]);
+    assert!(e.byte - before.byte > PRE_ROLL_BYTES, "a group over the cap");
+    assert_eq!((e.restart, e.restart_ns), (e.byte, e.time_ns), "no step back");
+
+    let last = |pad: usize| ran.seen.iter().rposition(|(p, s)| *p == pad && *s == Seen::Flush);
+    let flushed = last(SOURCE).expect("the source flushed");
+    let video = last(0).expect("the video flushed");
+    let picture = video
+        + ran.seen[video..]
+            .iter()
+            .position(|(p, s)| *p == 0 && matches!(s, Seen::Frame { .. }))
+            .expect("a picture");
+    let asks: Vec<(u64, u32)> = ran.seen[flushed..picture]
+        .iter()
+        .filter_map(|(_, s)| match s {
+            Seen::Ask { offset, len } => Some((*offset, *len)),
+            _ => None,
+        })
+        .collect();
+    assert!(!asks.is_empty(), "the seek read");
+    assert!(asks.iter().all(|a| a.0 >= e.byte), "nothing of the group before, {asks:?}");
+
+    let sound = ran.after_flush(1).first().expect("sound after the seek").0;
+    assert!((key..=key + 20 * MS).contains(&sound), "sound at {sound}, the picture at {key}");
 }

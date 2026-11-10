@@ -112,9 +112,11 @@ pub fn demuxer(
             if let Index::Avi(ix) = index {
                 d = d.with_index(Arc::clone(ix));
             }
-            // the VOL the open read past the header, the demuxer sends it ahead of each start
-            for t in o.tracks.iter().filter(|t| t.family == "mpeg4/asp") {
-                d = d.with_codec_head(t.stream as usize, o.codec_head(t).to_vec());
+            // the VOL the open read past the header, the demuxer sends it ahead of each start. A
+            // head without one leaves the demuxer what it finds itself
+            let vols = o.tracks.iter().filter(|t| t.family == "mpeg4/asp");
+            for (t, vol) in vols.filter_map(|t| Some((t, pf_avi::vol_prefix(o.codec_head(t))?))) {
+                d = d.with_codec_head(t.stream as usize, vol.to_vec());
             }
             (p.add(d), AviDemux::IN)
         }

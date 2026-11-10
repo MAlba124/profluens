@@ -130,9 +130,9 @@ fn an_avi_reads_its_idx1_once() {
     );
 }
 
-/// One second of 64x48 MJPEG beside a sine at `rate` coded with `audio`, made once by ffmpeg,
-/// None without it.
-fn ffmpeg_avi(name: &str, rate: u32, audio: &[&str]) -> Option<Vec<u8>> {
+/// One second of 64x48 MJPEG beside a sine at `rate`, coded as `args` say last, made once by
+/// ffmpeg, None without it.
+fn ffmpeg_avi(name: &str, rate: u32, args: &[&str]) -> Option<Vec<u8>> {
     use std::sync::atomic::{AtomicU32, Ordering};
     let path = std::env::temp_dir().join(format!("pf_open_avi_{name}_v1.avi"));
     if let Ok(b) = std::fs::read(&path) {
@@ -148,7 +148,7 @@ fn ffmpeg_avi(name: &str, rate: u32, audio: &[&str]) -> Option<Vec<u8>> {
         .args(["-f", "lavfi", "-i"])
         .arg(format!("sine=frequency=440:sample_rate={rate}:duration=1"))
         .args(["-c:v", "mjpeg"])
-        .args(audio)
+        .args(args)
         .args(["-f", "avi"])
         .arg(&tmp)
         .status()
@@ -192,6 +192,26 @@ fn an_avi_extensible_track_takes_its_subformat_valid_bits_and_speakers() {
     assert_eq!(a(&s16), (TrackKind::Audio, "audio/raw", 2, 48_000, 16, 0), "WAVEFORMATEX");
     let (kind, family, channels, rate, _, layout) = a(&ac3);
     assert_eq!((kind, family, channels, rate, layout), (TrackKind::Audio, "ac3", 6, 48_000, 0));
+}
+
+/// ffmpeg's global header puts the VOL in `strf` alone and counts it in `biSize`, the track's
+/// head is that VOL whole, not what lies past `biSize`.
+#[test]
+fn an_avi_with_the_vol_in_its_strf_has_it_whole_as_the_head() {
+    let mpeg4 = ["-c:v", "mpeg4", "-vtag", "XVID", "-flags", "+global_header", "-an"];
+    let Some(b) = ffmpeg_avi("mpeg4_global", 48_000, &mpeg4) else { return };
+    let o = open(&b);
+    let v = &o.tracks[0];
+    assert_eq!(v.family, "mpeg4/asp");
+    let strf = b.windows(4).position(|w| w == b"strf").unwrap() + 8;
+    let size = u32::from_le_bytes(b[strf..strf + 4].try_into().unwrap()) as usize;
+    assert!(size > 40, "biSize {size} counts the extradata");
+    let vol = o.codec_head(v);
+    assert_eq!(vol, &b[strf + 40..strf + size]);
+    assert_eq!(pf_avi::vol_prefix(vol), Some(vol), "{vol:x?}");
+    let movi = b.windows(4).position(|w| w == b"movi").unwrap();
+    let in_band = |w: &[u8]| w[..3] == [0, 0, 1] && w[3] & 0xF0 == 0x20;
+    assert!(!b[movi..].windows(4).any(in_band), "no VOL in a chunk");
 }
 
 #[test]

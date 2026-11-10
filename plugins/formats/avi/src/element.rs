@@ -79,6 +79,8 @@ struct PadStream {
     ticks: u64,
     gate: u64,
     started: bool,
+    /// The head owed ahead of the stream's next chunk, its pad linked mid-run.
+    greet: bool,
     is_video: bool,
     warned_undecodable: bool,
     /// Bytes the framer skipped between frames.
@@ -525,7 +527,8 @@ impl AviDemux {
         } else {
             BufferFlags::empty()
         };
-        Some((ps.pad, pts, flags, fresh))
+        let greet = std::mem::take(&mut ps.greet) || fresh;
+        Some((ps.pad, pts, flags, greet))
     }
 
     /// The stream's head on `pad` ahead of its first chunk of the run, stamped with it.
@@ -934,6 +937,7 @@ impl Element for AviDemux {
                 ticks: 0,
                 gate: 0,
                 started: false,
+                greet: false,
                 is_video: matches!(stream.kind, StreamKind::Video),
                 warned_undecodable: false,
                 junk: 0,
@@ -990,7 +994,7 @@ impl Element for AviDemux {
         (self.taken, self.measured, self.teller) =
             (0, rate::ByteRate::default(), rate::Teller::default());
         for ps in &mut self.pad_streams {
-            (ps.started, ps.ticks, ps.gate, ps.junk) = (false, 0, 0, 0);
+            (ps.started, ps.greet, ps.ticks, ps.gate, ps.junk) = (false, false, 0, 0, 0);
             ps.reorder.iter_mut().for_each(Reorder::reset);
         }
         (self.strays, self.seen) = (0, (0, 0));
@@ -1088,7 +1092,7 @@ impl AviDemux {
                 self.framing = None;
                 self.framers.iter_mut().flatten().for_each(codec::Framer::clear);
                 for (n, ps) in self.pad_streams.iter_mut().enumerate() {
-                    ps.started = false;
+                    (ps.started, ps.greet) = (false, false);
                     ps.reorder.iter_mut().for_each(Reorder::reset);
                     let tick = ps.sample_dur_ns.filter(|ns| *ns > 0);
                     let at = to.zip(tick).map_or(0, |(to, ns)| (to + ns / 2) / ns);
@@ -1098,9 +1102,42 @@ impl AviDemux {
                     };
                 }
             }
+            Event::SrcLinked { pad, on: true, restart } => {
+                self.relink(ctx, *pad, restart.map(|t| t.to_byte))
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    /// A link made on `pad` mid-run gets the stream's head ahead of what goes out on it next. A
+    /// restart at `restart` reads the stream again, what it held from before would go out twice.
+    fn relink(&mut self, ctx: &mut Ctx, pad: SrcPad, restart: Option<u64>) {
+        let Some(n) = self.pad_streams.iter().position(|ps| ps.pad == pad) else { return };
+        let carried = self.carry.as_ref().filter(|c| c.pad == pad).map(|c| (c.spot, c.pts_ns));
+        if let Some(byte) = restart {
+            if let Some((spot, _)) = carried {
+                self.carry = None;
+                self.pass(spot);
+            }
+            // a pushed source restarts with no pull reset to tell
+            self.restart_at(Some(byte));
+            self.framers.get_mut(n).into_iter().flatten().for_each(codec::Framer::clear);
+            self.framing = self.framing.filter(|f| f.0 != n);
+            self.pad_streams[n].reorder.iter_mut().for_each(Reorder::reset);
+        }
+        let ps = &mut self.pad_streams[n];
+        let held = ps.reorder.as_ref().filter(|r| !r.held.is_empty());
+        let at = restart.unwrap_or(u64::MAX);
+        log!(&*ctx, Level::Debug, "relink", stream = ps.stream_index, restart = at);
+        if restart.is_some() || (carried.is_none() && held.is_none()) {
+            ps.greet = true;
+            return;
+        }
+        // units read before the link go out first, the head goes ahead of them now
+        let next = ps.sample_dur_ns.map(|ns| ps.ticks.saturating_mul(ns));
+        let pts = held.and_then(|r| r.rt.peek()).or(carried.and_then(|c| c.1)).or(next);
+        self.greet(ctx, pad, pts);
     }
 
     fn on_stop(&mut self, ctx: &mut Ctx) {

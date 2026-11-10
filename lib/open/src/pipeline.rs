@@ -94,7 +94,7 @@ pub fn demuxer(
                 _ => MkvDemux::with_shared_head(Arc::clone(&o.head)),
             };
             // tags and chapters come from the open, attachments have no user
-            let mut d = d.without_extras();
+            let mut d = d.without_extras().with_len(o.len);
             if held {
                 d = d.with_held_start();
             }

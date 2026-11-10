@@ -54,7 +54,8 @@ pub(crate) fn describe(head: &[u8], tail: &[u8], d: &mut Desc) -> Result<u64, Op
         }
         d.push(t);
     }
-    if d.tracks.is_empty() {
+    // subpictures alone are a VobSub `.sub`, a subtitle file and no media
+    if !d.tracks.iter().any(|t| matches!(t.kind, TrackKind::Video | TrackKind::Audio)) {
         return Err(OpenError::NoStreams);
     }
     let Some((_, least)) = h.opening else { return Ok(0) };

@@ -11,6 +11,8 @@ name = "pf_probe"
 [dependencies]
 # The fetch machines the `*At` heads are read through.
 profluens-core = { path = "../../core" }
+# The MPEG audio frame header a bare sync is checked against.
+pf-mp3 = { path = "../../plugins/audio/mp3" }
 
 [lints]
 workspace = true

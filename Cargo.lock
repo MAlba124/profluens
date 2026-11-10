@@ -392,6 +392,7 @@ dependencies = [
 name = "pf-probe"
 version = "0.1.0"
 dependencies = [
+ "pf-mp3",
  "profluens-core",
 ]
 

@@ -429,20 +429,41 @@ pub fn ts_file(secs: u64, start: u64) -> Vec<u8> {
     out
 }
 
+/// An MPEG-2 pack header of the clock `s`, extension 0, mux rate, no stuffing.
+pub fn pack(out: &mut Vec<u8>, s: u64) {
+    out.extend_from_slice(&[0, 0, 1, 0xBA]);
+    out.push(0x44 | ((s >> 27) & 0x38) as u8 | ((s >> 28) & 3) as u8);
+    out.push((s >> 20) as u8);
+    out.push(((s >> 12) & 0xF8) as u8 | 4 | ((s >> 13) & 3) as u8);
+    out.push((s >> 5) as u8);
+    out.extend_from_slice(&[((s << 3) & 0xF8) as u8 | 4, 1, 0x01, 0x89, 0xC3, 0xF8]);
+}
+
+/// A VobSub `.sub` of `n` subtitles a second apart, each a 2048 byte pack of private stream 1
+/// carrying subpicture substream `0x20 + n % 2`, a padding stream filling it.
+pub fn vobsub_file(n: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    for k in 0..n {
+        let at = out.len();
+        let t = 90_000 + k * 90_000;
+        pack(&mut out, t);
+        // the SPU's size, its control sequence at 4, start display, the end
+        let spu = [0, 10, 0, 4, 0, 0, 0, 4, 0x01, 0xFF];
+        let mut payload = vec![0x20 + (k % 2) as u8];
+        payload.extend_from_slice(&spu);
+        out.extend_from_slice(&pes(0xBD, Some(t), &payload));
+        let pad = 2048 - (out.len() - at) - 6;
+        out.extend_from_slice(&[0, 0, 1, 0xBE, (pad >> 8) as u8, pad as u8]);
+        out.resize(at + 2048, 0xFF);
+    }
+    out
+}
+
 /// A program stream of MPEG-2 video and AC-3 in private stream 1, packs of 2048 bytes.
 pub fn ps_file(secs: u64, scr: bool, pts: bool) -> Vec<u8> {
     let mut out = Vec::new();
     let ac3 = pf_bare::fixture::ac3_frame(0, 192, false, 7);
-    let pack = |out: &mut Vec<u8>, t: u64| {
-        let s = if scr { t } else { 0 };
-        out.extend_from_slice(&[0, 0, 1, 0xBA]);
-        // the SCR in its MPEG-2 form, extension 0, mux rate, no stuffing
-        out.push(0x44 | ((s >> 27) & 0x38) as u8 | ((s >> 28) & 3) as u8);
-        out.push((s >> 20) as u8);
-        out.push(((s >> 12) & 0xF8) as u8 | 4 | ((s >> 13) & 3) as u8);
-        out.push((s >> 5) as u8);
-        out.extend_from_slice(&[((s << 3) & 0xF8) as u8 | 4, 1, 0x01, 0x89, 0xC3, 0xF8]);
-    };
+    let pack = |out: &mut Vec<u8>, t: u64| pack(out, if scr { t } else { 0 });
     let mut audio = 0u64;
     for f in 0..secs * 25 {
         let t = 90_000 + f * 3600;

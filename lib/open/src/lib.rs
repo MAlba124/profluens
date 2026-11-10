@@ -371,7 +371,7 @@ pub enum OpenError {
     Unknown(pf_probe::ProbeError),
     /// A container pf-open does not open.
     Unsupported(Kind),
-    /// No track in the head.
+    /// No track in the head, or a program stream with neither audio nor video.
     NoStreams,
     TooLarge,
     Malformed {

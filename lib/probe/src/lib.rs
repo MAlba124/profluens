@@ -6,6 +6,8 @@ pub mod head;
 
 use std::fmt;
 
+use pf_mp3::frame::Header as MpaHeader;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Mkv,
@@ -52,8 +54,12 @@ impl Kind {
     }
 }
 
-/// Prefix bytes [`probe`] reads. Every magic sits in the first 12, TS needs five packets.
-pub const PREFIX_LEN: usize = 1024;
+/// Prefix bytes [`probe`] reads. Every magic sits in the first 12, TS needs five packets and a
+/// bare MPEG audio stream the headers of three frames of up to 1729 bytes.
+pub const PREFIX_LEN: usize = 4096;
+
+/// Frames from byte 0 a bare MPEG audio sync is checked over.
+const MPA_RUN: usize = 3;
 
 const SUPPORTED: &str = "Matroska/WebM (.mkv/.webm), MP4/ISO-BMFF (.mp4/.m4a/.mov), Ogg (.ogg/.oga), \
      FLV (.flv), AVI (.avi), MPEG-TS (.ts/.m2ts), MPEG-PS (.mpg/.mpeg/.vob), FLAC (.flac), MP3 (.mp3), ADTS AAC (.aac/.adts), WAV (.wav), \
@@ -145,8 +151,7 @@ pub fn probe(prefix: &[u8]) -> Result<Kind, ProbeError> {
         let after = id3v2_len(prefix).and_then(|n| prefix.get(n..)).unwrap_or_default();
         return Ok(behind_id3(after));
     }
-    // An MPEG audio frame sync with a layer other than the reserved 00, ISO/IEC 11172-3.
-    if prefix.len() >= 2 && prefix[0] == 0xFF && prefix[1] & 0xE0 == 0xE0 && prefix[1] & 0x06 != 0 {
+    if is_mpeg_audio(prefix) {
         return Ok(Kind::Mp3);
     }
     let mut lead = [0u8; 8];
@@ -172,6 +177,26 @@ fn is_ts(prefix: &[u8]) -> bool {
         }
         (0..stride).any(|from| run(from, stride) >= RUN)
     })
+}
+
+/// MPEG audio frames in a row from byte 0, ISO/IEC 11172-3 2.4.1.3, each of the first's version,
+/// layer and rate and each at the length the one before states. Every one of [`MPA_RUN`] that fits
+/// in the prefix holds, two at least, or one frame is the whole file, an ID3v1 tag behind it. A
+/// lone sync word is too common in text and other bytes, a UTF-16 BOM is one.
+fn is_mpeg_audio(prefix: &[u8]) -> bool {
+    let p = &prefix[..prefix.len().min(PREFIX_LEN)];
+    let Some(first) = MpaHeader::parse(p) else { return false };
+    let v1 = |at: usize| p.len().checked_sub(128) == Some(at) && p[at..].starts_with(b"TAG");
+    let (mut at, mut frames) = (0, 0);
+    while frames < MPA_RUN && at + 4 <= p.len() && !v1(at) {
+        let same = MpaHeader::parse(&p[at..]).filter(|h| h.same_stream(&first));
+        // free format states no length to find the next frame at
+        match same.and_then(|h| h.frame_len()).filter(|&n| n > 4) {
+            Some(n) => (at, frames) = (at + n, frames + 1),
+            None => return false,
+        }
+    }
+    frames >= 2 || (frames == 1 && p.len() < PREFIX_LEN && (at == p.len() || v1(at)))
 }
 
 /// The length of an ID3v2 tag leading `prefix`, footer included, id3v2.4.0 section 3.1.
@@ -219,8 +244,6 @@ mod tests {
             ("adts mpeg4", &[0xFF, 0xF1, 0x50, 0x80], Kind::AdtsAac),
             ("adts mpeg2", &[0xFF, 0xF9, 0x4C, 0x80], Kind::AdtsAac),
             ("mp3 id3", b"ID3\x04\x00\x00", Kind::Mp3),
-            ("mp3 bare L3", &[0xFF, 0xFB, 0x90, 0x00], Kind::Mp3),
-            ("mp3 bare mpeg2 L3", &[0xFF, 0xF3, 0x82, 0xC4], Kind::Mp3),
             ("ac3", &[0x0B, 0x77, 0x1F, 0x2B, 0x14, 0x40], Kind::Ac3),
             ("eac3", &[0x0B, 0x77, 0x01, 0x7F, 0x3F, 0x84], Kind::Eac3),
             ("dts be", &[0x7F, 0xFE, 0x80, 0x01], Kind::Dts),
@@ -288,9 +311,78 @@ mod tests {
     #[test]
     fn adts_and_mp3_are_disambiguated_by_layer() {
         assert_eq!(probe(&[0xFF, 0xF1]), Ok(Kind::AdtsAac));
-        assert_eq!(probe(&[0xFF, 0xFB]), Ok(Kind::Mp3));
+        assert_eq!(probe(&frames(&[0xFF, 0xFB, 0x90, 0x00], 3)), Ok(Kind::Mp3));
         // MPEG-2.5 with the reserved layer 00 and not ADTS's F1 or F9 is neither.
         assert!(probe(&[0xFF, 0xE1]).is_err());
+    }
+
+    /// `n` frames of the header `h`, each as long as it states, its body zero.
+    fn frames(h: &[u8; 4], n: usize) -> Vec<u8> {
+        let len = pf_mp3::frame::Header::parse(h).unwrap().frame_len().unwrap();
+        let mut f = vec![0u8; len];
+        f[..4].copy_from_slice(h);
+        f.repeat(n)
+    }
+
+    #[test]
+    fn mpeg_audio_is_frames_in_a_row() {
+        // MPEG-1 layer III at 128 and 320 kbit/s, MPEG-2 layer III, MPEG-1 layer II at 384 kbit/s
+        // and 32 kHz, the longest frame there is
+        for h in [[0xFF, 0xFB, 0x90, 0x00], [0xFF, 0xFB, 0xE0, 0x00], [0xFF, 0xF3, 0x82, 0xC4]] {
+            assert_eq!(probe(&frames(&h, 20)[..PREFIX_LEN]), Ok(Kind::Mp3), "{h:02X?}");
+            assert_eq!(probe(&frames(&h, 2)), Ok(Kind::Mp3), "two whole {h:02X?}");
+        }
+        let long = frames(&[0xFF, 0xFD, 0xE8, 0x00], 3);
+        assert_eq!(long.len() / 3, 1728);
+        assert_eq!(probe(&long[..PREFIX_LEN]), Ok(Kind::Mp3), "the third header in the prefix");
+        // the first frame's padding moves the second
+        let mut padded = frames(&[0xFF, 0xFB, 0x92, 0x00], 1);
+        padded.extend(frames(&[0xFF, 0xFB, 0x90, 0x00], 2));
+        assert_eq!(probe(&padded), Ok(Kind::Mp3));
+    }
+
+    #[test]
+    fn a_lone_or_inconsistent_sync_is_no_mpeg_audio() {
+        let h = [0xFF, 0xFB, 0x90, 0x00];
+        let mut lone = frames(&h, 1);
+        lone.resize(PREFIX_LEN, 0x20);
+        assert!(probe(&lone).is_err(), "one header, then text");
+        let mut layer = frames(&h, 1);
+        layer.extend(frames(&[0xFF, 0xFD, 0x90, 0x00], 2));
+        assert!(probe(&layer).is_err(), "the second frame of another layer");
+        let mut rate = frames(&h, 2);
+        rate.extend(frames(&[0xFF, 0xFB, 0x94, 0x00], 1));
+        assert!(probe(&rate).is_err(), "the third of another rate");
+        let mut free = vec![0u8; 3 * 417];
+        free[..4].copy_from_slice(&[0xFF, 0xFB, 0x00, 0x00]);
+        assert!(probe(&free).is_err(), "free format states no length");
+        assert!(probe(&frames(&h, 1)[..400]).is_err(), "a frame cut short");
+    }
+
+    /// A whole file of one frame is MPEG audio, an ID3v1 tag behind it or none.
+    #[test]
+    fn a_single_whole_frame_is_mpeg_audio() {
+        let one = frames(&[0xFF, 0xFB, 0x90, 0x00], 1);
+        assert_eq!(probe(&one), Ok(Kind::Mp3));
+        let mut tagged = one.clone();
+        tagged.extend_from_slice(b"TAG");
+        tagged.resize(one.len() + 128, b' ');
+        assert_eq!(probe(&tagged), Ok(Kind::Mp3));
+        let mut junk = one.clone();
+        junk.extend_from_slice(b"xyz");
+        assert!(probe(&junk).is_err());
+    }
+
+    /// The sweep's subtitle, UTF-16 behind its FF FE mark, reads as an MPEG-1 layer I header.
+    #[test]
+    fn a_utf16_subtitle_is_no_mpeg_audio() {
+        let text = "1\r\n00:00:01,000 --> 00:00:02,500\r\nHello there\r\n\r\n".repeat(100);
+        let mut srt = vec![0xFF, 0xFE];
+        srt.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        assert!(pf_mp3::frame::Header::parse(&srt).is_some(), "the mark is a header");
+        assert!(probe(&srt[..PREFIX_LEN]).is_err());
+        assert!(probe(&srt[..300]).is_err(), "a short one");
+        assert!(probe(text.as_bytes()).is_err(), "UTF-8");
     }
 
     /// `n` packets of `stride` bytes after `skip` bytes of a cut packet, sync 0x47 at `sync`.
@@ -305,8 +397,12 @@ mod tests {
     #[test]
     fn ts_is_found_at_each_packet_size_and_any_offset() {
         for (stride, sync) in [(188, 0), (192, 4), (204, 0)] {
-            assert_eq!(probe(&ts(stride, sync, 0, 6)[..PREFIX_LEN]), Ok(Kind::Ts), "{stride}");
-            assert_eq!(probe(&ts(stride, sync, 77, 7)[..PREFIX_LEN]), Ok(Kind::Ts), "{stride} cut");
+            assert_eq!(probe(&ts(stride, sync, 0, 25)[..PREFIX_LEN]), Ok(Kind::Ts), "{stride}");
+            assert_eq!(
+                probe(&ts(stride, sync, 77, 26)[..PREFIX_LEN]),
+                Ok(Kind::Ts),
+                "{stride} cut"
+            );
             assert_eq!(probe(&ts(stride, sync, 0, 2)), Ok(Kind::Ts), "{stride} two packets");
         }
     }
@@ -314,7 +410,7 @@ mod tests {
     #[test]
     fn a_lone_or_broken_sync_is_no_ts() {
         assert!(probe(&ts(188, 0, 0, 1)).is_err(), "one packet");
-        let mut broken = ts(188, 0, 0, 6);
+        let mut broken = ts(188, 0, 0, 25);
         broken[2 * 188] = 0;
         assert!(probe(&broken[..PREFIX_LEN]).is_err());
         assert!(probe(b"GIF89a").is_err());

@@ -151,6 +151,32 @@ fn program_stream_fixtures_open() {
     assert_eq!((o.tracks[0].channels, o.tracks[0].depth), (2, 24));
 }
 
+/// A VobSub `.sub` sniffs as a program stream of subpictures alone and opens as no media. Beside
+/// video and audio the same packs open as a text track.
+#[test]
+fn a_program_stream_of_subpictures_alone_is_no_media() {
+    let sub = vobsub_file(600);
+    assert!(sub.len() > 1 << 20, "past the head");
+    assert_eq!(pf_probe::probe(&sub[..pf_probe::PREFIX_LEN]), Ok(Kind::Ps));
+    for b in [&sub[..], &sub[..20 * 2048]] {
+        let (o, _) = open_with(b, Want::ALL, Caps::default());
+        assert_eq!(o.err(), Some(OpenError::NoStreams), "{}", b.len());
+    }
+    let mut mixed = vobsub_file(2);
+    mixed.extend(ps_file(2, true, true));
+    let o = open(&mixed);
+    let got: Vec<_> = o.tracks.iter().map(|t| (t.id, t.kind, t.family)).collect();
+    assert_eq!(
+        got,
+        [
+            (0xE000, TrackKind::Video, "mpeg2"),
+            (0xBD80, TrackKind::Audio, "ac3"),
+            (0xBD20, TrackKind::Text, "subtitle/vobsub"),
+            (0xBD21, TrackKind::Text, "subtitle/vobsub"),
+        ]
+    );
+}
+
 #[test]
 fn elementary_audio_opens_through_baresrcs_head() {
     let ac3: Vec<u8> = (0..300).flat_map(|_| ac3_frame(0, 448, false, 7)).collect();

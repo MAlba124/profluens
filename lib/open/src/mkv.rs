@@ -144,7 +144,9 @@ fn track(t: &Track, d: &mut Desc) {
     out.default = t.flag_default;
     out.forced = t.flag_forced;
     out.channels = t.channels.min(u32::from(u16::MAX)) as u16;
-    out.rate = t.sampling_frequency as u32;
+    // an HE-AAC track decodes at its output rate, twice its core rate
+    let output = t.output_sampling_frequency;
+    out.rate = if output > 0.0 { output } else { t.sampling_frequency } as u32;
     out.depth = match kind {
         TrackKind::Video => pf_mkv::config_depth(family, &t.codec_private),
         _ => t.bit_depth.min(255) as u8,

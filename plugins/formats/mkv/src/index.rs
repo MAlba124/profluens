@@ -279,6 +279,7 @@ mod tests {
             flag_forced: false,
             disposition: Default::default(),
             sampling_frequency: 48_000.0,
+            output_sampling_frequency: 0.0,
             channels: 2,
             bit_depth: 0,
             pixel_width: 0,

@@ -28,6 +28,9 @@ pub struct Track {
     pub flag_forced: bool,
     pub disposition: Disposition,
     pub sampling_frequency: f64,
+    /// `OutputSamplingFrequency`, the rate decoded when it differs, an HE-AAC track's twice its
+    /// core rate (RFC 9559 section 5.1.4.1.29.2). 0 where absent.
+    pub output_sampling_frequency: f64,
     pub channels: u32,
     pub bit_depth: u32,
     pub pixel_width: u32,
@@ -709,6 +712,7 @@ fn parse_track_entry(data: &[u8], undone: &mut usize) -> Result<Track, ReadError
         flag_forced: false,
         disposition: Disposition::MAIN,
         sampling_frequency: 0.0,
+        output_sampling_frequency: 0.0,
         channels: 0,
         bit_depth: 0,
         pixel_width: 0,
@@ -895,6 +899,11 @@ fn parse_audio(data: &[u8], track: &mut Track) -> Result<(), ReadError> {
             let v = read_float(body)?;
             if v.is_finite() && v > 0.0 {
                 track.sampling_frequency = v;
+            }
+        } else if h.id == id::OUTPUT_SAMPLING_FREQUENCY {
+            let v = read_float(body)?;
+            if v.is_finite() && v > 0.0 {
+                track.output_sampling_frequency = v;
             }
         } else if h.id == id::CHANNELS {
             track.channels = read_uint(body) as u32;
@@ -2698,6 +2707,19 @@ mod tests {
         assert_eq!((t.sampling_frequency, t.channels), (8_000.0, 6));
         let t = parse_track_entry(&[0xD7, 0x81, 1], &mut 0).unwrap();
         assert_eq!((t.sampling_frequency, t.channels), (0.0, 0), "no Audio master states nothing");
+    }
+
+    #[test]
+    fn an_output_sampling_frequency_is_kept_beside_the_core_rate() {
+        let mut audio = Vec::new();
+        ebml::write_f64(&mut audio, id::SAMPLING_FREQUENCY, 24_000.0);
+        ebml::write_f64(&mut audio, id::OUTPUT_SAMPLING_FREQUENCY, 48_000.0);
+        let mut entry = vec![0xD7, 0x81, 1];
+        ebml::write_binary(&mut entry, id::AUDIO, &audio);
+        let t = parse_track_entry(&entry, &mut 0).unwrap();
+        assert_eq!((t.sampling_frequency, t.output_sampling_frequency), (24_000.0, 48_000.0));
+        let t = parse_track_entry(&[0xD7, 0x81, 1, 0xE1, 0x80], &mut 0).unwrap();
+        assert_eq!(t.output_sampling_frequency, 0.0, "absent");
     }
 
     /// A zlib stream of `n` zero octets in one fixed-Huffman block, 13 bits per 258 octets.

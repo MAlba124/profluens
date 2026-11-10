@@ -51,6 +51,7 @@ pub mod id {
     pub const CONTENT_ENCRYPTION: &[u8] = &[0x50, 0x35];
     pub const AUDIO: &[u8] = &[0xE1];
     pub const SAMPLING_FREQUENCY: &[u8] = &[0xB5];
+    pub const OUTPUT_SAMPLING_FREQUENCY: &[u8] = &[0x78, 0xB5];
     pub const CHANNELS: &[u8] = &[0x9F];
     pub const BIT_DEPTH: &[u8] = &[0x62, 0x64];
 

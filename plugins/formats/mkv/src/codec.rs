@@ -521,13 +521,16 @@ pub fn nal_head_from_config(
     if is_hevc { parse_hvcc(codec_private) } else { parse_avcc(codec_private) }
 }
 
-/// The bits of a luma sample a codec configuration states, 8 where it states none. An hvcC
-/// carries bitDepthLumaMinus8 (ISO/IEC 14496-15 section 8.3.3.1), an av1C the high_bitdepth and
-/// twelve_bit flags (AV1 in ISOBMFF section 2.3.3), a Matroska VP9 CodecPrivate is a feature list
-/// whose id 3 is the bit depth (WebM codec mapping).
+/// The bits of a luma sample a codec configuration states, 8 where it states none. An avcC or
+/// hvcC states it by the SPS it carries, an hvcC also by bitDepthLumaMinus8 (ISO/IEC 14496-15
+/// section 8.3.3.1), which some muxers leave at 8. An av1C the high_bitdepth and twelve_bit flags
+/// (AV1 in ISOBMFF section 2.3.3), a Matroska VP9 CodecPrivate is a feature list whose id 3 is
+/// the bit depth (WebM codec mapping).
 pub fn config_depth(family: &str, codec_private: &[u8]) -> u8 {
     match family {
-        "h265/annexb" => codec_private.get(17).map_or(8, |b| (b & 7) + 8),
+        "h264/annexb" => sps_depth(false, codec_private).unwrap_or(8),
+        "h265/annexb" => sps_depth(true, codec_private)
+            .unwrap_or_else(|| codec_private.get(17).map_or(8, |b| (b & 7) + 8)),
         "av1" => match codec_private.get(2) {
             Some(b) if b & 0x20 != 0 => 12,
             Some(b) if b & 0x40 != 0 => 10,
@@ -548,6 +551,25 @@ pub fn config_depth(family: &str, codec_private: &[u8]) -> u8 {
         }
         _ => 8,
     }
+}
+
+/// The luma depth the first SPS of an avcC or hvcC states.
+fn sps_depth(hevc: bool, record: &[u8]) -> Option<u8> {
+    let (head, _) = nal_head_from_config(record, hevc).ok()?;
+    for (from, to) in crate::config::nals(&head) {
+        let nal = head.get(from..to)?;
+        match (hevc, nal.first()?) {
+            (true, h) if (h >> 1) & 0x3F == 33 => {
+                return profluens_video::h265parse::parse_sps(nal).map(|s| s.depth());
+            }
+            (false, h) if h & 0x1F == 7 => {
+                let sps = profluens_video::h264parse::parse_sps(nal)?;
+                return Some((sps.bit_depth_luma_minus8 + 8).min(16) as u8);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `AVCDecoderConfigurationRecord` (ISO/IEC 14496-15 section 5.3.3.1).

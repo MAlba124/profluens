@@ -171,7 +171,7 @@ impl Feed {
                 // the pool refused a window, the first and every 64th time with its state
                 static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n % 64 == 0 {
+                if n.is_multiple_of(64) {
                     let st = ctx.pool_stats();
                     crate::log!(
                         &*ctx,

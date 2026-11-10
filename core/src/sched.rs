@@ -348,10 +348,11 @@ enum Sent {
 fn fed(d: &DownLink, (bytes, from, to): (u64, Timestamp, Timestamp), eos: bool, bus: &BusSender) {
     d.level.feed(bytes, from, to);
     d.peer.signal();
+    // An ended link starves no sibling, the weave rests on none for it.
+    if eos {
+        d.level.end();
+    }
     if let Some((element, pad)) = d.mark {
-        if eos {
-            d.level.end();
-        }
         d.level.judge(true, |fill, held| {
             bus.send(BusMessage::Buffering { element, pad: Some(pad), fill, held })
         });
@@ -1736,7 +1737,8 @@ impl Group {
         }
         for j in 0..self.downstream.len() {
             let pad = self.downstream[j].pad;
-            if self.ctxs[tail].output_on(pad).is_inert() {
+            let out = self.ctxs[tail].output_on(pad);
+            if out.is_inert() && !out.eos {
                 continue;
             }
             let shared = self.fan_out && self.downstream[j + 1..].iter().any(|o| o.pad == pad);
@@ -1801,13 +1803,14 @@ impl Group {
     fn stage_behind(&mut self, j: usize, mut out: Batch) -> Sent {
         let tail = self.elements.len() - 1;
         let d = &mut self.downstream[j];
-        let rows = out.len() as u64;
+        let (rows, eos) = (out.len() as u64, out.eos);
         let leaks = d.leaky == Leaky::DropNewest && rows > 0;
         if leaks {
             out.retain_state();
         }
         if let Some(staged) = d.staged.as_mut() {
             staged.append(&mut out);
+            staged.eos |= eos;
         }
         if leaks {
             return Sent::Dropped { rows, shell: Some(out) };

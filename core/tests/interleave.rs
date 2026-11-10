@@ -10,6 +10,7 @@ use profluens_core::element::{
     Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
 use profluens_core::error::{Error, GraphError};
+use profluens_core::event::Event;
 use profluens_core::format::OfferDesc;
 use profluens_core::id::{ElementId, SinkPad, SrcPad};
 use profluens_core::level::Limit;
@@ -219,4 +220,119 @@ fn the_latency_report_holds_the_residency_of_each_path() {
         (MAX_INTERLEAVE, MAX_INTERLEAVE),
         "two grow to the cap"
     );
+}
+
+/// Track 0 holds `short` rows, track 1 [`ROWS`], in time order. Track 0's pad ends after its
+/// last row when `end`.
+struct Ending {
+    short: u64,
+    next: [u64; 2],
+    end: bool,
+}
+
+impl Element for Ending {
+    fn desc(&self) -> &'static ElementDesc {
+        &DEMUX
+    }
+    fn process(&mut self, ctx: &mut Ctx, _: Inputs<'_>) -> Result<Flow, Error> {
+        let [a, b] = self.next;
+        let pad = match (a < self.short, b < ROWS) {
+            (true, true) if a <= b => 0,
+            (true, false) => 0,
+            (_, true) => 1,
+            (false, false) => return Ok(Flow::Eos),
+        };
+        let Some(mut buf) = ctx.try_alloc() else {
+            return Ok(Flow::Ok);
+        };
+        let n = self.next[pad];
+        buf.memory.set_len(8);
+        (buf.pts, buf.duration) = (Timestamp(n * STEP.0), STEP);
+        ctx.out(SrcPad(pad as u32)).push(buf);
+        self.next[pad] += 1;
+        if pad == 0 && self.next[0] == self.short && self.end {
+            ctx.end_src(SrcPad(0));
+        }
+        Ok(Flow::Ok)
+    }
+}
+
+struct Ends {
+    rows: Arc<Mutex<u64>>,
+    ended: Arc<Mutex<Option<Timestamp>>>,
+    clock: MockClock,
+}
+
+impl Element for Ends {
+    fn desc(&self) -> &'static ElementDesc {
+        &SINK
+    }
+    fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        while let Some(front) = inputs.front() {
+            if !ctx.due(front.pts) {
+                break;
+            }
+            inputs.pop();
+            *self.rows.lock().unwrap() += 1;
+        }
+        Ok(Flow::Ok)
+    }
+    fn event(&mut self, _: &mut Ctx, event: &Event) -> Result<(), Error> {
+        if matches!(event, Event::Eos) {
+            self.ended.lock().unwrap().get_or_insert(self.clock.now());
+        }
+        Ok(())
+    }
+}
+
+/// The rows each sink took, when each saw its end and the interleave warnings.
+fn play_ending(end: bool) -> ([u64; 2], [Option<Timestamp>; 2], usize) {
+    let clock = MockClock::starting_at(Timestamp::from_secs(5));
+    let mut p = Pipeline::with(DebugSpec::default(), false, Arc::new(clock.clone()));
+    p.set_pool(64, 1024);
+    let src = p.add(Ending { short: 50, next: [0, 0], end });
+    let rows: [Arc<Mutex<u64>>; 2] = Default::default();
+    let ended: [Arc<Mutex<Option<Timestamp>>>; 2] = Default::default();
+    for pad in 0..2 {
+        let sink = p.add(Ends {
+            rows: Arc::clone(&rows[pad]),
+            ended: Arc::clone(&ended[pad]),
+            clock: clock.clone(),
+        });
+        p.link(src.src(SrcPad(pad as u32)), sink.sink(SinkPad(0))).expect("link");
+        p.set_queue_capacity(sink, 512);
+        p.set_link_limit(sink, Limit::time(Timestamp::from_millis(100)));
+    }
+    let mut run = p.step(Arc::new(clock.clone())).expect("step");
+    drive(&mut run, &clock);
+    run.finish().expect("finish");
+    let warned = std::iter::from_fn(|| p.bus().try_recv())
+        .filter(|m| {
+            matches!(
+                m,
+                BusMessage::Warning { error: Error::Graph(GraphError::Interleaved { .. }), .. }
+            )
+        })
+        .count();
+    let taken = [*rows[0].lock().unwrap(), *rows[1].lock().unwrap()];
+    (taken, [*ended[0].lock().unwrap(), *ended[1].lock().unwrap()], warned)
+}
+
+#[test]
+fn a_pad_ended_early_ends_its_link_and_the_weave_rests_on_no_sibling_for_it() {
+    let (rows, ended, warned) = play_ending(true);
+    assert_eq!(rows, [50, ROWS]);
+    let (a, b) = (ended[0].expect("track 0 ended"), ended[1].expect("track 1 ended"));
+    assert!(a < Timestamp::from_secs(7), "track 0 ended at its last row, {a:?}");
+    assert!(b >= Timestamp::from_secs(16), "track 1 played on, {b:?}");
+    assert_eq!(warned, 0, "no starving sibling to grow the weave for");
+}
+
+#[test]
+fn a_pad_that_falls_silent_without_ending_waits_for_the_tail() {
+    let (rows, ended, warned) = play_ending(false);
+    assert_eq!(rows, [50, ROWS]);
+    let a = ended[0].expect("track 0 ended");
+    assert!(a >= Timestamp::from_secs(11), "only when the tail ends, {a:?}");
+    assert_eq!(warned, 1, "the weave grew to its cap for a link that would never fill");
 }

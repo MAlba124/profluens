@@ -1339,6 +1339,12 @@ impl Ctx {
         self.out_slot(pad).push_event(event);
     }
 
+    /// Nothing more goes out of src pad `pad` until a seek or a relink, its links end behind
+    /// what it holds while the other pads run on.
+    pub fn end_src(&mut self, pad: SrcPad) {
+        self.out_slot(pad).eos = true;
+    }
+
     /// Returns a spent batch from [`take_input_on`](Self::take_input_on) for reuse.
     pub fn recycle_input(&mut self, mut batch: Batch) {
         if self.spare_inputs.len() < 2 * self.pad_inputs.len().max(1) {

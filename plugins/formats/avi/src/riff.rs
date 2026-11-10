@@ -48,20 +48,22 @@ impl Stream {
         Some((self.scale as u64).saturating_mul(1_000_000_000) / self.rate as u64)
     }
 
-    /// The codec's own bytes behind the fixed format header of `strf`, behind the
-    /// BITMAPINFOHEADER (its `biSize`, 40 at least) of a video stream, behind the 18 octets of
-    /// WAVEFORMATEX of an audio one, the VOL of an MPEG-4 stream. Empty for other streams.
+    /// The codec's own bytes behind the fixed format header of `strf`, behind the 40 octets of
+    /// BITMAPINFOHEADER of a video stream, behind the 18 octets of WAVEFORMATEX of an audio one,
+    /// the VOL of an MPEG-4 stream. Empty for other streams.
     pub fn codec_head(&self) -> &[u8] {
-        let fixed = match self.kind {
+        let (fixed, end) = match self.kind {
             StreamKind::Video => {
                 let size =
                     self.strf.get(..4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-                usize::try_from(size).unwrap_or(usize::MAX).max(40)
+                // ffmpeg counts its extradata in biSize, a biSize of 40 or past strf ends nothing
+                let size = usize::try_from(size).unwrap_or(usize::MAX);
+                (40, if size > 40 && size <= self.strf.len() { size } else { self.strf.len() })
             }
-            StreamKind::Audio => 18,
+            StreamKind::Audio => (18, self.strf.len()),
             StreamKind::Other => return &[],
         };
-        self.strf.get(fixed..).unwrap_or(&[])
+        self.strf.get(fixed..end).unwrap_or(&[])
     }
 
     /// The WAVEFORMATEXTENSIBLE part of an audio stream's `strf`.
@@ -906,10 +908,15 @@ mod tests {
             name: String::new(),
         };
         assert_eq!(s.codec_head(), [0, 0, 1, 0xB0, 1], "the VOL behind 40 octets");
-        s.strf[..4].copy_from_slice(&44u32.to_le_bytes());
-        assert_eq!(s.codec_head(), [1], "behind a longer biSize");
         s.strf[..4].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(s.codec_head().is_empty(), "a biSize past the strf");
+        assert_eq!(s.codec_head(), [0, 0, 1, 0xB0, 1], "a biSize past the strf");
+        // ffmpeg's biSize of 40 plus its extradata, the strf padded to an even size
+        let vol = [0, 0, 1, 0xB0, 1, 0, 0, 1, 0xB5, 9, 0, 0, 1, 0, 0, 0, 1, 0x20, 0, 0xC4];
+        let size = 40 + vol.len() as u32 + 1;
+        s.strf = [&size.to_le_bytes()[..], &[0; 36], &vol, &[0x55], &[0]].concat();
+        assert_eq!(s.codec_head(), [&vol[..], &[0x55]].concat(), "the VOL whole, no pad");
+        s.strf[..4].copy_from_slice(&44u32.to_le_bytes());
+        assert_eq!(s.codec_head(), &vol[..4], "a biSize inside the strf ends the head");
         s.strf.truncate(10);
         assert!(s.codec_head().is_empty(), "a cut header");
         s.kind = StreamKind::Audio;

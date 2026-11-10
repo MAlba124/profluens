@@ -130,6 +130,70 @@ fn an_avi_reads_its_idx1_once() {
     );
 }
 
+/// One second of 64x48 MJPEG beside a sine at `rate` coded with `audio`, made once by ffmpeg,
+/// None without it.
+fn ffmpeg_avi(name: &str, rate: u32, audio: &[&str]) -> Option<Vec<u8>> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let path = std::env::temp_dir().join(format!("pf_open_avi_{name}_v1.avi"));
+    if let Ok(b) = std::fs::read(&path) {
+        return Some(b);
+    }
+    // tests make them at once, each its own copy until the rename
+    static MADE: AtomicU32 = AtomicU32::new(0);
+    let n = MADE.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}.{n}.avi", std::process::id()));
+    let ok = std::process::Command::new("ffmpeg")
+        .env_remove("LD_LIBRARY_PATH")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=1"])
+        .args(["-f", "lavfi", "-i"])
+        .arg(format!("sine=frequency=440:sample_rate={rate}:duration=1"))
+        .args(["-c:v", "mjpeg"])
+        .args(audio)
+        .args(["-f", "avi"])
+        .arg(&tmp)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("skipped: ffmpeg could not make {name}");
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    std::fs::rename(&tmp, &path).unwrap();
+    Some(std::fs::read(&path).unwrap())
+}
+
+/// A WAVE_FORMAT_EXTENSIBLE track is described by its SubFormat, its valid bits and its mask,
+/// as ffmpeg writes PCM past 16 bits or 48 kHz and AC-3 of more than two channels.
+#[test]
+fn an_avi_extensible_track_takes_its_subformat_valid_bits_and_speakers() {
+    let made = |name, rate, codec, ac| ffmpeg_avi(name, rate, &["-c:a", codec, "-ac", ac]);
+    let (Some(s24), Some(f32), Some(s16), Some(ac3)) = (
+        made("s24x6", 48_000, "pcm_s24le", "6"),
+        made("f32x2", 96_000, "pcm_f32le", "2"),
+        made("s16x2", 48_000, "pcm_s16le", "2"),
+        made("ac3x6", 48_000, "ac3", "6"),
+    ) else {
+        return;
+    };
+    let a = |b: &[u8]| {
+        let t = open(b).tracks[1];
+        (t.kind, t.family, t.channels, t.rate, t.depth, t.layout)
+    };
+    assert_eq!(a(&s24), (TrackKind::Audio, "audio/raw", 6, 48_000, 24, 0x3F));
+    assert_eq!(open(&s24).tracks[1].bitrate, 48_000 * 18 * 8);
+    // 20 bits valid in the 24 bit container
+    let strf = s24.windows(4).position(|w| w == b"auds").unwrap();
+    let strf = strf + s24[strf..].windows(4).position(|w| w == b"strf").unwrap();
+    assert_eq!(&s24[strf + 8..strf + 10], &[0xFE, 0xFF], "WAVE_FORMAT_EXTENSIBLE");
+    let mut short = s24.clone();
+    short[strf + 26..strf + 28].copy_from_slice(&20u16.to_le_bytes());
+    assert_eq!(a(&short), (TrackKind::Audio, "audio/raw", 6, 48_000, 20, 0x3F));
+    assert_eq!(a(&f32), (TrackKind::Audio, "audio/raw", 2, 96_000, 32, 0x3));
+    assert_eq!(a(&s16), (TrackKind::Audio, "audio/raw", 2, 48_000, 16, 0), "WAVEFORMATEX");
+    let (kind, family, channels, rate, _, layout) = a(&ac3);
+    assert_eq!((kind, family, channels, rate, layout), (TrackKind::Audio, "ac3", 6, 48_000, 0));
+}
+
 #[test]
 fn an_flv_describes_what_its_head_states() {
     let b = fixture("plugins/formats/flv/tests/fixtures/h264_aac.flv");

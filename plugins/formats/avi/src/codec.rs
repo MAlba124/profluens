@@ -1,6 +1,8 @@
 //! Stream format to src pad family mapping and per-track offer menus.
 
-use profluens_core::format::OfferDesc;
+use profluens_audio::layout::LAYOUT_FIELD;
+use profluens_audio::{FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE, SampleFormat};
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc};
 
 use crate::riff::{Stream, StreamKind};
 
@@ -14,7 +16,7 @@ pub const FAMILY_AC3: &str = "ac3";
 pub const FAMILY_DTS: &str = "dts";
 /// The `mp3` family, `wFormatTag` 0x0055.
 pub const FAMILY_MP3: &str = "mp3";
-/// The `audio/raw` family, `wFormatTag` 0x0001.
+/// The `audio/raw` family, `wFormatTag` 0x0001 and 0x0003.
 pub const FAMILY_AUDIO_RAW: &str = "audio/raw";
 pub const FAMILY_BYTES: &str = "bytes";
 /// On2 VP6 and VP7 and Sorenson Spark, decoded by pf-libav.
@@ -80,26 +82,20 @@ const H264_TAGS: [crate::riff::FourCc; 12] = [
 ];
 
 fn audio_family(format_tag: u16, bits: u16) -> &'static str {
-    match (format_tag, bits) {
-        (0x2000, _) => FAMILY_AC3,        // WAVE_FORMAT_DOLBY_AC3
-        (0x2001, _) => FAMILY_DTS,        // WAVE_FORMAT_DTS
-        (0x0050, _) => FAMILY_MP3,        // WAVE_FORMAT_MPEG, layer I and II
-        (0x0055, _) => FAMILY_MP3,        // WAVE_FORMAT_MPEGLAYER3
-        (0x0001, _) => FAMILY_AUDIO_RAW,  // WAVE_FORMAT_PCM
-        (0x0003, 32) => FAMILY_AUDIO_RAW, // WAVE_FORMAT_IEEE_FLOAT, f64 would need narrowing
+    match format_tag {
+        0x2000 => FAMILY_AC3, // WAVE_FORMAT_DOLBY_AC3
+        0x2001 => FAMILY_DTS, // WAVE_FORMAT_DTS
+        0x0050 => FAMILY_MP3, // WAVE_FORMAT_MPEG, layer I and II
+        0x0055 => FAMILY_MP3, // WAVE_FORMAT_MPEGLAYER3
+        _ if raw_format(format_tag, bits).is_some() => FAMILY_AUDIO_RAW,
         _ => FAMILY_BYTES,
     }
 }
 
-/// The `audio/raw` sample name of a PCM or float stream, FFmpeg `riff.c` `ff_codec_wav_tags`.
-pub fn raw_sample(format_tag: u16, bits: u16) -> &'static str {
-    match (format_tag, bits) {
-        (0x0003, _) => "f32",
-        (_, 8) => "u8",
-        (_, 24) => "s24",
-        (_, 32) => "s32",
-        _ => "s16",
-    }
+/// The `audio/raw` sample format of a WAVE_FORMAT_PCM or WAVE_FORMAT_IEEE_FLOAT stream, a width
+/// short of whole octets padded up as WAVEFORMATEX stores it. f64 would need narrowing.
+pub fn raw_format(format_tag: u16, bits: u16) -> Option<SampleFormat> {
+    SampleFormat::from_wav(format_tag, bits.checked_next_multiple_of(8)?)
 }
 
 fn fourcc_upper(cc: crate::riff::FourCc) -> crate::riff::FourCc {
@@ -314,6 +310,14 @@ pub fn offers_for(stream: &Stream) -> &'static [OfferDesc] {
     offers_of(family_for(stream))
 }
 
+/// What an `audio/raw` announcement names, the layout among them so the field is known.
+static RAW_FIELDS: [FieldDesc; 4] = [
+    FieldDesc { field: FIELD_RATE, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: FIELD_CHANNELS, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: FIELD_SAMPLE, allowed: ConstraintDesc::Any, preferred: None },
+    LAYOUT_FIELD,
+];
+
 fn offers_of(family: &str) -> &'static [OfferDesc] {
     static MPEG4: [OfferDesc; 2] = [OfferDesc::any("mpeg4/asp"), OfferDesc::any("bytes")];
     static H264: [OfferDesc; 2] = [OfferDesc::any("h264/annexb"), OfferDesc::any("bytes")];
@@ -323,7 +327,8 @@ fn offers_of(family: &str) -> &'static [OfferDesc] {
     static AC3: [OfferDesc; 2] = [OfferDesc::any("ac3"), OfferDesc::any("bytes")];
     static DTS: [OfferDesc; 2] = [OfferDesc::any("dts"), OfferDesc::any("bytes")];
     static MP3: [OfferDesc; 2] = [OfferDesc::any("mp3"), OfferDesc::any("bytes")];
-    static RAW: [OfferDesc; 2] = [OfferDesc::any("audio/raw"), OfferDesc::any("bytes")];
+    static RAW: [OfferDesc; 2] =
+        [OfferDesc { family: FAMILY_AUDIO_RAW, fields: &RAW_FIELDS }, OfferDesc::any("bytes")];
     static BYTES: [OfferDesc; 1] = [OfferDesc::any("bytes")];
     match family {
         FAMILY_MPEG4_ASP => &MPEG4,
@@ -577,14 +582,23 @@ mod tests {
         assert_eq!(family_for(&audio(0x2001)), "dts", "DTS is its own family");
         assert_eq!(family_for(&audio(0x0055)), "mp3");
         assert_eq!(family_for(&audio(0x0050)), "mp3", "MPEG layer I and II");
-        assert_eq!(family_for(&audio(0x0001)), "audio/raw");
+        assert_eq!(family_for(&audio_bits(0x0001, 16)), "audio/raw");
+        assert_eq!(family_for(&audio(0x0001)), "bytes", "PCM of no stated width");
         assert_eq!(family_for(&audio_bits(0x0003, 32)), "audio/raw", "IEEE float");
         assert_eq!(family_for(&audio_bits(0x0003, 64)), "bytes", "f64 is not narrowed");
-        assert_eq!(raw_sample(0x0003, 32), "f32");
-        assert_eq!(raw_sample(0x0001, 8), "u8");
-        assert_eq!(raw_sample(0x0001, 16), "s16");
-        assert_eq!(raw_sample(0x0001, 24), "s24");
-        assert_eq!(raw_sample(0x0001, 32), "s32");
+        use profluens_audio::SampleFormat::*;
+        assert_eq!(raw_format(0x0003, 32), Some(F32));
+        assert_eq!(raw_format(0x0001, 8), Some(U8));
+        assert_eq!(raw_format(0x0001, 16), Some(S16));
+        assert_eq!(raw_format(0x0001, 24), Some(S24), "packed in three octets");
+        assert_eq!(raw_format(0x0001, 32), Some(S32));
+        assert_eq!(raw_format(0x0001, 12), Some(S16), "padded to whole octets");
+        assert_eq!(raw_format(0x0001, 20), Some(S24));
+        assert_eq!(raw_format(0x0001, 0), None);
+        assert_eq!(raw_format(0x0001, 64), None);
+        assert_eq!(raw_format(0x0001, u16::MAX), None, "no width to pad to");
+        assert_eq!(raw_format(0x0003, 24), None);
+        assert_eq!(raw_format(0x0055, 16), None, "no PCM");
         assert_eq!(family_for(&audio(0x00FF)), "bytes", "unknown tag → bytes");
     }
 
@@ -597,6 +611,9 @@ mod tests {
         let bmenu = offers_for(&audio(0xBEEF));
         assert_eq!(bmenu.len(), 1);
         assert_eq!(bmenu[0].family, "bytes");
+        let raw = offers_for(&audio_bits(0x0001, 24));
+        let fields: Vec<&str> = raw[0].fields.iter().map(|f| f.field).collect();
+        assert_eq!(fields, ["rate", "channels", "sample", "layout"], "every field announced");
     }
 
     #[test]

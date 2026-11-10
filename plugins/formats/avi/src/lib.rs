@@ -14,8 +14,8 @@ pub use element::AviDemux;
 pub use idx1::{Idx1At, Idx1Body};
 pub use index::AviIndex;
 pub use riff::{
-    AviError, AviHeader, ChunkHead, Idx1, Idx1Entry, MediaChunk, MoviLocation, MoviWalker, Stream,
-    StreamKind, first_chunk_of, parse_idx1, probe_header,
+    AviError, AviHeader, ChunkHead, Extensible, Idx1, Idx1Entry, MediaChunk, MoviLocation,
+    MoviWalker, Stream, StreamKind, first_chunk_of, parse_idx1, probe_header,
 };
 
 use pf_registry::{Elements, Registry};

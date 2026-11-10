@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use profluens_audio::{AudioFormat, announce_raw};
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::{Buffer, BufferFlags};
 use profluens_core::bus::BusMessage;
@@ -673,21 +674,14 @@ impl AviDemux {
         );
         match family {
             codec::FAMILY_AUDIO_RAW => {
-                ctx.announce_format(
-                    pad,
-                    family,
-                    &[
-                        ("rate", ValueDesc::Int(stream.samples_per_sec as i64)),
-                        ("channels", ValueDesc::Int(stream.channels as i64)),
-                        (
-                            "sample",
-                            ValueDesc::Id(codec::raw_sample(
-                                stream.format_tag,
-                                stream.bits_per_sample,
-                            )),
-                        ),
-                    ],
-                );
+                match codec::raw_format(stream.format_tag, stream.bits_per_sample) {
+                    Some(sample) => {
+                        let fmt = AudioFormat::new(stream.samples_per_sec, stream.channels, sample);
+                        let layout = stream.layout();
+                        announce_raw(ctx, pad, fmt, (layout > 0).then_some(layout));
+                    }
+                    None => ctx.announce_format(pad, family, &[]),
+                }
             }
             codec::FAMILY_AC3 | codec::FAMILY_DTS | codec::FAMILY_MP3
                 if stream.samples_per_sec > 0 =>

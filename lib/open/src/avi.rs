@@ -77,7 +77,7 @@ pub(crate) fn describe(
         out.channels = s.channels;
         if kind == TrackKind::Audio {
             out.rate = s.samples_per_sec;
-            out.depth = s.bits_per_sample.min(255) as u8;
+            out.depth = s.valid_bits().min(255) as u8;
             out.bitrate = u64::from(s.avg_bytes_per_sec) * 8;
         }
         (out.width, out.height) = (s.width, s.height);
@@ -85,6 +85,10 @@ pub(crate) fn describe(
             out.frame_ns = s.sample_duration_ns().unwrap_or(0);
         }
         d.push(out);
+        // PCM speakers are the WAVEFORMATEXTENSIBLE mask's, `Desc::push` reads codec heads only
+        if let Some(t) = d.tracks.last_mut().filter(|t| t.family == "audio/raw") {
+            t.layout = s.layout();
+        }
     }
     if d.tracks.is_empty() {
         return Err(OpenError::NoStreams);

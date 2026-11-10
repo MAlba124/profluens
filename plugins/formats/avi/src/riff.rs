@@ -28,6 +28,7 @@ pub struct Stream {
     /// Absolute value, since top-down DIBs store `biHeight` negative.
     pub height: u32,
     pub strf: Vec<u8>,
+    /// `wFormatTag`, behind WAVE_FORMAT_EXTENSIBLE the tag its KSDATAFORMAT SubFormat carries.
     pub format_tag: u16,
     pub channels: u16,
     pub samples_per_sec: u32,
@@ -61,6 +62,68 @@ impl Stream {
             StreamKind::Other => return &[],
         };
         self.strf.get(fixed..).unwrap_or(&[])
+    }
+
+    /// The WAVEFORMATEXTENSIBLE part of an audio stream's `strf`.
+    pub fn extensible(&self) -> Option<Extensible> {
+        match self.kind {
+            StreamKind::Audio => Extensible::of(&self.strf),
+            _ => None,
+        }
+    }
+
+    /// Bits of a sample that carry signal, the `wValidBitsPerSample` of an extensible PCM or
+    /// float stream within its container, else `bits_per_sample`.
+    pub fn valid_bits(&self) -> u16 {
+        match self.extensible() {
+            Some(e)
+                if matches!(self.format_tag, 0x0001 | 0x0003)
+                    && (1..=self.bits_per_sample).contains(&e.valid_bits) =>
+            {
+                e.valid_bits
+            }
+            _ => self.bits_per_sample,
+        }
+    }
+
+    /// The speakers an extensible stream states, its `dwChannelMask` when that names as many
+    /// as `channels`, else 0.
+    pub fn layout(&self) -> u64 {
+        let mask = self.extensible().map_or(0, |e| e.channel_mask);
+        if mask.count_ones() == u32::from(self.channels) { u64::from(mask) } else { 0 }
+    }
+}
+
+pub const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+
+/// A KSDATAFORMAT SubFormat GUID past its first two octets, which hold a WAVE format tag
+/// (`ksmedia.h` DEFINE_WAVEFORMATEX_GUID).
+const KSDATAFORMAT_TAIL: [u8; 14] = [0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71];
+
+/// What WAVEFORMATEXTENSIBLE adds to WAVEFORMATEX.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Extensible {
+    /// `wValidBitsPerSample`, `wSamplesPerBlock` for a compressed SubFormat.
+    pub valid_bits: u16,
+    pub channel_mask: u32,
+    /// The WAVE format tag of a KSDATAFORMAT SubFormat, None for another GUID.
+    pub tag: Option<u16>,
+}
+
+impl Extensible {
+    /// The extension of a `strf` tagged 0xFFFE whose `cbSize` covers it.
+    pub fn of(strf: &[u8]) -> Option<Extensible> {
+        let le16 = |at: usize| strf.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+        if le16(0)? != WAVE_FORMAT_EXTENSIBLE || le16(16)? < 22 {
+            return None;
+        }
+        let ext = strf.get(18..40)?;
+        let guid = &ext[6..];
+        Some(Extensible {
+            valid_bits: u16::from_le_bytes([ext[0], ext[1]]),
+            channel_mask: u32::from_le_bytes([ext[2], ext[3], ext[4], ext[5]]),
+            tag: (guid[2..] == KSDATAFORMAT_TAIL).then(|| u16::from_le_bytes([guid[0], guid[1]])),
+        })
     }
 }
 
@@ -387,6 +450,9 @@ fn parse_waveformatex(strf: &[u8], s: &mut Stream) {
     s.avg_bytes_per_sec = c.u32le().unwrap_or(0);
     let _ = c.u16le(); // nBlockAlign
     s.bits_per_sample = c.u16le().unwrap_or(0);
+    if let Some(tag) = Extensible::of(strf).and_then(|e| e.tag) {
+        s.format_tag = tag;
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -851,6 +917,95 @@ mod tests {
         assert_eq!(s.codec_head(), [0x12, 0x10], "behind WAVEFORMATEX");
         s.kind = StreamKind::Other;
         assert!(s.codec_head().is_empty());
+    }
+
+    fn ks_guid(tag: u16) -> [u8; 16] {
+        let mut g = [0u8; 16];
+        g[..2].copy_from_slice(&tag.to_le_bytes());
+        g[2..].copy_from_slice(&KSDATAFORMAT_TAIL);
+        g
+    }
+
+    /// A WAVEFORMATEXTENSIBLE of 48 kHz.
+    fn wave_ext(channels: u16, bits: u16, valid: u16, mask: u32, guid: [u8; 16]) -> Vec<u8> {
+        let align = channels * bits / 8;
+        let mut f = WAVE_FORMAT_EXTENSIBLE.to_le_bytes().to_vec();
+        f.extend_from_slice(&channels.to_le_bytes());
+        f.extend_from_slice(&48_000u32.to_le_bytes());
+        f.extend_from_slice(&(48_000 * u32::from(align)).to_le_bytes());
+        f.extend_from_slice(&align.to_le_bytes());
+        f.extend_from_slice(&bits.to_le_bytes());
+        f.extend_from_slice(&22u16.to_le_bytes());
+        f.extend_from_slice(&valid.to_le_bytes());
+        f.extend_from_slice(&mask.to_le_bytes());
+        f.extend_from_slice(&guid);
+        f
+    }
+
+    fn audio_stream(strf: &[u8]) -> Stream {
+        let mut strh = [0u8; 56];
+        strh[..4].copy_from_slice(b"auds");
+        let mut body = b"strh".to_vec();
+        body.extend_from_slice(&56u32.to_le_bytes());
+        body.extend_from_slice(&strh);
+        body.extend_from_slice(b"strf");
+        body.extend_from_slice(&(strf.len() as u32).to_le_bytes());
+        body.extend_from_slice(strf);
+        parse_strl(&body, 1).expect("a stream")
+    }
+
+    #[test]
+    fn an_extensible_stream_takes_the_tag_of_its_subformat() {
+        use crate::codec::{family_for, raw_format};
+        use profluens_audio::SampleFormat;
+        let s = audio_stream(&wave_ext(6, 24, 24, 0x3F, ks_guid(1)));
+        assert_eq!(
+            (s.format_tag, s.bits_per_sample, s.valid_bits(), s.layout()),
+            (1, 24, 24, 0x3F)
+        );
+        assert_eq!((family_for(&s), raw_format(1, 24)), ("audio/raw", Some(SampleFormat::S24)));
+        let s = audio_stream(&wave_ext(2, 32, 24, 0x3, ks_guid(1)));
+        assert_eq!((s.format_tag, s.bits_per_sample, s.valid_bits()), (1, 32, 24));
+        assert_eq!(raw_format(s.format_tag, s.bits_per_sample), Some(SampleFormat::S32));
+        let s = audio_stream(&wave_ext(2, 32, 32, 0x3, ks_guid(3)));
+        assert_eq!((s.format_tag, family_for(&s)), (3, "audio/raw"));
+        assert_eq!(raw_format(s.format_tag, s.bits_per_sample), Some(SampleFormat::F32));
+        let s = audio_stream(&wave_ext(6, 16, 1536, 0x60F, ks_guid(0x2000)));
+        assert_eq!((s.format_tag, family_for(&s)), (0x2000, "ac3"));
+        assert_eq!((s.valid_bits(), s.layout()), (16, 0x60F), "wSamplesPerBlock is no width");
+        let s = audio_stream(&wave_ext(2, 24, 0, 0, ks_guid(1)));
+        assert_eq!((s.valid_bits(), s.layout()), (24, 0), "no valid width, no speakers");
+        let s = audio_stream(&wave_ext(2, 24, 32, 0x3F, ks_guid(1)));
+        assert_eq!((s.valid_bits(), s.layout()), (24, 0), "past the container, another count");
+        let s = audio_stream(&wave_ext(2, 16, 16, 0x3, ks_guid(0x0161)));
+        assert_eq!((s.format_tag, family_for(&s)), (0x0161, "bytes"), "a tag with no family");
+    }
+
+    #[test]
+    fn an_extensible_stream_without_a_ksdataformat_subformat_stays_unnamed() {
+        let mut other = ks_guid(1);
+        other[15] ^= 1;
+        let s = audio_stream(&wave_ext(2, 16, 16, 0x3, other));
+        assert_eq!((s.format_tag, crate::codec::family_for(&s)), (WAVE_FORMAT_EXTENSIBLE, "bytes"));
+        assert_eq!(s.extensible().map(|e| (e.tag, e.channel_mask)), Some((None, 0x3)));
+        let mut high = ks_guid(1);
+        high[2] = 1;
+        assert_eq!(audio_stream(&wave_ext(2, 16, 16, 0x3, high)).format_tag, 0xFFFE);
+        let mut short = wave_ext(2, 16, 16, 0x3, ks_guid(1));
+        short[16] = 21;
+        assert_eq!(audio_stream(&short).format_tag, 0xFFFE, "cbSize short of the extension");
+        let full = wave_ext(2, 16, 16, 0x3, ks_guid(1));
+        for cut in [16, 18, 24, 39] {
+            let s = audio_stream(&full[..cut]);
+            assert_eq!((s.format_tag, s.extensible(), s.layout()), (0xFFFE, None, 0), "{cut}");
+        }
+        let mut plain = full.clone();
+        plain[..2].copy_from_slice(&1u16.to_le_bytes());
+        let s = audio_stream(&plain);
+        assert_eq!((s.format_tag, s.extensible(), s.layout()), (1, None, 0), "WAVEFORMATEX");
+        let mut video = audio_stream(&full);
+        video.kind = StreamKind::Video;
+        assert_eq!(video.extensible(), None);
     }
 
     fn build_avi(data_chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {

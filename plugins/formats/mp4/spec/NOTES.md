@@ -130,8 +130,13 @@ library is a dependency of any kind.
   and said (`Mp4Reader::take_error`). A box whose size is smaller than its header loses
   the stream. Behind a source of segments the walk starts over at the next one, and a
   file fails the element.
-- **Seeking.** `Tables::fragments` is the index, from a `sidx` in the head or from the
-  `mfra` handed to `Mp4Reader::indexed`. `Tables::restart` names the `moof` of the last
+- **Length.** The `mehd`, else the end of the last fragment the `mfra` names
+  (`Tables::last_fragment`), else the end of the last `sidx` of the chain behind the head,
+  followed a read a fragment by the sizes each names (`frag::TailAt`,
+  `Tables::sidx_chain`) up to `frag::MAX_SIDX_READS` reads, past which the length reached
+  is scaled by bytes. An empty edit states no length.
+- **Seeking.** `Tables::fragments` is the index, from a `sidx` in the head and the chain
+  behind it or from the `mfra` handed to `Mp4Reader::indexed`. `Tables::restart` names the `moof` of the last
   indexed fragment at or before what any track needs, and with no index the first
   fragment, so a file with neither is sought by reading it from its first fragment to
   the target, all of it through the source and none of it through a decoder. Behind

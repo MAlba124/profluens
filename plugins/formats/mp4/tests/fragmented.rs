@@ -794,7 +794,7 @@ fn an_empty_edit_is_no_length_and_the_last_fragment_ends_the_movie() {
     assert!(one.abs_diff(SECOND) < SECOND / 10, "the first sidx ends at {one}");
 
     let mut log = Vec::new();
-    let mut at = frag::TailAt::new(file.len() as u64);
+    let mut at = frag::TailAt::new(file.len() as u64, None);
     let tail = profluens_core::fetch::drive_slice_log(&mut at, &file, &mut log).unwrap();
     assert_eq!(log.len(), 3, "the mfro, the mfra and the last moof, {log:?}");
     assert_eq!(&tail.moof[4..8], b"moof");
@@ -814,7 +814,57 @@ fn an_empty_edit_is_no_length_and_the_last_fragment_ends_the_movie() {
 fn the_tail_of_a_file_without_an_mfra_reads_once() {
     let mut log = Vec::new();
     let file = vec![0u8; 100];
-    let mut at = frag::TailAt::new(file.len() as u64);
+    let mut at = frag::TailAt::new(file.len() as u64, None);
     let tail = profluens_core::fetch::drive_slice_log(&mut at, &file, &mut log).unwrap();
     assert_eq!((tail, log.len()), (frag::Tail::default(), 1));
+}
+
+/// The sweep's form without the `mfra`, a `sidx` a track ahead of each fragment. The chain is
+/// followed a read a fragment from the head's last `sidx` to the end, its stamps the length.
+#[test]
+fn a_fragmented_file_without_an_mfra_lasts_its_sidx_chain() {
+    let Some(file) = late_fragments("dash_bare.mp4", "+dash+skip_trailer") else { return };
+    let len = file.len() as u64;
+    assert_eq!(frag::mfra_size(&file), None, "no mfra");
+    assert!(!file.windows(4).any(|w| w == b"mehd"), "no mehd");
+    assert_eq!(file.windows(4).filter(|w| w == b"sidx").count(), 12, "a sidx a track a fragment");
+    let elst = file.windows(4).position(|w| w == b"elst").unwrap() + 4;
+    assert_eq!(&file[elst + 8..elst + 16], [0, 0, 0, 80, 0xFF, 0xFF, 0xFF, 0xFF], "80 ms empty");
+    let head = head_of(&file);
+    let first = pf_mp4::Tables::resolve(head, &[], pf_mp4::Limits::default()).unwrap();
+    assert!(first.tracks().iter().all(|t| t.duration_ns == 0), "{:?}", first.tracks());
+    assert_eq!(first.fragments().len(), 1);
+
+    let mut log = Vec::new();
+    let mut at = frag::TailAt::new(len, frag::sidx_chain(head));
+    let tail = profluens_core::fetch::drive_slice_log(&mut at, &file, &mut log).unwrap();
+    assert_eq!(log.len(), 6, "the mfro, then each fragment past the head's, {log:?}");
+    assert_eq!((tail.sidx_ends.len(), tail.capped_at), (10, None));
+    let mut tables = pf_mp4::Tables::resolve(head, &tail.mfra, pf_mp4::Limits::default()).unwrap();
+    tables.last_fragment(&tail.moof);
+    tables.sidx_chain(&tail, len);
+    let video = &tables.tracks()[0];
+    assert_eq!((video.frame_ticks, video.timescale), (512, 12_800), "25 fps from the trun rows");
+    // 150 pictures stamped from 0, the fragments' samples have the media time taken off
+    let ends: Vec<u64> = tables.tracks().iter().map(|t| t.duration_ns).collect();
+    assert!(ends.iter().all(|e| e.abs_diff(6 * SECOND) < SECOND / 25), "{ends:?}");
+    let index = tables.seek_index(&|_| false);
+    let times: Vec<u64> = index.entries.iter().map(|e| e.time_ns / (SECOND / 10)).collect();
+    assert_eq!(times, [0, 10, 20, 30, 40, 50], "a fragment a second");
+    assert_eq!(index.duration.nanos(), Some(ends[0].max(ends[1])));
+
+    // stopped at its cap halfway, the length it reached scales by bytes
+    let cut = tail.sidx_ends[4] as usize - 52;
+    let capped = frag::Tail {
+        sidx: tail.sidx[..4 * 52].to_vec(),
+        sidx_ends: tail.sidx_ends[..4].to_vec(),
+        capped_at: Some(cut as u64),
+        ..frag::Tail::default()
+    };
+    let mut tables = pf_mp4::Tables::resolve(head, &[], pf_mp4::Limits::default()).unwrap();
+    tables.sidx_chain(&capped, len);
+    assert!(tables.tracks().iter().all(|t| t.duration_ns == 0), "the tracks' are left");
+    let three = 3 * SECOND as u128;
+    let scaled = (three * u128::from(len) / cut as u128) as u64;
+    assert!(tables.fragmented_duration_ns().abs_diff(scaled) < SECOND / 25);
 }

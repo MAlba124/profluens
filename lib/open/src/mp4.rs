@@ -36,6 +36,7 @@ pub(crate) fn describe(
     let limits = Limits { file_len: Some(len), ..Limits::default() };
     let mut tables = Tables::resolve(head, &tail.mfra, limits).map_err(OpenError::Mp4)?;
     tables.last_fragment(&tail.moof);
+    tables.sidx_chain(tail, len);
     let duration = tracks_into(tables.tracks(), d)?.max(tables.fragmented_duration_ns());
     Ok((duration, if index { Index::Mp4(Arc::new(tables)) } else { Index::None }))
 }

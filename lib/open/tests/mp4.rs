@@ -81,18 +81,25 @@ fn late_fragments(name: &str, flags: &str) -> Option<Vec<u8>> {
 }
 
 /// A fragmented movie lasts to the end of its last fragment, not its empty edit, whether a
-/// `sidx` leads each fragment, one indexes them all or none does, its frame rate is its rows'.
+/// `sidx` leads each fragment, one indexes them all or none does, with or without an `mfra`
+/// where a `sidx` leads each, its frame rate is its rows'.
 #[test]
 fn a_fragmented_movie_without_mehd_lasts_its_fragments() {
     const SECOND: u64 = 1_000 * MS;
-    for (name, flags) in [("dash.mp4", "+dash"), ("global.mp4", "+global_sidx"), ("plain.mp4", "")]
-    {
+    let forms = [
+        ("dash.mp4", "+dash"),
+        ("global.mp4", "+global_sidx"),
+        ("plain.mp4", ""),
+        ("bare.mp4", "+dash+skip_trailer"),
+    ];
+    for (name, flags) in forms {
         let Some(b) = late_fragments(name, flags) else { return };
         let o = open(&b);
-        assert!(o.duration_ns.abs_diff(6 * SECOND) < SECOND / 10, "{name} {}", o.duration_ns);
+        // within a frame
+        assert!(o.duration_ns.abs_diff(6 * SECOND) < 40 * MS, "{name} {}", o.duration_ns);
         let video = o.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap();
         assert_eq!(video.frame_ns, 40 * MS, "{name}");
-        assert!(o.tracks.iter().all(|t| t.duration_ns.abs_diff(6 * SECOND) < SECOND / 10));
+        assert!(o.tracks.iter().all(|t| t.duration_ns.abs_diff(6 * SECOND) < 40 * MS), "{name}");
         let pf_open::Index::Mp4(tables) = &o.index else { panic!("{name} {:?}", o.index) };
         let index = tables.seek_index(&|_| false);
         let last = index.entries.last().map(|e| e.time_ns);

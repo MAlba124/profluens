@@ -228,6 +228,12 @@ pub fn sidx_ns(sidx: &Sidx, track: Option<&Track>, ticks: u64) -> u64 {
     }
 }
 
+/// The byte past what a `sidx` anchored at `anchor` indexes.
+pub fn sidx_past(sidx: &Sidx, anchor: u64) -> u64 {
+    let span = sidx.refs.iter().fold(0u64, |n, r| n.saturating_add(u64::from(r.size)));
+    anchor.saturating_add(sidx.first_offset).saturating_add(span)
+}
+
 /// The end of a `sidx`'s last reference in its ticks.
 pub fn sidx_end(sidx: &Sidx) -> u64 {
     sidx.refs.iter().fold(sidx.earliest, |t, r| t.saturating_add(u64::from(r.duration)))
@@ -402,6 +408,28 @@ pub fn length_stated(head: &[u8]) -> Option<bool> {
     None
 }
 
+/// The byte the `sidx` atoms behind the `moov` of a head point past, where the chain goes on,
+/// None without one.
+pub fn sidx_chain(head: &[u8]) -> Option<u64> {
+    let mut at = 0usize;
+    let mut moov = false;
+    let mut next = None;
+    while let Ok(h) = boxes::read_box_header(head, at) {
+        match h.kind {
+            boxtype::MOOV => moov = true,
+            boxtype::MOOF | boxtype::MDAT => break,
+            boxtype::SIDX if moov => {
+                if let Ok(sidx) = parse_sidx(h.body(head)) {
+                    next = next.max(Some(sidx_past(&sidx, h.end as u64)));
+                }
+            }
+            _ => {}
+        }
+        at = h.end;
+    }
+    next
+}
+
 /// Each track's presentation end in media ticks into `ends`, where a `tfdt` places its rows, and
 /// its rows' durations into `deltas`, from the body of one `moof`. Rows past
 /// [`MAX_FRAGMENT_SAMPLES`] are not read.
@@ -465,6 +493,13 @@ pub(crate) fn summarize(
 const MAX_MFRA: u64 = 16 << 20;
 /// The first read at the last `moof`, most hold the whole atom.
 const MOOF_FIRST: u64 = 64 << 10;
+/// The most reads the `sidx` chain is followed for, one a fragment, about an hour of 4 s
+/// fragments. A walk stopped there scales the length it reached by bytes.
+pub const MAX_SIDX_READS: u32 = 1024;
+/// A read at a fragment, its `sidx` atoms and the head of its `moof`.
+const SIDX_READ: u64 = 4 << 10;
+/// The largest `sidx` read whole.
+const MAX_SIDX: u64 = 1 << 20;
 
 /// What [`TailAt`] read, each empty where the file has none.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -472,6 +507,12 @@ pub struct Tail {
     pub mfra: Vec<u8>,
     /// The last `moof` atom the `mfra` names, header and all.
     pub moof: Vec<u8>,
+    /// The `sidx` atoms the chain behind the head reached without an `mfra`, back to back.
+    pub sidx: Vec<u8>,
+    /// The file offset each of `sidx` ends at, its anchor.
+    pub sidx_ends: Vec<u64>,
+    /// The byte the walk stopped at for [`MAX_SIDX_READS`], short of the chain's end.
+    pub capped_at: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -484,10 +525,15 @@ enum TailStep {
         at: u64,
     },
     Whole,
+    /// A read at `at` in the `sidx` chain.
+    Sidx {
+        at: u64,
+    },
 }
 
 /// Reads the `mfra` a fragmented file of `len` bytes ends in (8.8.9), then the last `moof` its
-/// rows name, where the length of a movie its `mehd` does not state ends.
+/// rows name, where the length of a movie its `mehd` does not state ends. Without an `mfra` it
+/// follows the `sidx` chain from `sidx_at` (see [`sidx_chain`]) by the sizes each names.
 #[derive(Debug)]
 pub struct TailAt {
     len: u64,
@@ -495,11 +541,99 @@ pub struct TailAt {
     mfro: [u8; 16],
     tail: Tail,
     got: usize,
+    sidx_at: Option<u64>,
+    /// The fragment the `sidx` atoms of the read in flight point past, None before the first.
+    next: Option<u64>,
+    reads: u32,
+    win: Vec<u8>,
 }
 
 impl TailAt {
-    pub fn new(len: u64) -> Self {
-        TailAt { len, step: TailStep::Start, mfro: [0; 16], tail: Tail::default(), got: 0 }
+    // Cold path, once per open.
+    #[allow(clippy::disallowed_methods)]
+    pub fn new(len: u64, sidx_at: Option<u64>) -> Self {
+        TailAt {
+            len,
+            step: TailStep::Start,
+            mfro: [0; 16],
+            tail: Tail::default(),
+            got: 0,
+            sidx_at,
+            next: None,
+            reads: 0,
+            win: Vec::new(),
+        }
+    }
+
+    /// The read of `want` bytes at `at` in the `sidx` chain, the end without one or past the
+    /// cap.
+    // Cold path, the window grows to the largest read once.
+    #[allow(clippy::disallowed_methods)]
+    fn sidx_from(&mut self, at: Option<u64>, want: u64) -> Step<Tail> {
+        match at {
+            Some(at) if at < self.len && self.reads >= MAX_SIDX_READS => {
+                self.tail.capped_at = Some(at);
+                self.done()
+            }
+            Some(at) if at < self.len => {
+                let len = want.min(self.len - at) as usize;
+                self.reads += 1;
+                self.win.resize(len, 0);
+                self.step = TailStep::Sidx { at };
+                Step::Need(Need { at, len })
+            }
+            _ => self.done(),
+        }
+    }
+
+    /// Keeps the `sidx` atoms the read at `at` holds, then reads where they point past.
+    // Cold path, once per fragment.
+    #[allow(clippy::disallowed_methods)]
+    fn sidx_hop(&mut self, at: u64) -> Step<Tail> {
+        let got = self.got.min(self.win.len());
+        let mut p = 0usize;
+        loop {
+            let here = at + p as u64;
+            let Some((kind, header, size)) =
+                self.win[..got].get(p..).and_then(|b| box_head(b, self.len - here))
+            else {
+                // a header the read cut is read again from its start
+                let cut = p > 0 && got - p < 16 && here + 8 <= self.len;
+                return if cut { self.sidx_from(Some(here), SIDX_READ) } else { self.done() };
+            };
+            let end = p as u64 + size;
+            match &kind {
+                b"sidx" if end > got as u64 => {
+                    let room = (self.win.len() - p) as u64;
+                    if size > MAX_SIDX || room >= size {
+                        return self.done();
+                    }
+                    return self.sidx_from(Some(here), size + SIDX_READ);
+                }
+                b"sidx" => {
+                    let atom = &self.win[p..end as usize];
+                    if let Ok(sidx) = parse_sidx(&atom[header as usize..]) {
+                        let past = sidx_past(&sidx, here + size);
+                        self.next = Some(self.next.map_or(past, |n| n.max(past)));
+                        self.tail.sidx.extend_from_slice(atom);
+                        self.tail.sidx_ends.push(here + size);
+                    }
+                    p = end as usize;
+                }
+                b"styp" | b"free" | b"skip" | b"emsg" | b"prft" if self.next.is_none() => {
+                    if end >= got as u64 {
+                        return self.sidx_from(Some(at + end), SIDX_READ);
+                    }
+                    p = end as usize;
+                }
+                _ => {
+                    return match self.next.take() {
+                        Some(next) if next > here => self.sidx_from(Some(next), SIDX_READ),
+                        _ => self.done(),
+                    };
+                }
+            }
+        }
     }
 
     // Cold path, once per open.
@@ -515,7 +649,7 @@ impl TailAt {
     }
 
     fn done(&mut self) -> Step<Tail> {
-        self.step = TailStep::Start;
+        (self.step, self.next, self.reads) = (TailStep::Start, None, 0);
         Step::Done(std::mem::take(&mut self.tail))
     }
 
@@ -595,7 +729,7 @@ impl Fetch for TailAt {
                 Some(size) if (16..=MAX_MFRA.min(len)).contains(&size) => {
                     self.read(TailStep::Mfra, len - size, size, false)
                 }
-                _ => self.done(),
+                _ => self.sidx_from(self.sidx_at, SIDX_READ),
             },
             TailStep::Mfra => {
                 self.tail.mfra.truncate(self.got);
@@ -616,6 +750,7 @@ impl Fetch for TailAt {
                 }
                 self.done()
             }
+            TailStep::Sidx { at } => self.sidx_hop(at),
         })
     }
 
@@ -624,6 +759,7 @@ impl Fetch for TailAt {
             TailStep::Mfro => &mut self.mfro,
             TailStep::Mfra => &mut self.tail.mfra,
             TailStep::Moof { .. } | TailStep::Whole => &mut self.tail.moof,
+            TailStep::Sidx { .. } => &mut self.win,
             TailStep::Start => &mut [],
         }
     }
@@ -703,5 +839,72 @@ mod tests {
         tail.extend(be32(&[0, 77]));
         assert_eq!(mfra_size(&tail), Some(77));
         assert_eq!(mfra_size(&tail[..20]), None);
+    }
+
+    fn atom(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = be32(&[8 + body.len() as u32]);
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A version 0 `sidx` of track 1 at 1000 ticks a second, `refs` as size and duration.
+    fn sidx(earliest: u32, refs: &[(u32, u32)]) -> Vec<u8> {
+        let mut body = be32(&[0, 1, 1000, earliest, 0, refs.len() as u32]);
+        for &(size, duration) in refs {
+            body.extend(be32(&[size, duration, 0x9000_0000]));
+        }
+        atom(b"sidx", &body)
+    }
+
+    fn walk(file: &[u8], from: u64) -> (Tail, usize) {
+        let mut log = Vec::new();
+        let mut at = TailAt::new(file.len() as u64, Some(from));
+        let tail = profluens_core::fetch::drive_slice_log(&mut at, file, &mut log).unwrap();
+        (tail, log.len())
+    }
+
+    #[test]
+    fn the_sidx_chain_is_followed_a_read_a_fragment_up_to_its_cap() {
+        let mdat = atom(b"mdat", &[0; 8]);
+        let fragment = |n: u32| [sidx(n * 1000, &[(mdat.len() as u32, 1000)]), mdat.clone()];
+        let file: Vec<u8> = (0..5).flat_map(fragment).flatten().collect();
+        let (tail, reads) = walk(&file, 0);
+        assert_eq!((reads, tail.sidx_ends.len(), tail.capped_at), (6, 5, None), "the mfro, five");
+        assert_eq!(tail.sidx_ends[4], file.len() as u64 - mdat.len() as u64);
+
+        let n = MAX_SIDX_READS + 50;
+        let file: Vec<u8> = (0..n).flat_map(fragment).flatten().collect();
+        let (tail, reads) = walk(&file, 0);
+        let step = (file.len() / n as usize) as u64;
+        assert_eq!(reads, 1 + MAX_SIDX_READS as usize);
+        assert_eq!(tail.sidx_ends.len(), MAX_SIDX_READS as usize);
+        assert_eq!(tail.capped_at, Some(u64::from(MAX_SIDX_READS) * step));
+    }
+
+    #[test]
+    fn a_sidx_the_read_cuts_is_read_again_whole_and_the_chain_goes_on() {
+        let moof = atom(b"moof", &[0; 8]);
+        // both index the moof behind them, the big one a byte a reference
+        let refs: Vec<(u32, u32)> = (0..400).map(|n| (u32::from(n < 16), 10)).collect();
+        let (small, big) = (sidx(0, &[(moof.len() as u32, 4000)]), sidx(0, &refs));
+        assert!(small.len() + big.len() > SIDX_READ as usize);
+        let first = [small.clone(), big.clone(), moof.clone()].concat();
+        let file = [first.clone(), sidx(4000, &[(moof.len() as u32, 1000)]), moof].concat();
+        let (tail, reads) = walk(&file, 0);
+        assert_eq!(reads, 4, "the mfro, the first, the big sidx again, the second fragment");
+        assert_eq!(tail.sidx_ends, [44, (44 + big.len()) as u64, (first.len() + 44) as u64]);
+        assert_eq!(&tail.sidx[..small.len()], &small[..]);
+    }
+
+    #[test]
+    fn a_chain_that_points_nowhere_new_or_past_the_file_ends() {
+        let moof = atom(b"moof", &[0; 8]);
+        let file = [sidx(0, &[(0, 1000)]), moof.clone()].concat();
+        assert_eq!(walk(&file, 0).1, 2, "a size of 0 points back at the moof");
+        let file = [sidx(0, &[(1 << 30, 1000)]), moof].concat();
+        let (tail, reads) = walk(&file, 0);
+        assert_eq!((reads, tail.sidx_ends.len()), (2, 1));
+        assert_eq!(walk(&file, 1 << 40).1, 1, "a chain past the file reads nothing");
     }
 }

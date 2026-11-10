@@ -564,6 +564,36 @@ impl Tables {
         }
     }
 
+    /// Adds the fragments the `sidx` atoms a [`frag::TailAt`] walk reached index, and raises
+    /// the movie's length and each track's to where they end. A walk stopped at its cap at
+    /// byte `at` of a file of `len` scales the movie's length by bytes and leaves the tracks'.
+    // Cold path, once per open.
+    #[allow(clippy::disallowed_methods)]
+    pub fn sidx_chain(&mut self, tail: &frag::Tail, len: u64) {
+        let Tables { tracks, frag: Some(frag), .. } = self else { return };
+        let (mut at, mut walked) = (0usize, 0u64);
+        for &end in &tail.sidx_ends {
+            let Ok(h) = boxes::read_box_header(&tail.sidx, at) else { break };
+            at = h.end;
+            let Ok(sidx) = frag::parse_sidx(h.body(&tail.sidx)) else { continue };
+            let index = tracks.iter().position(|t| t.track_id == sidx.reference_id);
+            frag::sidx_fragments(&sidx, end, index.map(|i| &tracks[i]), &mut frag.fragments);
+            let ns = frag::sidx_ns(&sidx, index.map(|i| &tracks[i]), frag::sidx_end(&sidx));
+            walked = walked.max(ns);
+            if let (None, Some(i)) = (tail.capped_at, index) {
+                tracks[i].duration_ns = tracks[i].duration_ns.max(ns);
+            }
+        }
+        frag.fragments.sort_unstable();
+        frag.fragments.dedup_by_key(|f| f.offset);
+        let ns = match tail.capped_at {
+            Some(at) if at > 0 => (u128::from(walked) * u128::from(len) / u128::from(at))
+                .min(u128::from(u64::MAX)) as u64,
+            _ => walked,
+        };
+        frag.duration_ns = frag.duration_ns.max(ns);
+    }
+
     /// The time to byte map of the movie. Sync samples of the first
     /// video track, else the first audio track thinned to [`MAX_INDEX_ENTRIES`], or one entry
     /// per indexed fragment. An entry restarts ahead for audio pre-roll and for the sample up

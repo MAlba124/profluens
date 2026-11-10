@@ -435,7 +435,8 @@ impl OpenAt {
         }
         self.head = head;
         if pf_mp4::frag::length_stated(&self.head) == Some(false) {
-            self.stage = Stage::Mp4Tail(Box::new(TailAt::new(self.len)));
+            let sidx_at = pf_mp4::frag::sidx_chain(&self.head);
+            self.stage = Stage::Mp4Tail(Box::new(TailAt::new(self.len, sidx_at)));
             return Ok(None);
         }
         self.mp4_described(&Tail::default())

@@ -693,14 +693,19 @@ impl OggDemux {
         self.tracks.iter().position(|t| t.pad == Some(pad) || ctx.stream_pad(t.stream) == Some(pad))
     }
 
-    /// A link on `pad` made or cut mid-run. A new one gets the headers before what follows.
-    fn relink(&mut self, ctx: &Ctx, pad: SrcPad, on: bool) {
+    /// A link on `pad` made or cut mid-run. A new one gets the headers before what follows, one
+    /// made with a restart nothing read ahead of it.
+    fn relink(&mut self, ctx: &Ctx, pad: SrcPad, on: bool, restart: Option<SeekTarget>) {
         let Some(at) = self.track_on(ctx, pad) else {
             return;
         };
+        let back = on && restart.is_some();
+        if back {
+            self.drop_read();
+        }
         let t = &mut self.tracks[at];
-        let kept = t.kept_ends.len();
-        log!(ctx, Level::Debug, "relink", serial = t.serial.unwrap_or(0), on = on, heads = kept);
+        let (serial, kept) = (t.serial.unwrap_or(0), t.kept_ends.len());
+        log!(ctx, Level::Debug, "relink", serial = serial, on = on, heads = kept, restart = back);
         if on && t.kept_over {
             log!(ctx, Level::Warn, "headers_over", serial = t.serial.unwrap_or(0), max = KEPT_MAX);
         }
@@ -899,6 +904,20 @@ impl OggDemux {
         }
     }
 
+    /// What was read before a flush or a restart goes, the packet parked on the budget too, else
+    /// it goes out first and a decoder linked behind the restart places itself by it.
+    fn drop_read(&mut self) {
+        self.reader.reset();
+        if let Some(c) = self.pending.take() {
+            self.reader.recycle(c.data);
+        }
+        self.stamp_all(Timestamp::NONE);
+        self.tracks.iter_mut().for_each(|t| t.run.stop());
+        self.unland();
+        (self.at, self.measured) = (Timestamp::NONE, rate::ByteRate::default());
+        self.teller.restart();
+    }
+
     fn bisector(&self, ctx: &Ctx, from: SeekTarget) -> Option<Bisect> {
         let len = self.len.filter(|len| *len > 0 && ctx.pulls(Self::IN))?;
         let (key, clock) = self.learnt?;
@@ -970,7 +989,7 @@ impl OggDemux {
 
     fn restart_pull(&mut self, ctx: &mut Ctx, from: SeekTarget) {
         self.feed.restart(from.to_byte);
-        self.unland();
+        self.drop_read();
         // A source stamps nothing on its first byte read unasked.
         if std::mem::replace(&mut self.paired, true) {
             let bisect = self.bisector(ctx, from);
@@ -1143,13 +1162,7 @@ impl Element for OggDemux {
             // a link still owed the headers gets them ahead of the first packet behind the seek.
             Event::FlushStart => {
                 log!(&*ctx, Level::Debug, "flush", seek = ctx.seek_target().is_some());
-                self.reader.reset();
-                self.pending = None;
-                self.stamp_all(Timestamp::NONE);
-                self.tracks.iter_mut().for_each(|t| t.run.stop());
-                self.unland();
-                (self.at, self.measured) = (Timestamp::NONE, rate::ByteRate::default());
-                self.teller.restart();
+                self.drop_read();
             }
             Event::Eos => {
                 let left = self.reader.finish();
@@ -1169,7 +1182,7 @@ impl Element for OggDemux {
                     dropped = dropped
                 );
             }
-            Event::SrcLinked { pad, on, .. } => self.relink(ctx, *pad, *on),
+            Event::SrcLinked { pad, on, restart } => self.relink(ctx, *pad, *on, *restart),
             Event::SrcJoined { pad } => self.join(ctx, *pad),
             _ => {}
         }

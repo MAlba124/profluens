@@ -17,7 +17,7 @@ use profluens_core::error::Error;
 use profluens_core::event::Event;
 use profluens_core::format::OfferDesc;
 use profluens_core::id::{SinkPad, SrcPad};
-use profluens_core::log::DebugSpec;
+use profluens_core::log::{DebugSpec, Level, LogRecord, LogWriter};
 use profluens_core::pipeline::{Pipeline, SeekMode};
 use profluens_core::sched::Stepped;
 use profluens_core::time::Timestamp;
@@ -115,8 +115,20 @@ impl Element for RecSink {
     }
 }
 
+#[derive(Default)]
+struct Events(Mutex<Vec<&'static str>>);
+
+impl LogWriter for Events {
+    fn record(&self, rec: &LogRecord) {
+        self.0.lock().unwrap().push(rec.event);
+    }
+
+    fn line(&self, _level: Level, _msg: std::fmt::Arguments<'_>) {}
+}
+
 struct Ran {
     seen: Vec<(usize, Seen)>,
+    events: Vec<&'static str>,
 }
 
 impl Ran {
@@ -125,6 +137,10 @@ impl Ran {
         let from = self.seen.iter().rposition(|(p, s)| *p == n && *s == Seen::Flush);
         let after = &self.seen[from.map_or(self.seen.len(), |i| i + 1)..];
         after.iter().filter(|(p, _)| *p == n).filter_map(|(_, s)| s.stamp()).collect()
+    }
+
+    fn logged(&self, event: &str) -> usize {
+        self.events.iter().filter(|e| **e == event).count()
     }
 }
 
@@ -158,7 +174,9 @@ fn parsed(file: &[u8]) -> Parsed {
 fn sweep(demux: MkvDemux, file: &[u8], text_ms: Option<u64>, seek_ms: u64) -> Ran {
     let clock = MockClock::new();
     let shared: Arc<dyn Clock> = Arc::new(clock.clone());
-    let mut p = Pipeline::with(DebugSpec::default(), false, Arc::clone(&shared));
+    let mut p = Pipeline::with(DebugSpec::parse("debug"), false, Arc::clone(&shared));
+    let events = Arc::new(Events::default());
+    p.set_log_writer(Arc::clone(&events) as Arc<dyn LogWriter>);
     p.set_select_all(false);
     let src = p.add(MemSrc { file: Arc::from(file) });
     let demux = p.add(demux);
@@ -215,7 +233,8 @@ fn sweep(demux: MkvDemux, file: &[u8], text_ms: Option<u64>, seek_ms: u64) -> Ra
     }
     drop(p);
     let seen = std::mem::take(&mut *out.lock().unwrap());
-    Ran { seen }
+    let events = std::mem::take(&mut *events.0.lock().unwrap());
+    Ran { seen, events }
 }
 
 fn el(out: &mut Vec<u8>, of: &[u8], body: &[u8]) {
@@ -436,4 +455,31 @@ fn a_seek_restart_resyncs_past_damage_read_as_an_element() {
     let ran = sweep(demuxer(&file), &file, None, 61_700);
     assert_eq!(ran.after_flush(0), pictures_from(60_000), "every picture past the damage");
     assert!(ran.after_flush(1).last().is_some_and(|t| *t >= 119_900 * MS));
+}
+
+/// A download cut short of what its Segment states has lost the Cues at its end, an exact seek
+/// goes by the estimate. Told the length, the estimate lies in the bytes there are and the
+/// scan from it reads on to their end. By the Segment alone it lies past them and the run ends
+/// at once with nothing.
+#[test]
+fn a_seek_by_estimate_in_a_file_cut_short_of_its_segment_reads_what_there_is() {
+    let full = Film { cues: true, ..Film::default() }.build();
+    let file = &full[..full.len() * 2 / 5];
+    let seek_ms = END_MS / 2;
+    let ran = sweep(demuxer(file), file, None, seek_ms);
+    assert_eq!(ran.logged("cues_empty"), 1, "the Cues lie past the cut");
+    assert!(ran.after_flush(0).is_empty(), "by the Segment the estimate is past the end");
+    let told = demuxer(file).with_len(file.len() as u64);
+    let ran = sweep(told, file, None, seek_ms);
+    let pictures = ran.after_flush(0);
+    let first = pictures.first().copied().expect("pictures after the seek");
+    assert!(first < 2 * END_MS / 5 * MS, "within the bytes there are, {first}");
+    assert_eq!(
+        pictures,
+        (first / MS..pictures.last().unwrap() / MS + 1)
+            .step_by(40)
+            .map(|t| t * MS)
+            .collect::<Vec<_>>()
+    );
+    assert!(*pictures.last().unwrap() > first + 10_000 * MS, "read on to the cut");
 }

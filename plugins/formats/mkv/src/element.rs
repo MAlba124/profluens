@@ -922,6 +922,8 @@ struct Seek {
     whole: bool,
     grown: Grown,
     file_len: Option<u64>,
+    /// The source's length, a file cut short of its Segment's end ends there.
+    source_len: Option<u64>,
     duration: Timestamp,
     due: bool,
     reserve: Option<u64>,
@@ -1148,6 +1150,7 @@ impl MkvDemux {
                 whole: false,
                 grown: Grown::default(),
                 file_len: None,
+                source_len: None,
                 duration: Timestamp::NONE,
                 due: false,
                 reserve: None,
@@ -1292,6 +1295,13 @@ impl MkvDemux {
         self.seek.whole = !cues.is_empty();
         self.seek.reserve = at.filter(|_| self.seek.whole);
         self.seek.cues = cues;
+        self
+    }
+
+    /// The source is `len` octets long. A seek with no index goes by the bytes there are, not by
+    /// a Segment that states more, as a download cut short does.
+    pub fn with_len(mut self, len: u64) -> Self {
+        self.seek.source_len = Some(len);
         self
     }
 
@@ -2339,8 +2349,11 @@ impl MkvDemux {
         seek.duration = parsed.duration_ns.map_or(Timestamp::NONE, Timestamp);
         // A restart before the walk passes Info still stamps by the file's scale.
         (self.pull.walk.scale, self.pull.walk.duration_ns) = (seek.tick, parsed.duration_ns);
-        seek.file_len = parsed.segment_end;
-        self.pull.walk.end = seek.file_len;
+        seek.file_len = match (parsed.segment_end, seek.source_len) {
+            (Some(end), Some(len)) => Some(end.min(len)),
+            (end, len) => end.or(len),
+        };
+        self.pull.walk.end = parsed.segment_end;
         seek.segment_data_start = parsed.segment_data_start();
         let (cues_at, head_at) = (parsed.cues_pos(), parsed.next_head());
         // A front SeekHead may name only another SeekHead, the one hop followed for Cues.

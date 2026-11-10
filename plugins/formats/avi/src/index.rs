@@ -62,6 +62,8 @@ pub struct Scan {
     pub entries: Vec<IndexEntry>,
     marks: Vec<u64>,
     mark_clocks: Vec<u64>,
+    /// Every stream's clock at each entry's keyframe byte.
+    key_clocks: Vec<u64>,
     /// Keyframes whose audio lay further ahead than the ring, restarted at their byte.
     pub cut: u32,
     pub read: u64,
@@ -99,6 +101,7 @@ impl Scan {
             entries: Vec::new(),
             marks: Vec::new(),
             mark_clocks: Vec::new(),
+            key_clocks: Vec::new(),
             cut: 0,
             read: 0,
         }
@@ -113,11 +116,15 @@ impl Scan {
         }
     }
 
-    /// Every stream's clock at restart byte `byte`, where an entry restarts there.
+    /// Every stream's clock at `byte`, where an entry restarts there or has its keyframe.
     pub fn clocks_at(&self, byte: u64) -> Option<&[u64]> {
+        let w = self.tracks.len();
         let n = self.marks.partition_point(|m| *m < byte);
-        (self.marks.get(n) == Some(&byte))
-            .then(|| &self.mark_clocks[n * self.tracks.len()..][..self.tracks.len()])
+        if self.marks.get(n) == Some(&byte) {
+            return self.mark_clocks.get(n * w..(n + 1) * w);
+        }
+        let k = self.entries.binary_search_by_key(&byte, |e| e.byte).ok()?;
+        self.key_clocks.get(k * w..(k + 1) * w)
     }
 
     fn entry(&mut self, e: Idx1Entry) {
@@ -192,6 +199,7 @@ impl Scan {
             restart: at,
             restart_ns: if at < byte { restart_ns } else { time },
         });
+        self.key_clocks.extend_from_slice(&self.clocks);
         if self.marks.last().is_none_or(|m| *m < at) {
             self.marks.push(at);
             self.mark_clocks.extend_from_slice(&self.back);

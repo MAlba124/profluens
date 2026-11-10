@@ -7,7 +7,7 @@ use profluens_audio::{AudioFormat, announce_raw};
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::{Buffer, BufferFlags};
 use profluens_core::bus::BusMessage;
-use profluens_core::ctx::Ctx;
+use profluens_core::ctx::{Ctx, SeekTarget};
 use profluens_core::element::{
     Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
@@ -81,6 +81,10 @@ struct PadStream {
     started: bool,
     /// The head owed ahead of the stream's next chunk, its pad linked mid-run.
     greet: bool,
+    /// The file byte of the stream's last chunk taken, and up to where a restart drops what it
+    /// reads again, the stream had it out already.
+    read_to: Option<u64>,
+    resume: Option<u64>,
     is_video: bool,
     warned_undecodable: bool,
     /// Bytes the framer skipped between frames.
@@ -305,6 +309,8 @@ pub struct AviDemux {
     /// Chunks of no stream in the header, and the resync and framer junk counts last logged.
     strays: u64,
     seen: (u64, u64),
+    /// The file byte at a walker count, where its chunks lie, unknown behind a flush to nowhere.
+    origin: Option<(u64, u64)>,
 }
 
 impl AviDemux {
@@ -341,6 +347,7 @@ impl AviDemux {
             teller: rate::Teller::default(),
             strays: 0,
             seen: (0, 0),
+            origin: None,
         }
     }
 
@@ -654,10 +661,19 @@ impl AviDemux {
             else {
                 return Some(unit);
             };
+            let consumed = self.walker.consumed();
+            let at = self.origin.and_then(|(byte, from)| Some(byte + consumed.checked_sub(from)?));
+            let ps = &mut self.pad_streams[i];
+            match (at, ps.resume) {
+                (Some(at), Some(to)) if at <= to => {
+                    self.walker.take(&chunk);
+                    continue;
+                }
+                _ => (ps.resume, ps.read_to) = (None, at),
+            }
             let Some(framer) = self.framers.get_mut(i).and_then(Option::as_mut) else {
                 return Some(unit);
             };
-            let ps = &mut self.pad_streams[i];
             let dropped = framer.push(ps.family, self.walker.data(&chunk));
             self.walker.take(&chunk);
             ps.junk += dropped as u64;
@@ -732,10 +748,18 @@ impl AviDemux {
 
     fn restart_at(&mut self, byte: Option<u64>) {
         // A chunk held for the pool still goes out, as one taken from the walker would.
-        match self.carry.as_ref().map(|c| c.spot) {
-            Some(Spot::Walker(c)) => self.walker.resync_keeping(&c),
-            _ => self.walker.resync(),
-        }
+        let kept = match self.carry.as_ref().map(|c| c.spot) {
+            Some(Spot::Walker(c)) => {
+                self.walker.resync_keeping(&c);
+                c.total() as u64
+            }
+            _ => {
+                self.walker.resync();
+                0
+            }
+        };
+        let from = self.walker.consumed() + kept;
+        self.origin = byte.map(|byte| (byte.max(self.movi_data_start), from));
         match byte {
             Some(byte) if byte < self.movi_data_start => {
                 (self.in_movi, self.skipped) = (false, byte)
@@ -938,6 +962,8 @@ impl Element for AviDemux {
                 gate: 0,
                 started: false,
                 greet: false,
+                read_to: None,
+                resume: None,
                 is_video: matches!(stream.kind, StreamKind::Video),
                 warned_undecodable: false,
                 junk: 0,
@@ -987,7 +1013,7 @@ impl Element for AviDemux {
     #[allow(clippy::disallowed_methods)]
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         self.walker = MoviWalker::new();
-        self.skipped = 0;
+        (self.skipped, self.origin) = (0, Some((self.movi_data_start, 0)));
         self.in_movi = false;
         self.carry = None;
         self.posted_duration = false;
@@ -995,6 +1021,7 @@ impl Element for AviDemux {
             (0, rate::ByteRate::default(), rate::Teller::default());
         for ps in &mut self.pad_streams {
             (ps.started, ps.greet, ps.ticks, ps.gate, ps.junk) = (false, false, 0, 0, 0);
+            (ps.read_to, ps.resume) = (None, None);
             ps.reorder.iter_mut().for_each(Reorder::reset);
         }
         (self.strays, self.seen) = (0, (0, 0));
@@ -1092,7 +1119,7 @@ impl AviDemux {
                 self.framing = None;
                 self.framers.iter_mut().flatten().for_each(codec::Framer::clear);
                 for (n, ps) in self.pad_streams.iter_mut().enumerate() {
-                    (ps.started, ps.greet) = (false, false);
+                    (ps.started, ps.greet, ps.read_to, ps.resume) = (false, false, None, None);
                     ps.reorder.iter_mut().for_each(Reorder::reset);
                     let tick = ps.sample_dur_ns.filter(|ns| *ns > 0);
                     let at = to.zip(tick).map_or(0, |(to, ns)| (to + ns / 2) / ns);
@@ -1102,33 +1129,48 @@ impl AviDemux {
                     };
                 }
             }
-            Event::SrcLinked { pad, on: true, restart } => {
-                self.relink(ctx, *pad, restart.map(|t| t.to_byte))
-            }
+            Event::SrcLinked { pad, on: true, restart } => self.relink(ctx, *pad, *restart),
             _ => {}
         }
         Ok(())
     }
 
     /// A link made on `pad` mid-run gets the stream's head ahead of what goes out on it next. A
-    /// restart at `restart` reads the stream again, what it held from before would go out twice.
-    fn relink(&mut self, ctx: &mut Ctx, pad: SrcPad, restart: Option<u64>) {
+    /// restart reads the stream again from its clock there, what it held from before would go
+    /// out twice. The other streams drop what they read again up to where they had got.
+    fn relink(&mut self, ctx: &mut Ctx, pad: SrcPad, restart: Option<SeekTarget>) {
         let Some(n) = self.pad_streams.iter().position(|ps| ps.pad == pad) else { return };
         let carried = self.carry.as_ref().filter(|c| c.pad == pad).map(|c| (c.spot, c.pts_ns));
-        if let Some(byte) = restart {
+        if let Some(target) = restart {
             if let Some((spot, _)) = carried {
                 self.carry = None;
                 self.pass(spot);
             }
             // a pushed source restarts with no pull reset to tell
-            self.restart_at(Some(byte));
+            self.restart_at(Some(target.to_byte));
             self.framers.get_mut(n).into_iter().flatten().for_each(codec::Framer::clear);
             self.framing = self.framing.filter(|f| f.0 != n);
-            self.pad_streams[n].reorder.iter_mut().for_each(Reorder::reset);
+            let scan = self.shared.as_ref().map(|i| &i.scan).or(self.scan.as_ref());
+            let clock = scan.and_then(|s| s.clocks_at(target.to_byte)?.get(n).copied());
+            let placed = self.origin.is_some();
+            for (m, ps) in self.pad_streams.iter_mut().enumerate() {
+                if m != n {
+                    ps.resume = ps.read_to.filter(|_| placed);
+                    continue;
+                }
+                ps.reorder.iter_mut().for_each(Reorder::reset);
+                let tick = ps.sample_dur_ns.filter(|ns| *ns > 0);
+                let at = target.at.nanos().zip(tick).map_or(0, |(to, ns)| (to + ns / 2) / ns);
+                (ps.ticks, ps.gate) = match clock {
+                    Some(ticks) => (ticks, if ps.is_video { at } else { 0 }),
+                    None => (at, 0),
+                };
+                (ps.read_to, ps.resume) = (None, None);
+            }
         }
         let ps = &mut self.pad_streams[n];
         let held = ps.reorder.as_ref().filter(|r| !r.held.is_empty());
-        let at = restart.unwrap_or(u64::MAX);
+        let at = restart.map_or(u64::MAX, |t| t.to_byte);
         log!(&*ctx, Level::Debug, "relink", stream = ps.stream_index, restart = at);
         if restart.is_some() || (carried.is_none() && held.is_none()) {
             ps.greet = true;

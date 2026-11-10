@@ -611,6 +611,13 @@ pub struct ChunkHead {
     total: usize,
 }
 
+impl ChunkHead {
+    /// Its header, payload and pad byte.
+    pub fn total(&self) -> usize {
+        self.total
+    }
+}
+
 /// Incremental `movi` walker. `push` bytes as they arrive, `peek_chunk` finds chunks.
 #[derive(Default)]
 pub struct MoviWalker {
@@ -706,6 +713,11 @@ impl MoviWalker {
     /// The payload of `chunk`, the one [`peek_chunk`](Self::peek_chunk) found at the head.
     pub fn data(&self, chunk: &ChunkHead) -> &[u8] {
         self.buf.get(self.head + 8..self.head + 8 + chunk.len).unwrap_or_default()
+    }
+
+    /// Bytes stepped past since the walker was made, the head's place behind its first byte.
+    pub fn consumed(&self) -> u64 {
+        self.consumed
     }
 
     /// Steps past `chunk`, the one at the head.

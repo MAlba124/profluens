@@ -124,7 +124,8 @@ fn audio_ahead_restarts_at_its_chunk_with_the_clocks_there() {
     assert_eq!(s.entries, want);
     assert_eq!(s.clocks_at(BASE + 4), Some(&[0, 0][..]));
     assert_eq!(s.clocks_at(BASE + 58), Some(&[1, 2][..]), "next are v1 and a2");
-    assert_eq!(s.clocks_at(BASE + 130), None, "no entry restarts at v2's own byte");
+    assert_eq!(s.clocks_at(BASE + 130), Some(&[2, 5][..]), "at v2's own byte, a relink's");
+    assert_eq!(s.clocks_at(BASE + 76), None, "v1 is no keyframe");
     assert_eq!(s.cut, 0);
 }
 

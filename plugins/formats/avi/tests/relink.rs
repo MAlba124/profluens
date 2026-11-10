@@ -78,10 +78,51 @@ fn heads(rows: &[Row]) -> Vec<usize> {
         .collect()
 }
 
+/// Each pad's buffers of the fixture played through, pulled.
+fn whole() -> Vec<Vec<Row>> {
+    let data = std::fs::read(TINY).expect("the fixture");
+    let mut p = pf_reactor::pipeline();
+    p.set_pool(1 << 20, 32);
+    let src = p.add(FileSrc::new(TINY));
+    let demux = AviDemux::new(data[..64 << 10].to_vec()).with_len(Some(data.len() as u64));
+    let demux = p.add(demux);
+    p.link(src.src(FileSrc::OUT), demux.sink(AviDemux::IN)).expect("src ! demux");
+    let mut rows = Vec::new();
+    for pad in &p.preroll().expect("preroll").srcs {
+        let r = Rows::default();
+        let sink = p.add(Rec { rows: Arc::clone(&r), pace: Duration::ZERO });
+        p.link(pad.element.src(pad.pad), sink.sink(SinkPad(0))).expect("pad ! sink");
+        rows.push(r);
+    }
+    p.run().expect("run");
+    rows.iter().map(|r| r.lock().unwrap().clone()).collect()
+}
+
+/// The video keyframes of `data` by its idx1, their time and chunk byte.
+fn keyframes(data: &[u8]) -> Vec<(u64, u64)> {
+    let (header, movi) = pf_avi::probe_header(data).expect("probe");
+    let movi = movi.expect("movi");
+    let at = movi.movi_end as usize;
+    let size = u32::from_le_bytes(data[at + 4..at + 8].try_into().unwrap()) as usize;
+    let tick = header.streams[0].sample_duration_ns().expect("a frame rate");
+    let video =
+        data[at + 8..at + 8 + size].as_chunks::<16>().0.iter().filter(|e| &e[..4] == b"00dc");
+    let key = |e: &&[u8; 16]| u32::from_le_bytes(e[4..8].try_into().unwrap()) & 0x10 != 0;
+    let off = |e: &[u8; 16]| u64::from(u32::from_le_bytes(e[8..12].try_into().unwrap()));
+    (0u64..)
+        .zip(video)
+        .filter(|(_, e)| key(e))
+        .map(|(frame, e)| (frame * tick, movi.movi_data_start - 4 + off(e)))
+        .collect()
+}
+
+/// What the new sink got, what the audio sink got, the VOL and the keyframe restarted at.
+type Moved = (Vec<Row>, Vec<Row>, Vec<u8>, Option<(u64, Timestamp)>);
+
 /// The video of the fixture played to one sink, moved to another mid-run with or without a
-/// restart of the source at its keyframe, as a client's switch to a transcode does. What the
-/// new sink got, and the VOL.
-fn moved(push: bool, restart: bool) -> (Vec<Row>, Vec<u8>) {
+/// restart of the source at the keyframe up to where it played, as a client's switch to a
+/// transcode does, the audio playing on.
+fn moved(push: bool, restart: bool) -> Moved {
     let data = std::fs::read(TINY).expect("the fixture");
     let vol = {
         let (_, movi) = pf_avi::probe_header(&data).expect("probe");
@@ -89,6 +130,7 @@ fn moved(push: bool, restart: bool) -> (Vec<Row>, Vec<u8>) {
         let first = pf_avi::riff::first_chunk_of(&data[movi..], 0).expect("a video chunk");
         pf_avi::vol_prefix(first).expect("a VOL").to_vec()
     };
+    let keys = keyframes(&data);
     let mut p = pf_reactor::pipeline();
     p.set_pool(1 << 20, 32);
     let src = match push {
@@ -115,45 +157,58 @@ fn moved(push: bool, restart: bool) -> (Vec<Row>, Vec<u8>) {
     let rows = Arc::clone(&new);
     let edit = control.edit(move |p| {
         let position = played.lock().unwrap().last().and_then(|r| r.0).expect("a stamp");
-        let index = p.index(demux).expect("the index");
-        // a pushed file has no idx1, it restarts at the estimate
         let to = Timestamp(position);
-        let (byte, at) = index.restart_for(0, to).or(index.resolve(to)).expect("a restart");
+        // a pushed file has no idx1 read, the keyframe is the test's
+        let key = keys.iter().rev().find(|k| k.0 <= position).map(|k| (k.1, Timestamp(k.0)));
+        let index = p.index(demux).expect("the index");
+        let at = if push { key } else { index.restart_for(0, to) };
+        assert_eq!(at, key, "the published keyframe");
         p.remove(old, Leave::Cut).expect("remove");
         let sink = p.add(Rec { rows, pace });
         p.link(demux.src(pad), sink.sink(SinkPad(0))).expect("pad ! new sink");
-        let targets = [(src, byte, at), (demux, byte, at)];
+        let (byte, key) = at.expect("a keyframe");
+        let targets = [(src, byte, key), (demux, byte, key)];
         let targets = if restart { &targets[..] } else { &[] };
-        p.commit_at(Timestamp(position), targets).expect("commit");
-        (position, byte, at)
+        p.commit_at(to, targets).expect("commit");
+        restart.then_some((byte, key))
     });
-    let (position, byte, at) = edit.expect("the edit ran");
+    let at = edit.expect("the edit ran");
     let _ = run.join().expect("the run thread");
-    eprintln!("moved at {position} ns, restart {byte} at {at:?}");
     let rows = new.lock().unwrap().clone();
-    (rows, vol)
+    let audio = sinks[0].2.lock().unwrap().clone();
+    (rows, audio, vol, at)
 }
 
 #[test]
-fn a_restart_sends_the_vol_ahead_of_the_first_picture_read_again_and_not_again() {
+fn a_restart_sends_the_vol_ahead_of_the_keyframe_stamped_as_its_own_and_drops_the_audio_read_again()
+{
+    let all = whole();
     for push in [false, true] {
-        let (rows, vol) = moved(push, true);
+        let (rows, audio, vol, at) = moved(push, true);
+        let (_, key) = at.expect("a restart");
         assert!(rows.len() > 2, "push {push}, {} rows", rows.len());
         assert_eq!(heads(&rows), [0], "push {push}, the VOL once, ahead of the rest");
         assert_eq!(rows[0].2, vol, "push {push}");
         assert_eq!(rows[0].0, rows[1].0, "push {push}, stamped as the picture behind it");
-        let key = rows[1].1.contains(BufferFlags::KEYFRAME);
-        assert!(push || key, "the keyframe the index restarts at first");
+        assert!(rows[1].1.contains(BufferFlags::KEYFRAME), "push {push}, the keyframe first");
+        assert_eq!(rows[1].0, key.nanos(), "push {push}, at its own time");
+        let from = all[0].iter().position(|r| r.0 == key.nanos()).expect("the keyframe");
+        assert_eq!(rows[1..], all[0][from..], "push {push}, each picture on from it once");
+        assert_eq!(audio, all[1], "push {push}, the audio frames once, as played through");
     }
 }
 
 #[test]
 fn a_pad_linked_again_without_a_restart_gets_the_vol_ahead_of_what_follows() {
+    let all = whole();
     for push in [false, true] {
-        let (rows, vol) = moved(push, false);
+        let (rows, audio, vol, _) = moved(push, false);
         assert!(rows.len() > 2, "push {push}, {} rows", rows.len());
         assert_eq!(heads(&rows), [0], "push {push}, the VOL once, ahead of the rest");
         assert_eq!(rows[0].2, vol, "push {push}");
         assert_eq!(rows[0].0, rows[1].0, "push {push}, stamped as the picture behind it");
+        let tail = &all[0][all[0].len() + 1 - rows.len()..];
+        assert_eq!(rows[1..], *tail, "push {push}, the pictures on from where it was");
+        assert_eq!(audio, all[1], "push {push}");
     }
 }

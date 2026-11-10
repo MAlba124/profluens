@@ -3,6 +3,7 @@
 #![feature(allocator_api)] // per-`process()` arena scratch
 #![allow(dead_code)]
 
+pub mod asc;
 pub mod bytes_in;
 pub mod chop;
 pub mod convert;

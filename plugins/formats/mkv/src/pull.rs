@@ -8,8 +8,9 @@ use profluens_core::memory::Memory;
 
 use crate::ebml::{self, ReadError, id};
 use crate::reader::{
-    MAX_HELD_ELEMENT, Track, block_addition, block_frames, block_group_parts, block_pts_ns,
-    cluster_led, find_subslice, lace_stamp, parse_block_header, parse_info, read_uint,
+    MAX_BLOCK, MAX_HELD_ELEMENT, Track, block_addition, block_frames, block_group_parts,
+    block_pts_ns, cluster_led, find_subslice, lace_stamp, parse_block_header, parse_info,
+    read_uint,
 };
 
 /// The first window after a start or a seek, so the first frames wait on no more.
@@ -27,6 +28,24 @@ pub(crate) const AHEAD: usize = 2;
 /// A jump past the asked bytes shorter than this is read through. Reading it costs a disk about
 /// what the seek would, and the kernel's readahead stays on a sequential stream.
 pub(crate) const SKIP_MIN: u64 = 1 << 20;
+
+/// What the walk passes unread at Segment or Cluster level (RFC 9559 section 5.1), the raw ones
+/// CRC-32, Position, PrevSize, SilentTracks and EncryptedBlock, and a chained Segment's EBML head.
+const PASSED: [&[u8]; 13] = [
+    id::SEEK_HEAD,
+    id::TRACKS,
+    id::CUES,
+    id::ATTACHMENTS,
+    id::CHAPTERS,
+    id::TAGS,
+    id::VOID,
+    &[0xBF],
+    &[0xA7],
+    &[0xAB],
+    &[0x58, 0x54],
+    &[0xAF],
+    id::EBML,
+];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Step {
@@ -201,10 +220,15 @@ impl Walk {
         if self.end.is_some_and(|e| elem_end > e) {
             return self.lost(ReadError::Malformed("element runs past its Segment"));
         }
-        let parsed = id == id::INFO
-            || id == id::TIMESTAMP
-            || id == id::SIMPLE_BLOCK
-            || id == id::BLOCK_GROUP;
+        let block = id == id::SIMPLE_BLOCK || id == id::BLOCK_GROUP;
+        if block && size > MAX_BLOCK {
+            return self.lost(ReadError::Malformed("block larger than any the reader sends on"));
+        }
+        let parsed = block || id == id::INFO || id == id::TIMESTAMP;
+        // Damage read as an element, its size would take the walk anywhere up to the end.
+        if !parsed && !PASSED.contains(&id) {
+            return self.lost(ReadError::Malformed("no Matroska element at this level"));
+        }
         if !parsed {
             return Step::Skip { to: elem_end };
         }
@@ -1010,6 +1034,41 @@ mod tests {
             run.steps.iter().find_map(|s| if let Step::Skip { to } = s { Some(*to) } else { None });
         assert_eq!(to, Some(at), "the first place walked to is the Cluster");
         assert_eq!(run.steps.iter().filter(|s| matches!(s, Step::Block { .. })).count(), 2);
+    }
+
+    /// Clusters of 100 blocks of 3000 octets, `count` of them from stamp `from`.
+    fn clusters(file: &mut Vec<u8>, from: u64, count: u64) {
+        for c in from..from + count {
+            cluster(file, c, &[3_000; 100]);
+        }
+    }
+
+    #[test]
+    fn behind_a_seek_damage_read_as_an_element_no_level_holds_is_resynced_past() {
+        let mut file = Vec::new();
+        clusters(&mut file, 0, 2);
+        let reach = 20 * 101 * 3_010;
+        // ChapterTrack, an element of Chapters, its size reaching most of the file after it
+        file.push(0x8F);
+        ebml::write_size(&mut file, reach as u64);
+        clusters(&mut file, 2, 30);
+        let run = walk(&file, 10, true);
+        assert_eq!(run.blocks() + run.joined.len(), 31 * 100, "every Cluster after the first");
+    }
+
+    #[test]
+    fn a_block_larger_than_any_sent_on_is_damage_not_a_skip() {
+        let mut file = Vec::new();
+        cluster(&mut file, 0, &[100]);
+        // an unlaced block on track 9 whose size bit flipped to 17 MiB
+        ebml::write_id(&mut file, id::SIMPLE_BLOCK);
+        ebml::write_size_fixed(&mut file, 17 << 20, 4);
+        file.extend_from_slice(&[0x89, 0, 0, 0x80]);
+        clusters(&mut file, 1, 60);
+        let mut d = Drive::new(&file, None);
+        d.unlinked = &[9];
+        let run = d.walk(0, false);
+        assert_eq!(run.blocks() + run.joined.len(), 1 + 60 * 100, "every Cluster after it");
     }
 
     #[test]

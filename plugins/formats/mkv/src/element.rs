@@ -19,6 +19,8 @@ use profluens_core::pull::Ask;
 use profluens_core::rate;
 use profluens_core::time::Timestamp;
 
+use profluens_video::rap::{NalSyntax, length_size, random_access};
+
 use crate::codec::{self, Reframer};
 use crate::config::{self, ConfigError, NalCodec, ParamSets};
 use crate::cued::Cued;
@@ -667,6 +669,12 @@ struct PadTrack {
     /// `S_TEXT/WEBVTT`, its cues go in `D_WEBVTT` block form with their settings and identifier.
     webvtt: bool,
     pre_roll_ns: u64,
+    /// The NAL syntax and length size of an AVC or HEVC track, its keyframes judged by them.
+    nal: Option<(NalSyntax, u8)>,
+    /// The newest stamp read of it since the last restart, put out or not.
+    read_to: Option<u64>,
+    /// Read past its last block, its pad ended until a restart.
+    over: bool,
     gate: Gate,
     held: Vec<Out>,
     gap: Option<u64>,
@@ -907,6 +915,8 @@ struct Seek {
     cues: Held<Cue>,
     /// The caption cues' ends, from `cues` and the tracks.
     ends: Vec<CueEnd>,
+    /// Each cued track's last cue and the widest gap between two of its cues.
+    tails: Vec<Tail>,
     /// What the index takes from `cues`, computed once when they change.
     of_cues: OfCues,
     whole: bool,
@@ -935,6 +945,17 @@ struct OfCues {
 
 /// Linked sets whose entries are kept, a track switched to and back and the set between.
 const LINKED_SETS: usize = 4;
+
+/// A cued track's `(track, last cue, widest gap between two cues)`.
+type Tail = (u64, u64, u64);
+
+/// Stream read past a cued track's last block and last cue before its pad ends, at least, or
+/// twice its widest gap between cues. ffmpeg writes an encoder's last delayed pictures up to
+/// its 10 s interleave delta behind the other tracks.
+const OVER_NS: u64 = 30_000_000_000;
+/// The same for a track without cues, where only the stream read says it ended. Beyond the
+/// spread of a badly interleaved remux.
+const OVER_UNCUED_NS: u64 = 60_000_000_000;
 
 #[derive(Clone, Copy)]
 struct Stamp {
@@ -983,6 +1004,13 @@ pub struct MkvDemux {
     /// The largest keyframe of a linked video track read on its own lately, decaying.
     key_bytes: u32,
     hold: Hold,
+    /// A keyframe of the key track the container flagged and its NAL types deny, at this stamp,
+    /// and whether it would have opened the video gate.
+    false_key: Option<(u64, bool)>,
+    /// The newest stamp read of any linked picture or sound track since the last restart, and
+    /// the restart's time, where a track with nothing read yet is taken to stand.
+    read_to: u64,
+    restart_ns: u64,
 }
 
 /// A pulled start that a seek follows reads nothing until that seek, the bytes at the head of
@@ -1115,6 +1143,7 @@ impl MkvDemux {
                 read: CuesRead::Done,
                 cues: Held::Own(Vec::new()),
                 ends: Vec::new(),
+                tails: Vec::new(),
                 of_cues: OfCues::default(),
                 whole: false,
                 grown: Grown::default(),
@@ -1132,6 +1161,9 @@ impl MkvDemux {
             lost: 0,
             key_bytes: 0,
             hold: Hold::Off,
+            false_key: None,
+            read_to: 0,
+            restart_ns: 0,
         }
     }
 
@@ -1277,6 +1309,7 @@ impl MkvDemux {
         let seek = &mut self.seek;
         let tracks = &seek.parsed.tracks;
         seek.ends = cue_ends(&seek.cues, tracks);
+        seek.tails = tails(&seek.cues);
         let (spans, left_out) = crate::index::captions(&seek.cues, tracks);
         let pads = &self.pad_tracks;
         let stream = |n: u64| pads.iter().find(|pt| pt.track_number == n).map(|pt| pt.stream);
@@ -1594,10 +1627,10 @@ impl MkvDemux {
     fn starved(ctx: &Ctx, bytes: usize, off: usize) -> usize {
         static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n % 64 == 0 {
+        if n.is_multiple_of(64) {
             let st = ctx.pool_stats();
             log!(
-                &*ctx,
+                ctx,
                 Level::Debug,
                 "starved",
                 bytes = bytes,
@@ -1712,7 +1745,9 @@ impl MkvDemux {
 
     fn next_frame(&mut self, pulled: bool, point: u64) -> Option<(usize, Out)> {
         let tick = self.tick(pulled);
-        while let Some(frame) = self.pop_frame(pulled) {
+        while self.false_key.is_none()
+            && let Some(mut frame) = self.pop_frame(pulled)
+        {
             let number = frame.track_number;
             let of = |pt: &PadTrack| pt.linked && pt.track_number == number;
             let Some(idx) = self.pad_tracks.iter().position(of) else {
@@ -1720,6 +1755,39 @@ impl MkvDemux {
                 continue;
             };
             let pt = &mut self.pad_tracks[idx];
+            if pt.over {
+                Self::recycle(&mut self.reader, frame);
+                continue;
+            }
+            if frame.pts_ns != PTS_NONE && pt.kind != Kind::Other {
+                pt.read_to = pt.read_to.max(Some(frame.pts_ns));
+                if frame.pts_ns > self.read_to {
+                    self.read_to = frame.pts_ns;
+                    let (at, from, tails) = (self.read_to, self.restart_ns, &self.seek.tails[..]);
+                    if self.pad_tracks.iter().any(|pt| over_now(pt, at, from, tails)) {
+                        // the ended pad's end goes out before anything read past it
+                        self.front.push_front(frame);
+                        return None;
+                    }
+                }
+            }
+            let pt = &mut self.pad_tracks[idx];
+            if let Some(rap) = pt.nal.and_then(|(s, n)| random_access(s, n, frame.data())) {
+                let opens = matches!(pt.gate, Gate::Keyframe { from } if frame.pts_ns.saturating_add(tick) >= from);
+                if frame.keyframe
+                    && !rap
+                    && Some(number) == self.key_track
+                    && frame.pts_ns != PTS_NONE
+                {
+                    self.false_key = Some((frame.pts_ns, opens));
+                    if opens {
+                        // Judged once the walk went back, nothing of it went out.
+                        Self::recycle(&mut self.reader, frame);
+                        return None;
+                    }
+                }
+                frame.keyframe = rap;
+            }
             let held = (pt.held.first().map(|h| h.pts_ns), pt.held.len());
             match pass(&mut pt.gate, pt.kind, (frame.pts_ns, frame.keyframe), held, tick) {
                 Pass::Out => {
@@ -1925,19 +1993,103 @@ impl MkvDemux {
         }
         let pulled = ctx.pulls(Self::IN);
         let point = Self::point(ctx);
-        while let Some((idx, frame)) = self.next_frame(pulled, point) {
-            let (track, pts) = (frame.track_number, frame.pts_ns);
-            self.emit_frame(ctx, idx, frame, Emit::Bounded);
-            if !self.pending.is_empty() {
-                self.warn_undecoded(ctx);
-                return false;
+        loop {
+            while let Some((idx, frame)) = self.next_frame(pulled, point) {
+                let (track, pts) = (frame.track_number, frame.pts_ns);
+                self.emit_frame(ctx, idx, frame, Emit::Bounded);
+                if !self.pending.is_empty() {
+                    self.warn_undecoded(ctx);
+                    return false;
+                }
+                if Some(track) == self.key_track && pts != PTS_NONE {
+                    self.key_out(ctx, pulled, pts);
+                }
             }
-            if Some(track) == self.key_track && pts != PTS_NONE {
-                self.key_out(ctx, pulled, pts);
+            let judged = self.judged(ctx, pulled);
+            if !self.end_over(ctx) && !judged {
+                break;
             }
         }
         self.warn_undecoded(ctx);
         true
+    }
+
+    /// Ends the pad of each linked picture or sound track the walk read past, by its cues when
+    /// it has some, else by the stream alone, so its consumers end while the others play on.
+    /// True when one ended.
+    fn end_over(&mut self, ctx: &mut Ctx) -> bool {
+        let (at, from, tails) = (self.read_to, self.restart_ns, &self.seek.tails[..]);
+        let mut ended = false;
+        for pt in self.pad_tracks.iter_mut().filter(|pt| over_now(pt, at, from, tails)) {
+            pt.over = true;
+            ended = true;
+            let (track, last) = (pt.track_number, pt.read_to.unwrap_or(from));
+            log!(&*ctx, Level::Info, "track_over", track = track, last = last, at = at);
+            ctx.end_src(pt.pad);
+        }
+        ended
+    }
+
+    /// Drops a false keyframe from the index. One that would have opened the video gate walks
+    /// back to the entry before it when `back`, so the decode starts at a random access point.
+    /// False when there was none.
+    fn judged(&mut self, ctx: &Ctx, back: bool) -> bool {
+        let Some((pts, opened)) = self.false_key.take() else { return false };
+        let (key, tick) = (self.key_track, self.tick(back));
+        let near = |t: u64| t.abs_diff(pts) <= tick;
+        let before = match self.seek.cues.is_empty() {
+            false => {
+                let cues = &self.seek.cues;
+                let false_cue = |c: &Cue| Some(c.track) == key && near(c.time_ns);
+                let dropped = cues.iter().any(false_cue);
+                if dropped {
+                    let kept: Vec<Cue> = cues.iter().filter(|c| !false_cue(c)).copied().collect();
+                    self.seek.cues = Held::Own(kept);
+                    self.cues_changed(ctx);
+                }
+                let prior =
+                    self.seek.cues.iter().filter(|c| Some(c.track) == key && c.time_ns < pts);
+                dropped.then(|| prior.max_by_key(|c| c.time_ns).map(|c| (c.byte, c.time_ns)))
+            }
+            true => {
+                let entries = &mut self.seek.grown.entries;
+                let n = entries.len();
+                entries.retain(|e| !near(e.time_ns));
+                let prior = entries.iter().rev().find(|e| e.time_ns < pts);
+                (entries.len() < n).then(|| prior.map(|e| (e.byte, e.time_ns)))
+            }
+        };
+        log!(ctx, Level::Warn, "false_key", pts = pts, indexed = before.is_some());
+        if before.is_some() {
+            self.publish(ctx);
+        }
+        if let Some(prior) = before.filter(|_| back && opened && ctx.pulls(Self::IN)) {
+            let (byte, at) = prior.unwrap_or((self.seek.parsed.first_cluster, 0));
+            log!(ctx, Level::Debug, "key_back", at = byte, pts = at);
+            self.step_back(byte, at);
+        }
+        true
+    }
+
+    /// The walk restarts at `byte`, an earlier keyframe's at `at`, as after a seek there. Video
+    /// waits for a keyframe from `at`, a track that put out frames drops what it reads again.
+    fn step_back(&mut self, byte: u64, at: u64) {
+        let pull = &mut self.pull;
+        pull.plan.reset();
+        (pull.win, pull.stash) = (None, None);
+        pull.walk.restart(byte, byte != 0 && byte != self.seek.segment_data_start);
+        self.walk_from = byte;
+        while let Some(frame) = self.front.pop_front() {
+            Self::recycle(&mut self.reader, frame);
+        }
+        for pt in self.pad_tracks.iter_mut().filter(|pt| pt.linked) {
+            pt.gate = match (pt.kind, pt.gate, pt.last) {
+                (Kind::Video, Gate::Keyframe { from }, _) => Gate::Keyframe { from: from.min(at) },
+                (_, Gate::Open, Some((pts, left))) => Gate::Resume { pts, left, inside: false },
+                (_, gate, _) => gate,
+            };
+        }
+        self.pull.walk.lead = self.lead(Timestamp(at));
     }
 
     fn key_out(&mut self, ctx: &mut Ctx, pulled: bool, pts: u64) {
@@ -1976,20 +2128,28 @@ impl MkvDemux {
             recycle_park(&mut self.park_free, c.bytes);
         }
         let (pulled, point) = (ctx.pulls(Self::IN), Self::point(ctx));
-        while let Some((idx, frame)) = self.next_frame(pulled, point) {
-            self.emit_frame(ctx, idx, frame, Emit::Exact);
-        }
+        self.emit_all(ctx, pulled, point);
         // A track that ended at or before its line ends with its last block held.
         for pt in &mut self.pad_tracks {
             Self::release(pt, &mut self.front);
         }
-        while let Some((idx, frame)) = self.next_frame(pulled, point) {
-            self.emit_frame(ctx, idx, frame, Emit::Exact);
-        }
+        self.emit_all(ctx, pulled, point);
         // A track's last caption has no next block to end it.
         for idx in 0..self.pad_tracks.len() {
             if let Some(cue) = self.pad_tracks[idx].cue.take() {
                 self.emit_frame(ctx, idx, cue, Emit::Exact);
+            }
+        }
+    }
+
+    fn emit_all(&mut self, ctx: &mut Ctx, pulled: bool, point: u64) {
+        loop {
+            while let Some((idx, frame)) = self.next_frame(pulled, point) {
+                self.emit_frame(ctx, idx, frame, Emit::Exact);
+            }
+            let judged = self.judged(ctx, false);
+            if !self.end_over(ctx) && !judged {
+                return;
             }
         }
     }
@@ -2021,7 +2181,7 @@ impl MkvDemux {
         let point = ctx.presentation_point().and_then(|point| point.nanos());
         let tick = self.tick(ctx.pulls(Self::IN));
         for pt in &mut self.pad_tracks {
-            (pt.started, pt.last, pt.gap) = (false, None, None);
+            (pt.started, pt.last, pt.gap, pt.read_to, pt.over) = (false, None, None, None, false);
             pt.gate = match (pt.kind, point) {
                 (Kind::Video, _) => Gate::Keyframe { from: 0 },
                 (Kind::Audio, Some(point)) => {
@@ -2031,6 +2191,8 @@ impl MkvDemux {
             };
         }
         self.video_from = ctx.seek_target().and_then(|target| target.at.nanos());
+        self.read_to = 0;
+        self.restart_ns = self.video_from.or(point).unwrap_or(0);
     }
 
     /// A relinked track drops what it reads again up to its last frame out, so nothing is seen
@@ -2064,7 +2226,10 @@ impl MkvDemux {
                 if let Some((pts, left)) = pt.last {
                     pt.gate = Gate::Resume { pts, left, inside: false };
                 }
+                pt.read_to = None;
             }
+            self.read_to = 0;
+            self.restart_ns = restart.and_then(|t| t.at.nanos()).unwrap_or(0);
         }
         let pt = &mut self.pad_tracks[idx];
         let last = pt.last.map_or(PTS_NONE, |(pts, _)| pts);
@@ -2079,6 +2244,7 @@ impl MkvDemux {
         );
         pt.held.drain(..).chain(pt.cue.take()).for_each(|f| Self::recycle(&mut self.reader, f));
         (pt.pad, pt.linked, pt.started, pt.last, pt.gap) = (pad, on, false, None, None);
+        (pt.read_to, pt.over) = (None, false);
         let from = restart.and_then(|target| target.at.nanos());
         pt.gate = match (pt.kind, from) {
             (Kind::Video, _) => Gate::Keyframe { from: 0 },
@@ -2204,6 +2370,8 @@ impl MkvDemux {
             c.restart(self.cued_from);
         }
         self.walk_from = from.to_byte;
+        (self.read_to, self.restart_ns) = (0, from.at.nanos().unwrap_or(0));
+        self.pad_tracks.iter_mut().for_each(|pt| pt.read_to = None);
         let resync = self.mid_segment(from.to_byte);
         let lead = self.lead(from.at);
         let pull = &mut self.pull;
@@ -2452,14 +2620,16 @@ impl MkvDemux {
                         return Ok(());
                     };
                     let items = &mut pull.plan.items;
+                    let (pads, tracks) = (&self.pad_tracks, &seek.parsed.tracks);
+                    let (grown, due) = (&mut seek.grown, &mut seek.due);
                     let mut put = |mut p: Planned| {
                         let stamped = p.pts_ns != PTS_NONE;
-                        seek.due |=
-                            grow && stamped && seek.grown.block(p.track, p.pts_ns, p.keyframe);
+                        let grows = grow && stamped && grown.key == Some(p.track);
+                        *due |=
+                            grows && grown.block(p.track, p.pts_ns, walked_key(pads, tracks, &p));
                         p.tag = tag;
                         items.push_back(p);
                     };
-                    let tracks = &seek.parsed.tracks;
                     let decoded = pull.walk.frames(
                         win,
                         (from, to),
@@ -2693,6 +2863,60 @@ fn log_track(ctx: &Ctx, track: &Track, family: &'static str, kind: Kind) {
     }
 }
 
+/// Whether linked picture or sound track `pt` is read past, the stream at `at`, by its cue tail
+/// when it has one. A track with nothing read since the restart at `from` stands there.
+fn over_now(pt: &PadTrack, at: u64, from: u64, tails: &[Tail]) -> bool {
+    if !pt.linked || pt.over || pt.kind == Kind::Other {
+        return false;
+    }
+    let last = pt.read_to.unwrap_or(from);
+    let margin = match tails.iter().find(|t| t.0 == pt.track_number) {
+        Some(&(_, cue, _)) if cue > last => return false,
+        Some(&(_, _, gap)) => OVER_NS.max(gap.saturating_mul(2)),
+        None => OVER_UNCUED_NS,
+    };
+    at > last.saturating_add(margin)
+}
+
+/// Each cued track's last cue and widest gap between cues, the Cues in any order.
+// Cold path, once per Cues read.
+#[allow(clippy::disallowed_methods)]
+fn tails(cues: &[Cue]) -> Vec<Tail> {
+    let mut times: Vec<(u64, u64)> = cues.iter().map(|c| (c.track, c.time_ns)).collect();
+    times.sort_unstable();
+    let mut out: Vec<Tail> = Vec::new();
+    for (track, t) in times {
+        match out.last_mut() {
+            Some(tail) if tail.0 == track => {
+                tail.2 = tail.2.max(t - tail.1);
+                tail.1 = t;
+            }
+            _ => out.push((track, t, 0)),
+        }
+    }
+    out
+}
+
+/// A walked block's keyframe flag by its NAL types where its bytes are read and stored plain.
+fn walked_key(pads: &[PadTrack], tracks: &[Track], p: &Planned) -> bool {
+    let State::Ready(view, _) = &p.state else { return p.keyframe };
+    let nal = pads.iter().find(|pt| pt.track_number == p.track).and_then(|pt| pt.nal);
+    let coded = tracks.iter().any(|t| t.track_number == p.track && t.coding.transforms());
+    match nal.filter(|_| !coded) {
+        Some((s, n)) => random_access(s, n, view.data()).unwrap_or(p.keyframe),
+        None => p.keyframe,
+    }
+}
+
+fn nal_of(track: &Track) -> Option<(NalSyntax, u8)> {
+    let syntax = match track.codec_id.as_str() {
+        "V_MPEG4/ISO/AVC" => NalSyntax::Avc,
+        "V_MPEGH/ISO/HEVC" => NalSyntax::Hevc,
+        _ => return None,
+    };
+    Some((syntax, length_size(syntax, &track.codec_private)))
+}
+
 fn sample_name(bit_depth: u32) -> &'static str {
     match bit_depth {
         8 => "s8",
@@ -2778,6 +3002,9 @@ impl Element for MkvDemux {
                 opus: family == "opus",
                 webvtt: track.codec_id == "S_TEXT/WEBVTT",
                 pre_roll_ns: codec::lead_of(track).pre_roll,
+                nal: nal_of(track),
+                read_to: None,
+                over: false,
                 gate: Gate::Open,
                 held: Vec::new(),
                 cue: None,
@@ -2816,7 +3043,8 @@ impl Element for MkvDemux {
         }
         self.side.read.iter_mut().for_each(asked_again);
         for pt in &mut self.pad_tracks {
-            (pt.started, pt.gate, pt.last) = (false, Gate::Open, None);
+            (pt.started, pt.gate, pt.last, pt.read_to, pt.over) =
+                (false, Gate::Open, None, None, false);
             pt.held.clear();
             let pad = ctx.stream_pad(pt.stream);
             (pt.pad, pt.linked) =
@@ -2837,6 +3065,7 @@ impl Element for MkvDemux {
         self.pull.caps = (bytes.max(1), most(stats.max_slots).max(1) as u32);
         self.pull.walk.set_cap((stats.bytes_budget / 4).clamp(256, u32::MAX as u64) as u32);
         (self.cued, self.cued_off, self.cued_from, self.walk_from) = (None, false, 0, 0);
+        (self.read_to, self.restart_ns, self.false_key) = (0, 0, None);
         self.lost = 0;
         if !self.seek.cues.is_empty() {
             self.publish(ctx);

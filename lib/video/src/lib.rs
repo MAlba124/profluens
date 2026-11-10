@@ -19,6 +19,7 @@ pub mod keys;
 pub mod parse;
 pub mod props;
 pub mod qos;
+pub mod rap;
 pub mod sink;
 pub mod testsrc;
 

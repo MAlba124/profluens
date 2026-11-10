@@ -389,3 +389,23 @@ fn cues_in_the_head_are_not_read_again() {
         assert_eq!(again, 1, "the window alone touches its bytes, {log:?}");
     }
 }
+
+/// HE-AAC stated at its 24 kHz core by the track, the ASC signals SBR at 48 kHz explicitly.
+#[test]
+fn an_he_aac_track_is_described_at_its_output_rate() {
+    // object type 5, core at index 6, stereo, SBR at index 3, then AAC LC
+    let asc = vec![0x2B, 0x11, 0x88, 0x00];
+    let parsed = profluens_audio::asc::parse(&asc).unwrap();
+    assert_eq!((parsed.rate, parsed.out_rate, parsed.sbr), (24_000, 48_000, true));
+    let track = pf_mkv::TrackConfig::audio(1, "A_AAC", asc, 24_000.0, 2, 0);
+    let mut w = pf_mkv::MatroskaWriter::new(vec![track]);
+    let mut file = Vec::new();
+    w.write_header(&mut file).unwrap();
+    for i in 0..20u64 {
+        w.write_frame(&mut file, 1, i * 42_666_666, &[0x21, 0x10, i as u8], true).unwrap();
+    }
+    w.finalize(&mut file);
+    let o = open(&file);
+    let t = o.tracks.iter().find(|t| t.kind == TrackKind::Audio).unwrap();
+    assert_eq!((t.family, t.rate, t.channels), ("aac", 48_000, 2));
+}

@@ -13,7 +13,10 @@ pub(crate) fn of(family: &str, head: &[u8], channels: u32) -> u64 {
     let said = match family {
         "vorbis" | "flac" | "flac/ogg" => default_layout(channels),
         "opus" => opus(head),
-        "aac" => asc_config(head).map_or(0, aac),
+        "aac" => profluens_audio::asc::parse(head).map_or(0, |a| match a.ps && a.config == 1 {
+            true => STEREO,
+            false => aac(a.config),
+        }),
         "mp3" if channels <= 2 => default_layout(channels),
         _ => 0,
     };
@@ -27,20 +30,6 @@ fn opus(head: &[u8]) -> u64 {
         (0, n @ (1 | 2)) | (1, n) => default_layout(n),
         _ => 0,
     }
-}
-
-/// The channelConfiguration of an AudioSpecificConfig, behind the object type and the sampling
-/// frequency, each with its escape.
-fn asc_config(asc: &[u8]) -> Option<u8> {
-    let bit = |at: usize| asc.get(at / 8).map(|b| b >> (7 - at % 8) & 1);
-    let bits =
-        |at: usize, n: usize| (at..at + n).try_fold(0u32, |v, i| Some(v << 1 | u32::from(bit(i)?)));
-    let mut at = 5;
-    if bits(0, 5)? == 31 {
-        at += 6;
-    }
-    at += if bits(at, 4)? == 15 { 4 + 24 } else { 4 };
-    bits(at, 4).map(|c| c as u8)
 }
 
 /// The speakers of a channelConfiguration, as FFmpeg's AAC decoder lays them out. 0, a program
@@ -92,12 +81,12 @@ mod tests {
         assert_eq!(of("aac", &[0x11, 0xB0], 6), FL | FR | FC | LFE | BL | BR);
         // object type 31 escapes to 32 + 6 bits, frequency index 15 to 24 bits, config 1
         let esc = [0xF8, 0x1F, 0xFF, 0xFF, 0xFE, 0x20];
-        assert_eq!(asc_config(&esc), Some(1));
         assert_eq!(of("aac", &esc, 1), FC);
         // a program config element states the speakers elsewhere
         assert_eq!(of("aac", &[0x11, 0x80], 2), 0);
         // HE-AAC v2 says mono, its parametric stereo decodes to two
         assert_eq!(of("aac", &[0x11, 0x88], 2), 0);
+        assert_eq!(of("aac", &[0xEB, 0x09, 0x88, 0x00], 2), STEREO, "signalled stereo");
         assert_eq!(of("aac", &[0x11], 2), 0, "cut");
         assert_eq!(aac(7), FL | FR | FC | LFE | BL | BR | FLC | FRC);
         assert_eq!(aac(12), FL | FR | FC | LFE | BL | BR | SL | SR);

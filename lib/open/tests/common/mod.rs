@@ -16,6 +16,40 @@ pub fn own(name: &str) -> Vec<u8> {
     fixture(&format!("lib/open/tests/fixtures/{name}"))
 }
 
+/// What ffmpeg writes for `args` into a file named `name`, made once per argument set, None
+/// where ffmpeg is absent or refuses.
+pub fn ffmpeg(name: &str, args: &[&str]) -> Option<Vec<u8>> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hash = DefaultHasher::new();
+    args.hash(&mut hash);
+    let key = hash.finish();
+    let path = std::env::temp_dir().join(format!("pf_open_{key:016x}_{name}"));
+    if let Ok(b) = std::fs::read(&path) {
+        return Some(b);
+    }
+    let part =
+        std::env::temp_dir().join(format!("pf_open_{}_{key:016x}_{name}", std::process::id()));
+    let ok = std::process::Command::new("ffmpeg")
+        .env_remove("LD_LIBRARY_PATH")
+        .args(["-v", "error", "-y"])
+        .args(args)
+        .arg(&part)
+        .status()
+        .is_ok_and(|s| s.success())
+        && std::fs::rename(&part, &path).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&part);
+        eprintln!("ffmpeg could not make {name}, skipped");
+        return None;
+    }
+    std::fs::read(&path).ok()
+}
+
+/// The offset of the `n`th `needle` in `b`.
+pub fn find_nth(b: &[u8], needle: &[u8], n: usize) -> usize {
+    b.windows(needle.len()).enumerate().filter(|(_, w)| *w == needle).nth(n).unwrap().0
+}
+
 /// `bytes` opened, with every read logged.
 pub fn open_with(bytes: &[u8], want: Want, caps: Caps) -> (Result<Opened, OpenError>, Vec<Need>) {
     let mut log = Vec::new();

@@ -499,11 +499,43 @@ fn parse_audio_entry(payload: &[u8], entry: &mut SampleEntry) -> Result<(), BoxE
             }
         }
     }
+    // muxers may state two channels for any layout, the codec's own record states it
+    match entry.family {
+        "aac" => {
+            if let Some(asc) = profluens_audio::asc::parse(&entry.config_record) {
+                entry.channels = asc.channels().unwrap_or(entry.channels);
+                if asc.sbr || entry.sample_rate == 0 {
+                    entry.sample_rate = asc.out_rate;
+                }
+            }
+        }
+        "ac3" => entry.channels = child(b"dac3").and_then(dac3_channels).unwrap_or(entry.channels),
+        "eac3" => entry.channels = child(b"dec3").and_then(dec3_channels).unwrap_or(entry.channels),
+        _ => {}
+    }
     // a btrt wins over the esds
     if let Some(avg) = payload.get(children_off..).and_then(btrt_avg) {
         entry.avg_bitrate = avg;
     }
     Ok(())
+}
+
+/// Full bandwidth channels by `acmod`, 1+1 dual mono counted as two (A/52 Table 5.8).
+const ACMOD_CHANNELS: [u32; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
+
+/// The channels of a `dac3` body, its acmod and lfeon (ETSI TS 102 366 F.4).
+fn dac3_channels(dac3: &[u8]) -> Option<u32> {
+    let b = dac3.get(..3)?;
+    let v = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+    Some(ACMOD_CHANNELS[(v >> 11 & 7) as usize] + (v >> 10 & 1))
+}
+
+/// The channels of a `dec3` body's first independent substream, its acmod and lfeon (ETSI TS
+/// 102 366 F.6). Dependent substreams are not counted, as FFmpeg's demuxer counts none.
+fn dec3_channels(dec3: &[u8]) -> Option<u32> {
+    let b = dec3.get(2..5)?;
+    let v = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+    Some(ACMOD_CHANNELS[(v >> 9 & 7) as usize] + (v >> 8 & 1))
 }
 
 /// A native FLAC stream head from a `dfLa` body (RFC 9639 8.1). The first block must be
@@ -803,6 +835,57 @@ mod tests {
         assert_eq!(entry.config_record, asc, "CodecPrivate = the ASC verbatim");
         assert_eq!(entry.codec_head, asc, "in-band head = the ASC (first-buffer contract)");
         assert!(matches!(entry.reframer, Reframer::Passthrough), "raw AAC AUs, no reframe");
+    }
+
+    fn stsd_of(kind: &[u8; 4], entry: &[u8]) -> SampleEntry {
+        let mut stsd = vec![0u8; 4];
+        stsd.extend_from_slice(&1u32.to_be_bytes());
+        stsd.extend_from_slice(&box_bytes(kind, entry));
+        parse_stsd(&stsd).unwrap()
+    }
+
+    #[test]
+    fn the_asc_states_the_channels_and_an_explicit_sbr_rate() {
+        // LC 48 kHz 5.1 in an entry that says stereo
+        let e = stsd_of(b"mp4a", &mp4a_entry(&esds_body(0x40, &[0x11, 0xB0], false), 48_000, 2));
+        assert_eq!((e.channels, e.sample_rate), (6, 48_000));
+        // HE-AAC, a 24 kHz core with hierarchical SBR to 48 kHz, the entry at the core rate
+        let he = [0x2B, 0x11, 0x88, 0x00];
+        let e = stsd_of(b"mp4a", &mp4a_entry(&esds_body(0x40, &he, false), 24_000, 2));
+        assert_eq!((e.channels, e.sample_rate), (2, 48_000));
+        // implicit SBR is not seen in the ASC, the entry's rate stands
+        let e = stsd_of(b"mp4a", &mp4a_entry(&esds_body(0x40, &[0x13, 0x10], false), 48_000, 2));
+        assert_eq!((e.channels, e.sample_rate), (2, 48_000));
+        // a program config element leaves the entry's count
+        let e = stsd_of(b"mp4a", &mp4a_entry(&esds_body(0x40, &[0x11, 0x80], false), 48_000, 4));
+        assert_eq!(e.channels, 4);
+    }
+
+    fn ac3_entry(kind: &[u8; 4], config: &[u8]) -> Vec<u8> {
+        let mut ae = vec![0u8; 28];
+        ae[16..18].copy_from_slice(&2u16.to_be_bytes());
+        ae[24..28].copy_from_slice(&(48_000u32 << 16).to_be_bytes());
+        let child = if kind == b"ac-3" { b"dac3" } else { b"dec3" };
+        ae.extend_from_slice(&box_bytes(child, config));
+        ae
+    }
+
+    #[test]
+    fn dac3_and_dec3_state_the_channels() {
+        // fscod 0, bsid 8, bsmod 0, acmod 7, lfeon 1, bit_rate_code 15
+        let e = stsd_of(b"ac-3", &ac3_entry(b"ac-3", &[0x10, 0x3D, 0xE0]));
+        assert_eq!((e.family, e.channels), ("ac3", 6));
+        // acmod 2, no LFE
+        let e = stsd_of(b"ac-3", &ac3_entry(b"ac-3", &[0x10, 0x10, 0x00]));
+        assert_eq!(e.channels, 2);
+        // data_rate 640, one substream, fscod 0, bsid 16, acmod 7, lfeon 1, no dependents
+        let e = stsd_of(b"ec-3", &ac3_entry(b"ec-3", &[0x14, 0x00, 0x20, 0x0F, 0x00]));
+        assert_eq!((e.family, e.channels), ("eac3", 6));
+        // acmod 1, mono
+        let e = stsd_of(b"ec-3", &ac3_entry(b"ec-3", &[0x14, 0x00, 0x20, 0x02, 0x00]));
+        assert_eq!(e.channels, 1);
+        let e = stsd_of(b"ec-3", &ac3_entry(b"ec-3", &[0x14, 0x00]));
+        assert_eq!(e.channels, 2, "a cut dec3 leaves the entry's count");
     }
 
     #[test]

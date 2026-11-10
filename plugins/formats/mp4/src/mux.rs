@@ -1299,12 +1299,6 @@ fn text_head(id: u32) -> TrackHead {
     }
 }
 
-/// ISO/IEC 14496-3 1.6.3.4.
-const AAC_RATES: [u32; 13] = [
-    96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000,
-    7_350,
-];
-
 /// ISO/IEC 13818-7 6.2. `None` for no ADTS sync word.
 // Cold path, once per track.
 #[allow(clippy::disallowed_methods)]
@@ -1315,27 +1309,22 @@ fn adts_config(d: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let aot = (d[2] >> 6) + 1;
     let sfi = (d[2] >> 2) & 0x0F;
     let ch = ((d[2] & 1) << 2) | (d[3] >> 6);
-    let rate = *AAC_RATES.get(usize::from(sfi))?;
+    let rate = *profluens_audio::asc::AAC_RATES.get(usize::from(sfi))?;
     let asc = vec![(aot << 3) | (sfi >> 1), ((sfi & 1) << 7) | (ch << 3)];
     Some((asc, rate, u32::from(ch)))
 }
 
+/// The core rate and the channels, 0 for what the ASC does not state.
 fn asc_rate_channels(asc: &[u8]) -> (u32, u32) {
-    if asc.len() < 2 {
-        return (0, 0);
-    }
-    let sfi = ((asc[0] & 7) << 1) | (asc[1] >> 7);
-    let ch = (asc[1] >> 3) & 0x0F;
-    (AAC_RATES.get(usize::from(sfi)).copied().unwrap_or(0), u32::from(ch))
+    profluens_audio::asc::parse(asc).map_or((0, 0), |a| (a.rate, a.channels().unwrap_or(0)))
 }
 
 /// 1024 samples, or 960 where the GASpecificConfig says so.
 fn aac_hint(asc: &[u8], timescale: u32) -> Hint {
-    let (core, _) = asc_rate_channels(asc);
-    if core == 0 {
+    let Some(a) = profluens_audio::asc::parse(asc).filter(|a| a.rate != 0) else {
         return Hint::None;
-    }
-    let frame: u32 = if asc.len() >= 2 && asc[1] & 0x04 != 0 { 960 } else { 1024 };
+    };
+    let (core, frame) = (a.rate, if a.short_frame { 960u32 } else { 1024 });
     match (u64::from(frame) * u64::from(timescale)).checked_div(u64::from(core)) {
         Some(n) if n * u64::from(core) == u64::from(frame) * u64::from(timescale) => {
             Hint::Fixed(n as u32)

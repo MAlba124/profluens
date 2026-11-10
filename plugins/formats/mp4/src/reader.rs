@@ -202,7 +202,12 @@ impl Track {
 
     /// The decoder pre-roll ahead of a seek target in ns, from `profluens_audio::RESTARTS`.
     pub fn pre_roll_ns(&self) -> u64 {
-        pre_roll_ns(self.entry.family, self.entry.sample_rate, self.timescale)
+        // an SBR frame is 1024 samples of the core rate, the entry states the output rate
+        let core = match self.entry.family {
+            "aac" => profluens_audio::asc::parse(&self.entry.config_record).map(|a| a.rate),
+            _ => None,
+        };
+        pre_roll_ns(self.entry.family, core.unwrap_or(self.entry.sample_rate), self.timescale)
     }
 }
 

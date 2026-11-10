@@ -20,6 +20,9 @@ pf-mp3 = { path = "../audio/mp3" }
 
 [dev-dependencies]
 pf-harness = { path = "../../lib/harness" }
+# Dmabuf mode on udmabuf slots, tests/dmabuf.rs.
+pf-memory = { path = "../../lib/memory" }
+libc = "0.2"
 profluens-elements = { path = "../../lib/elements" }
 pf-ogg = { path = "../formats/ogg" }
 pf-mp4 = { path = "../formats/mp4" }

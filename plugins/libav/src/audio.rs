@@ -448,7 +448,7 @@ impl LibavAudioDec {
         if self.open_failed {
             return false;
         }
-        match Decoder::open(self.codec, &[], None, true) {
+        match Decoder::open(self.codec, &[], None, true, 1) {
             Ok(d) => {
                 log!(&*ctx, Level::Info, "parser_open", codec = self.codec.name());
                 self.decoder = Some(d);
@@ -472,7 +472,7 @@ impl LibavAudioDec {
             }
             return Ok(());
         }
-        match Decoder::open(lav::Codec::Aac, data, None, false) {
+        match Decoder::open(lav::Codec::Aac, data, None, false, 1) {
             Ok(d) => {
                 log!(&*ctx, Level::Info, "decoder_open", codec = "aac", config = data.len());
                 self.decoder = Some(d);
@@ -491,7 +491,7 @@ impl LibavAudioDec {
     fn open_alac(&mut self, ctx: &mut Ctx, data: &[u8]) -> Result<(), Error> {
         let fail = |e| Err(Error::element_failed(ctx.element(), LavAudioError::Open(e)));
         let Some(atom) = alac_atom(data) else { return fail(LavError::Argument) };
-        match Decoder::open(lav::Codec::Alac, &atom, None, false) {
+        match Decoder::open(lav::Codec::Alac, &atom, None, false, 1) {
             Ok(d) => {
                 log!(&*ctx, Level::Info, "decoder_open", codec = "alac", config = data.len());
                 self.decoder = Some(d);
@@ -548,7 +548,7 @@ impl LibavAudioDec {
     }
 
     fn open_vorbis(&mut self, ctx: &mut Ctx) {
-        match Decoder::open(lav::Codec::Vorbis, &self.vorbis.laced, None, false) {
+        match Decoder::open(lav::Codec::Vorbis, &self.vorbis.laced, None, false, 1) {
             Ok(d) => {
                 log!(
                     &*ctx,
@@ -583,7 +583,7 @@ impl LibavAudioDec {
             if self.framing == Framing::SpeexRaw && ident == self.speex.ident.as_slice() {
                 return false;
             }
-            match Decoder::open(lav::Codec::Speex, ident, None, false) {
+            match Decoder::open(lav::Codec::Speex, ident, None, false, 1) {
                 Ok(d) => {
                     log!(&*ctx, Level::Info, "decoder_open", codec = "speex", extra = extra);
                     self.decoder = Some(d);
@@ -1083,7 +1083,7 @@ impl LibavAudioDec {
                     }
                     if changed
                         && data.len() <= HEAD_MAX
-                        && let Ok(d) = Decoder::open(lav::Codec::Aac, data, None, false)
+                        && let Ok(d) = Decoder::open(lav::Codec::Aac, data, None, false, 1)
                     {
                         log!(&*ctx, Level::Debug, "aac_reconfig", config = data.len());
                         self.decoder = Some(d);

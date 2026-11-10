@@ -11,9 +11,10 @@ use profluens_core::ctx::{Ctx, SeekTarget};
 use profluens_core::element::{Element, Flow};
 use profluens_core::error::Error;
 use profluens_core::event::Event;
-use profluens_core::format::{FixedFormat, Vocabulary};
+use profluens_core::format::{FixedFormat, Value, Vocabulary};
 use profluens_core::id::{Interner, SinkPad, SrcPad};
 use profluens_core::memory::{Pool, PoolConfig};
+use profluens_core::props::PropTable;
 use profluens_core::sched::{after_process, process_once, resolve_announcements};
 use profluens_core::time::Timestamp;
 
@@ -42,6 +43,7 @@ pub struct Harness {
     off_pool: Pool,
     sink_pad: Option<SinkPad>,
     real_wakes: bool,
+    props: Option<Arc<PropTable>>,
 }
 
 impl Harness {
@@ -90,11 +92,9 @@ impl Harness {
         ctx.set_vocabulary(Arc::clone(&vocabulary));
         let clock = MockClock::new();
         ctx.set_clock(Arc::new(clock.clone()), Arc::new(std::sync::atomic::AtomicI64::new(0)));
-        if !desc.props.is_empty() {
-            ctx.set_props(
-                desc.props,
-                Arc::new(profluens_core::props::PropTable::new(desc.props.len())),
-            );
+        let props = (!desc.props.is_empty()).then(|| Arc::new(PropTable::new(desc.props.len())));
+        if let Some(table) = &props {
+            ctx.set_props(desc.props, Arc::clone(table));
         }
 
         Self {
@@ -110,6 +110,21 @@ impl Harness {
             off_pool: Pool::new(slot_size),
             sink_pad,
             real_wakes: false,
+            props,
+        }
+    }
+
+    /// Set a declared property, read by the element at its start. `false` for an undeclared one.
+    pub fn set_prop(&mut self, name: &str, v: Value) -> bool {
+        let Some(table) = &self.props else {
+            return false;
+        };
+        match self.element.desc().props.iter().position(|p| p.name == name) {
+            Some(idx) => {
+                table.set(idx, v);
+                true
+            }
+            None => false,
         }
     }
 

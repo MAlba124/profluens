@@ -2,6 +2,7 @@
 //! `video/raw` or `video/gpu` in and out. Frames wholly before a seek's presentation point are
 //! dropped. A PQ or HLG input to nv12 is tone mapped to BT.709 SDR by the driver's HDR10 filter.
 
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -14,7 +15,9 @@ use profluens_core::element::{
 };
 use profluens_core::error::Error;
 use profluens_core::event::Event;
-use profluens_core::format::{ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, Value, ValueDesc};
+use profluens_core::format::{
+    ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, OfferSpec, Value, ValueDesc,
+};
 use profluens_core::id::{SinkPad, SrcPad};
 use profluens_core::log;
 use profluens_core::log::Level;
@@ -35,9 +38,10 @@ use crate::gpuframe::{
 use crate::probe;
 use crate::va::{Display, ExportedSurface, ReadbackImage, SurfaceFormat, Surfaces, UploadImage};
 use crate::vpp::format::{self, Kind, NV12, P010};
+use crate::vpp::linear::linear_imports;
 use crate::vpp::plan::{Plan, Target, shown};
 use crate::vpp::proc::{
-    Color, Hdr10, Imported, Out, Proc, Src, ToneMap, dmabuf_key, import, surfaces,
+    Color, Hdr10, Imported, Out, Proc, Src, ToneMap, dmabuf_key, import, layout_key, surfaces,
 };
 
 const NAME: &str = "vaapipostproc";
@@ -265,6 +269,10 @@ struct GpuIn {
     frames: Option<FrameRx>,
     link: Option<(Kind, u64)>,
     imports: Vec<Imported>,
+    /// Raw pictures or linear dmabufs, whichever the link fixed, see `with_dmabuf_input`.
+    either: bool,
+    /// The driver refused a linear import, the CPU copies each picture in from then on.
+    cpu: bool,
 }
 
 struct GpuOut {
@@ -363,9 +371,35 @@ impl VaapiPostProc {
                 frames: None,
                 link: None,
                 imports: Vec::with_capacity(IMPORTS_MAX),
+                either: false,
+                cpu: false,
             }),
             ..Self::new(target)
         }
+    }
+
+    /// Takes `video/raw` or linear `video/gpu` frames from `channel`, a software decoder's udmabuf
+    /// slots in dmabuf mode. The dmabuf link is offered only where [`linear_imports`] passed, and
+    /// a picture the driver refuses is copied in by the CPU, so the stream never stops for it.
+    ///
+    /// [`linear_imports`]: crate::vpp::linear_imports
+    // Cold: construction.
+    #[allow(clippy::disallowed_methods)]
+    pub fn with_dmabuf_input(mut self, channel: Arc<GpuFrameChannel>) -> Self {
+        self.gpu_in = Some(GpuIn {
+            channel,
+            frames: None,
+            link: None,
+            imports: Vec::with_capacity(IMPORTS_MAX),
+            either: true,
+            cpu: false,
+        });
+        self
+    }
+
+    /// Whether frames come as dmabufs, the link fixed `video/gpu`.
+    fn gpu_linked(&self) -> bool {
+        self.gpu_in.as_ref().is_some_and(|g| !g.either || g.link.is_some())
     }
 
     // Cold: construction.
@@ -520,7 +554,9 @@ impl VaapiPostProc {
             }
         }
         self.session = None;
-        let (upload, gpu_out) = (self.gpu_in.is_none(), self.gpu_out.as_ref().map(|g| g.align));
+        // a dmabuf link keeps the upload surface for pictures the driver refuses to import
+        let upload = self.gpu_in.as_ref().is_none_or(|g| g.either);
+        let gpu_out = self.gpu_out.as_ref().map(|g| g.align);
         let warm = self.warm.take();
         let d = self.display()?;
         let proc = match warm {
@@ -1010,7 +1046,8 @@ impl VaapiPostProc {
                 self.warn(ctx, K::NoGpuFrame { token: h.token });
                 continue;
             };
-            let src = self.imported(&frame, kind, modifier).map_err(|e| Self::fail(ctx, e))?;
+            let src =
+                self.source(ctx, &frame, f, kind, modifier).map_err(|e| Self::fail(ctx, e))?;
             let mut out = self
                 .process_into(ctx, src, (h.crop_x, h.crop_y), f, p, sink)
                 .map_err(|e| Self::fail(ctx, e))?;
@@ -1026,6 +1063,35 @@ impl VaapiPostProc {
         Ok(())
     }
 
+    /// The surface `frame` is read from, imported, or on a linear link the upload surface the
+    /// CPU copied it into once the driver refused an import.
+    fn source(
+        &mut self,
+        ctx: &Ctx,
+        frame: &GpuFrame,
+        f: InFormat,
+        kind: Kind,
+        modifier: u64,
+    ) -> Result<ffi::VASurfaceID, K> {
+        let (either, cpu) = self.gpu_in.as_ref().map_or((false, false), |g| (g.either, g.cpu));
+        if !cpu {
+            match self.imported(frame, kind, modifier) {
+                Ok(id) => return Ok(id),
+                Err(e) if either => {
+                    log!(ctx, Level::Warn, "import_refused", layout = kind.name, err = e.name());
+                    if let Some(g) = &mut self.gpu_in {
+                        g.cpu = true;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let display = self.display.as_ref().ok_or(K::NoDevice)?;
+        let src = self.session.as_ref().and_then(|s| s.src.as_ref()).ok_or(K::NoDevice)?.ids()[0];
+        copy_in(display, src, frame, f)?;
+        Ok(src)
+    }
+
     fn imported(
         &mut self,
         frame: &GpuFrame,
@@ -1033,10 +1099,16 @@ impl VaapiPostProc {
         modifier: u64,
     ) -> Result<ffi::VASurfaceID, K> {
         let key = dmabuf_key(frame)?;
+        let shape = layout_key(frame);
         let display = self.display.as_ref().ok_or(K::NoDevice)?;
         let gpu = self.gpu_in.as_mut().ok_or(K::NoGpuLink)?;
-        if let Some(i) = gpu.imports.iter().find(|i| i.key == key) {
+        if let Some(i) = gpu.imports.iter().find(|i| i.key == key && i.shape == shape) {
             return Ok(i.id);
+        }
+        // a pool slot laid out anew, its old surface goes once the GPU is done with it
+        if let Some(at) = gpu.imports.iter().position(|i| i.key == key) {
+            let _ = crate::va::sync_surface(display, gpu.imports[at].id);
+            gpu.imports.swap_remove(at);
         }
         if gpu.imports.len() >= IMPORTS_MAX {
             // The GPU may still read the last one, the destroy waits for it.
@@ -1082,49 +1154,105 @@ pub(crate) fn black(
 
 fn upload(display: &Display, surface: ffi::VASurfaceID, f: InFormat, data: &[u8]) -> Result<(), K> {
     let short = K::ShortFrame { len: data.len(), need: frame_size(f.pixfmt, f.width, f.height) };
-    let geom = |p| {
-        plane_geometry(f.pixfmt, f.width, f.height, p)
-            .zip(plane_offset(f.pixfmt, f.width, f.height, p))
-            .ok_or(short)
+    let mut planes = [(0, 0); 3];
+    for (p, plane) in planes.iter_mut().enumerate().take(f.pixfmt.plane_count()) {
+        let g = plane_geometry(f.pixfmt, f.width, f.height, p).ok_or(short)?;
+        *plane = (plane_offset(f.pixfmt, f.width, f.height, p).ok_or(short)?, g.stride);
+    }
+    upload_planes(display, surface, f, data, &planes)
+}
+
+/// `f`'s planes at `(offset, pitch)` in `data` into `surface`, I420 interleaved to NV12.
+fn upload_planes(
+    display: &Display,
+    surface: ffi::VASurfaceID,
+    f: InFormat,
+    data: &[u8],
+    planes: &[(usize, usize); 3],
+) -> Result<(), K> {
+    let short = K::ShortFrame { len: data.len(), need: frame_size(f.pixfmt, f.width, f.height) };
+    // rows as tight as the format lays them, `pitch` apart
+    let geom = |p: usize| {
+        let g = plane_geometry(f.pixfmt, f.width, f.height, p).ok_or(short)?;
+        let (at, pitch) = planes[p];
+        if pitch < g.stride {
+            return Err(short);
+        }
+        Ok((g.height, g.stride, at, pitch))
+    };
+    let row_of = |at: usize, pitch: usize, len: usize, r: usize| {
+        data.get(at + r * pitch..at + r * pitch + len).ok_or(short)
     };
     let (w, h) = ((f.width + 1) & !1, (f.height + 1) & !1);
     let mut img =
         UploadImage::acquire_for(display, surface, w, h, f.kind().surface()).map_err(K::Upload)?;
-    let (yg, yo) = geom(0)?;
-    for r in 0..yg.height {
-        let src = data.get(yo + r * yg.stride..yo + (r + 1) * yg.stride).ok_or(short)?;
+    let (rows, len, at, pitch) = geom(0)?;
+    for r in 0..rows {
+        let src = row_of(at, pitch, len, r)?;
         let row = r as u32;
-        img.row_mut(0, row, yg.stride)
-            .ok_or(K::PlaneOverrun { plane: "Y", row })?
-            .copy_from_slice(src);
+        img.row_mut(0, row, len).ok_or(K::PlaneOverrun { plane: "Y", row })?.copy_from_slice(src);
     }
-    let (cg, co) = geom(1)?;
+    let (rows, len, co, cp) = geom(1)?;
     match f.pixfmt {
         PixelFormat::I420 => {
-            let (vg, vo) = geom(2)?;
-            for r in 0..cg.height {
-                let u = data.get(co + r * cg.stride..co + (r + 1) * cg.stride).ok_or(short)?;
-                let v = data.get(vo + r * vg.stride..vo + (r + 1) * vg.stride).ok_or(short)?;
+            let (_, _, vo, vp) = geom(2)?;
+            for r in 0..rows {
+                let u = row_of(co, cp, len, r)?;
+                let v = row_of(vo, vp, len, r)?;
                 let row = r as u32;
-                let dst = img
-                    .row_mut(1, row, cg.stride * 2)
-                    .ok_or(K::PlaneOverrun { plane: "CbCr", row })?;
+                let dst =
+                    img.row_mut(1, row, len * 2).ok_or(K::PlaneOverrun { plane: "CbCr", row })?;
                 for ((d, &u), &v) in dst.as_chunks_mut::<2>().0.iter_mut().zip(u).zip(v) {
                     *d = [u, v];
                 }
             }
         }
         _ => {
-            for r in 0..cg.height {
-                let src = data.get(co + r * cg.stride..co + (r + 1) * cg.stride).ok_or(short)?;
+            for r in 0..rows {
+                let src = row_of(co, cp, len, r)?;
                 let row = r as u32;
-                img.row_mut(1, row, cg.stride)
+                img.row_mut(1, row, len)
                     .ok_or(K::PlaneOverrun { plane: "CbCr", row })?
                     .copy_from_slice(src);
             }
         }
     }
     img.finish().map_err(K::Upload)
+}
+
+/// A linear frame's dmabuf mapped and copied into `surface`, for a picture the driver would not
+/// import.
+fn copy_in(
+    display: &Display,
+    surface: ffi::VASurfaceID,
+    frame: &GpuFrame,
+    f: InFormat,
+) -> Result<(), K> {
+    let fd = frame.fd(0).ok_or(K::Dmabuf { errno: libc::EBADF })?;
+    let errno = || K::Dmabuf { errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0) };
+    // SAFETY: lseek on the frame's own fd, a dma-buf reports its size at SEEK_END.
+    let len = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END) };
+    if len <= 0 {
+        return Err(errno());
+    }
+    let len = len as usize;
+    // SAFETY: a read-only shared map of the whole dma-buf, unmapped below before returning.
+    let base = unsafe {
+        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd.as_raw_fd(), 0)
+    };
+    if base == libc::MAP_FAILED {
+        return Err(errno());
+    }
+    // SAFETY: the mapping above, `len` bytes, alive until the munmap.
+    let data = unsafe { std::slice::from_raw_parts(base as *const u8, len) };
+    let mut planes = [(0, 0); 3];
+    for (p, plane) in planes.iter_mut().zip(frame.planes.iter()) {
+        *p = (plane.offset as usize, plane.pitch as usize);
+    }
+    let copied = upload_planes(display, surface, f, data, &planes);
+    // SAFETY: the mapping made above, `data` is not used past here.
+    unsafe { libc::munmap(base, len) };
+    copied
 }
 
 // SAFETY: the element runs on one scheduler thread at a time, its own when Active or its
@@ -1143,14 +1271,31 @@ impl Element for VaapiPostProc {
         if self.gpu_in.is_none() && self.gpu_out.is_none() {
             return Ok(());
         }
-        let formats = match self.display() {
-            Ok(d) => exported(d, &[SurfaceFormat::NV12, SurfaceFormat::P010]),
-            Err(e) => {
+        let either = self.gpu_in.as_ref().is_some_and(|g| g.either);
+        let tiled = self.gpu_out.is_some() || self.gpu_in.as_ref().is_some_and(|g| !g.either);
+        let formats = match tiled.then(|| self.display()) {
+            Some(Ok(d)) => exported(d, &[SurfaceFormat::NV12, SurfaceFormat::P010]),
+            Some(Err(e)) => {
                 self.warn(ctx, e);
                 Vec::new()
             }
+            None => Vec::new(),
         };
-        if self.gpu_in.is_some() {
+        if either {
+            // dmabufs first so a decoder offering both hands its slots over
+            let linear = match linear_imports() {
+                Ok(l) => l,
+                Err(e) => {
+                    log!(&*ctx, Level::Debug, "linear_refused", err = e.name());
+                    &[]
+                }
+            };
+            gpuframe::with_gpu_offers(linear, |gpu| {
+                let mut all: Vec<OfferSpec<'_>> = gpu.to_vec();
+                all.extend_from_slice(&IN_OFFERS);
+                ctx.offer_sink(IN_PAD, &all)
+            })?;
+        } else if self.gpu_in.is_some() {
             gpuframe::with_gpu_offers(&formats, |offers| ctx.offer_sink(IN_PAD, offers))?;
         }
         if self.gpu_out.is_some() {
@@ -1195,7 +1340,7 @@ impl Element for VaapiPostProc {
             self.in_fmt = read_format(ctx, &f);
             self.color = StreamColor::read(ctx, &f);
         }
-        if self.gpu_in.is_some() {
+        if self.gpu_linked() {
             self.process_gpu(ctx, &mut inputs)?;
         } else {
             self.process_raw(ctx, &mut inputs)?;

@@ -20,5 +20,7 @@ libc = "0.2"
 
 [dev-dependencies]
 pf-harness = { path = "../../../lib/harness" }
+# Dmabuf mode on udmabuf slots, tests/dmabuf.rs.
+pf-memory = { path = "../../../lib/memory" }
 pf-sim = { path = "../../../lib/sim", features = ["harness"] }
 profluens-elements = { path = "../../../lib/elements" }

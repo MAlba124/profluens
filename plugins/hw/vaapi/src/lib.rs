@@ -35,6 +35,8 @@ mod coded_reuse;
 mod enc_eos;
 #[cfg(test)]
 mod export_failure;
+#[cfg(test)]
+mod fence_storage;
 
 pub use av1dec::VaapiAv1Dec;
 pub use av1enc::VaapiAv1Enc;

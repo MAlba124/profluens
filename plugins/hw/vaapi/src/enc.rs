@@ -9,6 +9,8 @@ use profluens_core::error::Error;
 use profluens_core::format::{FixedFormat, Value};
 use profluens_core::id::SrcPad;
 use profluens_core::io::{Completion, Handle, IoError, IoResult, OpenMode};
+use profluens_core::log;
+use profluens_core::log::Level;
 use profluens_core::time::Timestamp;
 
 use crate::error::{VaapiErrorKind as K, failed};
@@ -295,22 +297,169 @@ impl Flight {
     }
 }
 
+/// The timer slack the thread has while the driver reads a picture back.
+const MAP_SLACK_NS: libc::c_ulong = 500_000;
+
+/// The calling thread's timer slack raised to `ns`, what it was put back on drop.
+pub(crate) struct Slack {
+    was: libc::c_ulong,
+}
+
+impl Slack {
+    pub(crate) fn raise(ns: libc::c_ulong) -> Slack {
+        // SAFETY: both calls read or set a number of the calling thread, no pointer is passed.
+        let was = unsafe { libc::prctl(libc::PR_GET_TIMERSLACK) }.max(0) as libc::c_ulong;
+        unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, ns.max(was)) };
+        Slack { was }
+    }
+}
+
+impl Drop for Slack {
+    fn drop(&mut self) {
+        // SAFETY: as in `raise`.
+        unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, self.was) };
+    }
+}
+
+/// The coded picture mapped, see [`VaBuffer::map_coded`]. iHD's HEVC encoder writes the count
+/// its status report compares in a batch of its own behind the picture's, on no buffer an
+/// application can wait on, so a picture whose fence signalled can still read incomplete. The
+/// driver then sleeps 10 us a turn until that batch ran, each turn two ioctls, 16000 turns a
+/// second at the default slack of 50 us. The slack raised makes it 2000.
+pub(crate) fn map_coded(b: &VaBuffer) -> VaResult<CodedMap<'_>> {
+    let _slack = Slack::raise(MAP_SLACK_NS);
+    b.map_coded()
+}
+
+/// How often the pictures read are told, at most.
+const READS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a session's pictures were read on and how long their maps took, told at info so one
+/// run says whether the completion signal holds on a driver.
+#[derive(Default)]
+pub(crate) struct Reads {
+    /// Pictures mapped by the state of their fence, [`Fence::Polled`], [`Fence::Pending`]
+    /// (the driver said done before the fence did) and [`Fence::Signalled`].
+    by_fence: [u32; 3],
+    /// Of them, those mapped without asking, the map waited.
+    waited: u32,
+    /// Maps under 100 us, under 1 ms and the rest. A map of a picture that is done is a few us.
+    map: [u32; 3],
+    map_max_us: u32,
+    told: Option<std::time::Instant>,
+}
+
+impl Reads {
+    /// A picture mapped, the map began at `since`.
+    pub(crate) fn mapped(&mut self, fence: Fence, how: How, since: std::time::Instant) {
+        let us = since.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+        self.by_fence[fence as usize] += 1;
+        self.waited += u32::from(how == How::Wait);
+        self.map[usize::from(us >= 100) + usize::from(us >= 1000)] += 1;
+        self.map_max_us = self.map_max_us.max(us);
+    }
+
+    fn due(&mut self, now: std::time::Instant, close: bool) -> bool {
+        let pictures = self.by_fence.iter().sum::<u32>() > 0;
+        let told = *self.told.get_or_insert(now);
+        let due = pictures && (close || now.duration_since(told) >= READS_EVERY);
+        if due {
+            self.told = Some(now);
+        }
+        due
+    }
+
+    /// Tells the counts since the session opened, every [`READS_EVERY`] and when it closes.
+    pub(crate) fn tell(&mut self, ctx: &Ctx, fences: &Fences, close: bool) {
+        if !self.due(crate::stats::mark(), close) {
+            return;
+        }
+        let [polled, pending, signalled] = self.by_fence;
+        let [fast, slow, stuck] = self.map;
+        log!(
+            ctx,
+            Level::Info,
+            "reads",
+            polled = polled,
+            pending = pending,
+            signalled = signalled,
+            waited = self.waited
+        );
+        log!(
+            ctx,
+            Level::Info,
+            "read_maps",
+            under_100us = fast,
+            under_1ms = slow,
+            over_1ms = stuck,
+            max_us = self.map_max_us
+        );
+        log!(ctx, Level::Info, "read_fences", exports = fences.exports, off = fences.off);
+        if close {
+            *self = Reads::default();
+        }
+    }
+}
+
 /// What a completion's `user` says it is, in its top bits.
 const USER_KIND: u64 = 3 << 62;
 const USER_ADOPT: u64 = 1 << 62;
 const USER_READY: u64 = 2 << 62;
 
+/// An adopt's `user`, the session it was asked in and the surface it is for.
+fn adopt_tag(epoch: u32, slot: usize) -> u64 {
+    USER_ADOPT | u64::from(epoch) << 8 | (slot as u64 & 0xFF)
+}
+
+/// Where the fence of a reconstruction surface stands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Watch {
+    /// No picture wrote the surface yet, the driver may still give it other storage.
+    Unused,
+    /// Exported, the reactor's adopt of it pends.
+    Adopting,
+    /// The reactor's handle of its dma-buf.
+    Adopted(Handle),
+}
+
+/// What a picture queued on a reconstruction surface does about its fence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ask {
+    /// Nothing, the picture polls.
+    Poll,
+    /// The surface is exported now that a picture writes it, the picture polls.
+    Export,
+    /// The reactor polls the fence.
+    Ready(Handle),
+}
+
 /// The fences of a session's reconstruction surfaces. Each is exported as a dma-buf and adopted
 /// by the reactor once, then a picture's completion is polled on the one it writes, so the
 /// encoder wakes when the GPU is done and not on a timer. Without a reactor, or one that refuses,
 /// the pictures poll as before.
+///
+/// A surface is exported once its first picture is queued and not before. iHD gives the
+/// reconstruction of a 10 bit or 4:2:2 or 4:4:4 HEVC picture other storage when the picture's
+/// parameters first name it (`DdiMedia_ReplaceSurfaceWithVariant`), an export from before
+/// that is of storage no picture writes, its fence reads signalled at once and the coded
+/// buffer is mapped with the picture still coding, which the driver waits out in a sleep loop.
 pub(crate) struct Fences {
-    /// One a reconstruction surface, kept open for the session.
+    /// One a reconstruction surface, kept open for the session, empty until exported.
     fds: Vec<DmabufFds>,
-    /// The reactor's handle of each, none until its adopt completes.
-    handles: Vec<Handle>,
+    watch: Vec<Watch>,
+    /// The fds of adopts a closed session left pending, by the adopt's tag. An adopted fd
+    /// stays open until its op completes.
+    parked: Vec<(u64, DmabufFds)>,
+    /// Handles of adopts that completed after their session closed, closed on the next call.
+    stale: Vec<Handle>,
+    /// Sessions closed, what tells a pending adopt of an old one from this one's.
+    epoch: u32,
     /// The reactor refused an op, nothing more is asked of it.
     off: bool,
+    /// [`Self::off`] was logged.
+    off_told: bool,
+    /// Surfaces exported since the session opened.
+    exports: u32,
     /// Pictures queued since the element was made, the next picture's number.
     next_seq: u64,
 }
@@ -321,78 +470,172 @@ impl Fences {
     pub(crate) fn new() -> Self {
         Fences {
             fds: Vec::with_capacity(REFS_MAX + 1),
-            handles: Vec::with_capacity(REFS_MAX + 1),
+            watch: Vec::with_capacity(REFS_MAX + 1),
+            parked: Vec::with_capacity(REFS_MAX + 1),
+            stale: Vec::with_capacity(REFS_MAX + 1),
+            epoch: 0,
             off: false,
+            off_told: false,
+            exports: 0,
             next_seq: 0,
         }
     }
 
-    /// A session opened on `recon`, the surfaces exported and handed to the reactor. The last
+    /// A session opened on `surfaces` reconstruction surfaces, none exported yet. The last
     /// session's handles are closed first.
-    pub(crate) fn open(&mut self, ctx: &mut Ctx, dpy: ffi::VADisplay, recon: &[ffi::VASurfaceID]) {
+    pub(crate) fn open(&mut self, ctx: &mut Ctx, surfaces: usize) {
         self.close(ctx);
-        if self.off {
-            return;
-        }
-        for (i, &surface) in recon.iter().enumerate() {
-            let Ok(mut e) = ExportedSurface::export_queued(dpy, surface) else {
-                self.off = true;
-                return self.close(ctx);
-            };
-            let fds = std::mem::take(&mut e.fds);
-            let Some(fd) = fds.fd(0) else {
-                self.off = true;
-                return self.close(ctx);
-            };
-            ctx.io().adopt(fd, OpenMode::Read, USER_ADOPT | i as u64);
-            self.fds.push(fds);
-            self.handles.push(Handle::NONE);
-        }
+        self.reset(surfaces);
+    }
+
+    fn reset(&mut self, surfaces: usize) {
+        self.fds.resize_with(surfaces, DmabufFds::default);
+        self.exports = 0;
+        self.watch.resize(surfaces, Watch::Unused);
     }
 
     /// The session is gone, the reactor's handles with it.
     pub(crate) fn close(&mut self, ctx: &mut Ctx) {
-        for h in self.handles.drain(..).filter(|h| !h.is_none()) {
+        self.retire();
+        self.sweep(ctx);
+    }
+
+    /// Forgets the session. Its handles go to [`Self::stale`], the fds of its pending adopts
+    /// are parked until those complete.
+    fn retire(&mut self) {
+        for (slot, (w, fds)) in self.watch.drain(..).zip(self.fds.drain(..)).enumerate() {
+            match w {
+                Watch::Adopted(h) => self.stale.push(h),
+                Watch::Adopting => self.parked.push((adopt_tag(self.epoch, slot), fds)),
+                Watch::Unused => {}
+            }
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    fn sweep(&mut self, ctx: &mut Ctx) {
+        for h in self.stale.drain(..) {
             ctx.io().close(h, 0);
         }
-        self.fds.clear();
     }
 
     /// A completion of the element. The number of the picture whose fence op ended, if it was
     /// one, and whether the fence signalled (else the op failed and the picture polls), the
     /// adopts noted on the way.
     pub(crate) fn completed(&mut self, c: &Completion) -> Option<(u64, bool)> {
+        self.note(c.user, c.result)
+    }
+
+    fn note(&mut self, user: u64, result: IoResult) -> Option<(u64, bool)> {
         let refused = matches!(
-            c.result,
+            result,
             IoResult::Err(IoError::NoBackend | IoError::Unsupported | IoError::WrongKind)
         );
         self.off |= refused;
-        match c.user & USER_KIND {
+        match user & USER_KIND {
             USER_ADOPT => {
-                let i = (c.user & !USER_KIND) as usize;
-                if let (IoResult::File { handle, .. }, Some(h)) =
-                    (c.result, self.handles.get_mut(i))
-                {
-                    *h = handle;
+                let slot = (user & 0xFF) as usize;
+                let handle = match result {
+                    IoResult::File { handle, .. } => Some(handle),
+                    _ => None,
+                };
+                let ours = user == adopt_tag(self.epoch, slot);
+                match (self.watch.get_mut(slot), handle) {
+                    (Some(w), Some(h)) if ours && *w == Watch::Adopting => *w = Watch::Adopted(h),
+                    (_, h) => {
+                        // an old session's, its fd was kept open for the op and goes now
+                        self.parked.retain(|(tag, _)| *tag != user);
+                        self.stale.extend(h);
+                    }
                 }
                 None
             }
-            USER_READY => Some((c.user & !USER_KIND, !matches!(c.result, IoResult::Err(_)))),
+            USER_READY => Some((user & !USER_KIND, !matches!(result, IoResult::Err(_)))),
             _ => None,
         }
     }
 
-    /// A picture queued, writing reconstruction `slot`. Its number, and whether a completion
-    /// comes for it.
-    pub(crate) fn queued(&mut self, ctx: &mut Ctx, slot: usize) -> (u64, Fence) {
+    fn ask(&self, slot: usize) -> Ask {
+        match self.watch.get(slot) {
+            _ if self.off => Ask::Poll,
+            Some(Watch::Unused) => Ask::Export,
+            Some(&Watch::Adopted(h)) => Ask::Ready(h),
+            Some(Watch::Adopting) | None => Ask::Poll,
+        }
+    }
+
+    /// A picture queued, writing `surface`, the reconstruction `slot`. Its number, and whether
+    /// a completion comes for it. The first picture on a surface polls, the surface is
+    /// exported behind it.
+    pub(crate) fn queued(
+        &mut self,
+        ctx: &mut Ctx,
+        dpy: ffi::VADisplay,
+        surface: ffi::VASurfaceID,
+        slot: usize,
+    ) -> (u64, Fence) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let handle = self.handles.get(slot).copied().unwrap_or(Handle::NONE);
-        if self.off || handle.is_none() {
-            return (seq, Fence::Polled);
+        #[cfg(test)]
+        self.audit(dpy, surface, slot);
+        self.sweep(ctx);
+        if self.off && !self.off_told {
+            self.off_told = true;
+            log!(&*ctx, Level::Info, "fences_off", seq = seq);
         }
-        ctx.io().ready(handle, USER_READY | seq);
-        (seq, Fence::Pending)
+        match self.ask(slot) {
+            Ask::Poll => {}
+            Ask::Ready(handle) => {
+                ctx.io().ready(handle, USER_READY | seq);
+                return (seq, Fence::Pending);
+            }
+            Ask::Export => self.export(ctx, dpy, surface, slot),
+        }
+        (seq, Fence::Polled)
+    }
+
+    /// Notes in [`WATCHED`] whether the export held for `slot` is of the storage `surface` has
+    /// now, the dma-buf of an object is one inode however often it is exported.
+    #[cfg(test)]
+    fn audit(&self, dpy: ffi::VADisplay, surface: ffi::VASurfaceID, slot: usize) {
+        use std::os::fd::AsRawFd;
+        let ino = |fd: std::os::fd::BorrowedFd<'_>| {
+            // SAFETY: a zeroed stat is a valid out struct, fd is open while borrowed.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            (unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == 0).then_some(st.st_ino)
+        };
+        let Some(held) = self.fds.get(slot).and_then(|f| f.fd(0)).and_then(ino) else {
+            return;
+        };
+        let Ok(now) = ExportedSurface::export_queued(dpy, surface) else {
+            return;
+        };
+        let now = now.fds.fd(0).and_then(ino);
+        let (live, stale) = WATCHED.get();
+        WATCHED.set(if now == Some(held) { (live + 1, stale) } else { (live, stale + 1) });
+    }
+
+    /// Exports `surface` and hands it to the reactor. A driver that does not export turns the
+    /// fences off.
+    fn export(
+        &mut self,
+        ctx: &mut Ctx,
+        dpy: ffi::VADisplay,
+        surface: ffi::VASurfaceID,
+        slot: usize,
+    ) {
+        let fds = ExportedSurface::export_queued(dpy, surface)
+            .map(|mut e| std::mem::take(&mut e.fds))
+            .unwrap_or_default();
+        match fds.fd(0) {
+            Some(fd) => {
+                ctx.io().adopt(fd, OpenMode::Read, adopt_tag(self.epoch, slot));
+                self.exports += 1;
+                self.fds[slot] = fds;
+                self.watch[slot] = Watch::Adopting;
+            }
+            None => self.off = true,
+        }
     }
 }
 
@@ -794,6 +1037,10 @@ impl EncEngine {
         self.recon[self.cur]
     }
 
+    pub(crate) fn dpy(&self) -> ffi::VADisplay {
+        self.context.display()
+    }
+
     /// Which of [`Self::recon_ids`] the picture coded now writes.
     pub(crate) fn recon_slot(&self) -> usize {
         self.cur
@@ -979,7 +1226,7 @@ impl EncEngine {
 /// fails every picture after a coded buffer destroyed unread. A failed submit goes through
 /// here too, the map waits out whatever the driver queued before it failed.
 pub(crate) fn discard_coded(engine: Option<&mut EncEngine>, b: VaBuffer) {
-    let read = b.map_coded().and_then(CodedMap::unmap);
+    let read = map_coded(&b).and_then(CodedMap::unmap);
     if let (Ok(()), Some(e)) = (read, engine) {
         e.put_coded(b);
     }
@@ -987,6 +1234,9 @@ pub(crate) fn discard_coded(engine: Option<&mut EncEngine>, b: VaBuffer) {
 
 #[cfg(test)]
 thread_local! {
+    /// Pictures queued on a reconstruction surface already exported, those whose export is of
+    /// the surface's storage and those whose is not.
+    pub(crate) static WATCHED: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
     /// Every picture through a new coded buffer, the path before the reuse, for a test to
     /// compare against. The harness drives an element on the test's thread.
     pub(crate) static FRESH_CODED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -999,7 +1249,116 @@ mod tests {
     use profluens_core::error::Error;
     use profluens_core::time::Timestamp;
 
-    use super::{End, IntraCadence, Outlet, STAGED_MAX, Staged, Stamp, align_up};
+    use profluens_core::io::{Handle, IoError, IoResult};
+
+    use std::time::Duration;
+
+    use super::{
+        Ask, End, Fence, Fences, How, IntraCadence, Outlet, Reads, STAGED_MAX, Slack, Staged,
+        Stamp, USER_READY, Watch, adopt_tag, align_up,
+    };
+
+    fn adopted(handle: Handle) -> IoResult {
+        IoResult::File { handle, len: 0 }
+    }
+
+    #[test]
+    fn a_surface_is_exported_by_its_first_picture_and_fenced_once_adopted() {
+        let mut f = Fences::new();
+        f.reset(3);
+        assert_eq!(f.ask(1), Ask::Export, "no picture wrote it yet");
+        f.watch[1] = Watch::Adopting;
+        assert_eq!(f.ask(1), Ask::Poll, "the adopt pends");
+        let h = Handle::new(7, 1);
+        assert_eq!(f.note(adopt_tag(f.epoch, 1), adopted(h)), None);
+        assert_eq!(f.ask(1), Ask::Ready(h));
+        assert_eq!(f.ask(0), Ask::Export, "the others wait for their own picture");
+        assert_eq!(f.ask(3), Ask::Poll, "no such surface");
+    }
+
+    #[test]
+    fn an_adopt_of_a_closed_session_arms_nothing_and_is_closed() {
+        let mut f = Fences::new();
+        f.reset(2);
+        (f.watch[0], f.watch[1]) = (Watch::Adopting, Watch::Adopted(Handle::new(1, 1)));
+        let old = adopt_tag(f.epoch, 0);
+        f.retire();
+        assert_eq!(f.stale, [Handle::new(1, 1)], "the adopted handle is closed");
+        assert_eq!(f.parked.len(), 1, "the fd of the pending adopt stays open");
+        f.reset(2);
+        f.watch[0] = Watch::Adopting;
+        let late = Handle::new(2, 1);
+        assert_eq!(f.note(old, adopted(late)), None);
+        assert_eq!(f.watch[0], Watch::Adopting, "the new session's adopt still pends");
+        assert!(f.parked.is_empty(), "its fd goes with the op");
+        assert_eq!(f.stale, [Handle::new(1, 1), late]);
+        let ours = Handle::new(3, 1);
+        f.note(adopt_tag(f.epoch, 0), adopted(ours));
+        assert_eq!(f.ask(0), Ask::Ready(ours));
+    }
+
+    #[test]
+    fn a_failed_adopt_of_a_closed_session_frees_its_fd() {
+        let mut f = Fences::new();
+        f.reset(1);
+        f.watch[0] = Watch::Adopting;
+        let old = adopt_tag(f.epoch, 0);
+        f.retire();
+        f.note(old, IoResult::Err(IoError::Full));
+        assert!(f.parked.is_empty() && f.stale.is_empty());
+        assert!(!f.off, "a full reactor is no refusal");
+    }
+
+    #[test]
+    fn a_reactor_that_refuses_turns_the_fences_off() {
+        let mut f = Fences::new();
+        f.reset(1);
+        f.watch[0] = Watch::Adopting;
+        f.note(adopt_tag(f.epoch, 0), IoResult::Err(IoError::NoBackend));
+        assert_eq!(f.ask(0), Ask::Poll);
+        f.watch[0] = Watch::Unused;
+        assert_eq!(f.ask(0), Ask::Poll, "nothing more is exported");
+    }
+
+    #[test]
+    fn the_slack_is_raised_for_the_map_and_put_back() {
+        // SAFETY: reads a number of the calling thread.
+        let slack = || unsafe { libc::prctl(libc::PR_GET_TIMERSLACK) } as libc::c_ulong;
+        let was = slack();
+        {
+            let _raised = Slack::raise(700_000);
+            assert_eq!(slack(), 700_000u64.max(was));
+            let _lower = Slack::raise(1);
+            assert_eq!(slack(), 700_000u64.max(was), "never lowered");
+        }
+        assert_eq!(slack(), was);
+    }
+
+    #[test]
+    fn reads_count_by_fence_and_map_time_and_tell_every_ten_seconds() {
+        let t0 = std::time::Instant::now();
+        let mut r = Reads::default();
+        assert!(!r.due(t0, true), "no picture, nothing to tell");
+        r.mapped(Fence::Signalled, How::Poll, t0);
+        r.mapped(Fence::Pending, How::Poll, t0 - Duration::from_micros(500));
+        r.mapped(Fence::Polled, How::Wait, t0 - Duration::from_millis(3));
+        assert_eq!((r.by_fence, r.waited), ([1, 1, 1], 1));
+        assert_eq!(r.map, [1, 1, 1]);
+        assert!(r.map_max_us >= 3000);
+        assert!(!r.due(t0, false), "the first look starts the clock");
+        assert!(!r.due(t0 + Duration::from_secs(9), false));
+        assert!(r.due(t0 + Duration::from_secs(10), false));
+        assert!(!r.due(t0 + Duration::from_secs(11), false));
+        assert!(r.due(t0 + Duration::from_secs(11), true), "a close tells at once");
+    }
+
+    #[test]
+    fn a_fence_completion_names_its_picture() {
+        let mut f = Fences::new();
+        assert_eq!(f.note(USER_READY | 41, IoResult::Ok(0)), Some((41, true)));
+        assert_eq!(f.note(USER_READY | 42, IoResult::Err(IoError::BadHandle)), Some((42, false)));
+        assert_eq!(f.note(9, IoResult::Ok(0)), None, "a close's completion");
+    }
 
     /// The cut flags of intra pictures `gaps` pictures apart, the first after `gaps[0]`.
     fn cuts(gaps: &[u32]) -> Vec<bool> {

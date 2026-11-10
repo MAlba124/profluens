@@ -454,6 +454,8 @@ pub struct Imported {
     dpy: ffi::VADisplay,
     pub id: ffi::VASurfaceID,
     pub key: (u64, u64),
+    /// The geometry it was imported at, see [`layout_key`].
+    pub shape: [u32; 7],
 }
 
 impl Drop for Imported {
@@ -475,6 +477,14 @@ fn stat(frame: &GpuFrame, object: u32) -> Result<((u64, u64), u64), K> {
 
 pub fn dmabuf_key(frame: &GpuFrame) -> Result<(u64, u64), K> {
     stat(frame, 0).map(|(key, _)| key)
+}
+
+/// A frame's format, coded size and first two planes. A pool slot keeps its dmabuf across
+/// pictures of another size, so its surface is kept only while this matches.
+pub fn layout_key(frame: &GpuFrame) -> [u32; 7] {
+    let plane = |i: usize| frame.planes.get(i).map_or((0, 0), |p| (p.offset, p.pitch));
+    let ((o0, p0), (o1, p1)) = (plane(0), plane(1));
+    [frame.drm_format, frame.coded_w, frame.coded_h, o0, p0, o1, p1]
 }
 
 pub fn import(
@@ -545,7 +555,7 @@ pub fn import(
         )
     };
     check(st, "vaCreateSurfaces(import)").map_err(K::Import)?;
-    Ok(Imported { dpy: display.raw(), id, key })
+    Ok(Imported { dpy: display.raw(), id, key, shape: layout_key(frame) })
 }
 
 pub fn surfaces(

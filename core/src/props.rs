@@ -47,7 +47,8 @@ impl PropTable {
         }
     }
 
-    pub(crate) fn set(&self, idx: usize, v: Value) {
+    /// Unvalidated, for a rig holding the table. A pipeline sets through `Pipeline::set`.
+    pub fn set(&self, idx: usize, v: Value) {
         let _g = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let (tag, bits) = encode(v);
         self.cells[idx].write([tag as u64, bits]);

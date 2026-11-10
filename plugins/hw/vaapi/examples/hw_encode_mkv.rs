@@ -1,5 +1,5 @@
 //! Hardware-encode a test pattern into an MKV file for external validation with ffprobe and mpv.
-//! Usage: hw_encode_mkv <h264|h265|vp8> [out.mkv] [frames]
+//! Usage: hw_encode_mkv <h264|h265|vp8> [out.mkv] [frames] [i420|p010] [width] [height]
 
 // An example app, not an element hot path.
 #![allow(clippy::disallowed_methods)]
@@ -19,6 +19,13 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("/tmp/pf_hw_{codec}.mkv")));
     let frames: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(90);
+    let pixfmt = match args.next().as_deref() {
+        Some("p010") => PixelFormat::P010,
+        _ => PixelFormat::I420,
+    };
+    // 360 is not MB/CTB aligned, so the crop must round-trip through the container.
+    let width: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(640);
+    let height: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(360);
 
     let Some(caps) = pf_vaapi::probe() else {
         eprintln!("no VA-API device available");
@@ -38,11 +45,11 @@ fn main() {
         std::process::exit(1);
     }
 
-    // 360 is not MB/CTB aligned, so the crop must round-trip through the container.
-    let fmt = VideoFormat::new(640, 360, PixelFormat::I420, Rational { num: 30, den: 1 });
+    let fmt = VideoFormat::new(width, height, pixfmt, Rational { num: 30, den: 1 });
 
     let mut p = pf_reactor::pipeline();
-    p.set_pool(1024 * 1024, 16);
+    let frame = profluens_video::geometry::frame_size(pixfmt, width, height);
+    p.set_pool(frame.max(1024 * 1024), 16);
     let src = p.add(VideoTestSrc::new(fmt, 7, frames));
     // The mkv writer holds a whole GOP until the next keyframe, so the encoder pool must be deeper.
     use pf_vaapi::{VaapiH264Enc, VaapiH265Enc, VaapiVp8Enc};
@@ -51,9 +58,9 @@ fn main() {
         "h265" => (p.add(VaapiH265Enc::new().with_gop(30)), VaapiH265Enc::IN, VaapiH265Enc::OUT),
         _ => (p.add(VaapiVp8Enc::new().with_gop(30)), VaapiVp8Enc::IN, VaapiVp8Enc::OUT),
     };
-    p.set_element_pool(enc, 512 * 1024, 48);
+    p.set_element_pool(enc, frame.max(512 * 1024), 48);
     let mux = p.add(MkvMuxN::new());
-    p.set_element_pool(mux, 512 * 1024, 8);
+    p.set_element_pool(mux, frame.max(512 * 1024), 8);
     let sink = p.add(FileSink::new(&out));
     p.link(src.src(VideoTestSrc::OUT), enc.sink(enc_in)).expect("link src->enc");
     p.link(enc.src(enc_out), mux.sink(MkvMuxN::INS[0])).expect("link enc->mux");

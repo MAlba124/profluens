@@ -14,6 +14,8 @@ pub const PF_LAV_ERR_NO_CODEC: c_int = -0x5046_0001;
 pub const PF_LAV_ERR_NOMEM: c_int = -0x5046_0002;
 pub const PF_LAV_ERR_ARG: c_int = -0x5046_0003;
 
+pub const PF_LAV_MAX_THREADS: c_int = 16;
+
 pub const PF_LAV_H264: c_int = 1;
 pub const PF_LAV_HEVC: c_int = 2;
 pub const PF_LAV_VP8: c_int = 3;
@@ -126,6 +128,7 @@ unsafe extern "C" {
         extradata_len: usize,
         slots: *const pf_lav_slots,
         parse: c_int,
+        threads: c_int,
     ) -> c_int;
     pub fn pf_lav_close(d: *mut pf_lav_dec);
     pub fn pf_lav_send(
@@ -152,6 +155,7 @@ unsafe extern "C" {
     pub fn pf_lav_fallbacks(d: *const pf_lav_dec) -> u64;
     pub fn pf_lav_skip_nonref(d: *mut pf_lav_dec, on: c_int);
     pub fn pf_lav_delay(d: *const pf_lav_dec) -> c_int;
+    pub fn pf_lav_threads(d: *const pf_lav_dec) -> c_int;
     pub fn pf_lav_enc_open(
         out: *mut *mut pf_lav_enc,
         codec: c_int,
@@ -218,13 +222,13 @@ mod tests {
             let mut d = std::ptr::null_mut();
             // SAFETY: an out pointer and no extradata or slots.
             let rc =
-                unsafe { pf_lav_open(&mut d, codec, std::ptr::null(), 0, std::ptr::null(), 0) };
+                unsafe { pf_lav_open(&mut d, codec, std::ptr::null(), 0, std::ptr::null(), 0, 1) };
             assert_eq!(rc, PF_LAV_OK, "codec {codec}");
             // SAFETY: opened above, closed once.
             unsafe { pf_lav_close(d) };
         }
         let mut d = std::ptr::null_mut();
-        let rc = unsafe { pf_lav_open(&mut d, 99, std::ptr::null(), 0, std::ptr::null(), 0) };
+        let rc = unsafe { pf_lav_open(&mut d, 99, std::ptr::null(), 0, std::ptr::null(), 0, 1) };
         assert_eq!(rc, PF_LAV_ERR_NO_CODEC);
         assert!(d.is_null());
     }
@@ -236,7 +240,7 @@ mod tests {
             let mut d = std::ptr::null_mut();
             // SAFETY: an out pointer and no extradata or slots.
             let rc =
-                unsafe { pf_lav_open(&mut d, codec, std::ptr::null(), 0, std::ptr::null(), 0) };
+                unsafe { pf_lav_open(&mut d, codec, std::ptr::null(), 0, std::ptr::null(), 0, 1) };
             assert!(rc < 0 && rc != PF_LAV_ERR_NO_CODEC, "codec {codec}, {rc}");
             assert!(d.is_null());
         }
@@ -249,7 +253,7 @@ mod tests {
         let mut d = std::ptr::null_mut();
         // SAFETY: an out pointer, the header outlives the call, closed below.
         let rc = unsafe {
-            pf_lav_open(&mut d, PF_LAV_SPEEX, head.as_ptr(), head.len(), std::ptr::null(), 0)
+            pf_lav_open(&mut d, PF_LAV_SPEEX, head.as_ptr(), head.len(), std::ptr::null(), 0, 1)
         };
         assert_eq!(rc, PF_LAV_OK);
         // SAFETY: opened above, closed once.
@@ -315,7 +319,7 @@ mod tests {
         let mut d = std::ptr::null_mut();
         // SAFETY: the encoder's AudioSpecificConfig as extradata.
         let rc = unsafe {
-            pf_lav_open(&mut d, PF_LAV_AAC, asc.as_ptr(), asc.len(), std::ptr::null(), 0)
+            pf_lav_open(&mut d, PF_LAV_AAC, asc.as_ptr(), asc.len(), std::ptr::null(), 0, 1)
         };
         assert_eq!(rc, PF_LAV_OK);
         let mut left = Vec::new();

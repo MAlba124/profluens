@@ -15,6 +15,9 @@ profluens-core = { path = "../../../core" }
 pf-registry = { path = "../../../lib/registry" }
 profluens-video = { path = "../../../lib/video" }
 pf-hdr = { path = "../../video/hdr" }
+# udmabuf slots a software decoder hands over, imported as surfaces.
+pf-memory = { path = "../../../lib/memory" }
+libc = "0.2"
 
 # Hand-rolled bench of the GPU chain on a real file, no criterion. `main` is the harness.
 [[bench]]

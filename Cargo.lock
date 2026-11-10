@@ -44,6 +44,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fearless_simd"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "629c9d6b6f30b5604089e0980f4d924a013aacb1654a6cdf5d3d852224f68651"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -184,6 +190,7 @@ dependencies = [
  "libdav1d-sys",
  "pf-harness",
  "pf-hdr",
+ "pf-memory",
  "pf-registry",
  "pf-sim",
  "profluens-core",
@@ -251,8 +258,10 @@ name = "pf-libav"
 version = "0.1.0"
 dependencies = [
  "libav-sys",
+ "libc",
  "pf-harness",
  "pf-hdr",
+ "pf-memory",
  "pf-mp3",
  "pf-mp4",
  "pf-ogg",
@@ -517,11 +526,13 @@ dependencies = [
 name = "pf-vaapi"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libdav1d-sys",
  "pf-av1",
  "pf-harness",
  "pf-hdr",
  "pf-libav",
+ "pf-memory",
  "pf-mkv",
  "pf-open",
  "pf-reactor",
@@ -573,6 +584,7 @@ dependencies = [
 name = "profluens-video"
 version = "0.1.0"
 dependencies = [
+ "fearless_simd",
  "libc",
  "pf-harness",
  "pf-hdr",

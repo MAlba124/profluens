@@ -315,17 +315,24 @@ pub struct Decoder {
     supply: Option<Supply>,
 }
 
-// SAFETY: driven from one thread at a time and starts no thread of its own (thread_count 1).
+// SAFETY: driven from one thread at a time. Frame threads, when opened with them, run libavcodec's
+// own thread safe allocator and never the supply's callbacks (pf_libav.c pf_lav_open).
 unsafe impl Send for Decoder {}
 
 pub const NONE: i64 = i64::MIN;
 
+/// The most frame threads a decoder takes, more are cut to it.
+pub const MAX_THREADS: u32 = ffi::PF_LAV_MAX_THREADS as u32;
+
 impl Decoder {
+    /// `threads` past 1 runs frame threads on a video codec that has them, its pictures then in
+    /// libavcodec's memory, never in `supply`.
     pub fn open(
         codec: Codec,
         extradata: &[u8],
         supply: Option<&Supply>,
         parse: bool,
+        threads: u32,
     ) -> Result<Decoder, LavError> {
         let slots = supply.map(|s| ffi::pf_lav_slots {
             opaque: s.cookie(),
@@ -343,6 +350,7 @@ impl Decoder {
                 extradata.len(),
                 slots_ptr,
                 c_int::from(parse),
+                threads.clamp(1, MAX_THREADS) as c_int,
             )
         };
         if code != ffi::PF_LAV_OK || raw.is_null() {
@@ -457,10 +465,17 @@ impl Decoder {
         unsafe { ffi::pf_lav_skip_nonref(self.raw, on as c_int) }
     }
 
-    /// Pictures held back for reordering, how many units in may wait for theirs.
+    /// Pictures held back for reordering and by frame threads, how many units in may wait for
+    /// theirs.
     pub fn delay(&self) -> usize {
         // SAFETY: the decoder is open.
         usize::try_from(unsafe { ffi::pf_lav_delay(self.raw) }).unwrap_or(0)
+    }
+
+    /// Frame threads running, 1 single threaded.
+    pub fn threads(&self) -> u32 {
+        // SAFETY: the decoder is open.
+        u32::try_from(unsafe { ffi::pf_lav_threads(self.raw) }).unwrap_or(1)
     }
 
     pub fn fallbacks(&self) -> u64 {
@@ -869,7 +884,7 @@ mod tests {
     fn pictures_decode_into_pool_slots() {
         let pool = Pool::new(1 << 20);
         let supply = Supply::new();
-        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false).expect("open");
+        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false, 1).expect("open");
         let mut direct = |bytes: usize| {
             pool.resize(bytes.max(pool_slot(&pool)));
             Some(pool.acquire())
@@ -910,7 +925,7 @@ mod tests {
     #[test]
     fn a_dry_pool_falls_back_to_libavcodec_memory() {
         let supply = Supply::new();
-        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false).expect("open");
+        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false, 1).expect("open");
         let mut none = |_: usize| None;
         let mut frames = 0;
         for u in units() {
@@ -961,7 +976,7 @@ mod tests {
     fn a_short_slot_is_reported() {
         let pool = Pool::new(1024);
         let supply = Supply::new();
-        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false).expect("open");
+        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false, 1).expect("open");
         let mut small = |_: usize| Some(pool.acquire());
         for u in units().iter().take(3) {
             let _ = d.send(u, NONE, NONE, 0, &mut small);
@@ -969,5 +984,79 @@ mod tests {
         }
         let (need, capacity) = supply.take_short().expect("reported");
         assert!(need > capacity && capacity == 1024);
+    }
+
+    /// The planes row by row without padding, and the stamp.
+    fn picture(f: &Frame) -> (i64, Vec<u8>) {
+        let (w, h) = (f.width() as usize, f.height() as usize);
+        let bytes = if f.raw.bit_depth > 8 { 2 } else { 1 };
+        let mut out = Vec::new();
+        for i in 0..3 {
+            let p = f.plane(i);
+            let (cols, rows) = if i == 0 { (w, h) } else { (w.div_ceil(2), h.div_ceil(2)) };
+            for r in 0..rows {
+                out.extend_from_slice(&p.data[r * p.stride..r * p.stride + cols * bytes]);
+            }
+        }
+        (f.pts(), out)
+    }
+
+    type Pictures = Vec<(i64, Vec<u8>)>;
+
+    /// Pictures before a flush at unit `cut`, then after it from the first unit to a drain.
+    fn decode_flushed(threads: u32, cut: usize) -> (Pictures, Pictures) {
+        let pool = Pool::new(1 << 20);
+        let supply = Supply::new();
+        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false, threads).expect("open");
+        assert_eq!(d.threads(), threads);
+        let mut direct = |bytes: usize| {
+            pool.resize(bytes.max(pool_slot(&pool)));
+            Some(pool.acquire())
+        };
+        let units = units();
+        let take = |d: &mut Decoder,
+                    direct: &mut dyn FnMut(usize) -> Option<Memory>,
+                    into: &mut Pictures| {
+            while let Ok(Received::Frame(f)) = d.receive(direct) {
+                assert_eq!(f.placement().is_some(), threads == 1, "slots only single threaded");
+                into.push(picture(&f));
+            }
+        };
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for (i, u) in units[..cut].iter().enumerate() {
+            assert_eq!(d.send(u, i as i64, NONE, 0, &mut direct), Ok(Sent::Taken));
+            take(&mut d, &mut direct, &mut before);
+        }
+        d.flush();
+        for (i, u) in units.iter().enumerate() {
+            let at = 1000 + i as i64;
+            let mut sent = d.send(u, at, NONE, 0, &mut direct);
+            while sent == Ok(Sent::Full) {
+                take(&mut d, &mut direct, &mut after);
+                sent = d.send(u, at, NONE, 0, &mut direct);
+            }
+            assert_eq!(sent, Ok(Sent::Taken));
+            take(&mut d, &mut direct, &mut after);
+        }
+        d.drain().expect("drain");
+        take(&mut d, &mut direct, &mut after);
+        assert_eq!(d.fallbacks(), 0, "no slot missed");
+        (before, after)
+    }
+
+    #[test]
+    fn frame_threads_decode_the_same_pictures_in_the_same_order() {
+        let cut = units().len() / 2;
+        let (one_before, one_after) = decode_flushed(1, cut);
+        let (four_before, four_after) = decode_flushed(4, cut);
+        assert!(one_after.len() > cut, "a whole stream after the flush");
+        // Three units still in the threads when the flush drops them.
+        assert!(four_before.len() + 3 >= one_before.len() && four_before.len() < one_before.len());
+        assert!(four_before[..] == one_before[..four_before.len()], "before the flush");
+        assert_eq!(four_after.len(), one_after.len());
+        for (k, (a, b)) in one_after.iter().zip(&four_after).enumerate() {
+            assert_eq!(a.0, b.0, "picture {k} stamp");
+            assert!(a.1 == b.1, "picture {k} pixels");
+        }
     }
 }

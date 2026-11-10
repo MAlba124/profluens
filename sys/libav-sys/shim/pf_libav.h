@@ -125,11 +125,16 @@ typedef struct pf_lav_frame {
 
 typedef struct pf_lav_dec pf_lav_dec;
 
-/* Open a single threaded decoder. `slots` may be NULL. `parse` adds a parser
- * that frames a byte stream (pf_lav_parse). Vorbis takes its three headers as
- * extradata, Xiph laced or each behind a 16-bit big-endian length. */
+/* The most frame threads a decoder takes, more are cut to it. */
+#define PF_LAV_MAX_THREADS 16
+
+/* Open a decoder. `slots` may be NULL. `parse` adds a parser that frames a byte stream
+ * (pf_lav_parse). Vorbis takes its three headers as extradata, Xiph laced or each behind
+ * a 16-bit big-endian length. `threads` 1 is single threaded. More runs frame threads on
+ * a video codec that has them, its pictures then in libavcodec's memory, never in
+ * `slots`, and pf_lav_delay grows by threads - 1. Other codecs stay single threaded. */
 int pf_lav_open(pf_lav_dec **out, int codec, const uint8_t *extradata, size_t extradata_len,
-                const pf_lav_slots *slots, int parse);
+                const pf_lav_slots *slots, int parse, int threads);
 void pf_lav_close(pf_lav_dec *d);
 
 /* One packet, copied into padded memory. pts, dts and duration are carried to the
@@ -152,9 +157,12 @@ int pf_lav_parse(pf_lav_dec *d, const uint8_t *in, size_t len, int64_t pts, cons
 /* Skip non-reference pictures from the next packet on, or decode all again. */
 void pf_lav_skip_nonref(pf_lav_dec *d, int on);
 
-/* Pictures the decoder holds back for reordering, has_b_frames, the decoder being single
- * threaded. */
+/* Pictures the decoder holds back, has_b_frames for reordering and threads - 1 for frame
+ * threads. */
 int pf_lav_delay(const pf_lav_dec *d);
+
+/* Frame threads the decoder runs, 1 when single threaded. */
+int pf_lav_threads(const pf_lav_dec *d);
 
 /* Pictures libavcodec had to place in its own memory, since open. */
 uint64_t pf_lav_fallbacks(const pf_lav_dec *d);

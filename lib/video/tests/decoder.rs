@@ -26,7 +26,7 @@ use profluens_video::decoder::{
 use profluens_video::gpuframe::{
     DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_NV12, DRM_FORMAT_P010, DRM_FORMAT_YUV420, DmabufFormat,
     F_HEIGHT, F_LAYOUT, F_MODIFIER, F_WIDTH, FAMILY_VIDEO_GPU, GpuFrameChannel, GpuFrameHeader,
-    LAYOUT_I420_DMABUF, LAYOUT_P010_DMABUF,
+    LAYOUT_I420_DMABUF, LAYOUT_NV12_DMABUF, LAYOUT_P010_DMABUF,
 };
 use profluens_video::{FAMILY, PixelFormat};
 
@@ -1813,4 +1813,173 @@ fn dmabuf_mode_puts_side_data_on_the_descriptor() {
     let out = h.pull(FakeDec::OUT).expect("the descriptor");
     assert!(GpuFrameHeader::from_bytes(out.memory.data()).is_some());
     assert_eq!(maxscl_of(&out), Some(40_000));
+}
+
+/// A decoder in dmabuf mode on a udmabuf pool of `slot` byte slots, its link fixed to NV12.
+fn nv12_link(slot: usize, formats: &[DmabufFormat]) -> Option<(Harness, Arc<GpuFrameChannel>)> {
+    let dev = match pf_memory::udmabuf::device() {
+        Ok(dev) => dev,
+        Err(e) => {
+            eprintln!("skip: {e}");
+            return None;
+        }
+    };
+    let ch = GpuFrameChannel::new();
+    let dec = FakeDec::new().with_dmabuf(Arc::clone(&ch), formats);
+    let page = pf_memory::udmabuf::align();
+    let config =
+        PoolConfig { align: page, allocator: dev.allocator(), ..PoolConfig::heap(slot, 4) };
+    let mut h = Harness::with_pool_config(dec, config);
+    let fixed = [
+        (F_WIDTH, ValueDesc::Int(8)),
+        (F_HEIGHT, ValueDesc::Int(8)),
+        (F_LAYOUT, ValueDesc::Id(LAYOUT_NV12_DMABUF)),
+        (F_MODIFIER, ValueDesc::Int(0)),
+    ];
+    lend_ready(&mut h);
+    h.fix_src_format(FakeDec::OUT, FAMILY_VIDEO_GPU, &fixed);
+    Some((h, ch))
+}
+
+fn nv12_only() -> [DmabufFormat; 1] {
+    [DmabufFormat { fourcc: DRM_FORMAT_NV12, modifiers: vec![DRM_FORMAT_MOD_LINEAR] }]
+}
+
+/// The bytes of a frame's dmabuf, `len` from its start.
+fn frame_bytes(fd: i32, len: usize) -> Vec<u8> {
+    let size = len.next_multiple_of(pf_memory::udmabuf::align());
+    // SAFETY: the frame's dup of its slot, mapped read-only and unmapped before returning.
+    let view =
+        unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+    assert_ne!(view, libc::MAP_FAILED, "{}", std::io::Error::last_os_error());
+    let bytes = unsafe { std::slice::from_raw_parts(view as *const u8, len) }.to_vec();
+    unsafe { libc::munmap(view, size) };
+    bytes
+}
+
+/// Tight I420 interleaved to NV12 at the even size, the last row and column repeated.
+fn nv12_of(i420: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let (ew, eh) = (2 * cw, 2 * ch);
+    let mut out = Vec::with_capacity(ew * eh * 3 / 2);
+    for r in 0..eh {
+        let row = &i420[r.min(h - 1) * w..][..w];
+        out.extend_from_slice(row);
+        out.extend(std::iter::repeat_n(row[w - 1], ew - w));
+    }
+    let (u, v) = i420[w * h..].split_at(cw * ch);
+    for r in 0..ch {
+        for x in 0..cw {
+            out.extend([u[r * cw + x], v[r * cw + x]]);
+        }
+    }
+    out
+}
+
+/// A frame's drm format, coded and shown size, planes and bytes.
+type Taken = (u32, (u32, u32), (u32, u32), Vec<(u32, u32)>, Vec<u8>);
+
+/// One picture out of `h` as its frame.
+fn take_frame(h: &mut Harness, rx: &mut profluens_video::gpuframe::FrameRx, len: usize) -> Taken {
+    let out = h.pull(FakeDec::OUT).expect("the descriptor");
+    let header = GpuFrameHeader::from_bytes(out.memory.data()).expect("a header");
+    let frame = rx.take(header.token).expect("the frame of the descriptor");
+    let planes = frame.planes.iter().map(|p| (p.offset, p.pitch)).collect();
+    let bytes = frame_bytes(frame.fds[0], len);
+    (frame.drm_format, (frame.coded_w, frame.coded_h), (frame.disp_w, frame.disp_h), planes, bytes)
+}
+
+#[test]
+fn dmabuf_mode_interleaves_an_i420_picture_into_an_nv12_slot() {
+    let page = pf_memory::udmabuf::align();
+    let Some((mut h, ch)) = nv12_link(page, &nv12_only()) else { return };
+    let mut rx = ch.take_rx().expect("the sink's end");
+    let want = nv12_of(&lent_packed(16, 0), 16, 16);
+    // a held picture in the codec's memory, then one decoded into a slot of the pool
+    push(&mut h, LEND, 16, 0);
+    let (fourcc, coded, shown, planes, bytes) = take_frame(&mut h, &mut rx, want.len());
+    assert_eq!(fourcc, DRM_FORMAT_NV12);
+    assert_eq!((coded, shown), ((16, 16), (16, 16)));
+    assert_eq!(planes, [(0, 16), (256, 16)], "Y then CbCr, one pitch");
+    assert_eq!(bytes, want, "the held picture as NV12");
+    push(&mut h, INTO, 16, 40);
+    let (fourcc, _, _, planes, bytes) = take_frame(&mut h, &mut rx, want.len());
+    assert_eq!(fourcc, DRM_FORMAT_NV12, "an I420 slot is packed, not handed over as it lies");
+    assert_eq!(planes, [(0, 16), (256, 16)]);
+    assert_eq!(bytes, nv12_of(&lent_packed(16, 1), 16, 16), "the decoded slot as NV12");
+    let announced = h.announced().expect("announced");
+    let v = h.vocabulary();
+    let Some(Value::Id(layout)) = announced.get(v.field_id(F_LAYOUT).unwrap()) else {
+        panic!("layout")
+    };
+    assert_eq!(v.value_name(layout), Some(LAYOUT_NV12_DMABUF));
+    let w = warnings(&mut h);
+    assert!(w.is_empty(), "{:?}", w.iter().map(ToString::to_string).collect::<Vec<_>>());
+}
+
+#[test]
+fn an_odd_picture_goes_into_an_even_nv12_slot_its_edges_repeated() {
+    let page = pf_memory::udmabuf::align();
+    let Some((mut h, ch)) = nv12_link(page, &nv12_only()) else { return };
+    let mut rx = ch.take_rx().expect("the sink's end");
+    let want = nv12_of(&lent_packed(15, 0), 15, 15);
+    push(&mut h, LEND, 15, 0);
+    let (fourcc, coded, shown, planes, bytes) = take_frame(&mut h, &mut rx, want.len());
+    assert_eq!(fourcc, DRM_FORMAT_NV12);
+    assert_eq!((coded, shown), ((16, 16), (15, 15)), "coded even, shown as decoded");
+    assert_eq!(planes, [(0, 16), (256, 16)]);
+    assert_eq!(bytes, want);
+}
+
+#[test]
+fn a_ten_bit_picture_without_p010_from_the_importer_is_narrowed_into_nv12() {
+    let page = pf_memory::udmabuf::align();
+    let Some((mut h, ch)) = nv12_link(page, &nv12_only()) else { return };
+    let mut rx = ch.take_rx().expect("the sink's end");
+    let lent = lend10(16, 0, 3);
+    let planes = [0, 1, 2].map(|p| PlaneRef { data: &lent[p].bytes, stride: lent[p].stride });
+    let mut i420 = vec![0u8; 16 * 16 * 3 / 2];
+    pack_reduced(&mut i420, 16, 16, (1, 1), 10, PixelFormat::I420, &planes).expect("narrowed");
+    let want = nv12_of(&i420, 16, 16);
+    push(&mut h, LEND10, 16, 0);
+    let (fourcc, _, _, _, bytes) = take_frame(&mut h, &mut rx, want.len());
+    assert_eq!(fourcc, DRM_FORMAT_NV12);
+    assert_eq!(bytes, want);
+}
+
+#[test]
+fn a_dmabuf_slot_smaller_than_the_picture_grows_instead_of_failing() {
+    let page = pf_memory::udmabuf::align();
+    let Some((mut h, ch)) = nv12_link(page, &nv12_only()) else { return };
+    let mut rx = ch.take_rx().expect("the sink's end");
+    // 80x80 NV12 is 9600 bytes, past a 4 KiB slot
+    let want = nv12_of(&lent_packed(80, 0), 80, 80);
+    push(&mut h, LEND, 80, 0);
+    let (fourcc, coded, _, _, bytes) = take_frame(&mut h, &mut rx, want.len());
+    assert_eq!((fourcc, coded), (DRM_FORMAT_NV12, (80, 80)));
+    assert_eq!(bytes, want);
+    assert!(h.pool_stats().slot_size >= want.len() as u64, "the slots grew to the picture");
+}
+
+#[test]
+fn pack_nv12_writes_gray_with_flat_chroma_and_refuses_a_layout_it_cannot_narrow() {
+    let y: Vec<u8> = (0..36).collect();
+    let planes = [PlaneRef { data: &y, stride: 6 }, PlaneRef::EMPTY, PlaneRef::EMPTY];
+    let (mut dst, mut scratch) = (vec![0u8; 54], Vec::new());
+    let n = decoder::pack_nv12(
+        &mut dst,
+        Some(&mut scratch),
+        HeldLayout::Native,
+        PixelFormat::Gray8,
+        6,
+        6,
+        &planes,
+    )
+    .expect("packed");
+    assert_eq!(n, 54);
+    assert_eq!(&dst[..36], y.as_slice());
+    assert!(dst[36..].iter().all(|&c| c == 128), "neutral chroma");
+    let refused =
+        decoder::pack_nv12(&mut dst, None, HeldLayout::Planar10, PixelFormat::P010, 6, 6, &planes);
+    assert!(matches!(refused, Err(VideoDecError::HeldLayout { .. })), "{refused:?}");
 }

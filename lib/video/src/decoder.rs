@@ -34,6 +34,7 @@ use crate::gpuframe::{
     DmabufFormat, ExportedPlane, F_HEIGHT, F_LAYOUT, F_MODIFIER, F_WIDTH, FAMILY_VIDEO_GPU,
     FrameToken, FrameTx, GPU_FRAME_HEADER_LEN, GpuFrame, GpuFrameChannel, GpuFrameHeader, Planes,
 };
+use crate::simd::{self, Lanes};
 use pf_hdr::carry::Carry;
 pub use pf_hdr::h26x::Scan;
 use pf_hdr::side::Writer;
@@ -664,6 +665,16 @@ pub fn pack_p010(
     height: u32,
     planes: &[PlaneRef<'_>; 3],
 ) -> Result<usize, VideoDecError> {
+    pack_p010_on(Lanes::detect(), dst, width, height, planes)
+}
+
+pub(crate) fn pack_p010_on(
+    lanes: Lanes,
+    dst: &mut [u8],
+    width: u32,
+    height: u32,
+    planes: &[PlaneRef<'_>; 3],
+) -> Result<usize, VideoDecError> {
     let (w, h) = (width as usize, height as usize);
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     let shapes = [(2 * w, h), (2 * cw, ch), (2 * cw, ch)];
@@ -684,7 +695,9 @@ pub fn pack_p010(
     if w > 0 {
         for (row, d) in y_dst.chunks_exact_mut(2 * w).enumerate() {
             let from = row * planes[0].stride;
-            p010_luma_row(d, &planes[0].data[from..from + 2 * w]);
+            let src = &planes[0].data[from..from + 2 * w];
+            let done = 2 * simd::shift(lanes, d, src, P010_SHIFT);
+            p010_luma_row(&mut d[done..], &src[done..]);
         }
     }
     if cw > 0 {
@@ -692,7 +705,8 @@ pub fn pack_p010(
             let (fu, fv) = (row * planes[1].stride, row * planes[2].stride);
             let u = &planes[1].data[fu..fu + 2 * cw];
             let v = &planes[2].data[fv..fv + 2 * cw];
-            p010_chroma_row(d, u, v);
+            let done = simd::interleave_shift(lanes, d, u, v, P010_SHIFT);
+            p010_chroma_row(&mut d[4 * done..], &u[2 * done..], &v[2 * done..]);
         }
     }
     Ok(luma + chroma)
@@ -738,6 +752,19 @@ pub fn pack_reduced(
     to: PixelFormat,
     planes: &[PlaneRef<'_>; 3],
 ) -> Result<usize, VideoDecError> {
+    let lanes = Lanes::detect();
+    pack_reduced_on(lanes, dst, (width, height), chroma_shift, bits, to, planes)
+}
+
+pub(crate) fn pack_reduced_on(
+    lanes: Lanes,
+    dst: &mut [u8],
+    (width, height): (u32, u32),
+    chroma_shift: (u8, u8),
+    bits: u8,
+    to: PixelFormat,
+    planes: &[PlaneRef<'_>; 3],
+) -> Result<usize, VideoDecError> {
     let (w, h) = (width as usize, height as usize);
     let shift = (chroma_shift.0.min(1), chroma_shift.1.min(1));
     let wide = bits > 8;
@@ -747,7 +774,7 @@ pub fn pack_reduced(
         return Err(VideoDecError::HeldLayout { layout, pixfmt: to.caps_name() });
     }
     if wide && to == PixelFormat::I420 {
-        return pack_narrowed(dst, (w, h), shift, bits, planes);
+        return pack_narrowed(lanes, dst, (w, h), shift, bits, planes);
     }
     let (sc, sr) = (w.div_ceil(1 << shift.0), h.div_ceil(1 << shift.1));
     let shapes = [(size * w, h), (size * sc, sr), (size * sc, sr)];
@@ -772,7 +799,10 @@ pub fn pack_reduced(
             let from = row * planes[0].stride;
             let src = &planes[0].data[from..from + size * w];
             match wide {
-                true => deep_luma_row(d, src, up),
+                true => {
+                    let done = 2 * simd::shift(lanes, d, src, up);
+                    deep_luma_row(&mut d[done..], &src[done..], up);
+                }
                 false => d.copy_from_slice(src),
             }
         }
@@ -781,15 +811,18 @@ pub fn pack_reduced(
         return Ok(luma + chroma);
     }
     let fit = Fit { shift, cols: sc, rows: sr };
+    let taps = shift.0 == 0;
+    let mut t = Temps::new();
     if wide {
         for (y, d) in c_dst.chunks_exact_mut(4 * cw).enumerate() {
             let (u, v) = (fit.rows_of::<true>(&planes[1], y), fit.rows_of::<true>(&planes[2], y));
-            for (k, d) in d.chunks_mut(4 * RUN).enumerate() {
-                let n = d.len() / 4;
-                let (mut su, mut sv) = ([0u16; RUN], [0u16; RUN]);
-                fit.sites::<true>(u, k * RUN, &mut su[..n]);
-                fit.sites::<true>(v, k * RUN, &mut sv[..n]);
-                for ((d, u), v) in d.as_chunks_mut::<4>().0.iter_mut().zip(&su[..n]).zip(&sv[..n]) {
+            let done = simd::fit_p010(lanes, taps, bits, u, v, d, up);
+            for (k, d) in d[4 * done..].chunks_mut(4 * RUN).enumerate() {
+                let (n, x0) = (d.len() / 4, done + k * RUN);
+                let (su, sv) = (&mut t.u[..n], &mut t.v[..n]);
+                fit.sites::<true>(u, x0, su, &mut t.taps);
+                fit.sites::<true>(v, x0, sv, &mut t.taps);
+                for ((d, u), v) in d.as_chunks_mut::<4>().0.iter_mut().zip(&*su).zip(&*sv) {
                     let (u, v) = ((u << up).to_le_bytes(), (v << up).to_le_bytes());
                     *d = [u[0], u[1], v[0], v[1]];
                 }
@@ -800,10 +833,11 @@ pub fn pack_reduced(
         for (src, dst) in [(&planes[1], u_dst), (&planes[2], v_dst)] {
             for (y, d) in dst.chunks_exact_mut(cw).enumerate() {
                 let rows = fit.rows_of::<false>(src, y);
-                for (k, d) in d.chunks_mut(RUN).enumerate() {
-                    let mut sites = [0u16; RUN];
-                    fit.sites::<false>(rows, k * RUN, &mut sites[..d.len()]);
-                    for (d, s) in d.iter_mut().zip(&sites) {
+                let done = simd::fit8(lanes, taps, rows, d);
+                for (k, d) in d[done..].chunks_mut(RUN).enumerate() {
+                    let sites = &mut t.u[..d.len()];
+                    fit.sites::<false>(rows, done + k * RUN, sites, &mut t.taps);
+                    for (d, s) in d.iter_mut().zip(&*sites) {
                         *d = *s as u8;
                     }
                 }
@@ -835,6 +869,7 @@ fn narrow(s: u16, down: u32) -> u8 {
 }
 
 fn pack_narrowed(
+    lanes: Lanes,
     dst: &mut [u8],
     (w, h): (usize, usize),
     shift: (u8, u8),
@@ -851,7 +886,8 @@ fn pack_narrowed(
         for (row, d) in y_dst.chunks_exact_mut(w).enumerate() {
             let from = row * planes[0].stride;
             let src = &planes[0].data[from..from + 2 * w];
-            for (d, s) in d.iter_mut().zip(src.as_chunks::<2>().0) {
+            let done = simd::narrow(lanes, d, src, down);
+            for (d, s) in d[done..].iter_mut().zip(src[2 * done..].as_chunks::<2>().0) {
                 *d = narrow(u16::from_le_bytes(*s), down);
             }
         }
@@ -860,14 +896,17 @@ fn pack_narrowed(
         return Ok(luma + chroma);
     }
     let fit = Fit { shift, cols: sc, rows: sr };
+    let taps = shift.0 == 0;
+    let mut t = Temps::new();
     let (u_dst, v_dst) = c_dst.split_at_mut(cw * ch);
     for (src, dst) in [(&planes[1], u_dst), (&planes[2], v_dst)] {
         for (y, d) in dst.chunks_exact_mut(cw).enumerate() {
             let rows = fit.rows_of::<true>(src, y);
-            for (k, d) in d.chunks_mut(RUN).enumerate() {
-                let mut sites = [0u16; RUN];
-                fit.sites::<true>(rows, k * RUN, &mut sites[..d.len()]);
-                for (d, s) in d.iter_mut().zip(&sites) {
+            let done = simd::fit_narrow(lanes, taps, bits, rows, d, down);
+            for (k, d) in d[done..].chunks_mut(RUN).enumerate() {
+                let sites = &mut t.u[..d.len()];
+                fit.sites::<true>(rows, done + k * RUN, sites, &mut t.taps);
+                for (d, s) in d.iter_mut().zip(&*sites) {
                     *d = narrow(*s, down);
                 }
             }
@@ -923,13 +962,18 @@ impl Fit {
 
     // 1 2 1 across columns clamped at the edges, averaged over both rows.
     #[inline]
-    fn sites<const WIDE: bool>(&self, (a, b): (&[u8], &[u8]), x0: usize, out: &mut [u16]) {
+    fn sites<const WIDE: bool>(
+        &self,
+        (a, b): (&[u8], &[u8]),
+        x0: usize,
+        out: &mut [u16],
+        [ra, rb]: &mut [Taps; 2],
+    ) {
         let n = out.len();
-        let (mut ra, mut rb) = ([0u16; 2 * RUN + 1], [0u16; 2 * RUN + 1]);
         if self.shift.0 == 1 {
             samples::<WIDE>(a, x0, &mut ra[..n]);
             samples::<WIDE>(b, x0, &mut rb[..n]);
-            for ((o, a), b) in out.iter_mut().zip(&ra).zip(&rb) {
+            for ((o, a), b) in out.iter_mut().zip(&*ra).zip(&*rb) {
                 *o = ((u32::from(*a) + u32::from(*b) + 1) >> 1) as u16;
             }
             return;
@@ -939,21 +983,37 @@ impl Fit {
         let m = (2 * n + 1 - lead).min(self.cols - from);
         samples::<WIDE>(a, from, &mut ra[lead..lead + m]);
         samples::<WIDE>(b, from, &mut rb[lead..lead + m]);
-        for r in [&mut ra, &mut rb] {
+        for r in [&mut *ra, &mut *rb] {
             r[0] = r[lead];
             let last = r[lead + m - 1];
             r[lead + m..=2 * n].fill(last);
         }
-        let taps = |r: &[u16; 2 * RUN + 1], i: usize| {
+        let taps = |r: &Taps, i: usize| {
             u32::from(r[2 * i]) + 2 * u32::from(r[2 * i + 1]) + u32::from(r[2 * i + 2])
         };
         for (i, o) in out.iter_mut().enumerate() {
-            *o = ((taps(&ra, i) + taps(&rb, i) + 4) >> 3) as u16;
+            *o = ((taps(ra, i) + taps(rb, i) + 4) >> 3) as u16;
         }
     }
 }
 
 const RUN: usize = 128;
+
+/// One row's samples around a run of sites, the clamped edge taps included.
+type Taps = [u16; 2 * RUN + 1];
+
+// Scalar scratch, zeroed once a picture rather than once a run.
+struct Temps {
+    taps: [Taps; 2],
+    u: [u16; RUN],
+    v: [u16; RUN],
+}
+
+impl Temps {
+    fn new() -> Temps {
+        Temps { taps: [[0; 2 * RUN + 1]; 2], u: [0; RUN], v: [0; RUN] }
+    }
+}
 
 #[inline]
 fn samples<const WIDE: bool>(row: &[u8], from: usize, out: &mut [u16]) {
@@ -992,6 +1052,110 @@ fn packed_size(pixfmt: PixelFormat, width: u32, height: u32) -> usize {
         .sum()
 }
 
+/// An NV12 slot's size, even and one pitch for both planes, as VA-API surfaces are.
+fn nv12_even(width: u32, height: u32) -> (usize, usize) {
+    (width.next_multiple_of(2) as usize, height.next_multiple_of(2) as usize)
+}
+
+fn nv12_size(width: u32, height: u32) -> usize {
+    let (w, h) = nv12_even(width, height);
+    w * h * 3 / 2
+}
+
+/// The planes, their count and the coded size of an NV12 slot.
+fn nv12_layout(width: u32, height: u32) -> ([(usize, usize); 3], usize, (u32, u32)) {
+    let (w, h) = nv12_even(width, height);
+    ([(0, w), (w * h, w), (0, 0)], 2, (w as u32, h as u32))
+}
+
+fn tight_i420(s: &[u8], w: usize, h: usize) -> [PlaneRef<'_>; 3] {
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let (y, c) = s.split_at(w * h);
+    let (u, v) = c.split_at(cw * ch);
+    [
+        PlaneRef { data: y, stride: w },
+        PlaneRef { data: u, stride: cw },
+        PlaneRef { data: v, stride: cw },
+    ]
+}
+
+/// An 8-bit 4:2:0 picture interleaved into tight NV12 at the even size, its last row and column
+/// repeated into the padding. A picture laid out otherwise goes to `scratch` as I420 first.
+/// Bytes written.
+pub fn pack_nv12(
+    dst: &mut [u8],
+    scratch: Option<&mut Vec<u8>>,
+    layout: HeldLayout,
+    pixfmt: PixelFormat,
+    width: u32,
+    height: u32,
+    planes: &[PlaneRef<'_>; 3],
+) -> Result<usize, VideoDecError> {
+    let lanes = Lanes::detect();
+    pack_nv12_on(lanes, dst, scratch, (layout, pixfmt), (width, height), planes)
+}
+
+pub(crate) fn pack_nv12_on(
+    lanes: Lanes,
+    dst: &mut [u8],
+    scratch: Option<&mut Vec<u8>>,
+    (layout, pixfmt): (HeldLayout, PixelFormat),
+    (width, height): (u32, u32),
+    planes: &[PlaneRef<'_>; 3],
+) -> Result<usize, VideoDecError> {
+    let (w, h) = (width as usize, height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let i420 = match (layout, pixfmt, scratch) {
+        (HeldLayout::Native, PixelFormat::I420, _) => *planes,
+        (layout, _, None) => return Err(VideoDecError::HeldLayout { layout, pixfmt: "nv12" }),
+        (_, _, Some(scratch)) => {
+            let need = packed_size(PixelFormat::I420, width, height);
+            if scratch.len() < need {
+                scratch.resize(need, 0);
+            }
+            let s = &mut scratch[..need];
+            match (layout, pixfmt) {
+                (HeldLayout::Native, PixelFormat::Gray8) | (HeldLayout::Gray, _) => {
+                    pack_gray(s, width, height, planes)?
+                }
+                (HeldLayout::Reduce { chroma_shift, bits }, _) => {
+                    let to = PixelFormat::I420;
+                    pack_reduced_on(lanes, s, (width, height), chroma_shift, bits, to, planes)?
+                }
+                (HeldLayout::Planar10, _) => {
+                    let to = PixelFormat::I420;
+                    pack_reduced_on(lanes, s, (width, height), (1, 1), 10, to, planes)?
+                }
+                (layout, _) => return Err(VideoDecError::HeldLayout { layout, pixfmt: "nv12" }),
+            };
+            tight_i420(&scratch[..need], w, h)
+        }
+    };
+    check_planes(&i420, &[(w, h), (cw, ch), (cw, ch)])?;
+    let (ew, eh) = nv12_even(width, height);
+    let (y_dst, uv_dst) = dst[..ew * eh * 3 / 2].split_at_mut(ew * eh);
+    if w == 0 || h == 0 {
+        return Ok(ew * eh * 3 / 2);
+    }
+    for (r, d) in y_dst.chunks_exact_mut(ew).enumerate() {
+        let from = r.min(h - 1) * i420[0].stride;
+        d[..w].copy_from_slice(&i420[0].data[from..from + w]);
+        if ew > w {
+            d[w] = d[w - 1];
+        }
+    }
+    for (r, d) in uv_dst.chunks_exact_mut(ew).enumerate() {
+        let (fu, fv) = (r * i420[1].stride, r * i420[2].stride);
+        let (u, v) = (&i420[1].data[fu..fu + cw], &i420[2].data[fv..fv + cw]);
+        let done = simd::interleave(lanes, d, u, v);
+        let pairs = d[2 * done..].as_chunks_mut::<2>().0.iter_mut();
+        for ((d, &u), &v) in pairs.zip(&u[done..]).zip(&v[done..]) {
+            *d = [u, v];
+        }
+    }
+    Ok(ew * eh * 3 / 2)
+}
+
 struct DmabufOut {
     channel: Arc<GpuFrameChannel>,
     formats: Vec<DmabufFormat>,
@@ -1002,6 +1166,39 @@ struct DmabufOut {
     desc: &'static ElementDesc,
     /// Frames the full channel refused since the last flush or end.
     refused: u64,
+    /// A picture as tight I420 on its way to an NV12 slot, when the codec lays it out otherwise.
+    scratch: Vec<u8>,
+}
+
+impl DmabufOut {
+    /// The layout and modifier a `pixfmt` picture goes out in, `None` on a raw link. The first the
+    /// importer takes of the picture's own and NV12, P010 before NV12 for a deep one, relinking
+    /// when it is not the fixed one.
+    fn target(&mut self, pixfmt: &'static str) -> Result<Option<(u32, u64)>, VideoDecError> {
+        let Some((fixed, modifier)) = self.link else {
+            return Ok(None);
+        };
+        let order: &[u32] = match pixfmt {
+            "i420" => &[DRM_FORMAT_YUV420, DRM_FORMAT_NV12],
+            "p010" => &[DRM_FORMAT_P010, DRM_FORMAT_NV12],
+            "nv12" | "gray8" => &[DRM_FORMAT_NV12],
+            _ => &[],
+        };
+        let takes = |fourcc: u32| {
+            fourcc == fixed
+                || self
+                    .formats
+                    .iter()
+                    .any(|f| f.fourcc == fourcc && f.modifiers.contains(&modifier))
+        };
+        match order.iter().copied().find(|&f| takes(f)) {
+            Some(fourcc) => {
+                self.link = Some((fourcc, modifier));
+                Ok(self.link)
+            }
+            None => Err(VideoDecError::Layout { pixfmt, fixed }),
+        }
+    }
 }
 
 pub struct VideoDec<C: Codec> {
@@ -1057,6 +1254,7 @@ impl<C: Codec> VideoDec<C> {
             released: Vec::new(),
             desc,
             refused: 0,
+            scratch: Vec::new(),
         });
         self
     }
@@ -1105,34 +1303,17 @@ impl<C: Codec> VideoDec<C> {
         while let Some(p) = self.ready.front() {
             let shape = p.shape();
             let (width, height, pixfmt, color) = shape;
-            // The picture must match the link's layout, or one the importer takes with the same
-            // modifier.
-            let link = match self.dmabuf.as_mut() {
-                Some(d) => match (d.link, dmabuf_layout(pixfmt)) {
-                    (Some((fixed, _)), Some((fourcc, _))) if fourcc == fixed => d.link,
-                    (Some((fixed, modifier)), found) => {
-                        let takes = |fourcc| {
-                            d.formats
-                                .iter()
-                                .any(|f| f.fourcc == fourcc && f.modifiers.contains(&modifier))
-                        };
-                        match found {
-                            Some((fourcc, _)) if takes(fourcc) => {
-                                d.link = Some((fourcc, modifier));
-                                d.link
-                            }
-                            _ => {
-                                return Err(
-                                    self.fatal(ctx, VideoDecError::Layout { pixfmt, fixed })
-                                );
-                            }
-                        }
-                    }
-                    (None, _) => None,
-                },
+            // A layout the importer takes with the link's modifier, the picture's own or NV12.
+            let link = match self.dmabuf.as_mut().map(|d| d.target(pixfmt)) {
+                Some(Ok(link)) => link,
+                Some(Err(e)) => return Err(self.fatal(ctx, e)),
                 None => None,
             };
-            let layout = link.and_then(|_| dmabuf_layout(pixfmt).map(|(_, layout)| layout));
+            let own = dmabuf_layout(pixfmt).map(|(fourcc, _)| fourcc);
+            // An NV12 link of a picture laid out otherwise is interleaved into the slot.
+            let nv12 =
+                link.is_some_and(|(f, _)| f == DRM_FORMAT_NV12) && own != Some(DRM_FORMAT_NV12);
+            let layout = link.and_then(|(fourcc, _)| gpuframe::layout_of(fourcc));
             if self.shape != Some(shape) {
                 let level = if self.shape.is_none() { Level::Info } else { Level::Debug };
                 log!(
@@ -1154,6 +1335,7 @@ impl<C: Codec> VideoDec<C> {
             }
             if let (Ready::Sent(sent), Some((fourcc, _))) = (p, link)
                 && sent.layout == HeldLayout::Native
+                && own == Some(fourcc)
                 && Dmabuf::of(&sent.memory).is_ok()
             {
                 self.export_sent(ctx, fourcc)?;
@@ -1183,11 +1365,18 @@ impl<C: Codec> VideoDec<C> {
             };
             self.stalled = false;
             let need = match p {
+                _ if nv12 => nv12_size(width, height),
                 Ready::Owned(p) => p.planes.iter().map(Vec::len).sum(),
                 Ready::Held(h) => packed_size(h.pixfmt, h.width, h.height),
                 Ready::Sent(s) => packed_size(s.pixfmt, s.width, s.height),
             };
             let capacity = buf.memory.capacity();
+            // Dmabuf mode sizes its slots to the stream, a larger picture grows them.
+            if capacity < need && self.dmabuf.is_some() && ctx.grow_slots(need) {
+                log!(&*ctx, Level::Debug, "grow_slots", bytes = need);
+                drop(buf);
+                continue;
+            }
             if capacity < need {
                 let error = VideoDecError::SlotTooSmall { width, height, pixfmt, need, capacity };
                 return Err(self.fatal(ctx, error));
@@ -1203,7 +1392,22 @@ impl<C: Codec> VideoDec<C> {
                 None => None,
             };
             let dst = buf.memory.as_mut_full();
+            let scratch = self.dmabuf.as_mut().map(|d| &mut d.scratch);
             let (pts, duration) = match p {
+                Ready::Owned(p) if nv12 => {
+                    let f = PixelFormat::from_caps_name(p.pixfmt).unwrap_or(PixelFormat::I420);
+                    let mut planes = [PlaneRef::EMPTY; 3];
+                    for (i, (plane, data)) in planes.iter_mut().zip(&p.planes).enumerate() {
+                        let stride = plane_geometry(f, width, height, i).map_or(0, |g| g.stride);
+                        *plane = PlaneRef { data, stride };
+                    }
+                    let packed =
+                        pack_nv12(dst, scratch, HeldLayout::Native, f, width, height, &planes);
+                    if let Err(error) = packed {
+                        return Err(self.fatal(ctx, error));
+                    }
+                    (p.pts, p.duration)
+                }
                 Ready::Owned(p) => {
                     let mut at = 0;
                     for plane in &p.planes {
@@ -1215,6 +1419,9 @@ impl<C: Codec> VideoDec<C> {
                 Ready::Held(h) => {
                     let planes = self.codec.held_planes(h.handle);
                     let packed = match (h.layout, h.pixfmt) {
+                        _ if nv12 => {
+                            pack_nv12(dst, scratch, h.layout, h.pixfmt, h.width, h.height, &planes)
+                        }
                         (HeldLayout::Native, _) => {
                             pack_planes(dst, h.pixfmt, h.width, h.height, &planes)
                         }
@@ -1243,6 +1450,9 @@ impl<C: Codec> VideoDec<C> {
                 Ready::Sent(s) => {
                     let planes = s.planes();
                     let packed = match (s.layout, s.pixfmt) {
+                        _ if nv12 => {
+                            pack_nv12(dst, scratch, s.layout, s.pixfmt, s.width, s.height, &planes)
+                        }
                         (HeldLayout::Native, _) => {
                             pack_planes(dst, s.pixfmt, s.width, s.height, &planes)
                         }
@@ -1277,10 +1487,16 @@ impl<C: Codec> VideoDec<C> {
                 (Some(dmabuf), Some((fourcc, _)), Some(d)) => {
                     let pixfmt = PixelFormat::from_caps_name(pixfmt).unwrap_or(PixelFormat::I420);
                     let ended = sync_write(dmabuf.fd, false).map_err(VideoDecError::Dmabuf);
-                    let packed = packed_layout(pixfmt, width, height);
-                    let n = pixfmt.plane_count();
+                    let (packed, n, coded) = match nv12 {
+                        true => nv12_layout(width, height),
+                        false => {
+                            let n = pixfmt.plane_count();
+                            (packed_layout(pixfmt, width, height), n, (width, height))
+                        }
+                    };
+                    let size = Size { coded, shown: (width, height) };
                     let sent = ended.and_then(|()| {
-                        export(d, ctx, buf, dmabuf, fourcc, &packed[..n], (width, height), side)
+                        export(d, ctx, buf, dmabuf, fourcc, &packed[..n], size, side)
                     });
                     if let Err(error) = sent {
                         // Held was already released, a later drop_all must not see it again.
@@ -1319,8 +1535,9 @@ impl<C: Codec> VideoDec<C> {
         let Some(d) = self.dmabuf.as_mut() else {
             return Ok(());
         };
-        let sent =
-            export(d, ctx, buf, dmabuf, fourcc, &planes[..n], (sent.width, sent.height), side);
+        let shown = (sent.width, sent.height);
+        let size = Size { coded: shown, shown };
+        let sent = export(d, ctx, buf, dmabuf, fourcc, &planes[..n], size, side);
         sent.map_err(|error| Error::element_failed(ctx.element(), error))
     }
 
@@ -1405,9 +1622,10 @@ impl<C: Codec> Element for VideoDec<C> {
     fn preroll(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         let Some(d) = &self.dmabuf else { return Ok(()) };
         let raw = C::DESC.srcs.first().map_or(&[][..], |pad| pad.offers);
+        // dmabufs first, so a sink taking both is handed the slots
         gpuframe::with_gpu_offers(&d.formats, |gpu| {
-            let mut all: Vec<OfferSpec<'_>> = raw.to_vec();
-            all.extend_from_slice(gpu);
+            let mut all: Vec<OfferSpec<'_>> = gpu.to_vec();
+            all.extend_from_slice(raw);
             ctx.offer_src(SRC_PAD, &all)
         })
     }
@@ -1555,6 +1773,13 @@ impl<C: Codec> Element for VideoDec<C> {
     }
 }
 
+/// A picture's size in its slot and on screen, the slot's rounded up to even for NV12.
+#[derive(Clone, Copy)]
+struct Size {
+    coded: (u32, u32),
+    shown: (u32, u32),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn export(
     d: &mut DmabufOut,
@@ -1563,7 +1788,7 @@ fn export(
     dmabuf: Dmabuf,
     fourcc: u32,
     layout: &[(usize, usize)],
-    (width, height): (u32, u32),
+    Size { coded, shown: (width, height) }: Size,
     side: &[u8],
 ) -> Result<(), VideoDecError> {
     let Some(tx) = d.tx.as_mut() else {
@@ -1596,8 +1821,8 @@ fn export(
         token,
         fds,
         drm_format: fourcc,
-        coded_w: width,
-        coded_h: height,
+        coded_w: coded.0,
+        coded_h: coded.1,
         disp_w: width,
         disp_h: height,
         crop_x: 0,
@@ -1618,8 +1843,8 @@ fn export(
     }
     let header = GpuFrameHeader {
         token,
-        coded_w: width,
-        coded_h: height,
+        coded_w: coded.0,
+        coded_h: coded.1,
         disp_w: width,
         disp_h: height,
         crop_x: 0,
@@ -1665,13 +1890,18 @@ fn announce_gpu(
     ctx.announce_format(SRC_PAD, FAMILY_VIDEO_GPU, &fields[..n]);
 }
 
-/// The importer's layouts the codec writes, linear only since a CPU writes the slot.
+/// The importer's layouts the codec writes, NV12 too where it writes I420 since the shell
+/// interleaves it, linear only since a CPU writes the slot.
 // Once per element, at construction.
 #[allow(clippy::disallowed_methods)]
 fn written_formats(desc: &ElementDesc, formats: &[DmabufFormat]) -> Vec<DmabufFormat> {
+    let writes = |fourcc| {
+        codec_writes(desc, fourcc)
+            || fourcc == DRM_FORMAT_NV12 && codec_writes(desc, DRM_FORMAT_YUV420)
+    };
     formats
         .iter()
-        .filter(|f| codec_writes(desc, f.fourcc) && f.modifiers.contains(&DRM_FORMAT_MOD_LINEAR))
+        .filter(|f| writes(f.fourcc) && f.modifiers.contains(&DRM_FORMAT_MOD_LINEAR))
         .map(|f| DmabufFormat { fourcc: f.fourcc, modifiers: vec![DRM_FORMAT_MOD_LINEAR] })
         .collect()
 }
@@ -1742,9 +1972,11 @@ mod tests {
             DmabufFormat { fourcc: DRM_FORMAT_NV12, modifiers: vec![DRM_FORMAT_MOD_LINEAR] },
         ];
         let written = written_formats(&DESC, &importer);
+        let linear = |fourcc| DmabufFormat { fourcc, modifiers: vec![DRM_FORMAT_MOD_LINEAR] };
         assert_eq!(
             written,
-            [DmabufFormat { fourcc: DRM_FORMAT_YUV420, modifiers: vec![DRM_FORMAT_MOD_LINEAR] }]
+            [linear(DRM_FORMAT_YUV420), linear(DRM_FORMAT_NV12)],
+            "NV12 too, the shell interleaves the codec's I420"
         );
         let tiled_only = [DmabufFormat { fourcc: DRM_FORMAT_YUV420, modifiers: vec![y_tiled] }];
         assert!(written_formats(&DESC, &tiled_only).is_empty());

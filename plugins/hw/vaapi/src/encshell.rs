@@ -361,7 +361,7 @@ impl<C: Codec> VaEnc<C> {
                 return Ok(());
             }
         };
-        let map = match out.map_coded() {
+        let map = match enc::map_coded(&out) {
             Ok(m) => m,
             // its buffer goes, the session makes another
             Err(e) => {

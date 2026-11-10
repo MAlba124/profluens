@@ -8,15 +8,18 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt;
+use std::sync::Arc;
 
-use profluens_core::element::{ElementDesc, PadDesc};
-use profluens_core::format::{FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{Element, ElementDesc, PadDesc, PropDesc};
+use profluens_core::format::{Constraint, FieldDesc, OfferDesc, Value, ValueDesc};
 use profluens_core::log;
 use profluens_core::log::Level;
 use profluens_core::memory::Memory;
 use profluens_core::time::Timestamp;
 use profluens_video::FAMILY;
 use profluens_video::decoder::{self, Codec, Held, Out, PlaneRef, Scan, Sent, VideoDec};
+use profluens_video::gpuframe::{DmabufFormat, GpuFrameChannel};
 
 use crate::lav::{self, Decoder, Frame, LavError, Received, Shape, Supply};
 
@@ -60,43 +63,74 @@ static THEORA_SINK: [OfferDesc; 1] =
     [OfferDesc { family: "theora", fields: &decoder::COLOR_FIELDS }];
 static THEORA_SINKS: [PadDesc; 1] = decoder::sink_pad(&THEORA_SINK);
 
+/// `threads` past 1 runs libavcodec's frame threads where the codec has them. Each picture then
+/// comes threads - 1 units later and is copied out of libavcodec's memory, not decoded into a slot.
+static PROPS: [PropDesc; 1] = [PropDesc { name: "threads", allowed: Constraint::Any, live: false }];
+
+/// Single threaded, the deterministic simulation rule.
+pub const DEFAULT_THREADS: u32 = 1;
+
 // One-time construction.
 #[allow(clippy::disallowed_methods)]
 pub(crate) static H264_DESC: ElementDesc =
-    decoder::desc("libavh264dec", &H264_SINKS, &SRCS, || Box::new(LibavH264Dec::new()));
+    decoder::desc_with_props("libavh264dec", &H264_SINKS, &SRCS, &PROPS, || {
+        Box::new(LibavH264Dec::new())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static H265_DESC: ElementDesc =
-    decoder::desc("libavh265dec", &H265_SINKS, &SRCS, || Box::new(LibavH265Dec::new()));
+    decoder::desc_with_props("libavh265dec", &H265_SINKS, &SRCS, &PROPS, || {
+        Box::new(LibavH265Dec::new())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VP8_DESC: ElementDesc =
-    decoder::desc("libavvp8dec", &VP8_SINKS, &SRCS, || Box::new(LibavVp8Dec::new()));
+    decoder::desc_with_props("libavvp8dec", &VP8_SINKS, &SRCS, &PROPS, || {
+        Box::new(LibavVp8Dec::new())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VP9_DESC: ElementDesc =
-    decoder::desc("libavvp9dec", &VP9_SINKS, &SRCS, || Box::new(LibavVp9Dec::new()));
+    decoder::desc_with_props("libavvp9dec", &VP9_SINKS, &SRCS, &PROPS, || {
+        Box::new(LibavVp9Dec::new())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static MPEG2_DESC: ElementDesc =
-    decoder::desc("libavmpeg2dec", &MPEG2_SINKS, &SRCS, || Box::new(LibavMpeg2Dec::new()));
+    decoder::desc_with_props("libavmpeg2dec", &MPEG2_SINKS, &SRCS, &PROPS, || {
+        Box::new(LibavMpeg2Dec::new())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static MPEG4_DESC: ElementDesc =
-    decoder::desc("libavmpeg4dec", &MPEG4_SINKS, &SRCS, || Box::new(LibavMpeg4Dec::new()));
+    decoder::desc_with_props("libavmpeg4dec", &MPEG4_SINKS, &SRCS, &PROPS, || {
+        Box::new(LibavMpeg4Dec::new())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static FLV1_DESC: ElementDesc =
-    decoder::desc("libavflv1dec", &FLV1_SINKS, &SRCS, || Box::new(LibavFlv1Dec::new()));
+    decoder::desc_with_props("libavflv1dec", &FLV1_SINKS, &SRCS, &PROPS, || {
+        Box::new(LibavFlv1Dec::new())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VP6_DESC: ElementDesc =
-    decoder::desc("libavvp6dec", &VP6_SINKS, &SRCS, || Box::new(LibavVp6Dec::new()));
+    decoder::desc_with_props("libavvp6dec", &VP6_SINKS, &SRCS, &PROPS, || {
+        Box::new(LibavVp6Dec::new())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VP6F_DESC: ElementDesc =
-    decoder::desc("libavvp6fdec", &VP6F_SINKS, &SRCS, || Box::new(LibavVp6fDec::new()));
+    decoder::desc_with_props("libavvp6fdec", &VP6F_SINKS, &SRCS, &PROPS, || {
+        Box::new(LibavVp6fDec::new())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VP6A_DESC: ElementDesc =
-    decoder::desc("libavvp6adec", &VP6A_SINKS, &SRCS, || Box::new(LibavVp6aDec::new()));
+    decoder::desc_with_props("libavvp6adec", &VP6A_SINKS, &SRCS, &PROPS, || {
+        Box::new(LibavVp6aDec::new())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VP7_DESC: ElementDesc =
-    decoder::desc("libavvp7dec", &VP7_SINKS, &SRCS, || Box::new(LibavVp7Dec::new()));
+    decoder::desc_with_props("libavvp7dec", &VP7_SINKS, &SRCS, &PROPS, || {
+        Box::new(LibavVp7Dec::new())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static THEORA_DESC: ElementDesc =
-    decoder::desc("libavtheoradec", &THEORA_SINKS, &SRCS, || Box::new(LibavTheoraDec::new()));
+    decoder::desc_with_props("libavtheoradec", &THEORA_SINKS, &SRCS, &PROPS, || {
+        Box::new(LibavTheoraDec::new())
+    });
 
 pub const H264: u8 = 0;
 pub const H265: u8 = 1;
@@ -141,6 +175,39 @@ pub type LibavVp6aDec = VideoDec<LavVideo<VP6A>>;
 pub type LibavVp7Dec = VideoDec<LavVideo<VP7>>;
 pub type LibavTheoraDec = VideoDec<LavVideo<THEORA>>;
 
+/// The decoder of `desc` in dmabuf mode, see [`VideoDec::with_dmabuf`]. `None` for an element
+/// that is not one of these.
+// Once per pipeline build.
+#[allow(clippy::disallowed_methods)]
+pub fn with_dmabuf(
+    desc: &ElementDesc,
+    channel: &Arc<GpuFrameChannel>,
+    formats: &[DmabufFormat],
+) -> Option<Box<dyn Element>> {
+    type Make = fn(&Arc<GpuFrameChannel>, &[DmabufFormat]) -> Box<dyn Element>;
+    fn boxed<C: Codec>(
+        channel: &Arc<GpuFrameChannel>,
+        formats: &[DmabufFormat],
+    ) -> Box<dyn Element> {
+        Box::new(VideoDec::<C>::new().with_dmabuf(Arc::clone(channel), formats))
+    }
+    let made: [(&ElementDesc, Make); 12] = [
+        (&H264_DESC, boxed::<LavVideo<H264>>),
+        (&H265_DESC, boxed::<LavVideo<H265>>),
+        (&VP8_DESC, boxed::<LavVideo<VP8>>),
+        (&VP9_DESC, boxed::<LavVideo<VP9>>),
+        (&MPEG2_DESC, boxed::<LavVideo<MPEG2>>),
+        (&MPEG4_DESC, boxed::<LavVideo<MPEG4>>),
+        (&FLV1_DESC, boxed::<LavVideo<FLV1>>),
+        (&VP6_DESC, boxed::<LavVideo<VP6>>),
+        (&VP6F_DESC, boxed::<LavVideo<VP6F>>),
+        (&VP6A_DESC, boxed::<LavVideo<VP6A>>),
+        (&VP7_DESC, boxed::<LavVideo<VP7>>),
+        (&THEORA_DESC, boxed::<LavVideo<THEORA>>),
+    ];
+    made.iter().find(|(d, _)| std::ptr::eq(*d, desc)).map(|(_, make)| make(channel, formats))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum LavVideoError {
     Open(LavError),
@@ -176,7 +243,8 @@ impl fmt::Display for LavVideoError {
 
 impl std::error::Error for LavVideoError {}
 
-/// A drain puts out a whole DPB, at most 16 frames (H.264 Table A-1, MaxDpbFrames).
+/// A drain puts out a whole DPB, at most 16 frames (H.264 Table A-1, MaxDpbFrames). Frame threads
+/// put out threads - 1 more, each held since none is in a slot, see `start`.
 const HELD: usize = 20;
 
 const SPARE: usize = 1;
@@ -205,6 +273,9 @@ pub struct LavVideo<const KIND: u8> {
     ident: Vec<u8>,
     laced: Vec<u8>,
     refs: Refs,
+    threads: u32,
+    /// Units of parameter sets alone held for the next unit under frame threads, see `decode`.
+    lead: Vec<u8>,
 }
 
 /// Whether a Theora inter frame has its reference pictures. vp3.c decodes one with none against
@@ -233,7 +304,7 @@ const STAMPS: usize = 32;
 impl<const KIND: u8> LavVideo<KIND> {
     /// Opens with the held configuration unit as extradata, else with `lead`.
     fn ensure_open(&mut self, lead: &[u8], out: &mut Out<'_>) -> bool {
-        let LavVideo { decoder, supply, open_failed, late, config, .. } = self;
+        let LavVideo { decoder, supply, open_failed, late, config, threads, .. } = self;
         if decoder.is_some() {
             return true;
         }
@@ -242,7 +313,7 @@ impl<const KIND: u8> LavVideo<KIND> {
         }
         let codec = codec_of(KIND);
         let extradata = if config.is_empty() { lead } else { config.as_slice() };
-        match Decoder::open(codec, extradata, Some(supply), false) {
+        match Decoder::open(codec, extradata, Some(supply), false, *threads) {
             Ok(mut d) => {
                 log!(
                     out.ctx(),
@@ -251,6 +322,7 @@ impl<const KIND: u8> LavVideo<KIND> {
                     codec = codec.name(),
                     extradata = extradata.len(),
                     late = *late,
+                    threads = d.threads(),
                 );
                 d.skip_nonref(*late);
                 *decoder = Some(d);
@@ -350,6 +422,55 @@ impl<const KIND: u8> LavVideo<KIND> {
                 }
             }
         }
+    }
+
+    /// Sends `unit` stamped `pts`, `stamp` for the log, and puts out the pictures ready.
+    fn send(&mut self, unit: &[u8], stamp: Timestamp, pts: i64, duration: i64, out: &mut Out<'_>) {
+        // A full decoder gives its pictures and takes the unit on the second try.
+        let mut taken = false;
+        for _ in 0..2 {
+            let Some(decoder) = &mut self.decoder else {
+                return;
+            };
+            let sent =
+                decoder.send(unit, pts, lav::NONE, duration, &mut |bytes| out.frame_memory(bytes));
+            check_short(&self.supply, out);
+            match sent {
+                Ok(lav::Sent::Full) => self.receive_all(out),
+                Ok(lav::Sent::Taken | lav::Sent::Ended) => {
+                    taken = true;
+                    break;
+                }
+                // A unit of parameter sets alone is taken into the decoder's state and refused as
+                // no frame.
+                Err(e) if !codes_picture(KIND, unit) => {
+                    log!(out.ctx(), Level::Trace, "no_picture", err = e.code(), bytes = unit.len());
+                    taken = true;
+                    break;
+                }
+                Err(e) => {
+                    if self.count_failed() {
+                        log!(
+                            out.ctx(),
+                            Level::Warn,
+                            "unit_error",
+                            err = e.code(),
+                            bytes = unit.len(),
+                            pts = stamp,
+                            failed = self.failed,
+                        );
+                    }
+                    out.warn(LavVideoError::Unit(e));
+                    taken = true;
+                    break;
+                }
+            }
+        }
+        if !taken && self.count_failed() {
+            log!(out.ctx(), Level::Warn, "unit_refused", bytes = unit.len(), pts = stamp);
+        }
+        self.receive_all(out);
+        self.trim();
     }
 
     /// Keeps the stamps of the pictures the decoder holds back and no more. One past them is
@@ -573,10 +694,24 @@ impl<const KIND: u8> Codec for LavVideo<KIND> {
             ident: Vec::new(),
             laced: Vec::new(),
             refs: Refs::Wanted,
+            threads: DEFAULT_THREADS,
+            lead: Vec::new(),
         }
     }
 
-    fn start(&mut self, _ctx: &profluens_core::ctx::Ctx) {
+    fn start(&mut self, ctx: &Ctx) {
+        let threads = match ctx.prop("threads") {
+            Some(Value::Int(v)) => v.clamp(1, i64::from(lav::MAX_THREADS)) as u32,
+            _ => DEFAULT_THREADS,
+        };
+        if threads != self.threads {
+            log!(ctx, Level::Debug, "threads", threads = threads, was = self.threads);
+            self.held.iter_mut().for_each(|h| *h = None);
+            self.held.resize_with(HELD + threads as usize - 1, || None);
+            self.decoder = None;
+            self.stamps.clear();
+            self.threads = threads;
+        }
         self.open_failed = false;
         self.failed = 0;
         self.lost = 0;
@@ -589,6 +724,7 @@ impl<const KIND: u8> Codec for LavVideo<KIND> {
         }
         self.open_failed = false;
         self.stamps.clear();
+        self.lead.clear();
         self.refs = Refs::Wanted;
     }
 
@@ -614,54 +750,26 @@ impl<const KIND: u8> Codec for LavVideo<KIND> {
                 self.stamps.pop();
             }
         }
-        // A full decoder gives its pictures and takes the unit on the second try.
-        let mut taken = false;
-        for _ in 0..2 {
-            let Some(decoder) = &mut self.decoder else {
-                return;
-            };
-            let sent =
-                decoder.send(unit, pts, lav::NONE, duration, &mut |bytes| out.frame_memory(bytes));
-            check_short(&self.supply, out);
-            match sent {
-                Ok(lav::Sent::Full) => self.receive_all(out),
-                Ok(lav::Sent::Taken | lav::Sent::Ended) => {
-                    taken = true;
-                    break;
-                }
-                // A unit of parameter sets alone is taken into the decoder's state and refused as
-                // no frame.
-                Err(e) if !codes_picture(KIND, unit) => {
-                    log!(out.ctx(), Level::Trace, "no_picture", err = e.code(), bytes = unit.len());
-                    taken = true;
-                    break;
-                }
-                Err(e) => {
-                    if self.count_failed() {
-                        log!(
-                            out.ctx(),
-                            Level::Warn,
-                            "unit_error",
-                            err = e.code(),
-                            bytes = unit.len(),
-                            pts = stamp,
-                            failed = self.failed,
-                        );
-                    }
-                    out.warn(LavVideoError::Unit(e));
-                    taken = true;
-                    break;
-                }
-            }
+        // Frame threads report a unit that codes no picture as failed on a later unit's call, so
+        // parameter sets alone ride in front of the next unit instead.
+        let threaded = self.decoder.as_ref().is_some_and(|d| d.threads() > 1);
+        if threaded && !codes_picture(KIND, unit) {
+            self.lead.extend_from_slice(unit);
+            return self.trim();
         }
-        if !taken && self.count_failed() {
-            log!(out.ctx(), Level::Warn, "unit_refused", bytes = unit.len(), pts = stamp);
+        let mut joined = std::mem::take(&mut self.lead);
+        if joined.is_empty() {
+            self.send(unit, stamp, pts, duration, out);
+        } else {
+            joined.extend_from_slice(unit);
+            self.send(&joined, stamp, pts, duration, out);
+            joined.clear();
         }
-        self.receive_all(out);
-        self.trim();
+        self.lead = joined;
     }
 
     fn finish(&mut self, out: &mut Out<'_>) {
+        self.lead.clear();
         let Some(decoder) = &mut self.decoder else {
             return;
         };

@@ -13,6 +13,8 @@ pf-registry = { path = "../registry" }
 # The decoder shell's dmabuf mode.
 pf-memory = { path = "../memory" }
 libc = "0.2"
+# Runtime dispatched AVX2 for the pack loops.
+fearless_simd = "1.1"
 
 [dev-dependencies]
 pf-reactor = { path = "../reactor" }

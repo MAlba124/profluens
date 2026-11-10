@@ -1,9 +1,10 @@
 //! `av1dec`, the AV1 side of the shared `VideoDec` shell.
 
 use std::fmt;
+use std::sync::Arc;
 
 use profluens_core::ctx::Ctx;
-use profluens_core::element::{ElementDesc, PadDesc, PropDesc};
+use profluens_core::element::{Element, ElementDesc, PadDesc, PropDesc};
 use profluens_core::format::{Constraint, FieldDesc, OfferDesc, Value, ValueDesc};
 use profluens_core::log;
 use profluens_core::log::Level;
@@ -11,6 +12,7 @@ use profluens_core::memory::Memory;
 use profluens_core::time::Timestamp;
 use profluens_video::FAMILY;
 use profluens_video::decoder::{self, Codec, Held, Out, PlaneRef, Scan, Sent, VideoDec};
+use profluens_video::gpuframe::{DmabufFormat, GpuFrameChannel};
 
 use crate::dav1d::{self, Dav1dError, Decoder, OpenError, Picture, PictureSupply, Settings};
 
@@ -49,6 +51,19 @@ pub const FRAME_SIZE_LIMIT: u32 = 8192 * 4352;
 
 /// Decodes AV1 temporal units to packed 8-bit `i420` or `gray8`, or 10-bit `p010`.
 pub type Av1Dec = VideoDec<Av1>;
+
+/// dav1d in dmabuf mode if `desc` is its element, see [`VideoDec::with_dmabuf`].
+// Once per pipeline build.
+#[allow(clippy::disallowed_methods)]
+pub fn with_dmabuf(
+    desc: &ElementDesc,
+    channel: &Arc<GpuFrameChannel>,
+    formats: &[DmabufFormat],
+) -> Option<Box<dyn Element>> {
+    std::ptr::eq(desc, &DESC).then(|| {
+        Box::new(Av1Dec::new().with_dmabuf(Arc::clone(channel), formats)) as Box<dyn Element>
+    })
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Av1DecError {

@@ -454,6 +454,11 @@ impl Context {
         self.id
     }
 
+    /// The display the context was made on.
+    pub fn display(&self) -> ffi::VADisplay {
+        self.dpy
+    }
+
     pub fn begin(&self, target: ffi::VASurfaceID) -> VaResult<()> {
         // SAFETY: context + target are live for this call.
         check(unsafe { ffi::vaBeginPicture(self.dpy, self.id, target) }, "vaBeginPicture")
@@ -1131,8 +1136,11 @@ impl UploadImage {
         }
 
         let mut base: *mut std::ffi::c_void = ptr::null_mut();
+        // Write only, a plain map has the driver copy the surface out of its tiling first, a
+        // tenth of a software decoded transcode's CPU for pixels the upload overwrites.
         // SAFETY: image.buf is the image's backing buffer, base out ptr valid.
-        let st = unsafe { ffi::vaMapBuffer(dpy, image.buf, &mut base) };
+        let st =
+            unsafe { ffi::vaMapBuffer2(dpy, image.buf, &mut base, ffi::VA_MAPBUFFER_FLAG_WRITE) };
         if let Err(e) = check(st, "vaMapBuffer(upload)") {
             // SAFETY: image is live, release before propagating.
             unsafe {

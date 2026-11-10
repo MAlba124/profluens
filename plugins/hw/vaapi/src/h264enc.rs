@@ -221,6 +221,7 @@ pub struct VaapiH264Enc {
     /// Waits for a picture in the driver, the encoder has its own thread.
     blocking: bool,
     fences: enc::Fences,
+    reads: enc::Reads,
 }
 
 // SAFETY: the element runs on one thread at a time, its group's after preroll, its own when
@@ -252,6 +253,7 @@ impl VaapiH264Enc {
             stats: Arc::default(),
             blocking: false,
             fences: enc::Fences::new(),
+            reads: enc::Reads::default(),
             gpu: None,
             display: None,
             session: None,
@@ -420,6 +422,7 @@ impl VaapiH264Enc {
                 return true;
             }
             log!(&*ctx, Level::Debug, "reinit", width = fmt.width, height = fmt.height);
+            self.reads.tell(ctx, &self.fences, true);
             self.fences.close(ctx);
             self.session = None;
         }
@@ -537,8 +540,8 @@ impl VaapiH264Enc {
             sps_refs,
             color: self.color,
         });
-        if let (Some(d), Some(s)) = (&self.display, &self.session) {
-            self.fences.open(ctx, d.raw(), s.engine.recon_ids());
+        if let Some(s) = &self.session {
+            self.fences.open(ctx, s.engine.recon_ids().len());
         }
         if self.bytes_out {
             ctx.announce_format(Self::OUT, "bytes", &[]);
@@ -621,10 +624,12 @@ impl VaapiH264Enc {
         };
         // the map waits for the GPU
         let t = crate::stats::mark();
-        let map = f.coded.map_coded();
+        let map = enc::map_coded(&f.coded);
         if how == enc::How::Wait {
             self.stats.waited(t);
         }
+        self.reads.mapped(fence, how, t);
+        self.reads.tell(ctx, &self.fences, false);
         self.stats.frame();
         let Ok(map) = map.map_err(|e| self.warn(ctx, K::Encode(e))) else {
             // its buffer goes, the session makes another
@@ -777,7 +782,7 @@ impl VaapiH264Enc {
         let Some(s) = self.session.as_mut() else {
             return Ok(());
         };
-        let slot = s.engine.recon_slot();
+        let (slot, recon, dpy) = (s.engine.recon_slot(), s.engine.recon_cur(), s.engine.dpy());
         s.engine.advance_recon();
         s.frame_num += 1;
         s.gop_pos += 1;
@@ -785,7 +790,7 @@ impl VaapiH264Enc {
             s.gop_pos = 0;
             s.idr_pic_id = s.idr_pic_id.wrapping_add(1) & 0xF;
         }
-        let (seq, fence) = self.fences.queued(ctx, slot);
+        let (seq, fence) = self.fences.queued(ctx, dpy, recon, slot);
         let stamp = Stamp { pts, duration, key: is_idr, preview };
         self.flight.push(enc::InFlight { coded, head, stamp, _frame: frame, seq, fence });
         Ok(())
@@ -1499,6 +1504,7 @@ impl Element for VaapiH264Enc {
         if let Some(g) = &mut self.gpu {
             g.stop();
         }
+        self.reads.tell(ctx, &self.fences, true);
         self.fences.close(ctx);
         self.session = None;
         self.display = None;

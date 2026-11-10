@@ -1,6 +1,6 @@
 /* The libavcodec side of pf_libav.h. Decoders and the encoder run single threaded
- * (thread_count 1, no frame or slice threads), the deterministic simulation rule, and log
- * nothing. */
+ * (thread_count 1, no frame or slice threads), the deterministic simulation rule, unless a
+ * video decoder is opened with frame threads. Nothing logs. */
 #include "config.h"
 
 #include <limits.h>
@@ -162,7 +162,7 @@ static int get_buffer2(AVCodecContext *avctx, AVFrame *frame, int flags)
 }
 
 int pf_lav_open(pf_lav_dec **out, int codec, const uint8_t *extradata, size_t extradata_len,
-                const pf_lav_slots *slots, int parse)
+                const pf_lav_slots *slots, int parse, int threads)
 {
     *out = NULL;
     pthread_once(&log_once, quiet);
@@ -170,14 +170,21 @@ int pf_lav_open(pf_lav_dec **out, int codec, const uint8_t *extradata, size_t ex
     const AVCodec *c = avcodec_find_decoder(id);
     if (!c)
         return PF_LAV_ERR_NO_CODEC;
-    if (extradata_len > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE)
+    if (extradata_len > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE || threads < 1)
         return PF_LAV_ERR_ARG;
+    if (threads > PF_LAV_MAX_THREADS)
+        threads = PF_LAV_MAX_THREADS;
+    /* Frame threads call get_buffer2 on their own threads, also after the host's call has
+     * returned, so a threaded decoder never reaches the host's slots. Its pictures stay in
+     * libavcodec's memory and come out with in_slot 0. */
+    int threaded = threads > 1 && c->type == AVMEDIA_TYPE_VIDEO
+                   && (c->capabilities & AV_CODEC_CAP_FRAME_THREADS);
 
     pf_lav_dec *d = av_mallocz(sizeof(*d));
     if (!d)
         return PF_LAV_ERR_NOMEM;
     d->codec = codec;
-    if (slots)
+    if (slots && !threaded)
         d->slots = *slots;
     d->ctx = avcodec_alloc_context3(c);
     d->pkt = av_packet_alloc();
@@ -197,8 +204,8 @@ int pf_lav_open(pf_lav_dec **out, int codec, const uint8_t *extradata, size_t ex
 
     AVCodecContext *ctx = d->ctx;
     ctx->opaque = d;
-    ctx->thread_count = 1;
-    ctx->thread_type = 0;
+    ctx->thread_count = threaded ? threads : 1;
+    ctx->thread_type = threaded ? FF_THREAD_FRAME : 0;
     ctx->pkt_timebase = (AVRational){ 1, 1000000000 };
     /* 8192x4352, the largest picture of any H.264, H.265 or AV1 level (H.264 Table A-1
      * MaxFS 139264 macroblocks at level 6.2). A header claiming more is refused before
@@ -208,7 +215,7 @@ int pf_lav_open(pf_lav_dec **out, int codec, const uint8_t *extradata, size_t ex
      * place what follows, so the frame comes out whole with the count beside it. */
     if (id == AV_CODEC_ID_VORBIS)
         ctx->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
-    if (c->type == AVMEDIA_TYPE_VIDEO && slots && slots->acquire)
+    if (c->type == AVMEDIA_TYPE_VIDEO && d->slots.acquire)
         ctx->get_buffer2 = get_buffer2;
     if (extradata && extradata_len) {
         ctx->extradata = av_mallocz(extradata_len + AV_INPUT_BUFFER_PADDING_SIZE);
@@ -487,7 +494,18 @@ void pf_lav_skip_nonref(pf_lav_dec *d, int on)
     d->ctx->skip_frame = on ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
 }
 
-int pf_lav_delay(const pf_lav_dec *d) { return d->ctx->has_b_frames; }
+int pf_lav_delay(const pf_lav_dec *d)
+{
+    /* Frame threads hold a picture back until every thread has a packet (pthread_frame.c
+     * ff_thread_receive_frame). */
+    int threads = d->ctx->active_thread_type & FF_THREAD_FRAME ? d->ctx->thread_count - 1 : 0;
+    return d->ctx->has_b_frames + threads;
+}
+
+int pf_lav_threads(const pf_lav_dec *d)
+{
+    return d->ctx->active_thread_type & FF_THREAD_FRAME ? d->ctx->thread_count : 1;
+}
 
 struct pf_lav_enc {
     AVCodecContext *ctx;

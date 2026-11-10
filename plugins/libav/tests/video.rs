@@ -799,3 +799,151 @@ fn garbage_warns_and_the_stream_goes_on() {
     let out = decode_all(&mut h, &units);
     assert!(out.len() >= 10, "the stream went on, {} frames", out.len());
 }
+
+/// Pictures of `units` before a seek after `cut` of them, then of the whole stream after it.
+fn decode_seeked(
+    element: impl Element + 'static,
+    threads: i64,
+    units: &[Vec<u8>],
+    cut: usize,
+) -> (Vec<Out>, Vec<Out>) {
+    let mut h = Harness::with_slot_size(element, SLOT);
+    assert!(h.set_prop("threads", Value::Int(threads)), "a declared property");
+    let mut before = feed(&mut h, units, 0..cut);
+    before.extend(take(h.drain_outputs()));
+    h.seek(0, Timestamp::ZERO).expect("seek");
+    let _ = h.drain_outputs();
+    let after = decode_all(&mut h, units);
+    assert_eq!(warnings(&mut h), 0, "{threads} threads: no warning");
+    (before, after)
+}
+
+/// Frame threads put out what one thread does, each picture `threads - 1` units later, so fewer
+/// before the seek's flush drops what is in flight.
+fn threads_match<E: Element + 'static>(c: &Case, make: fn() -> E, threads: i64) {
+    let size = format!("{}x{}", c.size.0, c.size.1);
+    let Some(bytes) = stream(c.name, &size, c.frames, c.pix, c.args, c.format) else {
+        return;
+    };
+    let units = match c.format {
+        "m4v" => support::mpeg4_units(&bytes),
+        "hevc" => support::annexb_units(&bytes, true),
+        _ => support::annexb_units(&bytes, false),
+    };
+    let cut = units.len() / 2;
+    let (one_before, one_after) = decode_seeked(make(), 1, &units, cut);
+    let (many_before, many_after) = decode_seeked(make(), threads, &units, cut);
+    let name = c.name;
+    assert_eq!(one_after.len(), c.frames, "{name}: every picture after the seek");
+    assert!(many_before.len() < one_before.len(), "{name}: frame threads delay");
+    assert!(many_before.len() + threads as usize > one_before.len(), "{name}: by threads - 1");
+    let pairs = one_before.iter().zip(&many_before).chain(one_after.iter().zip(&many_after));
+    for (k, (a, b)) in pairs.enumerate() {
+        assert_eq!(a.pts, b.pts, "{name}: picture {k} stamp");
+        assert!(a.bytes == b.bytes, "{name}: picture {k} pixels");
+    }
+    assert_eq!(many_after.len(), one_after.len(), "{name}: pictures after the seek");
+}
+
+#[test]
+fn h264_frame_threads_match_one_thread_across_a_seek_and_the_end() {
+    let high10 =
+        &["-c:v", "libx264", "-preset", "fast", "-profile:v", "high10", "-bf", "3", "-g", "12"];
+    let high444 =
+        &["-c:v", "libx264", "-preset", "fast", "-profile:v", "high444", "-bf", "2", "-g", "12"];
+    let high422 =
+        &["-c:v", "libx264", "-preset", "fast", "-profile:v", "high422", "-bf", "2", "-g", "12"];
+    let cases = [
+        Case {
+            name: "h264_threads.h264",
+            size: (320, 240),
+            frames: 30,
+            pix: "yuv420p",
+            args: X264,
+            format: "h264",
+        },
+        Case {
+            name: "h264_threads_10.h264",
+            size: (320, 240),
+            frames: 30,
+            pix: "yuv420p10le",
+            args: high10,
+            format: "h264",
+        },
+        Case {
+            name: "h264_threads_444_10.h264",
+            size: (318, 178),
+            frames: 24,
+            pix: "yuv444p10le",
+            args: high444,
+            format: "h264",
+        },
+        Case {
+            name: "h264_threads_422.h264",
+            size: (320, 240),
+            frames: 24,
+            pix: "yuv422p",
+            args: high422,
+            format: "h264",
+        },
+    ];
+    for c in &cases {
+        threads_match(c, LibavH264Dec::new, 4);
+    }
+}
+
+/// MPEG-4 Part 2 takes its stamps in decode order, so the held ones cover the threads' delay too.
+#[test]
+fn mpeg4_frame_threads_keep_the_decode_order_stamps() {
+    let c = Case {
+        name: "mpeg4_threads.m4v",
+        size: (320, 240),
+        frames: 30,
+        pix: "yuv420p",
+        args: &["-c:v", "mpeg4", "-q:v", "4", "-bf", "2", "-g", "12"],
+        format: "m4v",
+    };
+    threads_match(&c, LibavMpeg4Dec::new, 3);
+}
+
+#[test]
+fn hevc_frame_threads_match_one_thread() {
+    let c = Case {
+        name: "hevc_threads.hevc",
+        size: (320, 240),
+        frames: 24,
+        pix: "yuv420p",
+        args: X265,
+        format: "hevc",
+    };
+    threads_match(&c, LibavH265Dec::new, 4);
+}
+
+/// An MP4 or Matroska demuxer hands the parameter sets of its codec head as a unit of their own.
+/// Frame threads would fail it on a later unit's call and drop that unit's report as its own.
+#[test]
+fn h264_frame_threads_take_a_unit_of_parameter_sets_alone() {
+    let Some(bytes) = stream("h264_head.h264", "320x240", 12, "yuv420p", X264, "h264") else {
+        return;
+    };
+    let units = support::annexb_units(&bytes, false);
+    let first = &units[0];
+    let idr = (3..first.len()).find(|&i| first[i - 3..i] == [0, 0, 1] && first[i] & 0x1F == 5);
+    let slice = idr.expect("an IDR slice") - 4;
+    let mut split = vec![first[..slice].to_vec(), first[slice..].to_vec()];
+    split.extend(units[1..].iter().cloned());
+    let run = |threads: i64| {
+        let mut h = Harness::with_slot_size(LibavH264Dec::new(), SLOT);
+        assert!(h.set_prop("threads", Value::Int(threads)));
+        let out = decode_all(&mut h, &split);
+        assert_eq!(warnings(&mut h), 0, "{threads} threads: no unit failed");
+        out
+    };
+    let (one, four) = (run(1), run(4));
+    assert_eq!(one.len(), 12);
+    assert_eq!(four.len(), one.len());
+    for (k, (a, b)) in one.iter().zip(&four).enumerate() {
+        assert_eq!(a.pts, b.pts, "picture {k} stamp");
+        assert!(a.bytes == b.bytes, "picture {k} pixels");
+    }
+}

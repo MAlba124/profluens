@@ -31,6 +31,7 @@ pub const VA_CODED_BUF_STATUS_BROKEN: u32 = 0x200 | 0x1000 | 0x8000;
 pub const VA_STATUS_ERROR_TIMEDOUT: VAStatus = 0x26;
 pub const VA_STATUS_ERROR_UNIMPLEMENTED: VAStatus = 0x14;
 pub const VA_INVALID_ID: VAGenericID = 0xffff_ffff;
+pub const VA_MAPBUFFER_FLAG_WRITE: u32 = 2;
 pub const VA_INVALID_SURFACE: VASurfaceID = VA_INVALID_ID;
 
 pub const VAProfileNone: VAProfile = -1;
@@ -1448,6 +1449,12 @@ unsafe extern "C" {
         image: VAImageID,
     ) -> VAStatus;
     pub fn vaMapBuffer(dpy: VADisplay, buf_id: VABufferID, pbuf: *mut *mut c_void) -> VAStatus;
+    pub fn vaMapBuffer2(
+        dpy: VADisplay,
+        buf_id: VABufferID,
+        pbuf: *mut *mut c_void,
+        flags: u32,
+    ) -> VAStatus;
     pub fn vaUnmapBuffer(dpy: VADisplay, buf_id: VABufferID) -> VAStatus;
     pub fn vaDestroyImage(dpy: VADisplay, image: VAImageID) -> VAStatus;
 

@@ -27,6 +27,12 @@ pub const SHORT_PRE_ROLL: u64 = 25_000_000;
 /// ffmpeg.
 pub const PRE_ROLL_BYTES: u64 = LEAD_MIN as u64;
 
+/// The most a restart steps back of the keyframe's Cluster for a caption beside linked video.
+/// A caption up at a key was read from its block, up to [`CAPTION_REACH`] of the stream before
+/// the picture, 160 MB of a 64 Mbit/s film. Within this the step is a few reads, 8 s of an
+/// 8 Mbit/s film. A caption stored further back shows from its track's next one.
+pub const CAPTION_BYTES: u64 = 8 << 20;
+
 /// The first video track the Cues name (RFC 9559 section 22.1), else the first audio track.
 pub fn key_track(cues: &[Cue], tracks: &[Track]) -> Option<u64> {
     let cued = |t: &&Track| cues.iter().any(|c| c.track == t.track_number);
@@ -116,16 +122,23 @@ pub fn cue_entries_of(
             next += 1;
         }
         let reach = time.saturating_sub(CAPTION_REACH);
-        // Gone or out of reach stays so, the keys only move forward.
-        while let Some(Reverse((_, start, end))) = up.peek()
-            && (*start < reach || *end <= time)
+        let byte = keys[i].1;
+        let below = |block: u64| {
+            let n = by_byte.partition_point(|k| k.0 <= block);
+            by_byte[..n].last().map(|&(b, t)| (t, b))
+        };
+        // Beside video a block whose key lies over the cap below this one is not gone back
+        // for. Later keys lie further on, Cues out of byte order lose the step.
+        let far = |block: u64| {
+            video && below(block).is_some_and(|at| byte.saturating_sub(at.1) > CAPTION_BYTES)
+        };
+        // Gone, out of reach or too far stays so, the keys only move forward.
+        while let Some(Reverse((block, start, end))) = up.peek()
+            && (*start < reach || *end <= time || far(*block))
         {
             up.pop();
         }
-        text[i] = up.peek().and_then(|Reverse((block, _, _))| {
-            let below = by_byte.partition_point(|k| k.0 <= *block);
-            by_byte[..below].last().map(|&(b, t)| (t, b))
-        });
+        text[i] = up.peek().and_then(|Reverse((block, _, _))| below(*block));
     }
     keys.iter()
         .zip(text)
@@ -142,8 +155,15 @@ pub fn cue_entries_of(
             if let Some(at) = text {
                 earliest = earliest.min(at);
             }
-            if uncued && let Some(at) = floor(&keys, time.saturating_sub(CAPTION_REACH)) {
-                earliest = earliest.min(at);
+            if uncued {
+                let reach = time.saturating_sub(CAPTION_REACH);
+                let from = keys.partition_point(|k| k.0 <= reach).saturating_sub(1);
+                let within = |k: &&(u64, u64)| {
+                    k.0 <= time && (!video || byte.saturating_sub(k.1) <= CAPTION_BYTES)
+                };
+                if let Some(at) = keys[from..].iter().take_while(|k| k.0 <= time).find(within) {
+                    earliest = earliest.min(*at);
+                }
             }
             let (restart_ns, restart) = if earliest.0 < time { earliest } else { (time, byte) };
             IndexEntry { time_ns: time, byte, restart, restart_ns }
@@ -449,9 +469,10 @@ mod tests {
         assert_eq!(back(&entries), want);
     }
 
-    /// The cap is the audio's alone, a caption goes back as far as its block lies.
+    /// A caption has a cap of its own past the audio's, a key over it below the block's key
+    /// restarts at itself.
     #[test]
-    fn a_caption_goes_back_past_the_audio_cap() {
+    fn a_caption_goes_back_past_the_audio_cap_within_its_own() {
         let gap = 8 << 20;
         let (mut cues, mut tracks) =
             spaced(&(0..8).map(|n| 4_000 + n * gap).collect::<Vec<_>>(), "A_OPUS");
@@ -460,7 +481,8 @@ mod tests {
         cues.sort_by_key(|c| c.time_ns);
         let entries = cue_entries(&cues, &tracks, &|_| true, 1_000_000);
         let keys = own(&entries);
-        let want = [keys[0], keys[1], keys[2], keys[2], keys[2], keys[5], keys[6], keys[7]];
+        assert!(gap > PRE_ROLL_BYTES && gap == CAPTION_BYTES);
+        let want = [keys[0], keys[1], keys[2], keys[2], keys[4], keys[5], keys[6], keys[7]];
         assert_eq!(back(&entries), want);
 
         let (cues, mut tracks) =
@@ -468,10 +490,8 @@ mod tests {
         tracks.push(track(3, "S_TEXT/UTF8"));
         let entries = cue_entries(&cues, &tracks, &|_| true, 1_000_000);
         let keys = own(&entries);
-        let want: Vec<(u64, u64)> = (0..20u64)
-            .map(|n| keys[((n * 2 * S).saturating_sub(CAPTION_REACH) / (2 * S)) as usize])
-            .collect();
-        assert_eq!(back(&entries), want, "an uncued caption track goes back the reach");
+        let want: Vec<(u64, u64)> = (0..20).map(|n: usize| keys[n.saturating_sub(1)]).collect();
+        assert_eq!(back(&entries), want, "an uncued caption track goes back within the cap");
     }
 
     #[test]

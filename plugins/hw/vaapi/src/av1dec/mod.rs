@@ -207,6 +207,8 @@ pub struct VaapiAv1Dec {
     stream: Stream,
     slots: [Option<Slot>; NUM_REF_FRAMES],
     awaiting_key: bool,
+    /// The first picture goes at once and holds the next decode until its group put out.
+    first: crate::firstout::FirstOut,
     /// Spatial layers shown in the temporal unit in hand, one bit each.
     shown_layers: u8,
     tiles: Vec<ffi::VASliceParameterBufferAV1>,
@@ -265,6 +267,7 @@ impl VaapiAv1Dec {
             stream: Stream::new(),
             slots: [None; NUM_REF_FRAMES],
             awaiting_key: true,
+            first: crate::firstout::FirstOut::new(),
             shown_layers: 0,
             tiles: Vec::with_capacity(64),
             group_bufs: Vec::with_capacity(32),
@@ -811,6 +814,7 @@ impl VaapiAv1Dec {
         self.side.attach(buf.pts.0, &mut buf.memory);
         ctx.out(Self::OUT).push(buf);
         self.emitted += 1;
+        self.first.sent(ctx);
         self.transient.ok();
         self.release_if_unreferenced(out.surface);
         Ok(true)
@@ -933,6 +937,7 @@ impl VaapiAv1Dec {
         log!(&*ctx, Level::Trace, "gpu_frame", pts = buf.pts, token = token);
         ctx.out(Self::OUT).push(buf);
         self.emitted += 1;
+        self.first.sent(ctx);
         self.transient.ok();
         Ok(true)
     }
@@ -975,6 +980,7 @@ impl VaapiAv1Dec {
         }
         self.stream.reset();
         self.awaiting_key = true;
+        self.first.reset();
     }
 
     fn drain_all(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
@@ -1049,12 +1055,16 @@ impl Element for VaapiAv1Dec {
             return Ok(Flow::Ok);
         }
         loop {
-            let keep = usize::from(inputs.front().is_some());
+            // a picture waits queued while the next decodes, the GPU works on both
+            let keep = usize::from(inputs.front().is_some() && !self.first.fresh());
             if !self.emit_queued(ctx, keep)? {
                 return Ok(Flow::Ok);
             }
             // a picture put out goes downstream now, the next decode would hold it back
             if ctx.command_pending() || self.emitted != emitted {
+                return Ok(Flow::Ok);
+            }
+            if self.first.holds(ctx) {
                 return Ok(Flow::Ok);
             }
             let Some(front) = inputs.front() else { break };
@@ -1113,6 +1123,7 @@ impl Element for VaapiAv1Dec {
         self.slots = [None; NUM_REF_FRAMES];
         self.stream = Stream::new();
         self.awaiting_key = true;
+        self.first.reset();
         self.va = None;
         self.display = None;
     }

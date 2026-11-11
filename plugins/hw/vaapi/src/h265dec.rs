@@ -200,6 +200,8 @@ pub struct VaapiH265Dec {
     /// Surface id -> token for frames exported and not yet released. These stay out of the free
     /// pool so a decode cannot tear the shown picture.
     in_flight: std::collections::HashMap<ffi::VASurfaceID, FrameToken>,
+    /// The first picture holds the next decode until its group put out.
+    first: crate::firstout::FirstOut,
     export: ExportFn,
     link: Option<(u32, u64)>,
     only: bool,
@@ -287,6 +289,7 @@ impl VaapiH265Dec {
             released: Vec::new(),
             next_token: 1,
             in_flight: std::collections::HashMap::new(),
+            first: crate::firstout::FirstOut::new(),
             export: ExportedSurface::export,
             link: None,
             scratch: AuScratch::default(),
@@ -1294,6 +1297,7 @@ impl VaapiH265Dec {
         self.side.attach(buf.pts.0, &mut buf.memory);
         ctx.out(Self::OUT).push(buf);
         self.emitted += 1;
+        self.first.sent(ctx);
         self.transient.ok();
 
         self.recycle_output_surface(out.surface);
@@ -1451,6 +1455,7 @@ impl VaapiH265Dec {
         log!(&*ctx, Level::Trace, "gpu_frame", pts = buf.pts, token = token);
         ctx.out(Self::OUT).push(buf);
         self.emitted += 1;
+        self.first.sent(ctx);
         self.transient.ok();
 
         self.output_key.remove(&out.surface);
@@ -1594,6 +1599,9 @@ impl Element for VaapiH265Dec {
             if ctx.command_pending() || self.emitted != emitted {
                 return Ok(Flow::Ok);
             }
+            if self.first.holds(ctx) {
+                return Ok(Flow::Ok);
+            }
             let Some(inbuf) = inputs.pop() else { break };
             self.only = inbuf.flags.contains(BufferFlags::DECODE_ONLY);
             let au = inbuf.memory.data();
@@ -1647,6 +1655,7 @@ impl Element for VaapiH265Dec {
                 self.awaiting_irap = true; // resume at a clean random-access point
                 self.alloc_stalled = false;
                 self.ended = false;
+                self.first.reset();
             }
             Event::SkippedTo { to_time } => {
                 log!(&*ctx, Level::Debug, "skip", to = *to_time);
@@ -1672,6 +1681,7 @@ impl Element for VaapiH265Dec {
         self.output_queue.clear();
         self.dpb.clear();
         self.retired.clear();
+        self.first.reset();
         self.va = None;
         self.display = None;
     }

@@ -316,6 +316,10 @@ impl ElementCounters {
         self.bytes_in.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub fn buffers_out(&self) -> u64 {
+        self.buffers_out.load(Ordering::Relaxed)
+    }
+
     pub fn record_out(&self, buffers: u64, bytes: u64) {
         self.batches_out.fetch_add(1, Ordering::Relaxed);
         self.buffers_out.fetch_add(buffers, Ordering::Relaxed);

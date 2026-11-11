@@ -11,6 +11,7 @@ mod enc;
 pub mod encshell;
 pub mod error;
 pub mod ffi;
+mod firstout;
 pub mod gpuframe;
 mod gpuin;
 pub mod h264dec;

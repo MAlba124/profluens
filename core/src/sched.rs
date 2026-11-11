@@ -570,6 +570,9 @@ fn build_ctxs(setup: &mut GroupSetup) -> Vec<Ctx> {
     for (ctx, c) in ctxs.iter_mut().zip(&setup.counters) {
         ctx.set_trace(Arc::clone(c), Arc::clone(&shared.tracing));
         ctx.set_station(Arc::clone(&setup.station));
+        if let Some(tail) = setup.counters.last() {
+            ctx.set_tail(Arc::clone(tail));
+        }
     }
     for ((ctx, elem), props) in ctxs.iter_mut().zip(&setup.elements).zip(&setup.props) {
         let descs = elem.desc().props;

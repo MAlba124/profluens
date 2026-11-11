@@ -203,6 +203,7 @@ pub struct Ctx {
     running_base: Arc<std::sync::atomic::AtomicI64>,
     path_latency: Timestamp,
     trace: Option<(Arc<crate::counters::ElementCounters>, Arc<std::sync::atomic::AtomicBool>)>,
+    tail: Option<Arc<crate::counters::ElementCounters>>,
     paused: bool,
     offset: i64,
     linked_src_pads: Vec<bool>,
@@ -291,6 +292,7 @@ impl Ctx {
             props: None,
             path_latency: Timestamp::ZERO,
             trace: None,
+            tail: None,
             paused: false,
             offset: 0,
             linked_src_pads: Vec::new(),
@@ -552,6 +554,16 @@ impl Ctx {
 
     pub fn count_drop(&self) {
         self.trace.iter().for_each(|(counters, _)| counters.record_drops(1));
+    }
+
+    /// The buffers the last element of this element's group put out so far, None outside a
+    /// run. A decoder holds its next decode on it until the picture a seek waits for is out.
+    pub fn group_out(&self) -> Option<u64> {
+        self.tail.as_ref().map(|c| c.buffers_out())
+    }
+
+    pub(crate) fn set_tail(&mut self, counters: Arc<crate::counters::ElementCounters>) {
+        self.tail = Some(counters);
     }
 
     /// Whether the app appended a command this group has yet to apply.

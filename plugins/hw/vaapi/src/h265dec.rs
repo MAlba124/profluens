@@ -191,6 +191,7 @@ pub struct VaapiH265Dec {
     transient: Transient,
     warned: Warned,
     emitted: u64,
+    lead: Lead,
 
     zerocopy: Option<Arc<GpuFrameChannel>>,
     stats: Arc<Stats>,
@@ -283,6 +284,7 @@ impl VaapiH265Dec {
             transient: Transient::default(),
             warned: Warned::default(),
             emitted: 0,
+            lead: Lead::Off,
             zerocopy,
             stats: Arc::default(),
             tx: None,
@@ -716,7 +718,10 @@ impl VaapiH265Dec {
         });
 
         let preview = before && !self.only && sh0.pic_output_flag && ctx.take_preview();
-        if before && sh0.pic_output_flag && !preview {
+        if sh0.pic_output_flag && self.lead.leads(self.gop, poc) {
+            log!(&*ctx, Level::Trace, "before_lead", pts = pts);
+            ctx.count_drop();
+        } else if before && sh0.pic_output_flag && !preview {
             log!(&*ctx, Level::Trace, "decode_only", pts = pts);
             ctx.count_drop();
         } else if sh0.pic_output_flag {
@@ -737,6 +742,13 @@ impl VaapiH265Dec {
                 intra: sc.headers.iter().all(|h| h.slice_type == SliceType::I),
             });
             self.reorder_output(target, poc);
+            if is_irap && self.lead == Lead::Flushed && self.pending.is_none() {
+                self.pending = self.output_queue.pop_front();
+                self.lead = Lead::Out(self.gop, poc);
+            }
+        }
+        if is_irap && self.lead == Lead::Flushed {
+            self.lead = Lead::Off;
         }
         self.maybe_bump(&sps);
     }
@@ -1656,6 +1668,7 @@ impl Element for VaapiH265Dec {
                 self.alloc_stalled = false;
                 self.ended = false;
                 self.first.reset();
+                self.lead = Lead::Flushed;
             }
             Event::SkippedTo { to_time } => {
                 log!(&*ctx, Level::Debug, "skip", to = *to_time);
@@ -1682,8 +1695,27 @@ impl Element for VaapiH265Dec {
         self.dpb.clear();
         self.retired.clear();
         self.first.reset();
+        self.lead = Lead::Off;
         self.va = None;
         self.display = None;
+    }
+}
+
+/// The keyframe a flush restarts at goes out as it is decoded, ahead of the reorder, so the
+/// group works on it before the next decode is submitted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lead {
+    Off,
+    /// A flush came and no keyframe since.
+    Flushed,
+    /// The keyframe of this sequence and order count went out ahead.
+    Out(u32, i32),
+}
+
+impl Lead {
+    /// Whether a picture comes before the keyframe that went out, a decodable leading one.
+    fn leads(self, gop: u32, poc: i32) -> bool {
+        matches!(self, Lead::Out(g, p) if g == gop && poc < p)
     }
 }
 
@@ -2002,6 +2034,14 @@ fn pack_long_slice_flags(sh: &SliceHeader, last_slice: bool) -> u32 {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_pictures_before_the_keyframe_let_out_ahead_are_leading() {
+        assert!(!Lead::Off.leads(1, -1) && !Lead::Flushed.leads(1, -1));
+        let out = Lead::Out(3, 8);
+        assert!(out.leads(3, 7) && !out.leads(3, 8) && !out.leads(3, 9));
+        assert!(!out.leads(4, 0), "the next sequence orders anew");
+    }
 
     #[test]
     fn fill_ref_list_cycles_to_active_count() {

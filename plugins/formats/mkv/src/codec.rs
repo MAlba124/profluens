@@ -241,8 +241,17 @@ static VIDEO_FIELDS: [FieldDesc; 12] = {
     ]
 };
 
-static AUDIO_FIELDS: [FieldDesc; 1] =
-    [FieldDesc { field: FIELD_DELAY, allowed: ConstraintDesc::Any, preferred: None }];
+// Every name an audio announcement states. A copy links no decoder to name the rate, and an
+// announcement with a name no offer declared is dropped whole.
+static AUDIO_FIELDS: [FieldDesc; 3] = [
+    FieldDesc { field: profluens_audio::FIELD_RATE, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc {
+        field: profluens_audio::FIELD_CHANNELS,
+        allowed: ConstraintDesc::Any,
+        preferred: None,
+    },
+    FieldDesc { field: FIELD_DELAY, allowed: ConstraintDesc::Any, preferred: None },
+];
 
 /// One menu per track so link-time intersection cannot admit a wrong decoder.
 pub fn offers_for(codec_id: &str) -> &'static [OfferDesc] {
@@ -913,6 +922,14 @@ mod tests {
         }
         for &(id, family) in &CODEC_IDS {
             assert_eq!(offers_for(id)[0].family, family, "{id}");
+        }
+    }
+
+    #[test]
+    fn an_aac_offer_declares_every_name_its_announcement_states() {
+        let declared = offers_for("A_AAC")[0].fields;
+        for name in ["rate", "channels", "delay"] {
+            assert!(declared.iter().any(|f| f.field == name), "{name}");
         }
     }
 

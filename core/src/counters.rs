@@ -493,6 +493,15 @@ impl TapHandle {
         })?
     }
 
+    /// Bounds what the link into `pad` of `el` holds untaken to `bytes`, `u64::MAX` for none,
+    /// its time limit kept. A feeder resting on it stays so until a take or a command.
+    pub fn set_link_bytes(&self, el: ElementId, pad: crate::id::SinkPad, bytes: u64) {
+        row(&self.entries, el, |row| {
+            let l = row.levels.iter().find(|(p, _)| *p == pad);
+            l.map(|(_, l)| l.set_limit(Limit { bytes, ..l.limit() }));
+        });
+    }
+
     pub fn index(&self, el: ElementId) -> Option<Arc<Index>> {
         row(&self.entries, el, |row| row.counters.index.get()).flatten()
     }

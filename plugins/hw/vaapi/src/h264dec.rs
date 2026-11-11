@@ -198,6 +198,8 @@ pub struct VaapiH264Dec {
     released: Vec<FrameToken>,
     next_token: FrameToken,
     in_flight: std::collections::HashMap<ffi::VASurfaceID, FrameToken>,
+    /// The first picture holds the next decode until its group put out.
+    first: crate::firstout::FirstOut,
     export: ExportFn,
     modifier: Option<u64>,
     only: bool,
@@ -283,6 +285,7 @@ impl VaapiH264Dec {
             released: Vec::new(),
             next_token: 1,
             in_flight: std::collections::HashMap::new(),
+            first: crate::firstout::FirstOut::new(),
             export: ExportedSurface::export,
             modifier: None,
             scratch: AuScratch::default(),
@@ -1239,6 +1242,7 @@ impl VaapiH264Dec {
         self.side.attach(buf.pts.0, &mut buf.memory);
         ctx.out(Self::OUT).push(buf);
         self.emitted += 1;
+        self.first.sent(ctx);
         self.transient.ok();
 
         self.recycle_output_surface(out.surface);
@@ -1384,6 +1388,7 @@ impl VaapiH264Dec {
         log!(&*ctx, Level::Trace, "gpu_frame", pts = buf.pts, token = token);
         ctx.out(Self::OUT).push(buf);
         self.emitted += 1;
+        self.first.sent(ctx);
         self.transient.ok();
 
         self.output_key.remove(&out.surface);
@@ -1506,6 +1511,9 @@ impl Element for VaapiH264Dec {
             if ctx.command_pending() || self.emitted != emitted {
                 return Ok(Flow::Ok);
             }
+            if self.first.holds(ctx) {
+                return Ok(Flow::Ok);
+            }
             let Some(inbuf) = inputs.pop() else { break };
             self.only = inbuf.flags.contains(BufferFlags::DECODE_ONLY);
             let au = inbuf.memory.data();
@@ -1560,6 +1568,7 @@ impl Element for VaapiH264Dec {
                 self.poc.reset();
                 self.alloc_stalled = false;
                 self.ended = false;
+                self.first.reset();
             }
             Event::SkippedTo { to_time } => {
                 log!(&*ctx, Level::Debug, "skip", to = *to_time);
@@ -1585,6 +1594,7 @@ impl Element for VaapiH264Dec {
         self.output_queue.clear();
         self.dpb.clear();
         self.retired.clear();
+        self.first.reset();
         self.va = None;
         self.display = None;
     }

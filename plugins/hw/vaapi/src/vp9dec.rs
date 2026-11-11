@@ -525,6 +525,8 @@ pub struct VaapiVp9Dec {
     released: Vec<FrameToken>,
     next_token: FrameToken,
     in_flight: Vec<(ffi::VASurfaceID, FrameToken)>,
+    /// The first picture holds the next decode until its group put out.
+    first: crate::firstout::FirstOut,
     link: Option<(u32, u64)>,
     only: bool,
     shrink: Option<(Target, bool)>,
@@ -586,6 +588,7 @@ impl VaapiVp9Dec {
             released: Vec::with_capacity(16),
             next_token: 1,
             in_flight: Vec::with_capacity(16),
+            first: crate::firstout::FirstOut::new(),
             link: None,
             shrink: None,
         }
@@ -1078,6 +1081,7 @@ impl VaapiVp9Dec {
         self.side.attach(buf.pts.0, &mut buf.memory);
         ctx.out(Self::OUT).push(buf);
         self.emitted += 1;
+        self.first.sent(ctx);
         self.transient.ok();
         self.release_if_unreferenced(out.surface);
         Ok(true)
@@ -1211,6 +1215,7 @@ impl VaapiVp9Dec {
         log!(&*ctx, Level::Trace, "gpu_frame", pts = buf.pts, token = token);
         ctx.out(Self::OUT).push(buf);
         self.emitted += 1;
+        self.first.sent(ctx);
         self.transient.ok();
         Ok(true)
     }
@@ -1320,12 +1325,15 @@ impl Element for VaapiVp9Dec {
         }
         loop {
             // The newest picture stays back a packet so its decode overlaps the previous readback.
-            let keep = usize::from(inputs.front().is_some());
+            let keep = usize::from(inputs.front().is_some() && !self.first.fresh());
             if !self.emit_queued(ctx, keep)? {
                 return Ok(Flow::Ok);
             }
             // a picture put out goes downstream now, the next decode would hold it back
             if ctx.command_pending() || self.emitted != emitted {
+                return Ok(Flow::Ok);
+            }
+            if self.first.holds(ctx) {
                 return Ok(Flow::Ok);
             }
             let Some(front) = inputs.front() else { break };
@@ -1360,6 +1368,7 @@ impl Element for VaapiVp9Dec {
                 self.reset_stream();
                 self.alloc_stalled = false;
                 self.ended = false;
+                self.first.reset();
             }
             Event::SkippedTo { to_time } => {
                 log!(&*ctx, Level::Debug, "skip", to = *to_time);
@@ -1385,6 +1394,7 @@ impl Element for VaapiVp9Dec {
         self.slots = [None; NUM_REF_FRAMES];
         self.state = StreamState::new();
         self.awaiting_key = true;
+        self.first.reset();
         self.va = None;
         self.display = None;
     }

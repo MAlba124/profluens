@@ -706,6 +706,7 @@ impl VaapiH265Enc {
 
     /// Reads every picture the GPU is done with, in order, a wake asked for the first it is not.
     fn finish_ready(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        self.flight.reap(self.session.as_mut().map(|s| &mut s.engine), false);
         while !self.flight.is_empty() && self.finish(ctx, enc::How::Poll)? {}
         Ok(())
     }
@@ -732,6 +733,7 @@ impl VaapiH265Enc {
         while !self.flight.is_empty() {
             self.finish(ctx, enc::How::Wait)?;
         }
+        self.flight.reap(self.session.as_mut().map(|s| &mut s.engine), true);
         Ok(())
     }
 
@@ -1608,9 +1610,7 @@ impl Element for VaapiH265Enc {
                 }
             }
             Event::FlushStart => {
-                for f in self.flight.drain() {
-                    enc::discard_coded(self.session.as_mut().map(|s| &mut s.engine), f.coded);
-                }
+                self.flight.park(self.session.as_mut().map(|s| &mut s.engine));
                 self.cadence.reset();
                 log!(&*ctx, Level::Debug, "flush", pending = self.staged.len());
                 self.warned.summary(ctx, "flush");
@@ -1642,10 +1642,9 @@ impl Element for VaapiH265Enc {
     }
 
     fn stop(&mut self, ctx: &mut Ctx) {
-        // read and dropped before the session goes, as on a flush
-        for f in self.flight.drain() {
-            enc::discard_coded(None, f.coded);
-        }
+        // read and dropped before the session goes
+        self.flight.park(None);
+        self.flight.reap(None, true);
         self.staged.discard();
         if let Some(g) = &mut self.gpu {
             g.stop();

@@ -663,6 +663,7 @@ impl VaapiH264Enc {
 
     /// Reads every picture the GPU is done with, in order, a wake asked for the first it is not.
     fn finish_ready(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        self.flight.reap(self.session.as_mut().map(|s| &mut s.engine), false);
         while !self.flight.is_empty() && self.finish(ctx, enc::How::Poll)? {}
         Ok(())
     }
@@ -689,6 +690,7 @@ impl VaapiH264Enc {
         while !self.flight.is_empty() {
             self.finish(ctx, enc::How::Wait)?;
         }
+        self.flight.reap(self.session.as_mut().map(|s| &mut s.engine), true);
         Ok(())
     }
 
@@ -1460,9 +1462,7 @@ impl Element for VaapiH264Enc {
                 }
             }
             Event::FlushStart => {
-                for f in self.flight.drain() {
-                    enc::discard_coded(self.session.as_mut().map(|s| &mut s.engine), f.coded);
-                }
+                self.flight.park(self.session.as_mut().map(|s| &mut s.engine));
                 self.cadence.reset();
                 self.key_prev = None;
                 log!(&*ctx, Level::Debug, "flush", pending = self.staged.len());
@@ -1496,10 +1496,9 @@ impl Element for VaapiH264Enc {
     }
 
     fn stop(&mut self, ctx: &mut Ctx) {
-        // read and dropped before the session goes, as on a flush
-        for f in self.flight.drain() {
-            enc::discard_coded(None, f.coded);
-        }
+        // read and dropped before the session goes
+        self.flight.park(None);
+        self.flight.reap(None, true);
         self.staged.discard();
         if let Some(g) = &mut self.gpu {
             g.stop();
@@ -1845,9 +1844,9 @@ mod tests {
         std::iter::from_fn(|| batch.pop_front()).collect()
     }
 
-    /// A picture the driver refuses leaves its coded buffer to the next, and a flush with a
-    /// picture in flight reads it and hands the buffer back, so the session makes no other
-    /// and codes on.
+    /// A picture the driver refuses leaves its coded buffer to the next. A flush with a
+    /// picture in flight parks it unread, the pictures after read it and take its buffer back,
+    /// so the session makes one more at most and codes on.
     #[test]
     fn a_refused_picture_and_a_flush_keep_the_coded_buffer() {
         let test = "a_refused_picture_and_a_flush_keep_the_coded_buffer";
@@ -1882,6 +1881,7 @@ mod tests {
         assert!(!el.flight.is_empty(), "{test} a picture in flight at the flush");
         el.event(&mut ctx, &Event::FlushStart).expect("the flush");
         assert!(el.flight.is_empty() && ctx.take_output(VaapiH264Enc::OUT).is_empty());
+        assert_eq!(el.flight.parked(), 1, "{test} the flush waits for no picture");
         for i in 4..10 {
             let out = code(&mut el, &mut ctx, Input::Raw(&noise(w, h, i)), i);
             assert_eq!(out.len(), 1, "{test} picture {i} after the flush");
@@ -1890,7 +1890,8 @@ mod tests {
                 .any(|n| n.unit_type == h264parse::NAL_SLICE_IDR);
             assert_eq!(idr, i == 4, "{test} the run after the flush opens on a key");
         }
-        assert_eq!(made(&el), Some(1), "{test} one buffer through it all");
+        assert_eq!(el.flight.parked(), 0, "{test} the parked picture was read");
+        assert!(made(&el) <= Some(2), "{test} one buffer more at most");
         el.stop(&mut ctx);
     }
 

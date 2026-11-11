@@ -249,13 +249,20 @@ pub(crate) const DEPTH_MAX: usize = 4;
 pub(crate) struct Flight {
     ring: VecDeque<InFlight>,
     depth: usize,
+    /// Pictures a flush dropped that the GPU still codes, read once it is done so the flush
+    /// does not wait for them. iHD fails every picture after a coded buffer destroyed unread.
+    parked: VecDeque<InFlight>,
 }
 
 impl Flight {
     // Cold, construction.
     #[allow(clippy::disallowed_methods)]
     pub(crate) fn new(depth: usize) -> Self {
-        Flight { ring: VecDeque::with_capacity(DEPTH_MAX), depth: depth.clamp(1, DEPTH_MAX) }
+        Flight {
+            ring: VecDeque::with_capacity(DEPTH_MAX),
+            depth: depth.clamp(1, DEPTH_MAX),
+            parked: VecDeque::with_capacity(2 * DEPTH_MAX),
+        }
     }
 
     pub(crate) fn set_depth(&mut self, depth: usize) {
@@ -284,9 +291,30 @@ impl Flight {
         self.ring.pop_front()
     }
 
-    /// Every picture, oldest first, the ring left empty.
-    pub(crate) fn drain(&mut self) -> std::collections::vec_deque::Drain<'_, InFlight> {
-        self.ring.drain(..)
+    /// Every picture in flight parked, a flush. More than [`DEPTH_MAX`] parked waits for the
+    /// oldest, so flushes in a row keep the GPU's queue and the held frames bounded.
+    pub(crate) fn park(&mut self, mut engine: Option<&mut EncEngine>) {
+        self.parked.extend(self.ring.drain(..));
+        while self.parked.len() > DEPTH_MAX {
+            let Some(f) = self.parked.pop_front() else { break };
+            discard_coded(engine.as_deref_mut(), f.coded);
+        }
+    }
+
+    /// Reads the parked pictures the GPU is done with, oldest first, all of them when `wait`.
+    pub(crate) fn reap(&mut self, mut engine: Option<&mut EncEngine>, wait: bool) {
+        while let Some(f) = self.parked.front() {
+            if !wait && matches!(f.coded.idle(), Ok(false)) {
+                return;
+            }
+            let Some(f) = self.parked.pop_front() else { return };
+            discard_coded(engine.as_deref_mut(), f.coded);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parked(&self) -> usize {
+        self.parked.len()
     }
 
     /// The fence of picture `seq` signalled, or never will and it polls from here on.
@@ -1222,7 +1250,7 @@ impl EncEngine {
     }
 }
 
-/// A picture in flight read and dropped, a flush or a stop, its buffer back to `engine`. iHD
+/// A picture in flight read and dropped, a parked one or a stop, its buffer back to `engine`. iHD
 /// fails every picture after a coded buffer destroyed unread. A failed submit goes through
 /// here too, the map waits out whatever the driver queued before it failed.
 pub(crate) fn discard_coded(engine: Option<&mut EncEngine>, b: VaBuffer) {

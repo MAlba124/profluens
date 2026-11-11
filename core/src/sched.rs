@@ -18,7 +18,7 @@ use crate::io::{Completion, Reactor, ReactorFactory, Waker};
 use crate::level::Gauge;
 use crate::log::{Level, Log};
 use crate::memory::Pool;
-use crate::pipeline::{BYTES, RunEnd, RunReport};
+use crate::pipeline::{BYTES, RunEnd, RunReport, SeekMode};
 use crate::props::PropTable;
 use crate::pull::{Mode, START};
 use crate::ring::{Consumer, Leaky, Producer};
@@ -900,12 +900,13 @@ impl Group {
     }
 
     fn seek(&mut self, seek_gen: u64, to_time: Timestamp) -> Result<(), Error> {
-        let preview = self.shared.control.preview(seek_gen);
+        let mode = self.shared.control.mode_of(seek_gen);
         for (c, id) in self.ctxs.iter_mut().zip(&self.ids) {
             c.set_seek_target(seek_gen, to_time, self.shared.control.target(*id, seek_gen));
-            if preview {
+            if mode == Some(SeekMode::Preview) {
                 c.arm_preview();
             }
+            c.set_still(mode == Some(SeekMode::Key));
         }
         self.seek_gen = seek_gen;
         self.flush()

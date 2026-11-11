@@ -240,8 +240,9 @@ struct Writer {
     origin: Timestamp,
     presentation_point: Timestamp,
     seek_applied_at: u64,
-    preview_next: bool,
-    preview_gen: u64,
+    mode_next: SeekMode,
+    /// The newest seek's generation and mode.
+    mode_at: (u64, SeekMode),
     sinks: Vec<u32>,
     known: usize,
     /// Each element's seek target and its generation by id, sorted.
@@ -301,8 +302,8 @@ impl Control {
             origin,
             presentation_point,
             seek_applied_at,
-            preview_next: false,
-            preview_gen: 0,
+            mode_next: SeekMode::Accurate,
+            mode_at: (0, SeekMode::Accurate),
             sinks,
             known: 0,
             targets,
@@ -367,7 +368,7 @@ impl Control {
         }
         *held = (plan == SeekPlan::Deferred).then_some(Held { from, to, mode });
         self.holding.store(held.is_some(), Ordering::Release);
-        self.carry(plan, &s.targets, mode == SeekMode::Preview)?;
+        self.carry(plan, &s.targets, mode)?;
         Ok(plan)
     }
 
@@ -397,10 +398,15 @@ impl Control {
         view.read(|v| crate::seeker::plan(v, settled, (position, to, mode), s))
     }
 
-    fn carry(&self, plan: SeekPlan, targets: &[Target], preview: bool) -> Result<(), CommandError> {
+    fn carry(
+        &self,
+        plan: SeekPlan,
+        targets: &[Target],
+        mode: SeekMode,
+    ) -> Result<(), CommandError> {
         match plan {
             SeekPlan::Skip { to_time } => self.append(Command::SkipTo { to_time }).map(drop),
-            SeekPlan::Seek { to_time, .. } => self.append_seek(to_time, targets, preview).map(drop),
+            SeekPlan::Seek { to_time, .. } => self.append_seek(to_time, targets, mode).map(drop),
             SeekPlan::Deferred | SeekPlan::Unseekable => Ok(()),
         }
     }
@@ -422,7 +428,7 @@ impl Control {
             return;
         }
         if !matches!(
-            self.carry(plan, &s.targets, mode == SeekMode::Preview),
+            self.carry(plan, &s.targets, mode),
             Err(CommandError::Full | CommandError::NotRunning)
         ) {
             *held = None;
@@ -482,21 +488,22 @@ impl Control {
 
     /// The byte level of [`seek`](Self::seek), with where each source reads.
     pub fn seek_bytes(&self, to_time: Timestamp, targets: &[Target]) -> Result<u64, CommandError> {
-        self.append_seek(to_time, targets, false)
+        self.append_seek(to_time, targets, SeekMode::Accurate)
     }
 
     fn append_seek(
         &self,
         to_time: Timestamp,
         targets: &[Target],
-        preview: bool,
+        mode: SeekMode,
     ) -> Result<u64, CommandError> {
-        self.append_with_preview(Command::Seek { seek_gen: 0, to_time }, targets, preview)
+        self.append_in_mode(Command::Seek { seek_gen: 0, to_time }, targets, mode)
     }
 
-    pub(crate) fn preview(&self, seek_gen: u64) -> bool {
-        let w = relock(&self.writer);
-        w.preview_gen != 0 && w.preview_gen == seek_gen
+    /// The mode the seek of `seek_gen` was asked in, None once a newer one was committed.
+    pub(crate) fn mode_of(&self, seek_gen: u64) -> Option<SeekMode> {
+        let (at, mode) = relock(&self.writer).mode_at;
+        (at == seek_gen).then_some(mode)
     }
 
     pub fn skip_to(&self, to_time: Timestamp) {
@@ -576,16 +583,16 @@ impl Control {
         cmd: Command,
         targets: &[Target],
     ) -> Result<u64, CommandError> {
-        self.append_with_preview(cmd, targets, false)
+        self.append_in_mode(cmd, targets, SeekMode::Accurate)
     }
 
-    /// [`append_with`](Self::append_with), a seek marked as a preview under the same lock that
-    /// commits it, so a refused append leaves no flag behind.
-    fn append_with_preview(
+    /// [`append_with`](Self::append_with), a seek's mode noted under the same lock that commits
+    /// it, so a refused append leaves none behind.
+    fn append_in_mode(
         &self,
         cmd: Command,
         targets: &[Target],
-        preview: bool,
+        mode: SeekMode,
     ) -> Result<u64, CommandError> {
         let mut w = relock(&self.writer);
         if targets.iter().any(|(element, ..)| *element != ALL && element.0 as usize >= w.known) {
@@ -627,7 +634,7 @@ impl Control {
                 false => *slot(&mut w.targets, element.0) = target,
             }
         }
-        w.preview_next = preview;
+        w.mode_next = mode;
         Ok(self.commit(&mut w, cmd))
     }
 
@@ -672,7 +679,7 @@ impl Control {
         match &mut cmd {
             Command::Seek { seek_gen, to_time, .. } => {
                 *seek_gen = self.seek_gen() + 1;
-                w.preview_gen = if std::mem::take(&mut w.preview_next) { *seek_gen } else { 0 };
+                w.mode_at = (*seek_gen, w.mode_next);
                 self.rebase(now, *to_time);
                 self.restart(w, *to_time);
                 w.seek_applied_at = self.log.head() + 1;

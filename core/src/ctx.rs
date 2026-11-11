@@ -213,6 +213,7 @@ pub struct Ctx {
     applied_seek_gen: u64,
     present_from: Option<Timestamp>,
     preview: bool,
+    still: bool,
     control: Option<(Arc<Control>, Arc<Cursor>)>,
     scratch: Arena,
     props: Option<(&'static [crate::element::PropDesc], Arc<PropTable>)>,
@@ -287,6 +288,7 @@ impl Ctx {
             applied_seek_gen: 0,
             present_from: None,
             preview: false,
+            still: false,
             control: None,
             scratch: Arena::default(),
             props: None,
@@ -535,6 +537,18 @@ impl Ctx {
     /// The seek just applied wants a preview, see [`take_preview`](Self::take_preview).
     pub fn arm_preview(&mut self) {
         self.preview = self.present_from.is_some();
+    }
+
+    pub(crate) fn set_still(&mut self, still: bool) {
+        self.still = still;
+    }
+
+    /// Whether the seek last applied shows its keyframe alone, [`SeekMode::Key`]. A decoder
+    /// decodes nothing behind that picture, the next seek drops it.
+    ///
+    /// [`SeekMode::Key`]: crate::pipeline::SeekMode::Key
+    pub fn still(&self) -> bool {
+        self.still
     }
 
     /// Whether a decoder should let out the picture it drops before the presentation point as a

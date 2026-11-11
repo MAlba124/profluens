@@ -206,7 +206,8 @@ pub(crate) fn plan(
             SeekPlan::Skip { .. } => index.plan(to, mode, position, None, reach),
             plan => plan,
         };
-        s.seeks.push((*r, serves.by, plan, index.restart(plan)));
+        let restart = if mode == SeekMode::Key { None } else { index.restart(plan) };
+        s.seeks.push((*r, serves.by, plan, restart));
     }
     if !any_byte && s.timed.is_empty() {
         return SeekPlan::Unseekable;
@@ -581,6 +582,24 @@ mod tests {
         let (plan, targets) = planned(&p, MS(1_000), MS(4_500));
         assert_eq!(plan, seek(3_000, 4_000, 4_500));
         assert_eq!(targets, [(source, 2_000, MS(2_000)), (demux, 2_000, MS(4_000))]);
+    }
+
+    /// A key seek shows the one picture, so the restart a track's lead or caption put ahead
+    /// of the keyframe is not read.
+    #[test]
+    fn a_key_seek_restarts_at_the_keyframe_itself() {
+        let mut p = Pipeline::new();
+        let [source, demux, _] = chain(&mut p, &FILE);
+        let mut index = gops(true);
+        (index.entries[2].restart, index.entries[2].restart_ns) = (2_000, 2_000_000_000);
+        p.publish_index(demux, index);
+        let mut s = super::Scratch::default();
+        let plan = p.control().planned(&mut s, MS(1_000), MS(4_500), SeekMode::Key);
+        assert_eq!(plan, seek(3_000, 4_000, 4_000));
+        assert_eq!(s.targets, [(super::ALL, 3_000, MS(4_000))]);
+        let plan = p.control().planned(&mut s, MS(1_000), MS(4_500), SeekMode::Keyframe);
+        assert_eq!(plan, seek(3_000, 4_000, 4_000));
+        assert_eq!(s.targets, [(source, 2_000, MS(2_000)), (demux, 2_000, MS(4_000))]);
     }
 
     /// The restarts of a published index follow what is linked, so a link or an unlink made

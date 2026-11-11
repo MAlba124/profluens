@@ -257,7 +257,7 @@ fn a_skip_needs_nothing_the_demuxer_has_passed_and_a_seek_goes_to_the_floor() {
                 assert_eq!(to_byte, from.map_or(estimate, |(_, b)| b), "case {n}");
                 let at = match case.mode {
                     SeekMode::Accurate | SeekMode::Preview => case.target,
-                    SeekMode::Keyframe => needed_from,
+                    SeekMode::Keyframe | SeekMode::Key => needed_from,
                 };
                 assert_eq!(to_time, Timestamp(at), "case {n}");
                 let cheap = case.demuxed.is_some_and(|out| needed_from <= out);

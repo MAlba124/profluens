@@ -435,7 +435,7 @@ impl Index {
             Reach::Group => !known || key <= position,
         };
         match mode {
-            SeekMode::Keyframe => SeekPlan::Seek { to_byte, key, to_time: lands },
+            SeekMode::Keyframe | SeekMode::Key => SeekPlan::Seek { to_byte, key, to_time: lands },
             SeekMode::Accurate | SeekMode::Preview if read && held && position < target => {
                 SeekPlan::Skip { to_time: target }
             }
@@ -460,6 +460,8 @@ pub enum Reach {
 pub enum SeekMode {
     Accurate,
     Keyframe,
+    /// Keyframe, restarted at the keyframe's own byte, no track's lead or caption gone back for.
+    Key,
     /// Accurate, the first picture decoded on the way goes out flagged `BufferFlags::PREVIEW`.
     Preview,
 }

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::bus::{BusMessage, BusSender};
 use crate::command::{Command, CommandError, Control, Cursor};
-use crate::ctx::PadOffers;
+use crate::ctx::{PadOffers, PeerMenu};
 use crate::error::{Error, TopologyError};
 use crate::feedback::Upstream;
 use crate::format::FixedFormat;
@@ -63,6 +63,8 @@ pub(crate) enum PadEdit {
     Pads(usize, usize),
     StreamPad(u32, SrcPad),
     SrcFormat(SrcPad, FixedFormat),
+    /// The menus of the pads a src pad feeds once the change is made.
+    SrcPeers(SrcPad, Vec<PeerMenu>),
     SinkFormat(SinkPad, FixedFormat),
     SinkOffers(PadOffers),
     Latency(Timestamp),

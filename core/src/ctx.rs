@@ -65,11 +65,27 @@ pub(crate) struct PadFormats {
     /// Per src pad what every typed link of it takes of each announced field, see
     /// [`Ctx::src_takes`].
     pub(crate) takes: Vec<Option<Takes>>,
+    /// Per src pad the menus of the pads it feeds, see [`Ctx::src_peers_prefer`].
+    pub(crate) peers: Vec<Vec<PeerMenu>>,
 }
 
 pub(crate) type Takes = Vec<(FieldId, Vec<Value>)>;
 
+/// The menu of a pad a src pad feeds, the family each offer names and whether it is the
+/// wildcard, in the menu's order.
+pub(crate) type PeerMenu = Arc<[(Box<str>, bool)]>;
+
 impl PadFormats {
+    // Once per run and per change, at the group tables.
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) fn set_peers(&mut self, pad: SrcPad, menus: Vec<PeerMenu>) {
+        let i = pad.0 as usize;
+        if self.peers.len() <= i {
+            self.peers.resize(i + 1, Vec::new());
+        }
+        self.peers[i] = menus;
+    }
+
     // Once per run and per change, at the group tables.
     #[allow(clippy::disallowed_methods)]
     pub(crate) fn hold_to(&mut self, pad: SrcPad, link: &[(FieldId, Vec<Value>)]) {
@@ -343,6 +359,37 @@ impl Ctx {
         held.iter().find(|(f, _)| *f == field).map(|(_, v)| v.as_slice())
     }
 
+    /// Which of `families` the pads that src pad `pad` feeds name first in their own menus,
+    /// where each names one of them and all agree. `None` where one takes any family or names
+    /// none of them, where they disagree and where the pad feeds nothing.
+    ///
+    /// A link is made in the source's menu order, so a source that can put one stream out in
+    /// several families reads its consumers' order here and announces by it.
+    pub fn src_peers_prefer<'f>(&self, pad: SrcPad, families: &[&'f str]) -> Option<&'f str> {
+        let menus = self.negotiated.peers.get(pad.0 as usize)?;
+        let named = |menu: &PeerMenu| {
+            let typed = menu.iter().all(|(_, wildcard)| !wildcard);
+            let first = menu.iter().find_map(|(f, _)| families.iter().find(|x| ***x == **f));
+            first.copied().filter(|_| typed)
+        };
+        let first = named(menus.first()?)?;
+        menus[1..].iter().all(|menu| named(menu) == Some(first)).then_some(first)
+    }
+
+    /// Record the menus of the pads src pad `pad` feeds, for a harness.
+    // Test setup, once per pad.
+    #[allow(clippy::disallowed_methods)]
+    pub fn set_src_peers(&mut self, pad: SrcPad, menus: &[&[OfferSpec<'_>]]) {
+        let menu = |offers: &&[OfferSpec<'_>]| -> PeerMenu {
+            offers.iter().map(|o| (o.family.into(), o.is_wildcard())).collect()
+        };
+        self.negotiated.set_peers(pad, menus.iter().map(menu).collect());
+    }
+
+    pub(crate) fn feeds(&mut self, pad: SrcPad, menus: Vec<PeerMenu>) {
+        self.negotiated.set_peers(pad, menus);
+    }
+
     /// Record what src pad `pad`'s consumers take of `field`, for a harness.
     // Test setup, once per field.
     #[allow(clippy::disallowed_methods)]
@@ -609,6 +656,10 @@ impl Ctx {
 
     pub fn family_name(&self, id: FormatId) -> Option<&str> {
         self.vocabulary.as_ref()?.family_name(id)
+    }
+
+    pub fn family_id(&self, name: &str) -> Option<FormatId> {
+        self.vocabulary.as_ref()?.family_id(name)
     }
 
     pub fn value_name(&self, id: ValueId) -> Option<&str> {
@@ -1523,6 +1574,37 @@ mod tests {
         let pool = Pool::bounded(1024, 4);
         let (bus, _rx) = Bus::channel();
         Ctx::new(pool, bus, element, FormatId(0), 4)
+    }
+
+    #[test]
+    fn a_src_pad_reads_the_family_its_consumers_name_first() {
+        use crate::format::OfferDesc;
+        const BOTH: [&str; 2] = ["h265/annexb", "h265/hvcc"];
+        let stored: &[OfferDesc] = &[OfferDesc::any("h265/hvcc"), OfferDesc::any("h265/annexb")];
+        let plain: &[OfferDesc] = &[OfferDesc::any("vp9"), OfferDesc::any("h265/annexb")];
+        let other: &[OfferDesc] = &[OfferDesc::any("vp9"), OfferDesc::any("bytes")];
+        let any: &[OfferDesc] = &[OfferDesc::wildcard(), OfferDesc::any("h265/hvcc")];
+        let (mut ctx, pad) = (test_ctx(ElementId(0)), SrcPad(1));
+        assert_eq!(ctx.src_peers_prefer(pad, &BOTH), None, "a pad that feeds nothing");
+        type Case<'a> = (&'a [&'a [OfferDesc]], Option<&'a str>, &'a str);
+        let cases: [Case; 8] = [
+            (&[stored], Some("h265/hvcc"), "the first its one consumer names"),
+            (&[plain], Some("h265/annexb"), "the only one its consumer names"),
+            (&[stored, stored], Some("h265/hvcc"), "two that agree"),
+            (&[stored, plain], None, "two that disagree"),
+            (&[other], None, "a consumer that names neither"),
+            (&[stored, other], None, "one of two names neither"),
+            (&[any], None, "a consumer that takes any family"),
+            (&[], None, "every link gone"),
+        ];
+        for (menus, want, what) in cases {
+            ctx.set_src_peers(pad, menus);
+            assert_eq!(ctx.src_peers_prefer(pad, &BOTH), want, "{what}");
+        }
+        ctx.set_src_peers(pad, &[stored]);
+        assert_eq!(ctx.src_peers_prefer(SrcPad(0), &BOTH), None, "another pad");
+        assert_eq!(ctx.src_peers_prefer(pad, &["h265/annexb"]), Some("h265/annexb"));
+        assert_eq!(ctx.src_peers_prefer(pad, &[]), None, "nothing asked");
     }
 
     #[test]

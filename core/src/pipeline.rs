@@ -12,7 +12,7 @@ use crate::counters::{
     CHUNK, Chunks, CounterSnapshot, ElementCounters, LatencyReport, Roster, Row, TapHandle, View,
 };
 use crate::couple::{Coupling, Rule};
-use crate::ctx::{AddedPad as DynPad, Ctx, PadFormats, PadOffers, Stream};
+use crate::ctx::{AddedPad as DynPad, Ctx, PadFormats, PadOffers, PeerMenu, Stream};
 use crate::element::{Element, ElementDesc, InputPolicy, PadDesc, SchedHint};
 use crate::error::{
     EmptyIntersection, Error, FilterRejected, GraphError, LinkEnd, LinkError, Narrowing,
@@ -2358,6 +2358,12 @@ impl Pipeline {
             if let Some(k) = src.filter(|_| e.format.family != BYTES) {
                 negotiated[k].hold_to(e.src_pad, &e.takes);
             }
+            // every link of the pad at its first
+            let unset =
+                |f: &PadFormats| f.peers.get(e.src_pad.0 as usize).is_none_or(Vec::is_empty);
+            if let Some(k) = src.filter(|k| unset(&negotiated[*k])) {
+                negotiated[k].set_peers(e.src_pad, self.peers_of(e));
+            }
             let sink =
                 at(&ids, e.sink).and_then(|k| negotiated[k].sinks.get_mut(e.sink_pad.0 as usize));
             if let Some(slot) = sink {
@@ -2367,6 +2373,21 @@ impl Pipeline {
         let latency = |i: &u32| at(&part, ElementId(*i)).map_or(Timestamp::ZERO, |k| lat[k]);
         let path_latency = ids.iter().map(latency).collect();
         Tables { ids, pad_counts, negotiated, path_latency, linked_pads, pools, logs }
+    }
+
+    /// The menus of the sink pads that the src pad of `of` feeds, see [`Ctx::src_peers_prefer`].
+    // Once per run and per change.
+    #[allow(clippy::disallowed_methods)]
+    fn peers_of(&self, of: &Edge) -> Vec<PeerMenu> {
+        let menu = |e: &Edge| -> PeerMenu {
+            let own = &self.offers[e.slots[1] as usize];
+            let own = own.iter().find(|o| o.key == (false, e.sink_pad.0));
+            let offers = own.map_or(&[][..], |o| &o.offers.offers[..]);
+            let name = |family: FormatId| self.formats.resolve(family.0).unwrap_or("").into();
+            offers.iter().map(|&(family, _, wildcard)| (name(family), wildcard)).collect()
+        };
+        let fed = self.links().filter(|e| (e.src, e.src_pad) == (of.src, of.src_pad));
+        fed.map(menu).collect()
     }
 
     // Once per run and per change.
@@ -3312,6 +3333,7 @@ impl Pipeline {
                     let stream = self.stream_pads[i].iter().find(|(_, pad)| *pad == e.src_pad);
                     p.edits.extend(stream.map(|(s, pad)| (e.src, PadEdit::StreamPad(*s, *pad))));
                     p.edits.push((e.src, PadEdit::SrcFormat(e.src_pad, e.format.clone())));
+                    p.edits.push((e.src, PadEdit::SrcPeers(e.src_pad, self.peers_of(e))));
                     p.down_add.push(d);
                 }
             }
@@ -3352,6 +3374,10 @@ impl Pipeline {
             } else if leaves[a].is_none() || leaves[b].is_none() {
                 part(&mut splice, head(a)).down_cut.push(*link);
                 part(&mut splice, head(b)).up_cut.push(e.sink_pad);
+                if leaves[a].is_none() {
+                    let left = PadEdit::SrcPeers(e.src_pad, self.peers_of(e));
+                    part(&mut splice, head(a)).edits.push((e.src, left));
+                }
             }
         }
         for (g, how) in leaves.iter().enumerate() {

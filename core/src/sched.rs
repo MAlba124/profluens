@@ -1083,6 +1083,7 @@ impl Group {
                 PadEdit::SinkFormat(pad, format) => ctx.set_negotiated_sink(pad, format),
                 PadEdit::SinkOffers(offers) => ctx.add_offers(offers),
                 PadEdit::Latency(latency) => ctx.set_path_latency(latency),
+                PadEdit::SrcPeers(pad, menus) => ctx.feeds(pad, menus),
                 PadEdit::SrcFormat(pad, format) => match ctx.negotiated_src(pad).cloned() {
                     None => ctx.set_negotiated_src(pad, format),
                     Some(now) if now != format => {

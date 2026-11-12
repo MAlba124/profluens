@@ -25,6 +25,7 @@ use crate::bitwriter::{BitWriter, annexb_nal};
 use crate::colour;
 use crate::enc::{self, EncEngine, FrameBufs, InFormat, PadOut, RawPixFmt, Staged, Stamp};
 use crate::encshell;
+use crate::encside::{self, Sides};
 use crate::error::{VaapiErrorKind as K, Warned, failed};
 use crate::ffi;
 use crate::gpuframe::{self, GpuFrameChannel, GpuFrameHeader};
@@ -33,6 +34,7 @@ use crate::h264parse;
 use crate::probe;
 use crate::stats::Stats;
 use crate::va::{self, Buffer as VaBuffer, Display, SurfaceFormat};
+use pf_hdr::rpu::Fit;
 use profluens_video::color::StreamColor;
 
 const FAM_ANNEXB: &str = "h265/annexb";
@@ -242,11 +244,15 @@ pub struct VaapiH265Enc {
     ahead: Option<(u32, u32)>,
     /// The colour the VUI states in place of the input's, its HDR metadata still the input's.
     pinned: Option<StreamColor>,
+    /// The source picture's size and its quarter turns clockwise to the output, see
+    /// [`Self::with_dovi`].
+    dovi: Option<((u32, u32), u8)>,
     stats: Arc<Stats>,
     /// Waits for a picture in the driver, the encoder has its own thread.
     blocking: bool,
     fences: enc::Fences,
     reads: enc::Reads,
+    sides: Sides,
 }
 
 // SAFETY: the element runs on one thread at a time, its group's after preroll, its own when
@@ -302,6 +308,8 @@ impl VaapiH265Enc {
             frames: 0,
             ahead: None,
             pinned: None,
+            dovi: None,
+            sides: Sides::new(),
         }
     }
 
@@ -353,6 +361,15 @@ impl VaapiH265Enc {
     /// metadata.
     pub fn with_colour(mut self, color: StreamColor) -> Self {
         self.pinned = Some(color);
+        self
+    }
+
+    /// Writes each picture's Dolby Vision RPU behind its slices as a single layer's, profile 8,
+    /// where the VUI states PQ or HLG. `from` is the source picture the RPUs were written for
+    /// and `turns` its quarter turns clockwise to the output, what their active area is fitted
+    /// by. The stream's configuration record is the caller's to state.
+    pub fn with_dovi(mut self, from: (u32, u32), turns: u8) -> Self {
+        self.dovi = Some((from, turns));
         self
     }
 
@@ -532,7 +549,10 @@ impl VaapiH265Enc {
         let level_idc = pick_level(engine.coded_w, engine.coded_h, fmt.fps);
         let brc = self.bitrate_kbps > 0;
         let vps_nal = write_vps(level_idc, ten, refs);
-        let colour = colour::vui_colour(self.pinned.as_ref().unwrap_or(&self.color));
+        let vui = self.pinned.as_ref().unwrap_or(&self.color);
+        let fit = self.dovi.map(|(from, turns)| Fit { from, turns, to: (fmt.width, fmt.height) });
+        self.sides.rule = encside::keeps(vui, fit);
+        let colour = colour::vui_colour(vui);
         let sps_nal = write_sps(engine.coded(), fmt, level_idc, ctb_log2, refs, colour);
         let sei = colour::hdr_sei_rbsp(&self.color.hdr)
             .map(|r| annexb_nal(&nal_header(NAL_PREFIX_SEI), &r));
@@ -679,14 +699,13 @@ impl VaapiH265Enc {
         let sei = self.session.as_ref().and_then(|s| s.sei.as_deref()).filter(|_| f.stamp.key);
         log!(&*ctx, Level::Trace, "encoded", bytes = head.len() + map.len(), key = f.stamp.key);
         self.frames += 1;
-        if self.hvcc || sei.is_some() {
+        let dropped = self.sides.dropped;
+        if self.hvcc || sei.is_some() || self.sides.has(f.seq) {
             let b = &mut self.bufs;
             b.coded.clear();
             b.coded.extend_from_slice(head);
             map.append_to(&mut b.coded);
-            if let Some(sei) = sei {
-                insert_before_slices(&mut b.coded, sei);
-            }
+            self.sides.dress(f.seq, sei, &mut b.coded);
             if self.hvcc {
                 b.conv.clear();
                 annexb_to_hvcc(&b.coded, &mut b.conv);
@@ -695,6 +714,19 @@ impl VaapiH265Enc {
             self.staged.send_or_stage(&mut Self::pad(ctx), &mut b.coded, f.stamp)?;
         } else {
             self.staged.send_coded(&mut Self::pad(ctx), &[head], &map, f.stamp)?;
+        }
+        let d = self.sides.dropped;
+        if dropped == Default::default() && d != dropped {
+            // the first drop alone, the counts go out again at the end of stream
+            log!(
+                &*ctx,
+                Level::Info,
+                "side_dropped",
+                windows = d.windows,
+                malformed = d.malformed,
+                room = d.room,
+                rpu = d.rpu
+            );
         }
         match (map.unmap(), &mut self.session) {
             (Ok(()), Some(s)) => s.engine.put_coded(f.coded),
@@ -748,13 +780,14 @@ impl VaapiH265Enc {
     }
 
     /// Hands the picture to the GPU, it goes out on [`Self::finish`]. `frame` is the producer's
-    /// picture the GPU reads, held until then.
+    /// picture the GPU reads, held until then, `side` its side records.
     #[allow(clippy::too_many_arguments)]
     fn encode_frame(
         &mut self,
         ctx: &mut Ctx,
         input: Input<'_>,
         frame: Option<crate::gpuframe::GpuFrame>,
+        side: &[u8],
         pts: Timestamp,
         duration: Timestamp,
         preview: bool,
@@ -809,6 +842,7 @@ impl VaapiH265Enc {
             s.gop_pos = 0;
         }
         let (seq, fence) = self.fences.queued(ctx, dpy, recon, slot);
+        self.sides.keep(seq, side);
         let stamp = Stamp { pts, duration, key: is_idr, preview };
         self.flight.push(enc::InFlight { coded, head, stamp, _frame: frame, seq, fence });
         Ok(())
@@ -884,24 +918,6 @@ fn encode_one(
         return Err(e);
     }
     Ok((coded, is_idr && s.packed_mask & ffi::VA_ENC_PACKED_HEADER_SEQUENCE == 0))
-}
-
-/// `nal` put in Annex B `au` before its first VCL NAL, after the parameter sets.
-fn insert_before_slices(au: &mut Vec<u8>, nal: &[u8]) {
-    let mut i = 0;
-    while i + 3 < au.len() {
-        if au[i..i + 3] == [0, 0, 1] {
-            if (au[i + 3] >> 1) & 0x3F < 32 {
-                let at = if i > 0 && au[i - 1] == 0 { i - 1 } else { i };
-                au.splice(at..at, nal.iter().copied());
-                return;
-            }
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    au.extend_from_slice(nal);
 }
 
 // Cold, once per session.
@@ -1428,6 +1444,7 @@ impl VaapiH265Enc {
                 ctx,
                 Input::Surface(surface),
                 Some(frame),
+                inbuf.memory.side(),
                 inbuf.pts,
                 inbuf.duration,
                 inbuf.flags.contains(BufferFlags::PREVIEW),
@@ -1546,6 +1563,7 @@ impl Element for VaapiH265Enc {
                 ctx,
                 Input::Raw(inbuf.memory.data()),
                 None,
+                inbuf.memory.side(),
                 inbuf.pts,
                 inbuf.duration,
                 inbuf.flags.contains(BufferFlags::PREVIEW),
@@ -1626,13 +1644,15 @@ impl Element for VaapiH265Enc {
                 self.finish_all(ctx)?;
                 let drained = self.staged.finish(&mut Self::pad(ctx))?;
                 let pending = self.staged.len();
+                let d = self.sides.dropped;
                 log!(
                     &*ctx,
                     Level::Info,
                     "eos",
                     frames = self.frames,
                     pending = pending,
-                    drained = drained
+                    drained = drained,
+                    side_dropped = d.windows + d.malformed + d.room + d.rpu
                 );
                 self.warned.summary(ctx, "eos");
             }
@@ -1869,5 +1889,131 @@ mod tests {
         assert!(warned.is_empty(), "{test} warned {warned:?}");
         assert_eq!(out.len(), 6, "{test} every picture after the flush");
         assert!(out[0].flags.contains(BufferFlags::KEYFRAME), "{test} the run opens on a key");
+    }
+
+    struct Coded {
+        kinds: Vec<u8>,
+        maxscl: Option<u32>,
+        rpu: Option<Vec<u8>>,
+    }
+
+    /// Each picture coded under `vui` with an HDR10+ record and a two layer RPU on every input,
+    /// the source twice the picture's size where `dovi` asks for the RPUs.
+    fn coded_with_side(test: &str, vui: StreamColor, dovi: bool) -> Option<Vec<Coded>> {
+        use pf_hdr::rpu::{Sample, nal_form, sample};
+        use pf_hdr::side::{FrameMeta, Kind, Writer};
+        let Some(caps) = crate::probe() else {
+            eprintln!("skip {test}: no VA-API device");
+            return None;
+        };
+        if !caps.supports_encode("h265/annexb") {
+            eprintln!("skip {test}: no HEVC encode entrypoint");
+            return None;
+        }
+        let (w, h) = (128u32, 64u32);
+        let enc = VaapiH265Enc::new().with_gop(2).with_colour(vui);
+        let enc = if dovi { enc.with_dovi((2 * w, 2 * h), 0) } else { enc };
+        let mut hx = pf_harness::Harness::with_pool(enc, 256 * 1024, 16);
+        hx.fix_sink_format(
+            VaapiH265Enc::IN,
+            "video/raw",
+            &[
+                ("width", ValueDesc::Int(w.into())),
+                ("height", ValueDesc::Int(h.into())),
+                ("pixfmt", ValueDesc::Id("nv12")),
+                ("fps", ValueDesc::Rat(25, 1)),
+            ],
+        );
+        for i in 0..3u64 {
+            let frame: Vec<u8> = (0..(w * h * 3 / 2) as usize)
+                .map(|p| ((p as u64 + i * 7) % 220 + 16) as u8)
+                .collect();
+            let mut b = hx.alloc(&frame);
+            b.pts = Timestamp::from_nanos(i * 40_000_000);
+            let mut t35 = vec![0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04];
+            t35.extend(pf_hdr::hdr10plus::sample_payload([1000 * (i as u32 + 1), 1, 1], 1000));
+            let area = Some([0, 0, 20 + 2 * i as u32, 40]);
+            let rpu = sample(Sample { nlq: Some(false), area, ..Sample::P8 });
+            let mut side = [0u8; 1024];
+            let mut rec = Writer::new(&mut side);
+            assert!(rec.push(Kind::T35, &t35));
+            assert!(rec.push(Kind::DoviRpu, &nal_form(&rpu)));
+            assert!(rec.push(Kind::DoviEl, &[]));
+            let n = rec.len();
+            b.memory.set_side(&side[..n]).expect("a fresh slot's side area");
+            hx.push(b).expect("pushed");
+        }
+        let out = hx.eos().expect("the end");
+        assert_eq!(out.len(), 3, "{test} every picture coded");
+        let read = |au: &[u8]| {
+            let kinds = pf_hdr::h26x::annexb_nals(au).map(|n| n[0] >> 1 & 0x3F).collect();
+            let (mut side, mut scratch) = ([0u8; 2048], [0u8; 2048]);
+            let mut scan = pf_hdr::h26x::Scan::new(Writer::new(&mut side));
+            pf_hdr::h26x::scan_annexb(pf_hdr::h26x::Codec::H265, au, &mut scratch, &mut scan);
+            let n = scan.side.len();
+            let m = FrameMeta::read(&side[..n]).expect("records");
+            assert!(!m.dovi_el(), "{test} no enhancement layer");
+            Coded {
+                kinds,
+                maxscl: m.hdr10plus().and_then(|h| Some(h.ok()?.windows[0].maxscl[0])),
+                rpu: m.dovi_rpu().map(|(_, b)| b.to_vec()),
+            }
+        };
+        Some(out.iter().map(|b| read(b.memory.data())).collect())
+    }
+
+    fn pq() -> StreamColor {
+        StreamColor {
+            transfer: Some(profluens_video::color::TransferFn::Pq),
+            primaries: Some(profluens_video::color::Primaries::Bt2020),
+            ..StreamColor::default()
+        }
+    }
+
+    #[test]
+    fn each_picture_carries_its_own_hdr10plus_before_its_slices_under_pq() {
+        let test = "each_picture_carries_its_own_hdr10plus_before_its_slices_under_pq";
+        let Some(out) = coded_with_side(test, pq(), false) else { return };
+        for (i, c) in out.iter().enumerate() {
+            let kinds = &c.kinds;
+            assert_eq!(c.maxscl, Some(1000 * (i as u32 + 1)), "{test} picture {i} its own");
+            let sei = kinds.iter().position(|&k| k == NAL_PREFIX_SEI).expect("an SEI");
+            let slice = kinds.iter().position(|&k| k < 32).expect("a slice");
+            assert!(sei < slice, "{test} picture {i} {kinds:?}");
+            assert!(kinds[..sei].iter().all(|&k| (32..=34).contains(&k)), "{test} {kinds:?}");
+            assert_eq!(c.rpu, None, "{test} no RPU where none is asked for");
+        }
+    }
+
+    #[test]
+    fn each_picture_carries_its_own_rpu_behind_its_slices_as_a_single_layers() {
+        use pf_hdr::rpu::{Sample, nal_form, sample};
+        let test = "each_picture_carries_its_own_rpu_behind_its_slices_as_a_single_layers";
+        let Some(out) = coded_with_side(test, pq(), true) else { return };
+        for (i, c) in out.iter().enumerate() {
+            let kinds = &c.kinds;
+            // the source is twice the picture, so its bars are half
+            let area = Some([0, 0, 10 + i as u32, 20]);
+            let want = nal_form(&sample(Sample { area, ..Sample::P8 }));
+            assert_eq!(c.rpu.as_deref(), Some(&want[..]), "{test} picture {i} its own");
+            assert_eq!(kinds.last(), Some(&pf_hdr::h26x::H265_DOVI_RPU), "{test} {kinds:?}");
+            assert_eq!(kinds.iter().filter(|&&k| k >= 62).count(), 1, "{test} {kinds:?}");
+            assert_eq!(c.maxscl, Some(1000 * (i as u32 + 1)), "{test} HDR10+ beside it");
+        }
+    }
+
+    #[test]
+    fn an_sdr_session_writes_no_side_records() {
+        let test = "an_sdr_session_writes_no_side_records";
+        let sdr = StreamColor {
+            transfer: Some(profluens_video::color::TransferFn::Bt709),
+            ..StreamColor::default()
+        };
+        let Some(out) = coded_with_side(test, sdr, true) else { return };
+        for c in out {
+            assert_eq!((c.maxscl, c.rpu), (None, None), "{test}");
+            assert!(!c.kinds.contains(&NAL_PREFIX_SEI), "{test} {:?}", c.kinds);
+            assert!(c.kinds.iter().all(|&k| k < 62), "{test} {:?}", c.kinds);
+        }
     }
 }

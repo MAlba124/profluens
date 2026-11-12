@@ -19,11 +19,21 @@ pub struct DoviConfig {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DoviError {
-    Short { len: usize, need: usize },
+    Short {
+        len: usize,
+        need: usize,
+    },
     NoPrefix(u8),
     Emdf(u32),
     RpuType(u8),
     Range(&'static str),
+    /// The RPU ends inside a field, or before its 0x80.
+    Cut,
+    Crc,
+    /// Syntax the reader does not walk.
+    Unsupported(&'static str),
+    /// The output is too small.
+    Room,
 }
 
 impl std::fmt::Display for DoviError {
@@ -34,6 +44,10 @@ impl std::fmt::Display for DoviError {
             DoviError::Emdf(v) => write!(f, "EMDF header 0x{v:07x}, not 0x01be6841"),
             DoviError::RpuType(t) => write!(f, "rpu_type {t}"),
             DoviError::Range(what) => write!(f, "{what} out of range"),
+            DoviError::Cut => write!(f, "the RPU is cut short"),
+            DoviError::Crc => write!(f, "the RPU's CRC does not match"),
+            DoviError::Unsupported(what) => write!(f, "{what} is not read"),
+            DoviError::Room => write!(f, "no room for the RPU"),
         }
     }
 }
@@ -145,6 +159,29 @@ impl DoviConfig {
         }
     }
 
+    /// The record of a single layer profile 8 stream, `width` by `height` pictures at
+    /// `fps_milli`, 25 a second where that is 0, `compat_id` its base layer's. The last level
+    /// past the table.
+    pub fn profile8(width: u32, height: u32, fps_milli: u32, compat_id: u8) -> DoviConfig {
+        let fps_milli = if fps_milli == 0 { 25_000 } else { fps_milli };
+        let pps_milli = u64::from(width) * u64::from(height) * u64::from(fps_milli);
+        let level = LEVELS
+            .iter()
+            .position(|&(pps, max_width)| pps_milli <= pps * 1000 && width <= max_width)
+            .unwrap_or(LEVELS.len() - 1);
+        DoviConfig {
+            major: 1,
+            minor: 0,
+            profile: 8,
+            level: level as u8 + 1,
+            rpu: true,
+            el: false,
+            bl: true,
+            compat_id,
+            compression: 0,
+        }
+    }
+
     /// A record guessed from an RPU where the container states none.
     pub fn derived(rpu: &RpuHeader, el: bool) -> Option<DoviConfig> {
         Some(DoviConfig {
@@ -157,6 +194,23 @@ impl DoviConfig {
         })
     }
 }
+
+/// Levels 1 to 13, the pixels a second and the width each takes at most.
+const LEVELS: [(u64, u32); 13] = [
+    (1280 * 720 * 24, 1280),
+    (1280 * 720 * 30, 1280),
+    (1920 * 1080 * 24, 1920),
+    (1920 * 1080 * 30, 2560),
+    (1920 * 1080 * 60, 3840),
+    (3840 * 2160 * 24, 3840),
+    (3840 * 2160 * 30, 3840),
+    (3840 * 2160 * 48, 3840),
+    (3840 * 2160 * 60, 3840),
+    (3840 * 2160 * 120, 3840),
+    (3840 * 2160 * 120, 7680),
+    (7680 * 4320 * 60, 7680),
+    (7680 * 4320 * 120, 7680),
+];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RpuForm {
@@ -283,7 +337,8 @@ impl RpuHeader {
 
 const EMDF_MAGIC: u32 = 0x01be_6841;
 
-fn unwrap_emdf(bytes: &[u8], out: &mut [u8; HEAD]) -> Result<usize, DoviError> {
+/// The RPU inside AV1's EMDF wrapping onto `out`, as much as fits, its length.
+pub(crate) fn unwrap_emdf(bytes: &[u8], out: &mut [u8]) -> Result<usize, DoviError> {
     let mut b = Bits::new(bytes);
     let short = DoviError::Short { len: bytes.len(), need: 6 };
     let magic = b.u(27).ok_or(short)?;
@@ -303,7 +358,7 @@ fn unwrap_emdf(bytes: &[u8], out: &mut [u8; HEAD]) -> Result<usize, DoviError> {
     if (size as usize) * 8 > b.left() {
         return Err(DoviError::Short { len: bytes.len(), need: size as usize });
     }
-    let n = (size as usize).min(HEAD);
+    let n = (size as usize).min(out.len());
     for slot in &mut out[..n] {
         *slot = b.u(8).ok_or(short)? as u8;
     }
@@ -476,6 +531,23 @@ mod tests {
         assert_eq!(RpuHeader::parse(RpuForm::Nal, &nal).unwrap().guess_profile(), Some(4));
         let d = DoviConfig::derived(&RpuHeader::parse(RpuForm::Nal, &nal).unwrap(), false).unwrap();
         assert_eq!((d.profile, d.rpu, d.bl, d.el), (4, true, true, false));
+    }
+
+    #[test]
+    fn a_profile_8_record_takes_the_level_its_pictures_need() {
+        let level = |w, h, fps| DoviConfig::profile8(w, h, fps, 1).level;
+        assert_eq!(level(1280, 720, 23_976), 1);
+        assert_eq!(level(1280, 720, 30_000), 2);
+        assert_eq!(level(1920, 1080, 23_976), 3);
+        assert_eq!(level(1920, 804, 60_000), 5);
+        assert_eq!(level(2560, 720, 24_000), 4, "past level 3's width");
+        assert_eq!(level(3840, 2160, 24_000), 6);
+        assert_eq!(level(3840, 2160, 60_000), 9);
+        assert_eq!(level(3840, 2160, 0), 7, "25 a second where the rate is unknown");
+        assert_eq!(level(7680, 4320, 240_000), 13, "the last past the table");
+        let c = DoviConfig::profile8(1920, 1080, 24_000, 4);
+        assert_eq!((c.profile, c.rpu, c.el, c.bl, c.compat_id), (8, true, false, true, 4));
+        assert_eq!(c.box_name(), *b"dvvC");
     }
 
     #[test]

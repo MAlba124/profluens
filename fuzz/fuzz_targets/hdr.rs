@@ -15,6 +15,7 @@ use pf_hdr::color::{
 use pf_hdr::dovi::{DoviConfig, DoviError, RpuForm, RpuHeader};
 use pf_hdr::h26x::{self, Codec, Scan};
 use pf_hdr::hdr10plus::{Hdr10Plus, Hdr10PlusError, MAX_PAYLOAD, PeakGrid};
+use pf_hdr::rpu::{Fit, crc32, single_layer};
 use pf_hdr::side::{self, FrameMeta, Kind, SIDE_CAP, SideError, Writer};
 use pf_hdr::t35::{self, T35, T35Kind};
 use pf_hdr::{av1, vp9};
@@ -275,7 +276,36 @@ fn check_rpu(r: Result<RpuHeader, DoviError>) {
     }
 }
 
+/// `body` under a CRC that holds, rewritten for one layer, comes out with a CRC that holds and
+/// then goes through again as it is.
+fn single_layer_rpu(body: &[u8]) {
+    let turns = body.first().map_or(0, |x| x >> 6);
+    let fit = Fit { from: (3840, 2160), turns, to: (1920, 1080) };
+    let mut rbsp = body[..body.len().min(500)].to_vec();
+    let crc = crc32(&rbsp);
+    rbsp.extend_from_slice(&crc.to_be_bytes());
+    rbsp.push(0x80);
+    let nal = |rbsp: &[u8]| {
+        let mut n = vec![0x19];
+        n.extend(escape(rbsp));
+        n
+    };
+    let (mut out, mut again) = ([0u8; SIDE_CAP], [0u8; SIDE_CAP]);
+    let Ok(n) = single_layer(RpuForm::Nal, &nal(&rbsp), &fit, &mut out) else {
+        return;
+    };
+    assert_eq!(out[n - 1], 0x80);
+    assert_eq!(crc32(&out[..n - 1]), 0, "the CRC written does not hold");
+    let h = RpuHeader::parse(RpuForm::Nal, &nal(&out[..n])).expect("its own header");
+    let seq = h.seq.expect("a sequence info");
+    assert!(seq.disable_residual && !seq.el_spatial_resampling_filter, "still two layers");
+    let same = Fit { from: fit.to, turns: 0, to: fit.to };
+    assert_eq!(single_layer(RpuForm::Nal, &nal(&out[..n]), &same, &mut again), Ok(n));
+    assert_eq!(out[..n], again[..n], "a single layer RPU does not come out as it went in");
+}
+
 fn rpu(b: &[u8]) {
+    single_layer_rpu(b);
     check_rpu(RpuHeader::parse(RpuForm::Nal, b));
     check_rpu(RpuHeader::parse(RpuForm::Av1Emdf, b));
     let rbsp = &b[..b.len().min(511)];

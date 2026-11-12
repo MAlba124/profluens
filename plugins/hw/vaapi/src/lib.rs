@@ -9,6 +9,7 @@ pub mod colour;
 pub mod decproc;
 mod enc;
 pub mod encshell;
+mod encside;
 pub mod error;
 pub mod ffi;
 mod firstout;

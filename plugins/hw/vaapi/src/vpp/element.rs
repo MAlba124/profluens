@@ -21,6 +21,7 @@ use profluens_core::format::{
 use profluens_core::id::{SinkPad, SrcPad};
 use profluens_core::log;
 use profluens_core::log::Level;
+use profluens_core::memory::{Memory, SideError};
 use profluens_video::color::{
     ContentLight, HdrStatic, Mastering, Matrix, Primaries, Range, StreamColor, TransferFn,
 };
@@ -741,6 +742,8 @@ impl VaapiPostProc {
         Ok(Prepared::Ready(p, sink))
     }
 
+    /// `side` is the input picture's side records, the output carries them unless tone mapped.
+    #[allow(clippy::too_many_arguments)]
     fn process_into(
         &mut self,
         ctx: &mut Ctx,
@@ -749,6 +752,7 @@ impl VaapiPostProc {
         f: InFormat,
         p: Plan,
         sink: Sink,
+        side: &[u8],
     ) -> Result<Buffer, K> {
         let buf = match sink {
             Sink::Raw(mut buf, len) => {
@@ -774,11 +778,16 @@ impl VaapiPostProc {
                 }
                 drop(view);
                 buf.memory.set_len(len);
+                self.carry_side(ctx, side, &mut buf.memory, p.out);
                 buf
             }
             Sink::Gpu(mut buf, dst) => {
                 let coded = self.session.as_ref().ok_or(K::NoDevice)?.coded;
                 let ran = self.convert(ctx, src, src_at, f, p, dst);
+                if ran.is_ok() {
+                    // before the send, so the view the channel holds states it too
+                    self.carry_side(ctx, side, &mut buf.memory, p.out);
+                }
                 let r = ran.and_then(|_| self.send(ctx, &mut buf, dst, coded, p));
                 if let Err(e) = r {
                     if let Some(g) = &mut self.gpu_out {
@@ -791,6 +800,13 @@ impl VaapiPostProc {
         };
         self.stats.frames.fetch_add(1, Ordering::Relaxed);
         Ok(buf)
+    }
+
+    /// After [`Self::convert`], so a tone map the driver refused counts as none.
+    fn carry_side(&self, ctx: &Ctx, side: &[u8], to: &mut Memory, out: Kind) {
+        if carry_side(side, to, self.maps_tones(out)).is_err() {
+            log!(ctx, Level::Debug, "side_refused", bytes = side.len() as u64);
+        }
     }
 
     /// `src` into `dst` by plan `p`, tone mapped when [`Self::maps_tones`]. A tone map the
@@ -977,8 +993,9 @@ impl VaapiPostProc {
                 data,
             )
             .map_err(|e| Self::fail(ctx, e))?;
-            let mut out =
-                self.process_into(ctx, src, (0, 0), f, p, sink).map_err(|e| Self::fail(ctx, e))?;
+            let mut out = self
+                .process_into(ctx, src, (0, 0), f, p, sink, inbuf.memory.side())
+                .map_err(|e| Self::fail(ctx, e))?;
             (out.pts, out.dts, out.duration, out.flags) =
                 (inbuf.pts, inbuf.dts, inbuf.duration, inbuf.flags);
             self.announce(ctx, f, p.width, p.height, out_pixfmt(p.out));
@@ -1049,7 +1066,7 @@ impl VaapiPostProc {
             let src =
                 self.source(ctx, &frame, f, kind, modifier).map_err(|e| Self::fail(ctx, e))?;
             let mut out = self
-                .process_into(ctx, src, (h.crop_x, h.crop_y), f, p, sink)
+                .process_into(ctx, src, (h.crop_x, h.crop_y), f, p, sink, inbuf.memory.side())
                 .map_err(|e| Self::fail(ctx, e))?;
             drop(frame);
             (out.pts, out.dts, out.duration, out.flags) =
@@ -1123,6 +1140,14 @@ impl VaapiPostProc {
         self.stats.imports.fetch_add(1, Ordering::Relaxed);
         Ok(id)
     }
+}
+
+/// `side` onto `to`, none for a tone mapped picture, whose HDR metadata went with its PQ.
+fn carry_side(side: &[u8], to: &mut Memory, tone_mapped: bool) -> Result<(), SideError> {
+    if side.is_empty() || tone_mapped {
+        return Ok(());
+    }
+    to.set_side(side)
 }
 
 pub(crate) fn black(
@@ -1404,5 +1429,30 @@ impl Element for VaapiPostProc {
                 g.channel.put_tx(tx);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use profluens_core::memory::Pool;
+
+    #[test]
+    fn a_scaled_picture_carries_the_side_records_of_its_input() {
+        let pool = Pool::bounded(256, 1);
+        let mut to = pool.acquire();
+        carry_side(&[1, 4, 0, 9, 9, 9, 9], &mut to, false).unwrap();
+        assert_eq!(to.side(), &[1, 4, 0, 9, 9, 9, 9]);
+        assert_eq!(to.clone().side(), to.side(), "a view handed on states them too");
+    }
+
+    #[test]
+    fn a_tone_mapped_picture_and_one_without_records_carry_none() {
+        let pool = Pool::bounded(256, 2);
+        let mut to = pool.acquire();
+        carry_side(&[1, 4, 0, 9, 9, 9, 9], &mut to, true).unwrap();
+        assert!(to.side().is_empty());
+        carry_side(&[], &mut to, false).unwrap();
+        assert!(to.side().is_empty());
     }
 }

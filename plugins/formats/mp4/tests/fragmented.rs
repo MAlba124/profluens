@@ -769,6 +769,17 @@ fn late_fragments(name: &str, flags: &str) -> Option<Vec<u8>> {
     )
 }
 
+/// The first edit of the file's first `elst`, its length in milliseconds and its media time.
+/// The length is in the movie's timescale, which ffmpeg has written as 1000 and as the audio
+/// rate.
+fn first_edit(file: &[u8]) -> (u64, u32) {
+    let be = |at: usize| u32::from_be_bytes(file[at..at + 4].try_into().unwrap());
+    // a version 0 mvhd, the timescale behind the two times
+    let mvhd = file.windows(4).position(|w| w == b"mvhd").unwrap() + 4;
+    let elst = file.windows(4).position(|w| w == b"elst").unwrap() + 4;
+    (u64::from(be(elst + 8)) * 1000 / u64::from(be(mvhd + 12)), be(elst + 12))
+}
+
 /// The file up to its first `mdat`, the head an open hands the demuxer.
 fn head_of(file: &[u8]) -> &[u8] {
     let mut at = 0usize;
@@ -783,7 +794,7 @@ fn an_empty_edit_is_no_length_and_the_last_fragment_ends_the_movie() {
     let Some(file) = late_fragments("dash.mp4", "+dash") else { return };
     let elst = file.windows(4).position(|w| w == b"elst").unwrap() + 4;
     assert_eq!(&file[elst..elst + 8], [0, 0, 0, 0, 0, 0, 0, 2], "version 0, two edits");
-    assert_eq!(&file[elst + 8..elst + 16], [0, 0, 0, 80, 0xFF, 0xFF, 0xFF, 0xFF], "80 ms empty");
+    assert_eq!(first_edit(&file), (80, u32::MAX), "80 ms empty");
     let head = head_of(&file);
     assert_eq!(frag::length_stated(head), Some(false), "no mehd");
     let first = pf_mp4::Tables::resolve(head, &[], pf_mp4::Limits::default()).unwrap();
@@ -828,8 +839,7 @@ fn a_fragmented_file_without_an_mfra_lasts_its_sidx_chain() {
     assert_eq!(frag::mfra_size(&file), None, "no mfra");
     assert!(!file.windows(4).any(|w| w == b"mehd"), "no mehd");
     assert_eq!(file.windows(4).filter(|w| w == b"sidx").count(), 12, "a sidx a track a fragment");
-    let elst = file.windows(4).position(|w| w == b"elst").unwrap() + 4;
-    assert_eq!(&file[elst + 8..elst + 16], [0, 0, 0, 80, 0xFF, 0xFF, 0xFF, 0xFF], "80 ms empty");
+    assert_eq!(first_edit(&file), (80, u32::MAX), "80 ms empty");
     let head = head_of(&file);
     let first = pf_mp4::Tables::resolve(head, &[], pf_mp4::Limits::default()).unwrap();
     assert!(first.tracks().iter().all(|t| t.duration_ns == 0), "{:?}", first.tracks());

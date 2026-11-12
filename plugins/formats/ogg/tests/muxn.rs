@@ -339,10 +339,12 @@ fn a_stalled_stream_holds_the_other_back_by_a_bound() {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let count = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(AtomicUsize::new(0));
-        let third = want.iter().flat_map(|l| &l.packets).map(|p| p.0.len()).sum::<usize>() / 3;
+        // of the first stream's own bytes, the stalled one puts out next to none. How the two
+        // compare is the encoders', a share of both is more than the first holds with some.
+        let most = want[0].packets.iter().map(|p| p.0.len()).sum::<usize>() * 2 / 3;
         let mut a = PacketSrc::new(packets(0));
         a.done = Some(Arc::clone(&done));
-        a.watch = Some((want[0].packets.len() - 10, Arc::clone(&count), Arc::clone(&seen), third));
+        a.watch = Some((want[0].packets.len() - 10, Arc::clone(&count), Arc::clone(&seen), most));
         let mut b = PacketSrc::new(packets(1));
         let heads =
             Mapping::identify(&want[1].packets[0].0).header_packets(&want[1].packets[0].0) as usize;
@@ -351,7 +353,7 @@ fn a_stalled_stream_holds_the_other_back_by_a_bound() {
         let out = bytes.lock().unwrap().clone();
         let early = seen.load(Ordering::Acquire);
         assert!(
-            early > third,
+            early > most,
             "{what}: {early} of {} bytes out before the first stream ended",
             out.len()
         );

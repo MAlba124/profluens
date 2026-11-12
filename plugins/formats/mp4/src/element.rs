@@ -211,6 +211,9 @@ pub struct Mp4Demux {
     plan: Plan,
     ask_caps: AskCaps,
     rated: Option<profluens_core::pipeline::Index>,
+    /// The input was pushed. A caption track that joins is then not read from before the
+    /// restart, the index names its captions so the restart goes back for them.
+    pushed: bool,
     teller: rate::Teller,
     /// Samples dropped as malformed since start.
     dropped: u64,
@@ -272,6 +275,7 @@ impl Mp4Demux {
             plan: Plan::default(),
             ask_caps: AskCaps::default(),
             rated: None,
+            pushed: false,
             teller: rate::Teller::default(),
             dropped: 0,
         }
@@ -1029,11 +1033,17 @@ impl Mp4Demux {
 }
 
 impl Mp4Demux {
-    /// A seek index of the tables named by stream, kept for the rate teller.
+    /// A seek index of the tables named by stream, kept for the rate teller. With `aside` a
+    /// caption track that joins is read from its sample up wherever that is stored, see
+    /// [`Mp4Reader::rejoin_up`], so it restarts at the key and the index names no caption.
     fn indexed(
         &mut self,
         mut index: profluens_core::pipeline::Index,
+        aside: bool,
     ) -> profluens_core::pipeline::Index {
+        if aside {
+            index.captions.clear();
+        }
         let stream = |track: u32| self.pad_tracks.get(track as usize).map(|pt| pt.stream);
         index.stream = index.stream.and_then(stream);
         index.captions.retain_mut(|c| match stream(c.stream) {
@@ -1061,7 +1071,8 @@ impl Mp4Demux {
         };
         let on: Vec<bool> = (0..self.pad_tracks.len()).map(|i| reader.is_on(i)).collect();
         let index = reader.seek_index(&|i| on.get(i).is_some_and(|on| *on));
-        let index = self.indexed(index);
+        let aside = !self.pushed && !reader.is_fragmented();
+        let index = self.indexed(index, aside);
         ctx.publish_index(index);
     }
 
@@ -1082,6 +1093,9 @@ impl Mp4Demux {
                 let old = self.pad_tracks[idx].pad;
                 self.pending.retain(|c| c.pad != pad && c.pad != old);
                 reader.rejoin(idx, target.to_byte, target.at.nanos().unwrap_or(0));
+                if ctx.pulls(Self::IN) {
+                    reader.rejoin_up(idx, target.at.nanos().unwrap_or(0));
+                }
             }
             None => reader.select(idx, on),
         }
@@ -1187,7 +1201,7 @@ impl Element for Mp4Demux {
             log!(&*ctx, Level::Warn, "tracks_skipped", count = tables.skipped_tracks());
         }
         // No pad is linked at the open, the start publishes again for the caption tracks that are
-        let index = self.indexed(reader.seek_index(&|_| false));
+        let index = self.indexed(reader.seek_index(&|_| false), !reader.is_fragmented());
         log!(
             &*ctx,
             Level::Info,
@@ -1242,6 +1256,12 @@ impl Element for Mp4Demux {
             self.keys_found(ctx);
             self.tell_rate(ctx);
             return flow;
+        }
+        if !self.pushed {
+            self.pushed = true;
+            if self.reader.as_ref().is_some_and(|r| !r.is_fragmented()) {
+                self.republish(ctx);
+            }
         }
         // Backpressure. Consume input only while emission keeps up.
         let drained = self.drain(ctx);

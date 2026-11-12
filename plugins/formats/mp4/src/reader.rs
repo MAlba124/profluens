@@ -519,6 +519,21 @@ impl Tables {
         self.tracks.get(track).is_some_and(up)
     }
 
+    /// Where caption track `track` joining at `point` reads from wherever it is stored, its
+    /// sample up there, else its first behind the point. None for any other track.
+    fn caption_from(&self, track: usize, point: u64) -> Option<u64> {
+        let rule = self.rules.get(track).filter(|_| self.caption(track, &|_| true))?;
+        let bound = ticks_at_or_before(point, rule.timescale);
+        let mut up = None;
+        for s in self.samples.iter().filter(|s| s.track() == track) {
+            if s.pts.saturating_add(rule.delay_ticks).max(0) > bound {
+                return up.or(Some(s.offset));
+            }
+            up = self.caption_up(track, point, s.pts).then_some(s.offset);
+        }
+        up
+    }
+
     pub fn is_fragmented(&self) -> bool {
         self.frag.is_some()
     }
@@ -1121,6 +1136,20 @@ impl Mp4Reader {
         self.buffered = 0;
         self.stream_base = to_byte;
         self.next = self.tables.samples.partition_point(|s| s.offset < to_byte);
+    }
+
+    /// Caption track `track`, rejoined, reads from its sample up at `point` where that lies
+    /// before its gate. Each sample is asked alone, so only a pulled source may go back for it.
+    /// The other tracks keep their gates and put nothing out twice.
+    pub fn rejoin_up(&mut self, track: usize, point: u64) {
+        if self.walk.is_some() || track >= MAX_TRACKS || self.off[track] {
+            return;
+        }
+        let Some(from) = self.tables.caption_from(track, point) else { return };
+        if from < self.gates[track] {
+            self.gates[track] = from;
+            self.next = self.next.min(self.tables.samples.partition_point(|s| s.offset < from));
+        }
     }
 
     /// Follow a source that restarted at `to_byte` for a seek to `point`. Each track passes

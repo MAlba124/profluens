@@ -1,5 +1,3 @@
-//! VP9 Annex B superframe splitting, spec v0.7 sections B.1 to B.4.
-
 const SUPERFRAME_MARKER: u8 = 0b110;
 
 /// Split a chunk into the `(start, end)` ranges of its frames in decode order. A

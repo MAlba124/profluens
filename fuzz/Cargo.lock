@@ -43,6 +43,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fearless_simd"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "629c9d6b6f30b5604089e0980f4d924a013aacb1654a6cdf5d3d852224f68651"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -124,12 +130,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "memchr"
+version = "2.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
 name = "pf-avi"
 version = "0.1.0"
 dependencies = [
  "pf-registry",
  "profluens-audio",
  "profluens-core",
+ "profluens-video",
 ]
 
 [[package]]
@@ -140,6 +153,13 @@ dependencies = [
  "pf-registry",
  "profluens-audio",
  "profluens-core",
+]
+
+[[package]]
+name = "pf-bitstream"
+version = "0.1.0"
+dependencies = [
+ "profluens-video",
 ]
 
 [[package]]
@@ -157,6 +177,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "pf-avi",
+ "pf-bitstream",
  "pf-flv",
  "pf-harness",
  "pf-hdr",
@@ -192,6 +213,7 @@ dependencies = [
 name = "pf-hdr"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "profluens-core",
 ]
 
@@ -231,6 +253,7 @@ dependencies = [
 name = "pf-mkv"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "pf-hdr",
  "pf-registry",
  "profluens-audio",
@@ -277,10 +300,16 @@ dependencies = [
  "pf-avi",
  "pf-bare",
  "pf-flv",
+ "pf-hdr",
  "pf-mkv",
+ "pf-mp3",
  "pf-mp4",
+ "pf-mpegts",
  "pf-ogg",
  "pf-probe",
+ "pf-ps",
+ "pf-tsdemux",
+ "profluens-audio",
  "profluens-core",
  "profluens-video",
 ]
@@ -299,6 +328,7 @@ dependencies = [
 name = "pf-probe"
 version = "0.1.0"
 dependencies = [
+ "pf-mp3",
  "profluens-core",
 ]
 
@@ -380,7 +410,10 @@ dependencies = [
 name = "pf-vaapi"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "pf-bitstream",
  "pf-hdr",
+ "pf-memory",
  "pf-registry",
  "profluens-core",
  "profluens-video",
@@ -405,6 +438,7 @@ dependencies = [
 name = "profluens-video"
 version = "0.1.0"
 dependencies = [
+ "fearless_simd",
  "libc",
  "pf-hdr",
  "pf-memory",

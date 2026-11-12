@@ -1,5 +1,3 @@
-//! VP9 uncompressed header walker, spec v0.7 section 6.2.
-
 use super::Error;
 use super::bitreader::BitReader;
 

@@ -9,14 +9,14 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use libfuzzer_sys::fuzz_target;
-use pf_vaapi::av1dec::header::{
+use pf_bitstream::av1::parse::header::{
     self, FrameHeader, FrameType, NUM_REF_FRAMES, SEGMENTATION_FEATURE_MAX, parse_frame_header,
     qindex, relative_dist, shear_valid,
 };
-use pf_vaapi::av1dec::obu::{self, Bits, leb128, next_obu, obus};
-use pf_vaapi::av1dec::refs::RefFrame;
-use pf_vaapi::av1dec::seq::{SequenceHeader, parse_sequence_header};
-use pf_vaapi::av1dec::stream::{Frame, Stream, decoded_frames};
+use pf_bitstream::av1::parse::obu::{self, Bits, leb128, next_obu, obus};
+use pf_bitstream::av1::parse::refs::RefFrame;
+use pf_bitstream::av1::parse::seq::{SequenceHeader, parse_sequence_header};
+use pf_bitstream::av1::parse::stream::{Frame, Stream, decoded_frames};
 
 fuzz_target!(|data: &[u8]| {
     let Some((&knob, rest)) = data.split_first() else {

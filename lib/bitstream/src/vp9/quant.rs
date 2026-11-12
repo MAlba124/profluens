@@ -1,6 +1,3 @@
-//! VP9 dequantizer scales, spec section 8.6.1. VA-API takes the per segment scales
-//! from the application. The tables are from the deckit VP9 decoder.
-
 static DC_QLOOKUP: [[i16; 256]; 3] = [
     [
         4, 8, 8, 9, 10, 11, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 23, 24, 25, 26, 26,

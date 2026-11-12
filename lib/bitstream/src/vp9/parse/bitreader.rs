@@ -1,5 +1,3 @@
-//! VP9 uncompressed header bit reader, spec v0.7 sections 9.1, 4.9.2 and 6.1.1.
-
 use super::Error;
 
 #[derive(Debug)]

@@ -1,6 +1,3 @@
-//! AV1 `frame_header_obu()` and `uncompressed_header()`, spec sections 5.9 and 6.8,
-//! with the section 7 processes the header depends on. Allocation free.
-
 use super::obu::{Av1Error, Bits};
 use super::refs::RefFrame;
 use super::seq::{SELECT, SequenceHeader};

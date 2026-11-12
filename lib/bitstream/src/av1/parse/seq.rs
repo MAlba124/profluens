@@ -1,5 +1,3 @@
-//! `sequence_header_obu()`, AV1 spec section 5.5, and the colour config of 5.5.2.
-
 use super::obu::{Av1Error, Bits};
 
 pub const SELECT: u8 = 2;
@@ -296,7 +294,7 @@ fn operating_points(r: &mut Bits<'_>, s: &mut SequenceHeader) -> Result<(), Av1E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::av1enc::obu::{Sequence, sequence_header};
+    use crate::av1::write::{Sequence, sequence_header};
 
     fn payload(bytes: &[u8]) -> &[u8] {
         &bytes[5..]
@@ -354,7 +352,7 @@ mod tests {
 
     #[test]
     fn a_reduced_still_picture_header_and_srgb() {
-        use crate::av1enc::obu::Bits as W;
+        use crate::av1::write::Bits as W;
         let mut w = W::default();
         w.put(1, 3); // seq_profile
         w.flag(true); // still_picture

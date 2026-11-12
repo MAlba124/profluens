@@ -1,5 +1,3 @@
-//! A temporal unit taken apart frame by frame (AV1 section 7.5). No device here.
-
 use super::header::{FrameHeader, NUM_REF_FRAMES, parse_frame_header};
 use super::obu::{self, Av1Error, Tile, in_operating_point, next_obu};
 use super::refs::{self, RefFrame};

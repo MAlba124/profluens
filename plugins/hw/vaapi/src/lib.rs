@@ -26,10 +26,9 @@ pub mod stats;
 mod tenprobe;
 pub mod va;
 pub mod vp8enc;
-pub mod vp9;
+pub use pf_bitstream::vp9::parse as vp9;
 pub mod vp9dec;
 pub mod vp9enc;
-mod vp9quant;
 pub mod vpp;
 
 #[cfg(test)]

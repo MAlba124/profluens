@@ -42,8 +42,8 @@ use crate::va::{
     Buffer as VaBuffer, Config, Context, Display, ExportedSurface, ReadbackImage, SurfaceFormat,
     Surfaces, VaError,
 };
-use crate::vp9quant::{ac_q, dc_q};
 use crate::vpp::Target;
+use pf_bitstream::vp9::{ac_q, dc_q};
 
 const FAMILY: &str = "video/raw";
 const F_WIDTH: &str = "width";

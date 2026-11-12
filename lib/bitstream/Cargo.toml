@@ -1,0 +1,12 @@
+[package]
+name = "pf-bitstream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_bitstream"
+
+[dependencies]
+profluens-video = { path = "../video" }

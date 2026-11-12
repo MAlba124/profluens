@@ -9,8 +9,8 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use libfuzzer_sys::fuzz_target;
-use pf_vaapi::vp9::superframe::{split_superframe, split_superframe_into};
-use pf_vaapi::vp9::{
+use pf_bitstream::vp9::parse::superframe::{split_superframe, split_superframe_into};
+use pf_bitstream::vp9::parse::{
     ColorSpace, FrameType, MAX_SEGMENTS, RefFrameState, SEGMENTATION_FEATURE_BITS, Vp9FrameHeader,
     parse_uncompressed_header, parse_uncompressed_header_with_refs,
 };

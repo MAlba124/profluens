@@ -5,7 +5,8 @@
 #![allow(private_bounds, private_interfaces)]
 
 pub mod layout;
-pub mod obu;
+
+pub use pf_bitstream::av1::write as obu;
 
 use std::sync::Arc;
 

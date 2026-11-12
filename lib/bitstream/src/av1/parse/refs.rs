@@ -1,5 +1,3 @@
-//! The header side of the AV1 reference slots, sections 7.20 and 7.21.
-
 use super::header::{DEFAULT_GM_PARAMS, FilmGrain, FrameHeader, FrameType, NUM_REF_FRAMES};
 use super::seq::SequenceHeader;
 

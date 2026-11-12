@@ -3,12 +3,9 @@
 //! With `apply_grain` the grained picture goes to `current_display_picture`, a second
 //! surface, while `current_frame` stays the reference.
 
-pub mod header;
-pub mod obu;
 pub mod params;
-pub mod refs;
-pub mod seq;
-pub mod stream;
+
+pub use pf_bitstream::av1::parse::{header, obu, refs, seq, stream};
 #[cfg(test)]
 mod tests;
 

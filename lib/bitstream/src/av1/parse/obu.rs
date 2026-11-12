@@ -1,6 +1,3 @@
-//! AV1 framing, spec sections 4.10, 5.3 and 5.11.1: the bit reader, the OBUs of a
-//! temporal unit in the low overhead format, and the tile group header.
-
 use std::fmt;
 
 pub const OBU_SEQUENCE_HEADER: u8 = 1;

@@ -1,5 +1,3 @@
-//! VP9 uncompressed header (spec section 6.2) and Annex B superframe split, allocation free.
-
 pub mod bitreader;
 pub mod header;
 pub mod superframe;

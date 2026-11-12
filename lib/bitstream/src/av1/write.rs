@@ -1,6 +1,3 @@
-//! The AV1 OBUs written ahead of the driver's tile data, field by field as ffmpeg's
-//! `cbs_av1` writes them. Rate control offsets count from the OBU's first byte.
-
 pub const OBU_SEQUENCE_HEADER: u8 = 1;
 pub const OBU_FRAME_HEADER: u8 = 3;
 pub const OBU_TILE_GROUP: u8 = 4;

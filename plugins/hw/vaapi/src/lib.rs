@@ -77,14 +77,16 @@ pub static ELEMENTS: Elements = &[
     &vpp::element::DESCS[0][0],
 ];
 
-/// Whether the device `caps` describes runs `desc`, one of [`ELEMENTS`], by its first offers.
+/// Whether the device `caps` describes runs `desc`, one of [`ELEMENTS`], by its first offers. A
+/// decoder by any family its sink names, it names a codec once for each framing it reads.
 pub fn usable(caps: &VaCaps, desc: &ElementDesc) -> bool {
     let first = |pads: &[PadDesc]| pads.first().and_then(|p| p.offers.first()).map(|o| o.family);
     let (sink, src) = (first(desc.sinks).unwrap_or(""), first(desc.srcs).unwrap_or(""));
+    let coded = desc.sinks.first().map_or(&[][..], |pad| pad.offers);
     match (Raw::of(sink), Raw::of(src)) {
         (Some(_), Some(_)) => caps.video_proc,
         (Some(_), None) => caps.supports_encode(src),
-        (None, _) => caps.supports(sink),
+        (None, _) => coded.iter().any(|o| caps.supports(o.family)),
     }
 }
 

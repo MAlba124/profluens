@@ -40,6 +40,7 @@ use crate::vpp::Target;
 use profluens_video::color::{self as colour, HdrStatic};
 use profluens_video::decoder::{Color, color_fields};
 use profluens_video::format::COLOR_OFFER_FIELDS;
+use profluens_video::prefixed::Framing;
 
 const FAMILY: &str = "video/raw";
 /// MaxSliceSegmentsPerPicture of level 6.2 (A.4.1 Table A.8).
@@ -75,7 +76,9 @@ static SRC_FIELDS: [FieldDesc; 13] = {
     ]
 };
 static SRC_OFFERS: [OfferDesc; 1] = [OfferDesc { family: FAMILY, fields: &SRC_FIELDS }];
-static SINK_OFFERS: [OfferDesc; 1] = [OfferDesc::any("h265/annexb")];
+// Units as stored, length prefixed and led by their configuration record, ahead of Annex B. A
+// link is made in the source's order, a source that can put out either reads this one.
+static SINK_OFFERS: [OfferDesc; 2] = [OfferDesc::any("h265/hvcc"), OfferDesc::any("h265/annexb")];
 
 static SINKS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &SINK_OFFERS }];
 static SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: &SRC_OFFERS }];
@@ -206,6 +209,8 @@ pub struct VaapiH265Dec {
     export: ExportFn,
     link: Option<(u32, u64)>,
     only: bool,
+    /// How the input is framed, by the family linked or announced.
+    framing: Framing,
     /// Pictures leave scaled into this box by the decode call, bars around them when fixed.
     shrink: Option<(Target, bool)>,
 }
@@ -258,6 +263,7 @@ impl VaapiH265Dec {
     fn with_zerocopy(zerocopy: Option<Arc<GpuFrameChannel>>) -> Self {
         VaapiH265Dec {
             only: false,
+            framing: Framing::AnnexB,
             device: None,
             display: None,
             va: None,
@@ -1568,6 +1574,8 @@ impl Element for VaapiH265Dec {
             self.tx = Some(ch.take_tx().ok_or_else(|| failed(ctx, DESC.name, K::ChannelTaken))?);
         }
         self.link = gpuframe::link_layout(ctx, ctx.negotiated_src(Self::OUT));
+        let linked = ctx.negotiated_sink(Self::IN).and_then(|f| ctx.family_name(f.family));
+        self.framing = Framing::of(linked);
         Ok(())
     }
 
@@ -1618,7 +1626,8 @@ impl Element for VaapiH265Dec {
             self.only = inbuf.flags.contains(BufferFlags::DECODE_ONLY);
             let au = inbuf.memory.data();
             let mut sc = std::mem::take(&mut self.scratch);
-            h265parse::split_nals_into(au, &mut sc.nals);
+            let head = inbuf.flags.contains(BufferFlags::HEADER);
+            h265parse::split_framed_into(au, head, &mut self.framing, &mut sc.nals);
             if self.side.gather(
                 pf_hdr::h26x::Codec::H265,
                 sc.nals.iter().map(|n| n.raw(au)),
@@ -1644,6 +1653,13 @@ impl Element for VaapiH265Dec {
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
         match event {
+            Event::FormatChange(f) => {
+                let to = self.framing.turned(ctx.family_name(f.family));
+                if to.is_lengths() != self.framing.is_lengths() {
+                    log!(&*ctx, Level::Debug, "framing", lengths = to.is_lengths());
+                }
+                self.framing = to;
+            }
             Event::FlushStart => {
                 let queued = self.output_queue.len() + usize::from(self.pending.is_some());
                 log!(&*ctx, Level::Debug, "flush", queued = queued, dpb = self.dpb.len());

@@ -17,6 +17,7 @@ pub mod h264parse;
 pub mod h265parse;
 pub mod keys;
 pub mod parse;
+pub mod prefixed;
 pub mod props;
 pub mod qos;
 pub mod rap;

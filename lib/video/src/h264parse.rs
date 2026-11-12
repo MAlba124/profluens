@@ -2,6 +2,7 @@
 
 pub use crate::bits::{BitReader, de_emulate};
 use crate::fixed::FixedList;
+use crate::prefixed::{self, Framing};
 use pf_hdr::h26x::start_code;
 
 /// A parsed NAL (7.4.1) as offsets into the access unit, header and emulation bytes included.
@@ -73,6 +74,44 @@ pub fn for_each_nal(au: &[u8], mut f: impl FnMut(Nal)) {
         open = i + 3;
     }
     push_nal(au, open, au.len(), &mut f);
+}
+
+/// The NALs of a length prefixed sample into `out`, cleared first. See [`prefixed::for_each`].
+pub fn split_prefixed_into(au: &[u8], length_size: u8, out: &mut Vec<Nal>) {
+    out.clear();
+    prefixed::for_each(au, length_size, |start, end| {
+        push_nal(au, start, end, &mut |n| out.push(n))
+    });
+}
+
+/// The parameter sets of an avcC record into `out` as offsets into it, and its NAL length size.
+/// Nothing and `None` for a record that does not parse.
+pub fn split_record_into(record: &[u8], out: &mut Vec<Nal>) -> Option<u8> {
+    out.clear();
+    let mut push = |n| out.push(n);
+    let length_size = prefixed::avcc(record, |start, end| push_nal(record, start, end, &mut push));
+    if length_size.is_none() {
+        out.clear();
+    }
+    length_size
+}
+
+/// The NALs of one buffer of a stream framed as `framing` says, into `out`. A length prefixed
+/// stream's avcC record states the length size its samples go by. It is the first buffer behind
+/// the announcement and any `head`, and gives its parameter sets. A first buffer that is no
+/// record is a sample.
+pub fn split_framed_into(au: &[u8], head: bool, framing: &mut Framing, out: &mut Vec<Nal>) {
+    match *framing {
+        Framing::AnnexB => split_nals_into(au, out),
+        Framing::Lengths { size, record } if head || record => {
+            let stated = split_record_into(au, out);
+            *framing = framing.past_record(stated);
+            if stated.is_none() && !head {
+                split_prefixed_into(au, size, out);
+            }
+        }
+        Framing::Lengths { size, .. } => split_prefixed_into(au, size, out),
+    }
 }
 
 fn push_nal(au: &[u8], start: usize, end: usize, f: &mut impl FnMut(Nal)) {
@@ -1460,6 +1499,72 @@ mod tests {
         assert_eq!(split_nals(&au), out);
         split_nals_into(&[0, 0, 1], &mut out);
         assert!(out.is_empty(), "an empty NAL is none");
+    }
+
+    #[test]
+    // Test code.
+    #[allow(clippy::disallowed_methods)]
+    fn a_unit_splits_alike_by_start_codes_and_by_lengths() {
+        let nals: [&[u8]; 3] = [&[0x67, 0xAA], &[0x06, 5, 0, 0, 3, 1], &[0x41, 0x88, 9]];
+        let annexb: Vec<u8> = nals.iter().flat_map(|n| [&[0, 0, 0, 1][..], n].concat()).collect();
+        let want = split_nals(&annexb);
+        assert_eq!(want.len(), 3);
+        for size in [1u8, 2, 4] {
+            let lead = |n: &&[u8]| (n.len() as u32).to_be_bytes()[4 - usize::from(size)..].to_vec();
+            let au: Vec<u8> = nals.iter().flat_map(|n| [&lead(n)[..], n].concat()).collect();
+            let mut out = vec![Nal { ref_idc: 0, unit_type: 0, start: 9, end: 9 }];
+            split_prefixed_into(&au, size, &mut out);
+            let kinds = |l: &[Nal]| l.iter().map(|n| (n.unit_type, n.ref_idc)).collect::<Vec<_>>();
+            assert_eq!(kinds(&out), kinds(&want), "length size {size}");
+            for (got, nal) in out.iter().zip(nals) {
+                assert_eq!(got.raw(&au), nal, "length size {size}");
+            }
+        }
+        let mut out = Vec::new();
+        split_prefixed_into(&[0, 0, 0, 0, 0, 0, 0, 1, 0x68], 4, &mut out);
+        assert_eq!(out.len(), 1, "an empty NAL is none");
+        assert_eq!(out[0].unit_type, NAL_PPS);
+    }
+
+    #[test]
+    // Test code.
+    #[allow(clippy::disallowed_methods)]
+    fn a_length_prefixed_stream_is_led_by_its_record() {
+        let (sps, pps): (&[u8], &[u8]) = (&[0x67, 100, 0, 31], &[0x68, 0xCE]);
+        // two octet lengths, one set of each
+        let mut record = vec![1, 100, 0, 31, 0xfd, 0xe1, 0, sps.len() as u8];
+        record.extend_from_slice(sps);
+        record.extend_from_slice(&[1, 0, pps.len() as u8]);
+        record.extend_from_slice(pps);
+        let mut framing = Framing::of(Some("h264/avcc"));
+        let mut out = Vec::new();
+        // unflagged, the first buffer behind the announcement
+        split_framed_into(&record, false, &mut framing, &mut out);
+        let read = Framing::Lengths { size: 2, record: false };
+        assert_eq!(framing, read);
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].raw(&record), out[0].unit_type), (sps, NAL_SPS));
+        assert_eq!((out[1].raw(&record), out[1].unit_type), (pps, NAL_PPS));
+
+        let sample = [0, 2, 0x65, 0x88, 0, 3, 0x41, 9, 9];
+        split_framed_into(&sample, false, &mut framing, &mut out);
+        assert_eq!(out.len(), 2, "by the record's length size");
+        assert_eq!((out[0].raw(&sample), out[0].unit_type), (&[0x65, 0x88][..], NAL_SLICE_IDR));
+        assert_eq!(out[1].raw(&sample), &[0x41, 9, 9]);
+
+        split_framed_into(&record, true, &mut framing, &mut out);
+        assert_eq!((out.len(), framing), (2, read), "sent again as a head, it is the record");
+        split_framed_into(&record[..9], true, &mut framing, &mut out);
+        assert_eq!((out.len(), framing), (0, read), "a head that does not parse gives nothing");
+
+        let mut bare = Framing::of(Some("h264/avcc"));
+        split_framed_into(&[0, 0, 0, 2, 0x65, 0x88], false, &mut bare, &mut out);
+        assert_eq!(out.len(), 1, "a first buffer that is no record is a sample");
+        assert_eq!(bare, Framing::Lengths { size: 4, record: false });
+
+        let mut annexb = Framing::AnnexB;
+        split_framed_into(&[0, 0, 1, 0x67, 0xAA], true, &mut annexb, &mut out);
+        assert_eq!((out.len(), annexb), (1, Framing::AnnexB), "an Annex B head is a unit");
     }
 
     #[test]

@@ -36,7 +36,7 @@ static DEMUXERS: [(Elements, &[&str]); 8] = [
 ];
 
 /// What a demuxer emits that pf does not decode to raw media, and why.
-static UNDECODED: [(&str, &str); 13] = [
+static UNDECODED: [(&str, &str); 11] = [
     ("subtitle/srt", "text cues"),
     ("subtitle/ass", "text cues"),
     ("subtitle/vtt", "text cues"),
@@ -44,8 +44,6 @@ static UNDECODED: [(&str, &str); 13] = [
     ("subtitle/pgs", "pgsdec puts out subtitle/bitmap"),
     ("subtitle/vobsub", "vobsubdec puts out subtitle/bitmap"),
     ("subtitle/dvb", "dvbsubdec puts out subtitle/bitmap"),
-    ("h264/avcc", "a remux framing, its pad offers h264/annexb too"),
-    ("h265/hvcc", "a remux framing, its pad offers h265/annexb too"),
     ("vfw", "a VFW fourcc pf does not map"),
     ("pcm", "PCM of a depth audio/raw does not name"),
     ("encrypted", "refused, no keys"),

@@ -14,7 +14,7 @@ use pf_bitstream::vp9::parse::{
     ColorSpace, FrameType, MAX_SEGMENTS, RefFrameState, SEGMENTATION_FEATURE_BITS, Vp9FrameHeader,
     parse_uncompressed_header, parse_uncompressed_header_with_refs,
 };
-use pf_vaapi::vp9dec::StreamState;
+use pf_bitstream::vp9::StreamState;
 
 fuzz_target!(|data: &[u8]| {
     let Some((&knob, rest)) = data.split_first() else {

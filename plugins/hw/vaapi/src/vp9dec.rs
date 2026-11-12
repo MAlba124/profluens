@@ -5,10 +5,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::vp9::{
-    ColorConfig, ColorSpace, FrameType, MAX_SEGMENTS, RefFrameState, SEG_LVL_MAX, Vp9FrameHeader,
-    parse_uncompressed_header_with_refs,
-};
+use crate::vp9::{ColorConfig, ColorSpace, FrameType, MAX_SEGMENTS, Vp9FrameHeader};
 
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::BufferFlags;
@@ -43,7 +40,9 @@ use crate::va::{
     Surfaces, VaError,
 };
 use crate::vpp::Target;
-use pf_bitstream::vp9::{ac_q, dc_q};
+pub use pf_bitstream::vp9::StreamState;
+use pf_bitstream::vp9::{self as bs, NUM_SLOTS};
+use pf_bitstream::{DpbError, Event as DpbEvent, Events, Slot};
 
 const FAMILY: &str = "video/raw";
 const F_WIDTH: &str = "width";
@@ -110,169 +109,7 @@ static DESC_ZEROCOPY: ElementDesc = ElementDesc {
     couplings: &[],
 };
 
-const NUM_REF_FRAMES: usize = 8;
-const SEG_LVL_ALT_Q: usize = 0;
-const SEG_LVL_ALT_L: usize = 1;
-const SEG_LVL_REF_FRAME: usize = 2;
-const SEG_LVL_SKIP: usize = 3;
-const MAX_LOOP_FILTER: i32 = 63;
-/// A superframe is almost always a hidden alt-ref and its shown frame.
 const SUPERFRAME_RESERVE: usize = 2;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RefSlot {
-    pub surface: ffi::VASurfaceID,
-    pub width: u32,
-    pub height: u32,
-}
-
-/// Public for the fuzz targets.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StreamState {
-    pub color: ColorConfig,
-    pub lf_ref_deltas: [i8; 4],
-    pub lf_mode_deltas: [i8; 2],
-    pub feature_enabled: [[bool; SEG_LVL_MAX]; MAX_SEGMENTS],
-    pub feature_data: [[i16; SEG_LVL_MAX]; MAX_SEGMENTS],
-    pub abs_or_delta_update: bool,
-    pub tree_probs: [u8; 7],
-    pub pred_probs: [u8; 3],
-}
-
-impl StreamState {
-    pub fn new() -> Self {
-        let color = ColorConfig {
-            bit_depth: 8,
-            color_space: ColorSpace::Unknown,
-            color_range_full: false,
-            subsampling_x: true,
-            subsampling_y: true,
-        };
-        let mut s = StreamState {
-            color,
-            lf_ref_deltas: [0; 4],
-            lf_mode_deltas: [0; 2],
-            feature_enabled: [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
-            feature_data: [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
-            abs_or_delta_update: false,
-            tree_probs: [255; 7],
-            pred_probs: [255; 3],
-        };
-        s.setup_past_independence();
-        s
-    }
-
-    fn setup_past_independence(&mut self) {
-        self.feature_enabled = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
-        self.feature_data = [[0; SEG_LVL_MAX]; MAX_SEGMENTS];
-        self.abs_or_delta_update = false;
-        self.lf_ref_deltas = [1, 0, -1, -1];
-        self.lf_mode_deltas = [0, 0];
-    }
-
-    pub fn fold(&mut self, h: &Vp9FrameHeader) {
-        let intra = h.frame_type == FrameType::KeyFrame || h.intra_only;
-        if intra {
-            self.color = h.color_config;
-        }
-        if intra || h.error_resilient_mode {
-            self.setup_past_independence();
-        }
-        for (held, coded) in self.lf_ref_deltas.iter_mut().zip(h.loop_filter.ref_deltas) {
-            if let Some(d) = coded {
-                *held = d;
-            }
-        }
-        for (held, coded) in self.lf_mode_deltas.iter_mut().zip(h.loop_filter.mode_deltas) {
-            if let Some(d) = coded {
-                *held = d;
-            }
-        }
-        let seg = &h.segmentation;
-        if !seg.enabled {
-            return;
-        }
-        if let Some(p) = seg.tree_probs {
-            self.tree_probs = p;
-        }
-        if let Some(p) = seg.pred_prob {
-            self.pred_probs = p;
-        }
-        if seg.update_data {
-            self.abs_or_delta_update = seg.abs_or_delta_update;
-            self.feature_enabled = seg.feature_enabled;
-            self.feature_data = seg.feature_data;
-        }
-    }
-
-    fn active(&self, h: &Vp9FrameHeader, segment: usize, feature: usize) -> bool {
-        h.segmentation.enabled && self.feature_enabled[segment][feature]
-    }
-
-    pub fn qindex(&self, h: &Vp9FrameHeader, segment: usize) -> i32 {
-        let base = i32::from(h.quantization.base_q_idx);
-        if !self.active(h, segment, SEG_LVL_ALT_Q) {
-            return base;
-        }
-        let data = i32::from(self.feature_data[segment][SEG_LVL_ALT_Q]);
-        let q = if self.abs_or_delta_update { data } else { base + data };
-        q.clamp(0, 255)
-    }
-
-    /// `LvlLookup` of section 8.8.1. Level 0 is not filtered at all (section 8.4.1).
-    pub fn filter_levels(&self, h: &Vp9FrameHeader, segment: usize) -> [[u8; 2]; 4] {
-        let lf = &h.loop_filter;
-        let level = i32::from(lf.level);
-        if level == 0 {
-            return [[0; 2]; 4];
-        }
-        let mut seg_level = level;
-        if self.active(h, segment, SEG_LVL_ALT_L) {
-            let data = i32::from(self.feature_data[segment][SEG_LVL_ALT_L]);
-            seg_level = if self.abs_or_delta_update { data } else { level + data };
-            seg_level = seg_level.clamp(0, MAX_LOOP_FILTER);
-        }
-        if !lf.delta_enabled {
-            return [[seg_level as u8; 2]; 4];
-        }
-        let shift = level >> 5;
-        let clip = |v: i32| v.clamp(0, MAX_LOOP_FILTER) as u8;
-        let mut out = [[0u8; 2]; 4];
-        // INTRA_FRAME reads mode 0 only, mode 1 gets the same level.
-        let intra = clip(seg_level + (i32::from(self.lf_ref_deltas[0]) << shift));
-        out[0] = [intra, intra];
-        for (r, row) in out.iter_mut().enumerate().skip(1) {
-            for (m, cell) in row.iter_mut().enumerate() {
-                let ref_delta = i32::from(self.lf_ref_deltas[r]) << shift;
-                let mode_delta = i32::from(self.lf_mode_deltas[m]) << shift;
-                *cell = clip(seg_level + ref_delta + mode_delta);
-            }
-        }
-        out
-    }
-}
-
-impl Default for StreamState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub(crate) fn parse_header(
-    frame: &[u8],
-    slots: &[Option<RefSlot>; NUM_REF_FRAMES],
-    state: &StreamState,
-) -> Result<Vp9FrameHeader, crate::vp9::Error> {
-    let mut dims = [(0u32, 0u32); NUM_REF_FRAMES];
-    for (d, s) in dims.iter_mut().zip(slots) {
-        if let Some(s) = s {
-            *d = (s.width, s.height);
-        }
-    }
-    let refs = RefFrameState { ref_dims: &dims, color_config: state.color };
-    parse_uncompressed_header_with_refs(frame, Some(refs))
-}
 
 pub(crate) fn pic_fields(h: &Vp9FrameHeader) -> u32 {
     let flag = |b: bool, bit: u32| if b { bit } else { 0 };
@@ -306,24 +143,10 @@ pub(crate) fn pic_fields(h: &Vp9FrameHeader) -> u32 {
     v
 }
 
-pub(crate) fn refresh_slots(
-    slots: &mut [Option<RefSlot>; NUM_REF_FRAMES],
-    flags: u8,
-    new: RefSlot,
-) -> [Option<RefSlot>; NUM_REF_FRAMES] {
-    let mut old = [None; NUM_REF_FRAMES];
-    for (i, slot) in slots.iter_mut().enumerate() {
-        if (flags >> i) & 1 == 1 {
-            old[i] = slot.replace(new);
-        }
-    }
-    old
-}
-
 pub(crate) fn pic_param(
     h: &Vp9FrameHeader,
     state: &StreamState,
-    refs: [ffi::VASurfaceID; NUM_REF_FRAMES],
+    refs: [ffi::VASurfaceID; NUM_SLOTS],
 ) -> ffi::VADecPictureParameterBufferVP9 {
     ffi::VADecPictureParameterBufferVP9 {
         frame_width: h.frame_width as u16,
@@ -350,24 +173,21 @@ pub(crate) fn segment_param(
     state: &StreamState,
     segment: usize,
 ) -> ffi::VASegmentParameterVP9 {
-    let bd = h.color_config.bit_depth;
-    let q = state.qindex(h, segment);
-    let quant = &h.quantization;
+    let g = state.segment(h, segment);
     let mut flags = 0u16;
-    if state.active(h, segment, SEG_LVL_REF_FRAME) {
-        let r = state.feature_data[segment][SEG_LVL_REF_FRAME] as u16 & 3;
-        flags |= ffi::VP9_SEG_REFERENCE_ENABLED | (r << ffi::VP9_SEG_REFERENCE_SHIFT);
+    if let Some(r) = g.reference {
+        flags |= ffi::VP9_SEG_REFERENCE_ENABLED | (u16::from(r) << ffi::VP9_SEG_REFERENCE_SHIFT);
     }
-    if state.active(h, segment, SEG_LVL_SKIP) {
+    if g.skipped {
         flags |= ffi::VP9_SEG_REFERENCE_SKIPPED;
     }
     ffi::VASegmentParameterVP9 {
         segment_flags: flags,
-        filter_level: state.filter_levels(h, segment),
-        luma_ac_quant_scale: ac_q(bd, q),
-        luma_dc_quant_scale: dc_q(bd, q + i32::from(quant.delta_q_y_dc)),
-        chroma_ac_quant_scale: ac_q(bd, q + i32::from(quant.delta_q_uv_ac)),
-        chroma_dc_quant_scale: dc_q(bd, q + i32::from(quant.delta_q_uv_dc)),
+        filter_level: g.filter_level,
+        luma_ac_quant_scale: g.luma_ac_quant_scale as i16,
+        luma_dc_quant_scale: g.luma_dc_quant_scale as i16,
+        chroma_ac_quant_scale: g.chroma_ac_quant_scale as i16,
+        chroma_dc_quant_scale: g.chroma_dc_quant_scale as i16,
         va_reserved: [0; ffi::VA_PADDING_LOW],
     }
 }
@@ -501,9 +321,11 @@ pub struct VaapiVp9Dec {
     display: Option<Display>,
     device: Option<PathBuf>,
 
-    slots: [Option<RefSlot>; NUM_REF_FRAMES],
-    state: StreamState,
-    awaiting_key: bool,
+    dpb: Box<bs::Dpb>,
+    /// the VA surface of each DPB slot
+    surfaces: Vec<ffi::VASurfaceID>,
+    /// per slot, held by a reference slot
+    held: Vec<bool>,
     ranges: Vec<(usize, usize)>,
     output_queue: VecDeque<PendingOut>,
     side: crate::colour::HdrCarry,
@@ -567,9 +389,9 @@ impl VaapiVp9Dec {
             va: None,
             display: None,
             device: None,
-            slots: [None; NUM_REF_FRAMES],
-            state: StreamState::new(),
-            awaiting_key: true,
+            dpb: Box::new(bs::Dpb::new()),
+            surfaces: Vec::new(),
+            held: Vec::new(),
             ranges: Vec::with_capacity(8),
             output_queue: VecDeque::with_capacity(16),
             side: crate::colour::HdrCarry::new(),
@@ -697,7 +519,7 @@ impl VaapiVp9Dec {
             return false;
         };
         let count = crate::va::decode_surface_count(
-            NUM_REF_FRAMES as u32,
+            NUM_SLOTS as u32,
             SUPERFRAME_RESERVE as u32,
             self.zerocopy.is_some(),
         );
@@ -773,7 +595,11 @@ impl VaapiVp9Dec {
     }
 
     fn teardown_session(&mut self, ctx: &Ctx) {
-        self.slots = [None; NUM_REF_FRAMES];
+        // the key frame refreshes every slot, the state it folded stays
+        let mut ev = Events::new();
+        self.dpb.drop_slots(&mut ev);
+        self.surfaces.clear();
+        self.held.clear();
         if !self.output_queue.is_empty() {
             log!(ctx, Level::Debug, "teardown_drop", queued = self.output_queue.len());
         }
@@ -793,7 +619,7 @@ impl VaapiVp9Dec {
     }
 
     fn surface_referenced(&self, id: ffi::VASurfaceID) -> bool {
-        self.slots.iter().flatten().any(|s| s.surface == id)
+        self.surfaces.iter().zip(&self.held).any(|(&s, &held)| held && s == id)
             || self.output_queue.iter().any(|o| o.surface == id)
             || self.in_flight.iter().any(|(s, _)| *s == id)
     }
@@ -823,27 +649,28 @@ impl VaapiVp9Dec {
     }
 
     fn decode_frame(&mut self, ctx: &mut Ctx, frame: &[u8], pts: Timestamp, duration: Timestamp) {
-        let h = match parse_header(frame, &self.slots, &self.state) {
+        let h = match self.dpb.parse(frame) {
             Ok(h) => h,
             Err(_) => {
-                if !self.awaiting_key {
+                if !self.dpb.awaits_key() {
                     self.warn(ctx, K::Vp9Header);
                 }
-                self.awaiting_key = true;
+                self.dpb.await_key();
                 return;
             }
         };
-        if self.awaiting_key && h.frame_type != FrameType::KeyFrame {
+        if self.dpb.awaits_key() && h.frame_type != FrameType::KeyFrame {
             log!(&*ctx, Level::Trace, "await_key", pts = pts);
             return;
         }
+        let mut ev = Events::new();
         if h.show_existing_frame {
-            let idx = h.frame_to_show_map_idx.unwrap_or(0);
-            match self.slots[usize::from(idx & 7)] {
-                Some(slot) => {
-                    self.queue_output(ctx, slot.surface, slot.width, slot.height, pts, duration)
+            match self.dpb.begin(&h, &mut ev) {
+                Ok(_) => self.apply(ctx, &ev, None, pts, duration),
+                Err(_) => {
+                    let slot = h.frame_to_show_map_idx.unwrap_or(0);
+                    self.warn(ctx, K::EmptyRefSlot { slot });
                 }
-                None => self.warn(ctx, K::EmptyRefSlot { slot: idx }),
             }
             return;
         }
@@ -858,7 +685,7 @@ impl VaapiVp9Dec {
                     subsampling_y: cc.subsampling_y,
                 },
             );
-            self.awaiting_key = true;
+            self.dpb.await_key();
             return;
         }
         // `frame_header_length_in_bytes` is a byte, and the compressed header is never empty
@@ -869,43 +696,91 @@ impl VaapiVp9Dec {
             || h.uncompressed_header_size_bytes + compressed > frame.len()
         {
             self.warn(ctx, K::Vp9Header);
-            self.awaiting_key = true;
+            self.dpb.await_key();
             return;
         }
-        if let Some(idx) = h.ref_frame_idx
-            && let Some(&i) = idx.iter().find(|&&i| self.slots[usize::from(i)].is_none())
-        {
-            self.warn(ctx, K::EmptyRefSlot { slot: i });
-            self.awaiting_key = true;
+        // takes the frame's state, a slot it names empty refuses it
+        if let Err(e) = self.dpb.begin(&h, &mut ev) {
+            let empty = |i: &&u8| self.dpb.slots()[usize::from(**i & 7)].is_none();
+            match h.ref_frame_idx.as_ref().and_then(|idx| idx.iter().find(empty)) {
+                Some(&slot) if e == DpbError::MissingReference => {
+                    self.warn(ctx, K::EmptyRefSlot { slot })
+                }
+                _ => self.warn(ctx, K::Dpb(e)),
+            }
+            self.dpb.await_key();
             return;
         }
         if !self.ensure_va(ctx, &h) {
-            self.awaiting_key = true;
+            self.dpb.await_key();
             return;
         }
         let Some(target) = self.acquire_surface() else {
             self.warn(ctx, K::NoFreeSurface);
-            self.awaiting_key = true;
+            self.dpb.await_key();
             return;
         };
-        self.state.fold(&h);
         if let Err(e) = self.submit(&h, frame, target) {
             self.picture_failed(ctx, &e, K::Submit(e));
             self.release_if_unreferenced(target);
-            self.awaiting_key = true;
+            self.dpb.await_key();
             return;
         }
-        self.awaiting_key = false;
+        let slot = self.slot_of(target);
+        self.held[usize::from(slot.0)] = true;
+        self.dpb.end(&h, slot, &mut ev);
+        let cur = (slot, h.frame_width, h.frame_height);
+        self.apply(ctx, &ev, Some(cur), pts, duration);
+    }
 
-        let new = RefSlot { surface: target, width: h.frame_width, height: h.frame_height };
-        let old = refresh_slots(&mut self.slots, h.refresh_frame_flags, new);
-        if h.show_frame {
-            self.queue_output(ctx, target, h.frame_width, h.frame_height, pts, duration);
+    /// Carries out what the DPB asked. A picture goes out with the current frame's timestamps,
+    /// `cur` the frame decoded now and its size.
+    fn apply(
+        &mut self,
+        ctx: &mut Ctx,
+        ev: &Events,
+        cur: Option<(Slot, u32, u32)>,
+        pts: Timestamp,
+        duration: Timestamp,
+    ) {
+        for e in ev.as_slice() {
+            match *e {
+                DpbEvent::Output(slot) => {
+                    let size = match cur {
+                        Some((s, w, h)) if s == slot => Some((w, h)),
+                        _ => self
+                            .dpb
+                            .slots()
+                            .iter()
+                            .flatten()
+                            .find(|r| r.slot == slot)
+                            .map(|r| (r.width, r.height)),
+                    };
+                    if let Some((w, h)) = size {
+                        let surface = self.surfaces[usize::from(slot.0)];
+                        self.queue_output(ctx, surface, w, h, pts, duration);
+                    }
+                }
+                DpbEvent::Release(slot) => {
+                    let i = usize::from(slot.0);
+                    self.held[i] = false;
+                    self.release_if_unreferenced(self.surfaces[i]);
+                }
+            }
         }
-        for o in old.into_iter().flatten() {
-            self.release_if_unreferenced(o.surface);
-        }
-        self.release_if_unreferenced(target);
+    }
+
+    /// The DPB's name of surface `id`, a slot per surface seen.
+    fn slot_of(&mut self, id: ffi::VASurfaceID) -> Slot {
+        let i = match self.surfaces.iter().position(|&s| s == id) {
+            Some(i) => i,
+            None => {
+                self.surfaces.push(id);
+                self.held.push(false);
+                self.surfaces.len() - 1
+            }
+        };
+        Slot(i as u16)
     }
 
     fn submit(
@@ -917,14 +792,15 @@ impl VaapiVp9Dec {
         let (Some(display), Some(va)) = (&self.display, &self.va) else {
             return Ok(());
         };
-        let mut refs = [ffi::VA_INVALID_SURFACE; NUM_REF_FRAMES];
-        for (r, s) in refs.iter_mut().zip(&self.slots) {
+        let mut refs = [ffi::VA_INVALID_SURFACE; NUM_SLOTS];
+        for (r, s) in refs.iter_mut().zip(self.dpb.slots()) {
             if let Some(s) = s {
-                *r = s.surface;
+                *r = self.surfaces[usize::from(s.slot.0)];
             }
         }
-        let pic = pic_param(h, &self.state, refs);
-        let slice = slice_param(h, &self.state, frame.len());
+        let state = self.dpb.state();
+        let pic = pic_param(h, state, refs);
+        let slice = slice_param(h, state, frame.len());
         let pic_buf =
             VaBuffer::new_struct(display, &va.context, ffi::VAPictureParameterBufferType, &pic)?;
         let slice_buf =
@@ -986,7 +862,7 @@ impl VaapiVp9Dec {
             coded_w,
             coded_h,
             format: va.format,
-            color: stated_color(&self.state.color),
+            color: stated_color(&self.dpb.state().color),
             preview,
         });
     }
@@ -1248,15 +1124,18 @@ impl VaapiVp9Dec {
     }
 
     fn reset_stream(&mut self) {
-        let slots = std::mem::replace(&mut self.slots, [None; NUM_REF_FRAMES]);
         while let Some(o) = self.output_queue.pop_front() {
             self.release_if_unreferenced(o.surface);
         }
-        for s in slots.into_iter().flatten() {
-            self.release_if_unreferenced(s.surface);
+        let mut ev = Events::new();
+        self.dpb.discard(&mut ev);
+        for e in ev.as_slice() {
+            if let DpbEvent::Release(slot) = *e {
+                let i = usize::from(slot.0);
+                self.held[i] = false;
+                self.release_if_unreferenced(self.surfaces[i]);
+            }
         }
-        self.state = StreamState::new();
-        self.awaiting_key = true;
     }
 
     fn drain_all(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
@@ -1391,9 +1270,9 @@ impl Element for VaapiVp9Dec {
         }
         self.in_flight.clear();
         self.output_queue.clear();
-        self.slots = [None; NUM_REF_FRAMES];
-        self.state = StreamState::new();
-        self.awaiting_key = true;
+        *self.dpb = bs::Dpb::new();
+        self.surfaces.clear();
+        self.held.clear();
         self.first.reset();
         self.va = None;
         self.display = None;
@@ -1404,6 +1283,7 @@ impl Element for VaapiVp9Dec {
 mod tests {
     use super::*;
     use crate::bitwriter::BitWriter;
+    use pf_bitstream::vp9::{SEG_LVL_ALT_Q, ac_q, dc_q};
 
     fn signed(w: &mut BitWriter, v: i32, n: u32) {
         w.u(v.unsigned_abs(), n);
@@ -1582,8 +1462,24 @@ mod tests {
         w.into_bytes()
     }
 
-    fn slot(surface: u32, width: u32, height: u32) -> Option<RefSlot> {
-        Some(RefSlot { surface, width, height })
+    fn slot(_surface: u32, width: u32, height: u32) -> Option<(u32, u32)> {
+        Some((width, height))
+    }
+
+    /// The header as the element parses it against slots of these sizes.
+    fn parse_header(
+        frame: &[u8],
+        slots: &[Option<(u32, u32)>; 8],
+        state: &StreamState,
+    ) -> Result<Vp9FrameHeader, crate::vp9::Error> {
+        let mut dims = [(0u32, 0u32); 8];
+        for (d, s) in dims.iter_mut().zip(slots) {
+            if let Some(s) = s {
+                *d = *s;
+            }
+        }
+        let refs = crate::vp9::RefFrameState { ref_dims: &dims, color_config: state.color };
+        crate::vp9::parse_uncompressed_header_with_refs(frame, Some(refs))
     }
 
     fn feature_key_frame() -> (Vp9FrameHeader, StreamState) {
@@ -1798,22 +1694,6 @@ mod tests {
         let mut bad_sync = key.clone();
         bad_sync[1] ^= 0x10;
         assert!(parse_header(&bad_sync, &[None; 8], &state).is_err(), "sync code");
-    }
-
-    #[test]
-    fn refresh_flags_name_the_slots() {
-        let mut slots = [None; 8];
-        let a = RefSlot { surface: 1, width: 64, height: 64 };
-        assert_eq!(refresh_slots(&mut slots, 0xFF, a), [None; 8]);
-        let b = RefSlot { surface: 2, width: 32, height: 32 };
-        let old = refresh_slots(&mut slots, 0b1000_0001, b);
-        assert_eq!(old[0], Some(a));
-        assert_eq!(old[7], Some(a));
-        assert_eq!(old[1..7], [None; 6]);
-        assert_eq!(slots[0], Some(b));
-        assert_eq!(slots[3], Some(a));
-        assert_eq!(slots[7], Some(b));
-        assert_eq!(refresh_slots(&mut slots, 0, a), [None; 8]);
     }
 
     #[test]

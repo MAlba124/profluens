@@ -37,6 +37,8 @@ use crate::va::{
     SurfaceFormat, Surfaces,
 };
 use crate::vpp::Target;
+use pf_bitstream::h265::{self as bs, RpsSet, Seq};
+use pf_bitstream::{Event as DpbEvent, Events, Fate, Slot};
 use profluens_video::color::{self as colour, HdrStatic};
 use profluens_video::decoder::{Color, color_fields};
 use profluens_video::format::COLOR_OFFER_FIELDS;
@@ -112,15 +114,6 @@ static DESC_ZEROCOPY: ElementDesc = ElementDesc {
     couplings: &[],
 };
 
-#[derive(Clone)]
-struct DpbEntry {
-    surface: ffi::VASurfaceID,
-    poc: i32,
-    long_term: bool,
-    rps_flag: u32,
-    in_rps: bool,
-}
-
 struct PendingOut {
     surface: ffi::VASurfaceID,
     /// What is exported, the surface or its twin, the geometry below is its.
@@ -172,15 +165,18 @@ pub struct VaapiH265Dec {
     pps: [Option<Arc<Pps>>; 64],
     scratch: AuScratch,
 
-    dpb: Vec<DpbEntry>,
-    poc: h265parse::PocState,
+    dpb: Box<bs::Dpb>,
+    /// the VA surface of each DPB slot
+    slots: Vec<ffi::VASurfaceID>,
+    /// per slot, held by the DPB
+    held: Vec<bool>,
+    /// per slot, the picture to put out when the DPB lets it go, none when it is not shown
+    outs: Vec<Option<PendingOut>>,
+    /// pictures due, in output order
     output_queue: VecDeque<PendingOut>,
-    output_key: std::collections::HashMap<ffi::VASurfaceID, (u32, i32)>,
-    gop: u32,
     pending: Option<PendingOut>,
-
-    skip_rasl: bool,
-    awaiting_irap: bool,
+    /// decode sessions opened, one opened mid sequence waits for an IRAP
+    sessions: u32,
 
     shape: Option<(u32, u32, u64, u32, Color)>,
     hdr: HdrStatic,
@@ -188,13 +184,11 @@ pub struct VaapiH265Dec {
     dims: Option<(u32, u32)>,
     alloc_stalled: bool,
     ended: bool,
-    seq_end: bool,
     disabled: bool,
     failed: bool,
     transient: Transient,
     warned: Warned,
     emitted: u64,
-    lead: Lead,
 
     zerocopy: Option<Arc<GpuFrameChannel>>,
     stats: Arc<Stats>,
@@ -270,27 +264,24 @@ impl VaapiH265Dec {
             retired: Vec::new(),
             sps: std::array::from_fn(|_| None),
             pps: std::array::from_fn(|_| None),
-            dpb: Vec::new(),
-            poc: h265parse::PocState::new(),
+            dpb: Box::new(bs::Dpb::new()),
+            slots: Vec::new(),
+            held: Vec::new(),
+            outs: Vec::new(),
             output_queue: VecDeque::new(),
-            output_key: std::collections::HashMap::new(),
-            gop: 0,
             pending: None,
-            skip_rasl: false,
-            awaiting_irap: true,
+            sessions: 0,
             shape: None,
             hdr: HdrStatic::default(),
             side: crate::colour::HdrCarry::new(),
             dims: None,
             alloc_stalled: false,
             ended: false,
-            seq_end: false,
             disabled: false,
             failed: false,
             transient: Transient::default(),
             warned: Warned::default(),
             emitted: 0,
-            lead: Lead::Off,
             zerocopy,
             stats: Arc::default(),
             tx: None,
@@ -499,6 +490,7 @@ impl VaapiH265Dec {
             coded_h,
             count,
         });
+        self.sessions = self.sessions.wrapping_add(1);
         self.dims = Some((width, height));
         true
     }
@@ -526,8 +518,6 @@ impl VaapiH265Dec {
     /// with VA_STATUS_ERROR_INVALID_SURFACE. So the session lives until no holder names its
     /// surfaces.
     fn retire_session(&mut self) {
-        self.dpb.clear();
-        self.awaiting_irap = true;
         if let Some(va) = self.va.take() {
             self.retired.push(va);
         }
@@ -546,7 +536,7 @@ impl VaapiH265Dec {
     }
 
     fn surface_referenced(&self, id: ffi::VASurfaceID) -> bool {
-        self.dpb.iter().any(|e| e.surface == id)
+        self.slots.iter().zip(&self.held).any(|(&s, &held)| held && s == id)
             || self.output_queue.iter().any(|o| o.surface == id)
             || self.pending.as_ref().is_some_and(|o| o.surface == id)
             || self.in_flight.contains_key(&id)
@@ -566,9 +556,24 @@ impl VaapiH265Dec {
         duration: Timestamp,
         sc: &mut AuScratch,
     ) {
-        self.seq_end =
-            sc.nals.iter().any(|n| matches!(n.nal_type, h265parse::NAL_EOS | h265parse::NAL_EOB));
+        self.decode_picture(ctx, au, pts, duration, sc);
+        // an end of sequence lets every picture out, the next IRAP starts anew
+        if sc.nals.iter().any(|n| bs::is_eos(n.nal_type)) {
+            let mut ev = Events::new();
+            self.dpb.flush(&mut ev);
+            self.apply(&ev);
+            self.dpb.end_of_sequence();
+        }
+    }
 
+    fn decode_picture(
+        &mut self,
+        ctx: &mut Ctx,
+        au: &[u8],
+        pts: Timestamp,
+        duration: Timestamp,
+        sc: &mut AuScratch,
+    ) {
         for nal in &sc.nals {
             match nal.nal_type {
                 h265parse::NAL_SPS => match h265parse::parse_sps(nal.raw(au)) {
@@ -596,20 +601,18 @@ impl VaapiH265Dec {
         }
         let first = sc.slices[0];
         let nal_type = first.nal_type;
-        let temporal_id = first.temporal_id;
-        let is_idr = h265parse::is_idr(nal_type);
         let is_irap = h265parse::is_irap(nal_type);
 
-        if self.awaiting_irap && !is_irap {
-            log!(&*ctx, Level::Trace, "await_irap", pts = pts, nal_type = nal_type);
-            return; // wait for a clean random-access point
-        }
-        if h265parse::is_rasl(nal_type) && self.skip_rasl {
-            log!(&*ctx, Level::Trace, "skip_rasl", pts = pts);
+        if self.dpb.skips(nal_type) {
+            if h265parse::is_rasl(nal_type) {
+                log!(&*ctx, Level::Trace, "skip_rasl", pts = pts);
+            } else {
+                log!(&*ctx, Level::Trace, "await_irap", pts = pts, nal_type = nal_type);
+            }
             return;
         }
 
-        let Some(pps_id) = peek_pps_id(first.raw(au), is_irap) else {
+        let Some(pps_id) = bs::peek_pps_id(first.raw(au), is_irap) else {
             self.warn(ctx, K::PpsIdUnreadable);
             return;
         };
@@ -661,24 +664,28 @@ impl VaapiH265Dec {
         }
         let sh0 = &sc.headers[0];
 
-        let cvs = is_irap && (is_idr || h265parse::is_bla(nal_type) || self.awaiting_irap);
+        let inter = sc.headers.iter().any(|h| h.slice_type.is_inter());
+        let mut ev = Events::new();
+        let begun = self.dpb.begin(&Seq::of(&sps), &first, sh0, inter, &mut ev);
+        self.apply(&ev);
+        let mut p = match begun {
+            Ok(p) if p.fate == Fate::Skip => return,
+            Ok(p) => p,
+            Err(e) => {
+                self.warn(ctx, K::Dpb(e));
+                return;
+            }
+        };
+        let cvs = p.irap && p.no_rasl_output;
+        let sessions = self.sessions;
         if !self.ensure_va(ctx, &sps, cvs) {
             return;
         }
-
-        let no_rasl_output = is_idr || h265parse::is_bla(nal_type) || self.awaiting_irap;
-        if is_irap && no_rasl_output {
-            self.reset_dpb();
-            self.gop = self.gop.wrapping_add(1);
+        if self.sessions != sessions && !cvs {
+            // the references are the old session's, decoding waits for the next IRAP
+            self.discard_dpb();
+            return;
         }
-        if is_irap {
-            self.skip_rasl = no_rasl_output;
-        }
-        self.awaiting_irap = false;
-
-        let poc = self.poc.compute(&sps, sh0, is_idr, is_irap && no_rasl_output, temporal_id);
-
-        self.apply_rps(&sps, sh0, poc, is_idr);
 
         let Some(target) = self.acquire_surface() else {
             self.warn(ctx, K::NoFreeSurface);
@@ -706,7 +713,7 @@ impl VaapiH265Dec {
             &sc.slices,
             au,
             target,
-            poc,
+            &p,
             nal_type,
             &mut sc.buffers,
         ) {
@@ -715,23 +722,20 @@ impl VaapiH265Dec {
             return;
         }
 
-        self.dpb.push(DpbEntry {
-            surface: target,
-            poc,
-            long_term: false,
-            rps_flag: 0,
-            in_rps: true,
-        });
-
         let preview = before && !self.only && sh0.pic_output_flag && ctx.take_preview();
-        if sh0.pic_output_flag && self.lead.leads(self.gop, poc) {
+        if p.fate == Fate::Hidden && sh0.pic_output_flag {
             log!(&*ctx, Level::Trace, "before_lead", pts = pts);
             ctx.count_drop();
-        } else if before && sh0.pic_output_flag && !preview {
+        } else if p.fate == Fate::Shown && before && !preview {
             log!(&*ctx, Level::Trace, "decode_only", pts = pts);
             ctx.count_drop();
-        } else if sh0.pic_output_flag {
-            self.output_queue.push_back(PendingOut {
+            p.fate = Fate::Hidden;
+        }
+        let slot = self.slot_of(target);
+        let i = slot.0 as usize;
+        self.held[i] = true;
+        if p.fate == Fate::Shown {
+            self.outs[i] = Some(PendingOut {
                 surface: target,
                 export,
                 pts,
@@ -747,99 +751,55 @@ impl VaapiH265Dec {
                 preview,
                 intra: sc.headers.iter().all(|h| h.slice_type == SliceType::I),
             });
-            self.reorder_output(target, poc);
-            if is_irap && self.lead == Lead::Flushed && self.pending.is_none() {
-                self.pending = self.output_queue.pop_front();
-                self.lead = Lead::Out(self.gop, poc);
-            }
         }
-        if is_irap && self.lead == Lead::Flushed {
-            self.lead = Lead::Off;
-        }
-        self.maybe_bump(&sps);
-    }
-
-    fn apply_rps(&mut self, sps: &Sps, sh: &SliceHeader, cur_poc: i32, is_idr: bool) {
-        for e in &mut self.dpb {
-            (e.rps_flag, e.in_rps) = (0, false);
-        }
-        if is_idr {
-            return;
-        }
-
-        let max_poc_lsb = sps.max_poc_lsb();
-
-        let st = sh
-            .st_rps
-            .delta_poc_s0
-            .iter()
-            .zip(&sh.st_rps.used_s0)
-            .map(|e| (e, ffi::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE));
-        let st = st.chain(
-            sh.st_rps
-                .delta_poc_s1
-                .iter()
-                .zip(&sh.st_rps.used_s1)
-                .map(|e| (e, ffi::VA_PICTURE_HEVC_RPS_ST_CURR_AFTER)),
-        );
-        for ((delta, used), flag) in st {
-            let ref_poc = cur_poc.wrapping_add(*delta);
-            if let Some(e) = self.dpb.iter_mut().find(|e| e.poc == ref_poc) {
-                (e.rps_flag, e.long_term, e.in_rps) = (if *used { flag } else { 0 }, false, true);
-            }
-        }
-        for lt in &sh.long_term_refs {
-            let target_lsb = lt.poc_lsb as i32;
-            let found = if lt.delta_poc_msb_present {
-                let cur_lsb = ((cur_poc % max_poc_lsb) + max_poc_lsb) % max_poc_lsb;
-                // Eq. 8-5 in i64, the accumulated cycle times MaxPocLsb passes i32.
-                let target = i64::from(cur_poc)
-                    - i64::from(lt.delta_poc_msb_cycle) * i64::from(max_poc_lsb)
-                    - i64::from(cur_lsb - target_lsb);
-                self.dpb.iter_mut().find(|e| i64::from(e.poc) == target)
-            } else {
-                self.dpb
-                    .iter_mut()
-                    .find(|e| (e.poc % max_poc_lsb + max_poc_lsb) % max_poc_lsb == target_lsb)
-            };
-            if let Some(e) = found {
-                let flag = if lt.used_by_curr_pic { ffi::VA_PICTURE_HEVC_RPS_LT_CURR } else { 0 };
-                (e.rps_flag, e.long_term, e.in_rps) = (flag, true, true);
-            }
-        }
-
-        while let Some(at) = self.dpb.iter().position(|e| !e.in_rps) {
-            let e = self.dpb.remove(at);
-            self.release_if_unreferenced(e.surface);
-        }
-    }
-
-    fn reorder_output(&mut self, surface: ffi::VASurfaceID, poc: i32) {
-        self.output_key.insert(surface, (self.gop, poc));
-        let mut i = self.output_queue.len().saturating_sub(1);
-        while i > 0 {
-            let a = self.output_queue[i - 1].surface;
-            let b = self.output_queue[i].surface;
-            let ka = *self.output_key.get(&a).unwrap_or(&(u32::MAX, i32::MAX));
-            let kb = *self.output_key.get(&b).unwrap_or(&(u32::MAX, i32::MAX));
-            if ka > kb {
-                self.output_queue.swap(i - 1, i);
-                i -= 1;
-            } else {
-                break;
+        let mut ev = Events::new();
+        match self.dpb.end(&p, slot, &mut ev) {
+            Ok(()) => self.apply(&ev),
+            Err(e) => {
+                (self.held[i], self.outs[i]) = (false, None);
+                self.release_if_unreferenced(target);
+                self.warn(ctx, K::Dpb(e));
             }
         }
     }
 
-    fn maybe_bump(&mut self, sps: &Sps) {
-        let budget = if self.seq_end { 0 } else { sps.reorder_frames() as usize };
-        while self.output_queue.len() > budget && self.pending.is_none() {
-            if let Some(out) = self.output_queue.pop_front() {
-                self.pending = Some(out);
-            } else {
-                break;
+    /// Carries out what the DPB asked, in order.
+    fn apply(&mut self, ev: &Events) {
+        for e in ev.as_slice() {
+            match *e {
+                DpbEvent::Output(slot) => {
+                    if let Some(out) = self.outs[slot.0 as usize].take() {
+                        self.output_queue.push_back(out);
+                    }
+                }
+                DpbEvent::Release(slot) => {
+                    let i = slot.0 as usize;
+                    (self.held[i], self.outs[i]) = (false, None);
+                    self.release_if_unreferenced(self.slots[i]);
+                }
             }
         }
+    }
+
+    /// The DPB's name of surface `id`, a slot per surface seen.
+    fn slot_of(&mut self, id: ffi::VASurfaceID) -> Slot {
+        let i = match self.slots.iter().position(|&s| s == id) {
+            Some(i) => i,
+            None => {
+                self.slots.push(id);
+                self.held.push(false);
+                self.outs.push(None);
+                self.slots.len() - 1
+            }
+        };
+        Slot(i as u16)
+    }
+
+    /// Lets go of every picture the DPB holds, those waiting for output unseen.
+    fn discard_dpb(&mut self) {
+        let mut ev = Events::new();
+        self.dpb.discard(&mut ev);
+        self.apply(&ev);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -851,7 +811,7 @@ impl VaapiH265Dec {
         slice_nals: &[Nal],
         au: &[u8],
         target: ffi::VASurfaceID,
-        cur_poc: i32,
+        p: &bs::Picture,
         nal_type: u8,
         keep: &mut Vec<VaBuffer>,
     ) -> Result<(), crate::va::VaError> {
@@ -863,28 +823,29 @@ impl VaapiH265Dec {
         let mut pic = zeroed_pic_param_hevc();
         pic.CurrPic = ffi::VAPictureHEVC {
             picture_id: target,
-            pic_order_cnt: cur_poc,
+            pic_order_cnt: p.poc,
             flags: 0,
             va_reserved: [0; ffi::VA_PADDING_LOW],
         };
         pic.ReferenceFrames = [ffi::VAPictureHEVC::invalid(); 15];
-        let mut ref_index: [(ffi::VASurfaceID, u8); 15] = [(0, 0); 15];
-        let mut ref_index_len = 0usize;
-        for (i, e) in self.dpb.iter().filter(|e| e.in_rps).take(15).enumerate() {
-            let mut flags = e.rps_flag;
-            if e.long_term {
+        // the DPB in its order, the lists index it
+        for (i, r) in self.dpb.refs().iter().take(15).enumerate() {
+            let mut flags = match r.set {
+                RpsSet::StCurrBefore => ffi::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE,
+                RpsSet::StCurrAfter => ffi::VA_PICTURE_HEVC_RPS_ST_CURR_AFTER,
+                RpsSet::LtCurr => ffi::VA_PICTURE_HEVC_RPS_LT_CURR,
+                RpsSet::None | RpsSet::Foll => 0,
+            };
+            if r.long_term {
                 flags |= ffi::VA_PICTURE_HEVC_LONG_TERM_REFERENCE;
             }
             pic.ReferenceFrames[i] = ffi::VAPictureHEVC {
-                picture_id: e.surface,
-                pic_order_cnt: e.poc,
+                picture_id: self.slots[r.slot.0 as usize],
+                pic_order_cnt: r.poc,
                 flags,
                 va_reserved: [0; ffi::VA_PADDING_LOW],
             };
-            ref_index[ref_index_len] = (e.surface, i as u8);
-            ref_index_len += 1;
         }
-        let ref_index = &ref_index[..ref_index_len];
 
         pic.pic_width_in_luma_samples = sps.pic_width_in_luma_samples as u16;
         pic.pic_height_in_luma_samples = sps.pic_height_in_luma_samples as u16;
@@ -990,7 +951,7 @@ impl VaapiH265Dec {
             }
             let last = headers.len().saturating_sub(1);
             for (i, (sh, nal)) in headers.iter().zip(slice_nals.iter()).enumerate() {
-                let sp = self.build_slice_param(sps, sh, nal.raw(au), i == last, ref_index);
+                let sp = self.build_slice_param(sps, sh, nal.raw(au), i == last, p);
                 let ty = ffi::VASliceParameterBufferType;
                 let sp_buf = match va.rext {
                     true => VaBuffer::new_struct(display, context, ty, &slice_ext(sp, sps, sh))?,
@@ -1013,9 +974,9 @@ impl VaapiH265Dec {
         sh: &SliceHeader,
         raw_nal: &[u8],
         last_slice: bool,
-        ref_index: &[(ffi::VASurfaceID, u8)],
+        p: &bs::Picture,
     ) -> ffi::VASliceParameterBufferHEVC {
-        let (ref_pic_list, collocated_ref_idx) = self.build_ref_pic_list(sh, ref_index);
+        let (ref_pic_list, collocated_ref_idx) = self.build_ref_pic_list(sh, p);
         let long_slice_flags = pack_long_slice_flags(sh, last_slice);
 
         let mut sp: ffi::VASliceParameterBufferHEVC = zeroed_slice_param_hevc();
@@ -1073,92 +1034,18 @@ impl VaapiH265Dec {
         sp
     }
 
-    fn build_ref_pic_list(
-        &self,
-        sh: &SliceHeader,
-        ref_index: &[(ffi::VASurfaceID, u8)],
-    ) -> ([[u8; 15]; 2], u8) {
+    fn build_ref_pic_list(&self, sh: &SliceHeader, p: &bs::Picture) -> ([[u8; 15]; 2], u8) {
         let mut list = [[0xFFu8; 15]; 2];
         if !sh.slice_type.is_inter() {
             return (list, if sh.slice_temporal_mvp_enabled_flag { 0 } else { 0xFF });
         }
-
-        let mut before: [(i32, u8); 16] = [(0, 0); 16];
-        let mut before_len = 0usize;
-        for e in self.dpb.iter().filter(|e| e.rps_flag == ffi::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE) {
-            if let Some(&(_, i)) = ref_index.iter().find(|(s, _)| *s == e.surface)
-                && before_len < before.len()
-            {
-                before[before_len] = (e.poc, i);
-                before_len += 1;
+        let [l0, l1] = &mut list;
+        self.dpb.lists(p, sh, l0, l1);
+        // a DPB index past ReferenceFrames names no picture
+        for i in list.iter_mut().flatten() {
+            if *i != bs::NO_REF && *i >= 15 {
+                *i = 0xFF;
             }
-        }
-        let before = &mut before[..before_len];
-        before.sort_by_key(|a| std::cmp::Reverse(a.0)); // descending (nearest below cur first)
-        let mut after: [(i32, u8); 16] = [(0, 0); 16];
-        let mut after_len = 0usize;
-        for e in self.dpb.iter().filter(|e| e.rps_flag == ffi::VA_PICTURE_HEVC_RPS_ST_CURR_AFTER) {
-            if let Some(&(_, i)) = ref_index.iter().find(|(s, _)| *s == e.surface)
-                && after_len < after.len()
-            {
-                after[after_len] = (e.poc, i);
-                after_len += 1;
-            }
-        }
-        let after = &mut after[..after_len];
-        after.sort_by_key(|a| a.0); // ascending (nearest above cur first)
-        let mut long: [u8; 16] = [0; 16];
-        let mut long_len = 0usize;
-        for e in self.dpb.iter().filter(|e| e.rps_flag == ffi::VA_PICTURE_HEVC_RPS_LT_CURR) {
-            if let Some(&(_, i)) = ref_index.iter().find(|(s, _)| *s == e.surface)
-                && long_len < long.len()
-            {
-                long[long_len] = i;
-                long_len += 1;
-            }
-        }
-        let long = &long[..long_len];
-
-        let mut temp0: [u8; 48] = [0; 48];
-        let mut temp0_len = 0usize;
-        for i in before
-            .iter()
-            .map(|(_, i)| *i)
-            .chain(after.iter().map(|(_, i)| *i))
-            .chain(long.iter().copied())
-        {
-            if temp0_len < temp0.len() {
-                temp0[temp0_len] = i;
-                temp0_len += 1;
-            }
-        }
-        let temp0 = &temp0[..temp0_len];
-        let mut temp1: [u8; 48] = [0; 48];
-        let mut temp1_len = 0usize;
-        for i in after
-            .iter()
-            .map(|(_, i)| *i)
-            .chain(before.iter().map(|(_, i)| *i))
-            .chain(long.iter().copied())
-        {
-            if temp1_len < temp1.len() {
-                temp1[temp1_len] = i;
-                temp1_len += 1;
-            }
-        }
-        let temp1 = &temp1[..temp1_len];
-
-        let n0 = (sh.num_ref_idx_l0_active_minus1 as usize + 1).min(15);
-        fill_ref_list(&mut list[0], temp0, n0, &sh.ref_list_mods.l0, sh.ref_list_mods.l0_present);
-        if sh.slice_type == SliceType::B {
-            let n1 = (sh.num_ref_idx_l1_active_minus1 as usize + 1).min(15);
-            fill_ref_list(
-                &mut list[1],
-                temp1,
-                n1,
-                &sh.ref_list_mods.l1,
-                sh.ref_list_mods.l1_present,
-            );
         }
 
         // The syntax element verbatim, not a ReferenceFrames index. Resolving it broke TMVP with
@@ -1476,7 +1363,6 @@ impl VaapiH265Dec {
         self.first.sent(ctx);
         self.transient.ok();
 
-        self.output_key.remove(&out.surface);
         Ok(true)
     }
 
@@ -1502,6 +1388,13 @@ impl VaapiH265Dec {
             ctx.count_drop();
             self.recycle_output_surface(out.surface);
         }
+        // pictures still in the DPB's reorder go when it lets them out
+        for out in &mut self.outs {
+            if out.as_ref().is_some_and(before) {
+                *out = None;
+                ctx.count_drop();
+            }
+        }
         let mut at = 0;
         while at < self.output_queue.len() {
             if !before(&self.output_queue[at]) {
@@ -1514,14 +1407,7 @@ impl VaapiH265Dec {
     }
 
     fn recycle_output_surface(&mut self, surface: ffi::VASurfaceID) {
-        self.output_key.remove(&surface);
         self.release_if_unreferenced(surface);
-    }
-
-    fn reset_dpb(&mut self) {
-        while let Some(e) = self.dpb.pop() {
-            self.release_if_unreferenced(e.surface);
-        }
     }
 
     fn drain_all(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
@@ -1537,7 +1423,8 @@ impl VaapiH265Dec {
     }
 
     fn emit_over_budget(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
-        if self.pending.is_some() && !self.emit_pending(ctx)? {
+        let due = self.pending.is_some() || !self.output_queue.is_empty();
+        if due && !self.emit_pending(ctx)? {
             return Ok(false);
         }
         Ok(true)
@@ -1609,7 +1496,13 @@ impl Element for VaapiH265Dec {
                     continue;
                 }
                 if self.pending.is_none() && self.output_queue.is_empty() {
-                    break; // held by the DPB alone, decode_au_with's drop is the fuse
+                    // the reorder holds them, its next picture goes out ahead
+                    let mut ev = Events::new();
+                    if !self.dpb.bump_one(&mut ev) {
+                        break; // held by the DPB alone, decode_au_with's drop is the fuse
+                    }
+                    self.apply(&ev);
+                    continue;
                 }
                 if !self.emit_pending(ctx)? {
                     return Ok(Flow::Ok);
@@ -1662,7 +1555,7 @@ impl Element for VaapiH265Dec {
             }
             Event::FlushStart => {
                 let queued = self.output_queue.len() + usize::from(self.pending.is_some());
-                log!(&*ctx, Level::Debug, "flush", queued = queued, dpb = self.dpb.len());
+                log!(&*ctx, Level::Debug, "flush", queued = queued, dpb = self.dpb.refs().len());
                 self.warned.summary(ctx, "flush");
                 self.side.clear();
                 let outs: Vec<_> = self
@@ -1672,19 +1565,15 @@ impl Element for VaapiH265Dec {
                     .chain(self.output_queue.drain(..))
                     .map(|o| o.surface)
                     .collect();
-                self.output_key.clear();
                 self.drain_presentation_releases();
                 for id in outs {
                     self.release_if_unreferenced(id);
                 }
-                self.reset_dpb();
-                self.poc.reset();
-                self.skip_rasl = false;
-                self.awaiting_irap = true; // resume at a clean random-access point
+                // resumes at a clean random-access point, which goes out ahead of the reorder
+                self.discard_dpb();
                 self.alloc_stalled = false;
                 self.ended = false;
                 self.first.reset();
-                self.lead = Lead::Flushed;
             }
             Event::SkippedTo { to_time } => {
                 log!(&*ctx, Level::Debug, "skip", to = *to_time);
@@ -1692,6 +1581,9 @@ impl Element for VaapiH265Dec {
             }
             Event::Eos => {
                 self.ended = true;
+                let mut ev = Events::new();
+                self.dpb.flush(&mut ev);
+                self.apply(&ev);
                 self.drain_all(ctx)?;
                 log!(&*ctx, Level::Info, "eos", emitted = self.emitted, failed = self.failed);
                 self.warned.summary(ctx, "eos");
@@ -1708,46 +1600,14 @@ impl Element for VaapiH265Dec {
         self.in_flight.clear();
         self.pending = None;
         self.output_queue.clear();
-        self.dpb.clear();
+        *self.dpb = bs::Dpb::new();
+        self.slots.clear();
+        self.held.clear();
+        self.outs.clear();
         self.retired.clear();
         self.first.reset();
-        self.lead = Lead::Off;
         self.va = None;
         self.display = None;
-    }
-}
-
-/// The keyframe a flush restarts at goes out as it is decoded, ahead of the reorder, so the
-/// group works on it before the next decode is submitted.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Lead {
-    Off,
-    /// A flush came and no keyframe since.
-    Flushed,
-    /// The keyframe of this sequence and order count went out ahead.
-    Out(u32, i32),
-}
-
-impl Lead {
-    /// Whether a picture comes before the keyframe that went out, a decodable leading one.
-    fn leads(self, gop: u32, poc: i32) -> bool {
-        matches!(self, Lead::Out(g, p) if g == gop && poc < p)
-    }
-}
-
-fn fill_ref_list(dst: &mut [u8; 15], temp: &[u8], active: usize, mods: &[u32], mods_present: bool) {
-    if temp.is_empty() {
-        return;
-    }
-    if mods_present && !mods.is_empty() {
-        for (i, slot) in dst.iter_mut().take(active.min(15)).enumerate() {
-            let idx = *mods.get(i).unwrap_or(&0) as usize;
-            *slot = *temp.get(idx).unwrap_or(&temp[0]);
-        }
-    } else {
-        for (i, slot) in dst.iter_mut().take(active.min(15)).enumerate() {
-            *slot = temp[i % temp.len()];
-        }
     }
 }
 
@@ -1766,39 +1626,6 @@ impl AuScratch {
         self.headers.clear();
         self.buffers.clear();
     }
-}
-
-fn peek_pps_id(nal: &[u8], is_irap: bool) -> Option<u32> {
-    if nal.len() < 3 {
-        return None;
-    }
-    let (body, body_len) = de_emulate_prefix(&nal[2..]);
-    let mut r = crate::h264parse::BitReader::new(&body[..body_len]);
-    let _first = r.flag();
-    if is_irap {
-        let _no_output = r.flag();
-    }
-    Some(r.ue())
-}
-
-fn de_emulate_prefix(body: &[u8]) -> ([u8; 16], usize) {
-    let mut out = [0u8; 16];
-    let mut out_len = 0usize;
-    let mut zeros = 0;
-    let mut i = 0;
-    while i < body.len() && out_len < 16 {
-        let b = body[i];
-        if zeros >= 2 && b == 0x03 && i + 1 < body.len() && body[i + 1] <= 0x03 {
-            zeros = 0;
-            i += 1;
-            continue;
-        }
-        out[out_len] = b;
-        out_len += 1;
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-        i += 1;
-    }
-    (out, out_len)
 }
 
 fn unsupported(sps: &Sps) -> K {
@@ -2050,31 +1877,6 @@ fn pack_long_slice_flags(sh: &SliceHeader, last_slice: bool) -> u32 {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_pictures_before_the_keyframe_let_out_ahead_are_leading() {
-        assert!(!Lead::Off.leads(1, -1) && !Lead::Flushed.leads(1, -1));
-        let out = Lead::Out(3, 8);
-        assert!(out.leads(3, 7) && !out.leads(3, 8) && !out.leads(3, 9));
-        assert!(!out.leads(4, 0), "the next sequence orders anew");
-    }
-
-    #[test]
-    fn fill_ref_list_cycles_to_active_count() {
-        let mut dst = [0xFFu8; 15];
-        let temp = [3u8, 5];
-        fill_ref_list(&mut dst, &temp, 4, &[], false);
-        assert_eq!(&dst[..4], &[3, 5, 3, 5]);
-        assert_eq!(dst[4], 0xFF, "entries beyond active stay invalid");
-    }
-
-    #[test]
-    fn fill_ref_list_applies_modifications() {
-        let mut dst = [0xFFu8; 15];
-        let temp = [10u8, 20, 30];
-        fill_ref_list(&mut dst, &temp, 3, &[2, 0, 1], true);
-        assert_eq!(&dst[..3], &[30, 10, 20]);
-    }
 
     /// At wpOffsetHalfRangeC 128 the derivation is the 8 bit one, a wider range keeps what 128
     /// would clip.

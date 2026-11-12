@@ -47,6 +47,8 @@ pub enum VaapiErrorKind {
     },
     Interlaced,
     NoFreeSurface,
+    /// the decode process refused the picture, a reference missing most often
+    Dpb(pf_bitstream::DpbError),
     Submit(VaError),
     Readback(VaError),
     NotNv12 {
@@ -212,6 +214,7 @@ impl VaapiErrorKind {
             K::PpsTiles { .. } => "pps_tiles",
             K::Interlaced => "interlaced",
             K::NoFreeSurface => "no_free_surface",
+            K::Dpb(_) => "dpb",
             K::Submit(_) => "submit",
             K::Readback(_) => "readback",
             K::NotNv12 { .. } => "not_nv12",
@@ -362,6 +365,7 @@ impl fmt::Display for VaapiErrorKind {
             }
             K::Interlaced => f.write_str("field/interlaced coding not supported, dropped"),
             K::NoFreeSurface => f.write_str("no free surface, AU dropped"),
+            K::Dpb(e) => write!(f, "{e}, picture dropped"),
             K::Submit(e) => write!(f, "VA submit failed, {e}, dropped"),
             K::Readback(e) => write!(f, "readback failed, {e}, frame dropped"),
             K::NotNv12 { planes } => {

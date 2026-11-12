@@ -23,10 +23,10 @@ use profluens_video::rap::{NalSyntax, length_size, random_access};
 
 use crate::codec::{self, Reframer};
 use crate::config::{self, ConfigError, NalCodec, ParamSets};
-use crate::cued::Cued;
+use crate::cued::{Cued, CuedFrame};
 use crate::error::{DemuxError, MkvError, MuxError};
 use crate::extras::{Extras, MkvExtras, parse_attachments, parse_chapters};
-use crate::index::{CaptionSpan, CueEnd, Grown, cue_end, cue_ends, cue_entries_of};
+use crate::index::{CaptionSpan, CueEnd, Grown, cue_end, cue_ends, cue_entries_of, placed, up_at};
 use crate::parsed::Parsed;
 use crate::pull::{Need, Plan, Planned, Span, State, Step, Walk, Window};
 use crate::reader::{
@@ -941,6 +941,10 @@ struct OfCues {
     left_out: Vec<u64>,
     captions: Vec<Caption>,
     uncued: Vec<u32>,
+    /// The caption tracks read by their cues at a restart, see [`placed`].
+    aside: Vec<u64>,
+    /// `sets` leave the `aside` tracks out.
+    aside_on: bool,
     /// The linked track numbers and their entries, the latest first.
     sets: Vec<(Vec<u64>, Vec<IndexEntry>)>,
 }
@@ -1000,6 +1004,13 @@ pub struct MkvDemux {
     cued: Option<Cued>,
     cued_off: bool,
     cued_from: u64,
+    /// The captions up at a restart whose blocks lie before it, read by their cues. Nothing
+    /// walked goes out before them.
+    up: Option<Cued>,
+    /// A cue placed its block wrong, restarts go back for the captions again.
+    up_off: bool,
+    /// The input was pushed, nothing is read aside.
+    pushed: bool,
     walk_from: u64,
     /// Frames that failed to reframe at the end, past the bus.
     lost: u64,
@@ -1160,6 +1171,9 @@ impl MkvDemux {
             cued: None,
             cued_off: false,
             cued_from: 0,
+            up: None,
+            up_off: false,
+            pushed: false,
             walk_from: 0,
             lost: 0,
             key_bytes: 0,
@@ -1330,8 +1344,10 @@ impl MkvDemux {
         captions.sort_unstable_by_key(|c| c.time_ns);
         let uncued = left_out.iter().filter_map(|&t| stream(t)).collect();
         let key = crate::index::key_track(&seek.cues, tracks);
+        let aside = placed(&seek.cues, tracks);
         log!(ctx, Level::Debug, "captions", count = captions.len(), cues = seek.cues.len());
-        seek.of_cues = OfCues { key, spans, left_out, captions, uncued, ..OfCues::default() };
+        seek.of_cues =
+            OfCues { key, spans, left_out, captions, uncued, aside, ..OfCues::default() };
     }
 
     /// The entries of the Cues for the tracks linked now, computed only for a linked set not
@@ -1342,10 +1358,18 @@ impl MkvDemux {
         let (seek, pads) = (&mut self.seek, &self.pad_tracks);
         let linked = || pads.iter().filter(|pt| pt.linked).map(|pt| pt.track_number);
         let of = &mut seek.of_cues;
+        let now = !self.pushed && !self.up_off;
+        if of.aside_on != now {
+            of.aside_on = now;
+            of.sets.clear();
+        }
+        let aside: &[u64] = if now { &of.aside } else { &[] };
         let set = match of.sets.iter().position(|(set, _)| linked().eq(set.iter().copied())) {
             Some(at) => of.sets.remove(at),
             None => {
-                let on = |n: u64| pads.iter().any(|pt| pt.linked && pt.track_number == n);
+                let on = |n: u64| {
+                    !aside.contains(&n) && pads.iter().any(|pt| pt.linked && pt.track_number == n)
+                };
                 let spans = (&of.spans[..], &of.left_out[..]);
                 let entries =
                     cue_entries_of(&seek.cues, &seek.parsed.tracks, spans, of.key, &on, seek.tick);
@@ -1372,7 +1396,16 @@ impl MkvDemux {
             }
         };
         let seek = &self.seek;
-        let (captions, uncued) = (seek.of_cues.captions.clone(), seek.of_cues.uncued.clone());
+        let of = &seek.of_cues;
+        let (mut captions, uncued) = (of.captions.clone(), of.uncued.clone());
+        if of.aside_on && !seek.cues.is_empty() {
+            // read by their cues, a stream linked while running restarts at its key
+            let read = |c: &Caption| {
+                let of_stream = |pt: &&PadTrack| pt.stream == c.stream;
+                self.pad_tracks.iter().find(of_stream).map(|pt| pt.track_number)
+            };
+            captions.retain(|c| !read(c).is_some_and(|n| of.aside.contains(&n)));
+        }
         let key = key.and_then(|n| self.pad_tracks.iter().find(|pt| pt.track_number == n));
         let (stream, grouped) =
             (key.map(|pt| pt.stream), key.is_some_and(|pt| pt.kind == Kind::Video));
@@ -1679,35 +1712,21 @@ impl MkvDemux {
         if !pulled {
             return self.reader.next_frame().map(Out::owned);
         }
-        if let Some(c) = self.cued.as_mut() {
-            loop {
-                let f = c.pop()?;
-                let Some(view) = f.mem else {
-                    if c.untrusted() {
-                        return None;
-                    }
-                    continue;
-                };
-                let coded = self.seek.parsed.tracks.iter().find(|t| t.track_number == f.track);
-                let bytes = match coded.map(|t| &t.coding).filter(|c| c.transforms()) {
-                    None => Bytes::View(view, true),
-                    Some(coding) => {
-                        match self.reader.decode_frame(f.track, &coding.frames, view.data()) {
-                            Some(data) => Bytes::Owned(data),
-                            None => continue,
-                        }
-                    }
-                };
-                let (track_number, pts_ns, duration_ns) = (f.track, f.pts_ns, f.duration_ns);
-                return Some(Out {
-                    track_number,
-                    pts_ns,
-                    duration_ns,
-                    keyframe: true,
-                    bytes,
-                    t35: Bytes::Owned(empty()),
-                    discard_ns: 0,
-                });
+        while let Some(f) = self.up.as_mut().and_then(Cued::pop) {
+            if let Some(out) = self.cued_out(f) {
+                return Some(out);
+            }
+        }
+        if self.up.as_ref().is_some_and(|c| !c.done()) {
+            return None;
+        }
+        while let Some(c) = self.cued.as_mut() {
+            let f = c.pop()?;
+            if f.mem.is_none() && c.untrusted() {
+                return None;
+            }
+            if let Some(out) = self.cued_out(f) {
+                return Some(out);
             }
         }
         loop {
@@ -1738,6 +1757,27 @@ impl MkvDemux {
                 discard_ns,
             });
         }
+    }
+
+    /// None for a block dropped or one that does not decode.
+    fn cued_out(&mut self, f: CuedFrame) -> Option<Out> {
+        let view = f.mem?;
+        let coded = self.seek.parsed.tracks.iter().find(|t| t.track_number == f.track);
+        let bytes = match coded.map(|t| &t.coding).filter(|c| c.transforms()) {
+            None => Bytes::View(view, true),
+            Some(coding) => {
+                Bytes::Owned(self.reader.decode_frame(f.track, &coding.frames, view.data())?)
+            }
+        };
+        Some(Out {
+            track_number: f.track,
+            pts_ns: f.pts_ns,
+            duration_ns: f.duration_ns,
+            keyframe: true,
+            bytes,
+            t35: Bytes::Owned(empty()),
+            discard_ns: 0,
+        })
     }
 
     fn recycle(reader: &mut MatroskaReader, out: Out) {
@@ -2138,6 +2178,7 @@ impl MkvDemux {
             recycle_park(&mut self.park_free, c.bytes);
         }
         let (pulled, point) = (ctx.pulls(Self::IN), Self::point(ctx));
+        self.up = None;
         self.emit_all(ctx, pulled, point);
         // A track that ended at or before its line ends with its last block held.
         for pt in &mut self.pad_tracks {
@@ -2383,6 +2424,7 @@ impl MkvDemux {
             c.restart(self.cued_from);
         }
         self.walk_from = from.to_byte;
+        self.up = self.up_from(from.to_byte);
         (self.read_to, self.restart_ns) = (0, from.at.nanos().unwrap_or(0));
         self.pad_tracks.iter_mut().for_each(|pt| pt.read_to = None);
         let resync = self.mid_segment(from.to_byte);
@@ -2395,6 +2437,21 @@ impl MkvDemux {
         if let Some(video_from) = self.video_from.take() {
             self.hold_video(video_from, from.at);
         }
+    }
+
+    /// The read of the captions a restart at `byte` leaves behind, none when the linked tracks
+    /// are read by their cues anyway or have none there.
+    fn up_from(&self, byte: u64) -> Option<Cued> {
+        let of = &self.seek.of_cues;
+        if self.cued.is_some() || !of.aside_on || of.aside.is_empty() {
+            return None;
+        }
+        let pads = &self.pad_tracks;
+        let aside = |n: u64| {
+            of.aside.contains(&n) && pads.iter().any(|pt| pt.linked && pt.track_number == n)
+        };
+        let refs = up_at(&self.seek.cues, &self.seek.ends, &aside, byte, self.cued_from);
+        (!refs.is_empty()).then(|| Cued::new(refs, self.seek.tick, 0))
     }
 
     /// The lead of a seek to `at`, none without a linked video track.
@@ -2427,7 +2484,8 @@ impl MkvDemux {
             if self.side_in(ctx, tag, buf.memory.data()) {
                 continue;
             }
-            if let Some(c) = self.cued.as_mut().filter(|c| c.owns(tag)) {
+            let cued = [self.up.as_mut(), self.cued.as_mut()];
+            if let Some(c) = cued.into_iter().flatten().find(|c| c.owns(tag)) {
                 c.served(tag, buf.memory);
                 continue;
             }
@@ -2453,6 +2511,7 @@ impl MkvDemux {
         }
         self.ask_cues(ctx);
         self.ask_side(ctx);
+        self.ask_up(ctx);
         match self.read_mode(ctx) {
             Read::Wait => return Ok(Flow::Ok),
             Read::Cued => {
@@ -2468,6 +2527,7 @@ impl MkvDemux {
             ctx.hold_end();
             return Ok(Flow::Ok);
         }
+        self.settle_up(ctx);
         self.walk_on(ctx)?;
         if self.seek.due {
             self.publish(ctx);
@@ -2507,6 +2567,7 @@ impl MkvDemux {
         match Cued::refs(&self.seek.cues, &numbers).filter(|r| !r.is_empty() && self.seek.whole) {
             Some(refs) => {
                 log!(ctx, Level::Debug, "cued", blocks = refs.len() as u64, from = self.cued_from);
+                self.up = None;
                 self.cued = Some(Cued::new(refs, self.seek.tick, self.cued_from));
                 Read::Cued
             }
@@ -2553,21 +2614,54 @@ impl MkvDemux {
     }
 
     fn ask_cued(&mut self, ctx: &mut Ctx) {
-        let Some(c) = self.cued.as_mut() else { return };
-        let most = (self.pull.caps.1 / 2).max(1) as usize;
+        if let Some(c) = self.cued.as_mut() {
+            Self::ask_by(c, &mut self.pull, ctx);
+        }
+    }
+
+    /// Asks what `c` wants while the source and the pool allow. False when the pool had no
+    /// buffer for a block.
+    fn ask_by(c: &mut Cued, pull: &mut Pulled, ctx: &mut Ctx) -> bool {
+        let most = (pull.caps.1 / 2).max(1) as usize;
         while ctx.asks_left(Self::IN) > 0 && c.held() < most {
             let Some((offset, len)) = c.want() else { break };
             let Ok(Some(buf)) = ctx.try_alloc_sized(len as usize) else {
                 c.unasked();
-                break;
+                return false;
             };
-            let tag = self.pull.plan.next_tag;
+            let tag = pull.plan.next_tag;
             if ctx.ask(Self::IN, Ask { offset, len, tag, buf }).is_err() {
                 c.unasked();
                 break;
             }
-            self.pull.plan.next_tag += 1;
+            pull.plan.next_tag += 1;
             c.asked(tag);
+        }
+        true
+    }
+
+    /// The walk's frames wait behind the captions up, and its windows are given back only by
+    /// those frames going out. So a pool the walk filled before a block was asked would never
+    /// have a buffer for it, and the captions are let go.
+    fn ask_up(&mut self, ctx: &mut Ctx) {
+        let Some(c) = self.up.as_mut() else { return };
+        if !Self::ask_by(c, &mut self.pull, ctx) && c.held() == 0 && self.pull.plan.held > 0 {
+            log!(&*ctx, Level::Warn, "captions_up_starved", from = self.cued_from);
+            self.up = None;
+        }
+    }
+
+    /// Ends the read of the captions up once every block is out. One placed wrong before any
+    /// read says the Cues are untrusted, the index then restarts behind the captions again.
+    fn settle_up(&mut self, ctx: &mut Ctx) {
+        let Some(c) = self.up.take_if(|c| c.done()) else { return };
+        if c.dropped > 0 {
+            log!(&*ctx, Level::Warn, "cued_dropped", blocks = u64::from(c.dropped));
+        }
+        if c.untrusted() {
+            log!(&*ctx, Level::Warn, "cued_untrusted", from = self.walk_from);
+            self.up_off = true;
+            self.publish(ctx);
         }
     }
 
@@ -2658,6 +2752,8 @@ impl MkvDemux {
                     }
                     pull.walk.pos = next;
                 }
+                // a block of the captions up may still be to ask
+                Step::End if self.up.is_some() => return Ok(()),
                 Step::End => {
                     if !pull.plan.asked_all {
                         pull.plan.asked_all = true;
@@ -3078,6 +3174,7 @@ impl Element for MkvDemux {
         self.pull.caps = (bytes.max(1), most(stats.max_slots).max(1) as u32);
         self.pull.walk.set_cap((stats.bytes_budget / 4).clamp(256, u32::MAX as u64) as u32);
         (self.cued, self.cued_off, self.cued_from, self.walk_from) = (None, false, 0, 0);
+        self.up = None;
         (self.read_to, self.restart_ns, self.false_key) = (0, 0, None);
         self.lost = 0;
         if !self.seek.cues.is_empty() {
@@ -3126,6 +3223,13 @@ impl MkvDemux {
         }
         if ctx.pulls(Self::IN) {
             return self.pull(ctx, inputs);
+        }
+        if !self.pushed {
+            // nothing is read aside of a pushed stream, its restarts go back for the captions
+            self.pushed = true;
+            if self.seek.of_cues.aside_on && !self.seek.of_cues.aside.is_empty() {
+                self.publish(ctx);
+            }
         }
         if let CuesRead::Want { .. } = self.seek.read {
             self.seek.read = CuesRead::Done;
@@ -3214,7 +3318,7 @@ impl MkvDemux {
         self.flush_exact(ctx);
         self.pull.plan.reset();
         (self.pull.win, self.pull.stash) = (None, None);
-        self.cued = None;
+        (self.cued, self.up) = (None, None);
         self.reader = MatroskaReader::new();
         self.scratch.clear();
         self.reframe_buf.clear();

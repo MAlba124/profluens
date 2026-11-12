@@ -55,7 +55,10 @@ const OUT: SrcPad = SrcPad(0);
 /// Serves every range asked whole, short only at the end of the file, as `FileSrc` does.
 struct MemSrc {
     file: Arc<[u8]>,
+    asked: Asked,
 }
+
+type Asked = Arc<Mutex<Vec<(u64, u32)>>>;
 
 impl Element for MemSrc {
     fn desc(&self) -> &'static ElementDesc {
@@ -70,6 +73,7 @@ impl Element for MemSrc {
     fn process(&mut self, ctx: &mut Ctx, _inputs: Inputs<'_>) -> Result<Flow, Error> {
         while let Some(ask) = ctx.next_ask(OUT) {
             let profluens_core::pull::Ask { offset, len, tag, mut buf } = ask;
+            self.asked.lock().unwrap().push((offset, len));
             let from = offset.min(self.file.len() as u64) as usize;
             let n = (len as usize).min(self.file.len() - from).min(buf.memory.capacity());
             buf.memory.as_mut_full()[..n].copy_from_slice(&self.file[from..from + n]);
@@ -129,6 +133,8 @@ impl LogWriter for Events {
 struct Ran {
     seen: Vec<(usize, Seen)>,
     events: Vec<&'static str>,
+    /// The ranges asked of the source from the seek on.
+    asked: Vec<(u64, u32)>,
 }
 
 impl Ran {
@@ -137,6 +143,11 @@ impl Ran {
         let from = self.seen.iter().rposition(|(p, s)| *p == n && *s == Seen::Flush);
         let after = &self.seen[from.map_or(self.seen.len(), |i| i + 1)..];
         after.iter().filter(|(p, _)| *p == n).filter_map(|(_, s)| s.stamp()).collect()
+    }
+
+    /// The bytes the seek asked below `byte`.
+    fn asked_below(&self, byte: u64) -> u64 {
+        self.asked.iter().filter(|a| a.0 < byte).map(|a| u64::from(a.1)).sum()
     }
 
     fn logged(&self, event: &str) -> usize {
@@ -178,7 +189,8 @@ fn sweep(demux: MkvDemux, file: &[u8], text_ms: Option<u64>, seek_ms: u64) -> Ra
     let events = Arc::new(Events::default());
     p.set_log_writer(Arc::clone(&events) as Arc<dyn LogWriter>);
     p.set_select_all(false);
-    let src = p.add(MemSrc { file: Arc::from(file) });
+    let asked: Asked = Arc::default();
+    let src = p.add(MemSrc { file: Arc::from(file), asked: Arc::clone(&asked) });
     let demux = p.add(demux);
     p.set_element_pool(src, 1 << 20, 8);
     p.set_element_pool_bytes(demux, 128 << 10, 1024, 64 << 20);
@@ -223,6 +235,7 @@ fn sweep(demux: MkvDemux, file: &[u8], text_ms: Option<u64>, seek_ms: u64) -> Ra
         p.commit_at(at, &targets).unwrap();
         go(&mut run, Some(ms + 5_000));
     }
+    asked.lock().unwrap().clear();
     p.control().seek(Timestamp(seek_ms * MS), SeekMode::Accurate).unwrap();
     go(&mut run, None);
     let _ = run.finish();
@@ -234,7 +247,8 @@ fn sweep(demux: MkvDemux, file: &[u8], text_ms: Option<u64>, seek_ms: u64) -> Ra
     drop(p);
     let seen = std::mem::take(&mut *out.lock().unwrap());
     let events = std::mem::take(&mut *events.0.lock().unwrap());
-    Ran { seen, events }
+    let asked = std::mem::take(&mut *asked.lock().unwrap());
+    Ran { seen, events, asked }
 }
 
 fn el(out: &mut Vec<u8>, of: &[u8], body: &[u8]) {
@@ -275,6 +289,8 @@ const KEY_MS: u64 = 4_000;
 #[derive(Default)]
 struct Film {
     cues: bool,
+    /// Every caption's cue places its block an octet off.
+    misplaced: bool,
     /// Damage at Segment level behind the Cluster of this time, read as an element of
     /// Chapters whose size reaches this many octets on.
     damage: Option<(u64, u64)>,
@@ -365,7 +381,8 @@ impl Film {
                 block.extend_from_slice(payload);
                 match track {
                     3 => {
-                        cues.push((*stamp, 3, at, Some(cl.len() as u64)));
+                        let off = u64::from(self.misplaced);
+                        cues.push((*stamp, 3, at, Some(cl.len() as u64 + off)));
                         let mut group = Vec::new();
                         el(&mut group, id::BLOCK, &block);
                         el(&mut cl, id::BLOCK_GROUP, &group);
@@ -426,11 +443,17 @@ fn pictures_from(from: u64) -> Vec<u64> {
     (from..END_MS).step_by(40).map(|t| t * MS).collect()
 }
 
+/// Where the Cues place the Cluster of the video key at `ms`.
+fn key_byte(file: &[u8], ms: u64) -> u64 {
+    let cues = parsed(file).cues;
+    cues.iter().find(|c| c.track == 1 && c.time_ns == ms * MS).expect("a key cue").byte
+}
+
 /// The sweep's exact seek with a VobSub track on. The caption up at the target was stored
-/// ahead of the key's Cluster, so the restart is the key below its block, and the scan from
-/// there reaches the target with every picture from the key on.
+/// ahead of the key's Cluster. The restart is the key all the same, the caption's block is
+/// read where its cue places it and nothing else before the key is, a whole group otherwise.
 #[test]
-fn a_seek_with_a_vobsub_track_on_restarts_behind_its_key_and_plays_on() {
+fn a_seek_with_a_vobsub_track_on_reads_the_caption_up_by_its_cue_and_plays_on() {
     let file = Film { cues: true, ..Film::default() }.build();
     for (text_ms, seek_ms) in [(4_100, 61_700), (9_000, 87_100)] {
         let ran = sweep(demuxer(&file), &file, Some(text_ms), seek_ms);
@@ -440,10 +463,29 @@ fn a_seek_with_a_vobsub_track_on_restarts_behind_its_key_and_plays_on() {
         // the AC-3 frame up at the target less its pre-roll
         assert!(audio.is_some_and(|t| t.abs_diff(seek_ms * MS) < 64 * MS), "{audio:?}");
         let captions = ran.after_flush(2);
-        let (first, last) = (captions.first().copied(), captions.last().copied());
-        assert!(first.is_some_and(|t| t <= seek_ms * MS), "the caption up, {first:?}");
-        assert_eq!(last, Some(115_000 * MS), "every caption to the end");
+        let up = seek_ms / 5_000 * 5_000;
+        let all: Vec<u64> = (up..END_MS).step_by(5_000).map(|t| t * MS).collect();
+        assert_eq!(captions, all, "the caption up and every one to the end, in order");
+        // two captions lie before the key, a Cluster head and under 31 KiB of block each
+        let below = ran.asked_below(key_byte(&file, key));
+        assert!(below > 0 && below < 100 << 10, "{below} octets asked before the key");
+        assert_eq!(ran.logged("cued_untrusted") + ran.logged("cued_dropped"), 0);
     }
+}
+
+/// Cues that place the captions wrong lose the ones stored before a restart, once. The index
+/// goes back for a caption again from then on.
+#[test]
+fn a_caption_placed_wrong_by_its_cue_is_lost_once_and_the_rest_plays_on() {
+    let file = Film { cues: true, misplaced: true, ..Film::default() }.build();
+    let ran = sweep(demuxer(&file), &file, Some(4_100), 61_700);
+    assert_eq!(ran.after_flush(0), pictures_from(60_000));
+    assert_eq!(ran.logged("cued_untrusted"), 1, "at the switch, its caption up is the one lost");
+    let captions = ran.after_flush(2);
+    // the seek's restart went back for the caption up
+    let all: Vec<u64> = (60_000..END_MS).step_by(5_000).map(|t| t * MS).collect();
+    assert_eq!(captions, all);
+    assert!(ran.asked_below(key_byte(&file, 60_000)) > 1 << 20, "a walk from the key before");
 }
 
 /// A run of damage behind the restart's Cluster that reads as an element of another level, its
@@ -451,7 +493,7 @@ fn a_seek_with_a_vobsub_track_on_restarts_behind_its_key_and_plays_on() {
 #[test]
 fn a_seek_restart_resyncs_past_damage_read_as_an_element() {
     let reach = 7 << 20;
-    let file = Film { cues: true, damage: Some((64_000, reach)) }.build();
+    let file = Film { cues: true, damage: Some((64_000, reach)), ..Film::default() }.build();
     let ran = sweep(demuxer(&file), &file, None, 61_700);
     assert_eq!(ran.after_flush(0), pictures_from(60_000), "every picture past the damage");
     assert!(ran.after_flush(1).last().is_some_and(|t| *t >= 119_900 * MS));

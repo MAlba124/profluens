@@ -8,6 +8,7 @@ pub use profluens_core::pipeline::CAPTION_REACH;
 use profluens_core::pipeline::IndexEntry;
 
 use crate::codec::{family_for, is_audio_family, is_video_family, lead_of};
+use crate::cued::{IN_FLIGHT, Ref};
 use crate::element::LEAD_MIN;
 use crate::reader::{Cue, Track};
 
@@ -198,6 +199,51 @@ pub fn captions(cues: &[Cue], tracks: &[Track]) -> (Vec<CaptionSpan>, Vec<u64>) 
         }
     }
     (spans, left_out)
+}
+
+/// The caption tracks whose every cue places its block (`CueRelativePosition`). A pulled restart
+/// reads their captions up at its point by the cue alone, so no restart goes back for them.
+// Cold path, once per Cues.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn placed(cues: &[Cue], tracks: &[Track]) -> Vec<u64> {
+    let all = |t: u64| {
+        let mut own = cues.iter().filter(|c| c.track == t).peekable();
+        own.peek().is_some() && own.all(|c| c.relative.is_some())
+    };
+    tracks.iter().filter(|t| is_caption(t)).map(|t| t.track_number).filter(|&t| all(t)).collect()
+}
+
+/// The blocks a restart at `byte` reads past of the `aside` tracks' captions still to show at
+/// `point`, ascending by time. One up at the point, and one a remux stored ahead of its time,
+/// both in a Cluster before `byte`. The latest [`IN_FLIGHT`] when a hostile Cues names more.
+// Cold path, once per restart.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn up_at(
+    cues: &[Cue],
+    ends: &[CueEnd],
+    aside: &dyn Fn(u64) -> bool,
+    byte: u64,
+    point: u64,
+) -> Vec<Ref> {
+    let reach = |start: u64| start.saturating_add(CAPTION_REACH);
+    let end = |c: &Cue| match c.duration_ns {
+        Some(d) => c.time_ns.saturating_add(d),
+        None => cue_end(ends, c.track, c.time_ns).unwrap_or(reach(c.time_ns)),
+    };
+    let mut refs: Vec<Ref> = cues
+        .iter()
+        .filter(|c| c.byte < byte && c.time_ns < reach(point) && aside(c.track))
+        .filter(|c| end(c) > point)
+        .filter_map(|c| {
+            let (track, time_ns, cluster, duration_ns) =
+                (c.track, c.time_ns, c.byte, c.duration_ns);
+            Some(Ref { track, time_ns, cluster, relative: c.relative?, duration_ns })
+        })
+        .collect();
+    refs.sort_unstable_by_key(|r| (r.time_ns, r.cluster, r.relative));
+    refs.dedup_by_key(|r| (r.cluster, r.relative));
+    refs.drain(..refs.len().saturating_sub(IN_FLIGHT));
+    refs
 }
 
 /// A caption cue as `(track, start, end)`.
@@ -705,5 +751,47 @@ mod tests {
         assert!(!g.block(1, 150_000, true), "a step of half the published, not 64");
         g.cluster(1_500_010);
         assert!(g.block(1, 150_001, true), "the step reached");
+    }
+
+    /// A restart reads aside the captions stored before its byte that still show, one up at
+    /// the point by its duration or its track's next cue, and one stored ahead of its time.
+    /// A track with a cue that places no block is not read aside at all.
+    #[test]
+    fn the_captions_up_at_a_restart_are_the_ones_stored_before_it_still_to_show() {
+        let cue = |track: u64, s: u64, dur: Option<u64>, byte: u64, rel: Option<u64>| Cue {
+            time_ns: s * S,
+            track,
+            byte,
+            duration_ns: dur.map(|d| d * S),
+            relative: rel,
+        };
+        let tracks = [track(1, "V_VP9"), track(3, "S_TEXT/UTF8"), track(4, "S_HDMV/PGS")];
+        let cues = [
+            cue(1, 0, None, 100, None),
+            cue(3, 2, Some(3), 100, Some(10)),
+            cue(4, 3, None, 100, Some(20)),
+            cue(3, 6, Some(30), 100, Some(30)),
+            cue(4, 9, None, 100, Some(40)),
+            cue(1, 10, None, 200, None),
+            cue(4, 12, None, 100, Some(50)),
+            cue(3, 13, Some(1), 200, Some(10)),
+        ];
+        assert_eq!(placed(&cues, &tracks), [3, 4]);
+        let ends = cue_ends(&cues, &tracks);
+        let up = |on: &dyn Fn(u64) -> bool, byte: u64, at: u64| -> Vec<(u64, u64)> {
+            let refs = up_at(&cues, &ends, on, byte, at * S);
+            refs.iter().map(|r| (r.track, r.time_ns / S)).collect()
+        };
+        let both = |_: u64| true;
+        // the text of 2 s ended, the one of 6 s lasts, the bitmap of 9 s is up until 12 s,
+        // and the one of 12 s was stored ahead
+        assert_eq!(up(&both, 200, 11), [(3, 6), (4, 9), (4, 12)]);
+        assert_eq!(up(&both, 200, 12), [(3, 6), (4, 12)], "ended where the next starts");
+        assert_eq!(up(&|t| t == 3, 200, 11), [(3, 6)], "the linked track alone");
+        assert_eq!(up(&both, 100, 11), [], "nothing lies before the first Cluster");
+        assert_eq!(up(&both, 300, 40), [], "the last bitmap is past its reach");
+        let mut unplaced = cues;
+        unplaced[3].relative = None;
+        assert_eq!(placed(&unplaced, &tracks), [4]);
     }
 }

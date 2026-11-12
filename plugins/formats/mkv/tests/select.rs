@@ -465,7 +465,8 @@ fn a_restart_drops_what_the_track_parked_and_the_other_tracks_keep_theirs() {
 /// The seek index of the Cues is computed once a set of linked tracks. A seek computes none, a
 /// link that changes the set computes it once, and one back to a set seen lately none. The
 /// captions are not computed again for any of them. What preroll logs is not handed to the
-/// writer, so the counts start at the start.
+/// writer, so the counts start at the start. The first buffer pushed computes the set once
+/// more, the captions placed by their cues are read aside only of a pulled source.
 #[test]
 fn the_cued_entries_are_computed_once_a_linked_set() {
     let stream = movie_with_text(&[100, 1_900, 2_200]);
@@ -485,20 +486,20 @@ fn the_cued_entries_are_computed_once_a_linked_set() {
     r.p.commit_at(Timestamp(at), &[(r.src, byte, Timestamp(at))]).expect("seek");
     assert!(!r.run(&mut run, past(1_000)));
     assert_eq!(*r.flushes.lock().unwrap(), [byte], "the seek went back");
-    assert_eq!(events.count("entries"), 1, "the set at start, none for the seek");
+    assert_eq!(events.count("entries"), 2, "the set at start and pushed, none for the seek");
     let entries = |r: &Rig| r.p.index(r.demux).expect("an index").entries.clone();
     let all = entries(&r);
     r.p.remove(text, Leave::Cut).expect("remove");
     r.p.commit().expect("commit");
     assert!(!r.run(&mut run, past(1_400)));
-    assert_eq!(events.count("entries"), 2, "the set without the captions");
+    assert_eq!(events.count("entries"), 3, "the set without the captions");
     assert_ne!(entries(&r), all, "the set without the captions is published");
     let (_, _again) = r.play(3);
     r.p.commit().expect("commit");
     assert!(r.run(&mut run, || false), "the run ends");
     run.finish().expect("finish");
     assert_eq!(events.count("relink"), 2, "the captions unlinked and linked again");
-    assert_eq!(events.count("entries"), 2, "the set at start is kept");
+    assert_eq!(events.count("entries"), 3, "the set at start is kept");
     assert_eq!(entries(&r), all, "the kept set is published again");
     assert_eq!(events.count("captions"), 0, "the captions once at preroll");
 }

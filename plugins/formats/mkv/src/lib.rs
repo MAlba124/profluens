@@ -25,7 +25,7 @@ pub mod writer;
 
 pub use codec::{
     EMITS, Lead, ReframeError, Reframer, config_depth, family_for, is_audio_family,
-    is_video_family, lead_of, nal_head_from_config, track_family, track_offers,
+    is_video_family, lead_of, nal_head_from_config, stored_family, track_family, track_offers,
 };
 pub use element::{MkvDemux, MkvMux};
 

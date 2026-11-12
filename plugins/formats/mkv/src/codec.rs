@@ -70,6 +70,8 @@ pub static EMITS: &[&str] = &[
     "av1",
     "h264/annexb",
     "h265/annexb",
+    "h264/avcc",
+    "h265/hvcc",
     "mpeg4/asp",
     "mpeg2",
     "vfw",
@@ -129,19 +131,45 @@ pub fn track_offers(track: &Track) -> &'static [OfferDesc] {
             OfferDesc::any("bytes"),
         ]
     }
+    // The stored family behind the others. A pad whose consumers name it first announces it, see
+    // `takes_stored` in the element, and an announced name some offer has to declare.
+    const fn nal(annexb: &'static str, stored: &'static str) -> [OfferDesc; 5] {
+        [
+            OfferDesc::any(annexb),
+            OfferDesc { family: annexb, fields: &VIDEO_FIELDS },
+            OfferDesc::any("bytes"),
+            OfferDesc::any(stored),
+            OfferDesc { family: stored, fields: &VIDEO_FIELDS },
+        ]
+    }
     static VP6: [OfferDesc; 3] = video("vp6");
     static VP7: [OfferDesc; 3] = video("vp7");
     static FLV1: [OfferDesc; 3] = video("flv1");
+    static H264: [OfferDesc; 5] = nal("h264/annexb", "h264/avcc");
+    static H265: [OfferDesc; 5] = nal("h265/annexb", "h265/hvcc");
+    let stores = |hevc| nal_head_from_config(&track.codec_private, hevc).is_ok();
     match track_family(track) {
         "encrypted" => &ENCRYPTED,
         "compressed" => &COMPRESSED,
         "pcm" => &PCM,
         "mpeg4/asp" => offers_for("V_MPEG4/ISO/ASP"),
+        "h264/annexb" if track.codec_id == "V_MPEG4/ISO/AVC" && stores(false) => &H264,
+        "h265/annexb" if stores(true) => &H265,
         "h264/annexb" => offers_for("V_MPEG4/ISO/AVC"),
         "vp6" => &VP6,
         "vp7" => &VP7,
         "flv1" => &FLV1,
         _ => offers_for(&track.codec_id),
+    }
+}
+
+/// The family an Annex B family's units leave as when they leave as stored, length prefixed and
+/// led by the track's configuration record.
+pub fn stored_family(family: &str) -> Option<&'static str> {
+    match family {
+        "h264/annexb" => Some("h264/avcc"),
+        "h265/annexb" => Some("h265/hvcc"),
+        _ => None,
     }
 }
 
@@ -240,7 +268,6 @@ static VIDEO_FIELDS: [FieldDesc; 12] = {
         c[9],
     ]
 };
-
 // Every name an audio announcement states. A copy links no decoder to name the rate, and an
 // announcement with a name no offer declared is dropped whole.
 static AUDIO_FIELDS: [FieldDesc; 3] = [
@@ -334,6 +361,8 @@ pub fn is_video_family(family: &str) -> bool {
             | "av1"
             | "h264/annexb"
             | "h265/annexb"
+            | "h264/avcc"
+            | "h265/hvcc"
             | "mpeg4/asp"
             | "mpeg2"
             | "vfw"

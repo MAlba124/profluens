@@ -9,7 +9,7 @@ use profluens_core::element::{
 };
 use profluens_core::error::Error;
 use profluens_core::event::Event;
-use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use profluens_core::format::{ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, Value, ValueDesc};
 use profluens_core::id::{FormatId, SinkPad, SrcPad};
 use profluens_core::log;
 use profluens_core::log::Level;
@@ -661,6 +661,11 @@ struct PadTrack {
     family: &'static str,
     codec_head: Vec<u8>,
     reframer: Reframer,
+    /// An AVC or HEVC track whose record parsed, its units can leave as stored.
+    can_store: bool,
+    /// Its units leave as stored, length prefixed and led by the configuration record, as
+    /// `h264/avcc` or `h265/hvcc`. Read off the pad's consumers each time the pad starts.
+    stored: bool,
     track: Track,
     started: bool,
     kind: Kind,
@@ -680,6 +685,33 @@ struct PadTrack {
     gap: Option<u64>,
     /// A caption without a duration, waiting for its track's next block to end it.
     cue: Option<Out>,
+}
+
+impl PadTrack {
+    /// Whether every consumer of the pad names the stored family ahead of Annex B. Then the
+    /// blocks go out untouched, neither rewritten here nor scanned for start codes there. A
+    /// consumer that takes any family is one of Annex B, as it always was.
+    fn takes_stored(&self, ctx: &Ctx) -> bool {
+        let Some(stored) = codec::stored_family(self.family).filter(|_| self.can_store) else {
+            return false;
+        };
+        ctx.src_peers_prefer(self.pad, &[self.family, stored]) == Some(stored)
+    }
+
+    /// What turns a block into a frame, nothing for units that leave as stored.
+    fn framer(&self) -> Reframer {
+        if self.stored { Reframer::Passthrough } else { self.reframer }
+    }
+
+    /// The family the pad announces.
+    fn out_family(&self) -> &'static str {
+        codec::stored_family(self.family).filter(|_| self.stored).unwrap_or(self.family)
+    }
+
+    /// The head that leads the pad, the configuration record ahead of units as stored.
+    fn head(&mut self) -> &mut Vec<u8> {
+        if self.stored { &mut self.track.codec_private } else { &mut self.codec_head }
+    }
 }
 
 const GAP_EVERY_NS: u64 = 500_000_000;
@@ -1924,7 +1956,11 @@ impl MkvDemux {
     /// A Block that fails to reframe is dropped, since input is untrusted.
     fn emit_frame(&mut self, ctx: &mut Ctx, idx: usize, frame: Out, how: Emit) {
         let Out { track_number, pts_ns, duration_ns, keyframe, mut bytes, t35, discard_ns } = frame;
-        let (reframer, opus) = (self.pad_tracks[idx].reframer, self.pad_tracks[idx].opus);
+        if !self.pad_tracks[idx].started {
+            // ahead of the frame the pad starts with, which the answer frames
+            self.pad_tracks[idx].stored = self.pad_tracks[idx].takes_stored(ctx);
+        }
+        let (reframer, opus) = (self.pad_tracks[idx].framer(), self.pad_tracks[idx].opus);
         let webvtt = self.pad_tracks[idx].webvtt;
         let mut side = std::mem::take(&mut self.side_buf);
         let side_len = if webvtt { 0 } else { side_records(&t35, &mut side) };
@@ -2025,23 +2061,42 @@ impl MkvDemux {
             return;
         }
         pt.started = true;
-        let (pad, family) = (pt.pad, pt.family);
-        let head = std::mem::take(&mut pt.codec_head);
+        let (pad, family) = (pt.pad, pt.out_family());
         Self::announce(ctx, pad, family, &self.pad_tracks[idx].track);
+        let head = std::mem::take(self.pad_tracks[idx].head());
         let stamp = Stamp { pad, pts_ns, duration_ns: None, flags: BufferFlags::HEADER };
         self.send(ctx, stamp, &head, how, &[]);
-        self.pad_tracks[idx].codec_head = head;
+        *self.pad_tracks[idx].head() = head;
+    }
+
+    /// A pad that left as stored lost its link. What it told is taken back to the track's own
+    /// family, or the next consumer were first told the stored one, which it may not take.
+    fn untell(&mut self, ctx: &mut Ctx, pad: SrcPad) {
+        let of = |pt: &&mut PadTrack| pt.stored && ctx.stream_pad(pt.stream) == Some(pad);
+        let Some(pt) = self.pad_tracks.iter_mut().find(of) else {
+            return;
+        };
+        pt.stored = false;
+        if let Some(family) = ctx.family_id(pt.family) {
+            ctx.set_negotiated_src(pad, FixedFormat::new(family));
+        }
     }
 
     fn greet(&mut self, ctx: &mut Ctx, pad: SrcPad) {
         let Some(idx) = self.pad_tracks.iter().position(|pt| pt.linked && pt.pad == pad) else {
             return;
         };
-        let head = std::mem::take(&mut self.pad_tracks[idx].codec_head);
+        let pt = &mut self.pad_tracks[idx];
+        if pt.takes_stored(ctx) != pt.stored {
+            // the one that joined reads the other framing, the pad starts again for all of them
+            pt.started = false;
+            return;
+        }
+        let head = std::mem::take(self.pad_tracks[idx].head());
         let pts_ns = self.pad_tracks[idx].last.map_or(0, |(pts, _)| pts);
         let stamp = Stamp { pad, pts_ns, duration_ns: None, flags: BufferFlags::HEADER };
         self.send(ctx, stamp, &head, Emit::Exact, &[]);
-        self.pad_tracks[idx].codec_head = head;
+        *self.pad_tracks[idx].head() = head;
     }
 
     fn drain(&mut self, ctx: &mut Ctx) -> bool {
@@ -3077,6 +3132,8 @@ impl Element for MkvDemux {
                 let number = track.track_number;
                 log!(&*ctx, Level::Warn, "codec_private_bad", track = number, family = family);
             }
+            // A record that does not parse leaves no head to lead the stored units.
+            let can_store = !codec_head.is_empty() && matches!(reframer, Reframer::Nal { .. });
             let name = format!("src_track{}", track.track_number);
             let kind = match family {
                 f if codec::is_video_family(f) => Kind::Video,
@@ -3113,6 +3170,8 @@ impl Element for MkvDemux {
                 family,
                 codec_head,
                 reframer,
+                can_store,
+                stored: false,
                 track: track.clone(),
                 started: false,
                 kind,
@@ -3311,6 +3370,9 @@ impl MkvDemux {
                 }
             }
             Event::SrcLinked { pad, on, restart } => {
+                if !*on {
+                    self.untell(ctx, *pad);
+                }
                 self.relink(ctx, *pad, *on, *restart);
                 if !self.seek.cues.is_empty() {
                     self.publish(ctx);

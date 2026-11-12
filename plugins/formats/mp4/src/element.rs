@@ -145,6 +145,36 @@ struct PadTrack {
     delay_ticks: i64,
     text: Option<FourCc>,
     duration_ns: u64,
+    /// An AVC or HEVC track with its record, its units can leave as stored.
+    can_store: bool,
+    /// Its units leave as stored, wired as in remux mode, as `h264/avcc` or `h265/hvcc`. Read
+    /// off the pad's consumers each time the pad starts.
+    stored: bool,
+}
+
+/// A sample entry of length prefixed NAL units led by an `avcC` or `hvcC` record.
+fn is_nal_entry(kind: &FourCc) -> bool {
+    matches!(kind, b"avc1" | b"avc3" | b"hvc1" | b"hev1" | b"dvh1" | b"dvhe" | b"dva1" | b"dvav")
+}
+
+/// Whether every consumer of `pad`, the track's, names the track's stored family ahead of its
+/// Annex B one. Then the samples go out untouched, neither rewritten here nor scanned for start
+/// codes there. A consumer that takes any family is one of Annex B, as it always was.
+fn takes_stored(ctx: &Ctx, pad: SrcPad, track: &crate::reader::Track) -> bool {
+    let Some(stored) = pf_mkv::stored_family(track.family()) else {
+        return false;
+    };
+    ctx.src_peers_prefer(pad, &[track.family(), stored]) == Some(stored)
+}
+
+/// The fields the pipeline can name. An announcement with a name nothing declared is dropped
+/// whole, which a change of family must not be.
+fn nameable(ctx: &Ctx, fields: &mut Vec<(&'static str, ValueDesc)>) {
+    let known = |v: &ValueDesc| match v {
+        ValueDesc::Id(name) => ctx.value_id(name).is_some(),
+        _ => true,
+    };
+    fields.retain(|(name, v)| ctx.field_id(name).is_some() && known(v));
 }
 
 fn text_of(track: &crate::reader::Track) -> Option<FourCc> {
@@ -460,10 +490,8 @@ impl Mp4Demux {
         track: &crate::reader::Track,
         passthrough: bool,
     ) -> Result<(&'static str, Vec<u8>, Reframer), Mp4Error> {
-        if passthrough
-            && let k @ (b"avc1" | b"avc3" | b"hvc1" | b"hev1" | b"dvh1" | b"dvhe" | b"dva1"
-            | b"dvav") = &track.entry.kind
-        {
+        if passthrough && is_nal_entry(&track.entry.kind) {
+            let k = &track.entry.kind;
             if track.entry.config_record.is_empty() {
                 return Err(Mp4Error::NoConfigRecord { entry: *k });
             }
@@ -511,7 +539,8 @@ impl Mp4Demux {
         passthrough: bool,
     ) {
         for (pt, track) in pad_tracks.iter_mut().zip(tracks) {
-            let Ok((family, codec_head, reframer)) = Self::track_wiring(track, passthrough) else {
+            let stored = passthrough || pt.stored;
+            let Ok((family, codec_head, reframer)) = Self::track_wiring(track, stored) else {
                 let (id, fourcc) = (track.track_id, track.entry.kind);
                 log!(ctx, Level::Warn, "rewire_failed", track = id, fourcc = fourcc);
                 continue;
@@ -618,6 +647,11 @@ impl Mp4Demux {
     /// order.
     fn put_sample(&mut self, ctx: &mut Ctx, s: ResolvedSample, own: Own, how: Emit) -> bool {
         let fmt = self.out_fmt;
+        let turned = match self.pad_tracks.get(s.track_index) {
+            // ahead of the sample the pad starts with, which the answer frames
+            Some(pt) if !pt.started => self.wire(ctx, s.track_index),
+            _ => false,
+        };
         let Self { reader, pad_tracks, pending, reframe_buf, passthrough, dropped, .. } = self;
         let shift = reader.as_ref().map_or(0, |r| r.shift_ns());
         let (idx, sync) = (s.track_index, s.sync);
@@ -635,7 +669,7 @@ impl Mp4Demux {
             pt.started = true;
             let (pad, family, ann) = (pt.pad, pt.family, pt.announce);
             let head = std::mem::take(&mut pt.codec_head);
-            Self::announce(ctx, pad, family, ann);
+            Self::announce(ctx, pad, family, ann, turned || pt.stored);
             if !head.is_empty() && how == Emit::Exact {
                 Self::emit_exact(ctx, pad, (pts_ns, None), BufferFlags::HEADER, &head, 0);
             } else if !head.is_empty() {
@@ -946,7 +980,9 @@ impl Mp4Demux {
 
     // Cold path, once per pad.
     #[allow(clippy::disallowed_methods)]
-    fn announce(ctx: &mut Ctx, pad: SrcPad, family: &'static str, announce: Announce) {
+    /// `sure` for a family the pad turns to or from, its announcement keeps the fields the
+    /// pipeline names and loses the others.
+    fn announce(ctx: &mut Ctx, pad: SrcPad, family: &'static str, announce: Announce, sure: bool) {
         match announce {
             Announce::Video { width, height, duration_ns, colour, rotation }
                 if width != 0 && height != 0 =>
@@ -968,6 +1004,9 @@ impl Mp4Demux {
                 let turn = profluens_video::format::FIELD_ROTATION;
                 if rotation != 0 && ctx.field_id(turn).is_some() {
                     fields.push((turn, ValueDesc::Int(i64::from(rotation))));
+                }
+                if sure {
+                    nameable(ctx, &mut fields);
                 }
                 ctx.announce_format(pad, family, &fields);
             }
@@ -1018,13 +1057,9 @@ impl Mp4Demux {
         for pt in &mut self.pad_tracks {
             pt.started = false;
         }
-        let heads: Vec<Vec<u8>> = reader
-            .tracks()
-            .iter()
-            .map(|t| Self::track_wiring(t, self.passthrough).map(|(_, h, _)| h).unwrap_or_default())
-            .collect();
-        for (pt, head) in self.pad_tracks.iter_mut().zip(heads) {
-            pt.codec_head = head;
+        for (pt, t) in self.pad_tracks.iter_mut().zip(reader.tracks()) {
+            let wiring = Self::track_wiring(t, self.passthrough || pt.stored);
+            pt.codec_head = wiring.map(|(_, head, _)| head).unwrap_or_default();
         }
         self.pending.clear();
         self.plan.reset();
@@ -1099,11 +1134,41 @@ impl Mp4Demux {
             }
             None => reader.select(idx, on),
         }
-        let head =
-            reader.tracks().get(idx).and_then(|t| Self::track_wiring(t, self.passthrough).ok());
         let pt = &mut self.pad_tracks[idx];
         (pt.pad, pt.started) = (pad, false);
-        pt.codec_head = head.map(|(_, head, _)| head).unwrap_or_default();
+    }
+
+    /// Wires track `idx` for the consumers its pad has, at the pad's start. Its units leave as
+    /// stored where they name that first, as its entry frames them otherwise. Whether the
+    /// family turned.
+    fn wire(&mut self, ctx: &Ctx, idx: usize) -> bool {
+        let track = self.reader.as_ref().and_then(|reader| reader.tracks().get(idx));
+        let (Some(track), Some(pt)) = (track, self.pad_tracks.get_mut(idx)) else {
+            return false;
+        };
+        let was = pt.stored;
+        pt.stored = pt.can_store && takes_stored(ctx, pt.pad, track);
+        // a track that does not wire keeps its family and goes without a head
+        let wiring = Self::track_wiring(track, self.passthrough || pt.stored);
+        let (family, head, reframer) = wiring.unwrap_or((pt.family, empty(), pt.reframer));
+        (pt.family, pt.codec_head, pt.reframer) = (family, head, reframer);
+        pt.announce = Self::announce_of(track, family, self.passthrough);
+        was != pt.stored
+    }
+
+    /// A pad that left as stored lost its link. What it told is taken back to the track's own
+    /// family, or the next consumer were first told the stored one, which it may not take.
+    fn untell(&mut self, ctx: &mut Ctx, pad: SrcPad) {
+        let of = |pt: &PadTrack| pt.stored && ctx.stream_pad(pt.stream) == Some(pad);
+        let Some(idx) = self.pad_tracks.iter().position(of) else {
+            return;
+        };
+        let track = self.reader.as_ref().and_then(|reader| reader.tracks().get(idx));
+        if let Some(family) = track.and_then(|t| ctx.family_id(t.family())) {
+            ctx.set_negotiated_src(pad, profluens_core::format::FixedFormat::new(family));
+        }
+        // told again at the pad's next start, whatever its consumer reads
+        self.pad_tracks[idx].stored = false;
     }
 }
 
@@ -1113,8 +1178,14 @@ impl Mp4Demux {
             return;
         };
         let track = self.reader.as_ref().and_then(|reader| reader.tracks().get(idx));
-        if let Some((_, head, _)) = track.and_then(|t| Self::track_wiring(t, self.passthrough).ok())
-        {
+        let pt = &mut self.pad_tracks[idx];
+        if track.is_some_and(|t| (pt.can_store && takes_stored(ctx, pad, t)) != pt.stored) {
+            // the one that joined reads the other framing, the pad starts again for all of them
+            pt.started = false;
+            return;
+        }
+        let stored = self.passthrough || pt.stored;
+        if let Some((_, head, _)) = track.and_then(|t| Self::track_wiring(t, stored).ok()) {
             Self::emit_exact(ctx, pad, (None, None), BufferFlags::HEADER, &head, 0);
         }
     }
@@ -1141,6 +1212,11 @@ impl Element for Mp4Demux {
                 .map_err(|e| Error::element_failed(ctx.element(), e))?;
             let announce = Self::announce_of(track, family, self.passthrough);
             log_track(ctx, track, family, announce);
+            // remux mode stores every NAL track already, a track without its record has no head
+            let can_store = !self.passthrough
+                && is_nal_entry(&track.entry.kind)
+                && !track.entry.config_record.is_empty()
+                && matches!(reframer, Reframer::Nal { .. });
             let name = format!("src_track{}", track.track_id);
             let stream = ctx.add_stream(Stream {
                 kind: match track.kind() {
@@ -1185,6 +1261,8 @@ impl Element for Mp4Demux {
                 delay_ticks: track.delay_ticks(),
                 text: text_of(track),
                 duration_ns: track.duration_ns,
+                can_store,
+                stored: false,
             });
             if let Some(refused) = track.edit_refused {
                 let element = ctx.element();
@@ -1309,6 +1387,9 @@ impl Element for Mp4Demux {
                 self.restart(ctx, ctx.seek_target())?;
             }
             Event::SrcLinked { pad, on, restart } => {
+                if !*on {
+                    self.untell(ctx, *pad);
+                }
                 self.relink(ctx, *pad, *on, *restart);
                 self.republish(ctx);
             }

@@ -45,6 +45,8 @@ use crate::va::{
     Surfaces, VaError,
 };
 use crate::vp9dec::{CopyFail, PendingOut, copy_out, frame_bytes};
+use pf_bitstream::av1::{Dpb, Ref};
+use pf_bitstream::{DpbError, Event as DpbEvent, Events, Fate, Slot};
 
 pub use header::{FrameHeader, FrameType};
 pub use obu::Av1Error;
@@ -122,42 +124,45 @@ use header::NUM_REF_FRAMES;
 /// for as many free surfaces as it decodes frames.
 const UNIT_RESERVE: usize = 2;
 
+/// A decoded frame, row `Slot` of the DPB's table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Slot {
+pub(crate) struct Pic {
+    /// the reference, `current_frame`
     pub surface: ffi::VASurfaceID,
+    /// the picture put out, grained when `apply_grain`, else `surface`
     pub display: ffi::VASurfaceID,
     pub width: u32,
     pub height: u32,
-    /// `showable_frame`, show_existing_frame may name this slot (6.8.2).
-    pub showable: bool,
 }
 
+/// The reference surfaces of the DPB's slots, the ungrained ones.
 pub(crate) fn ref_surfaces(
-    slots: &[Option<Slot>; NUM_REF_FRAMES],
+    slots: &[Option<Ref>; NUM_REF_FRAMES],
+    pics: &[Pic],
 ) -> [ffi::VASurfaceID; NUM_REF_FRAMES] {
     let mut refs = [ffi::VA_INVALID_SURFACE; NUM_REF_FRAMES];
     for (r, s) in refs.iter_mut().zip(slots) {
-        if let Some(s) = s {
-            *r = s.surface;
+        if let Some(p) = s.and_then(|s| pics.get(usize::from(s.slot.0))) {
+            *r = p.surface;
         }
     }
     refs
 }
 
-pub(crate) fn refresh_slots(
-    slots: &mut [Option<Slot>; NUM_REF_FRAMES],
-    h: &FrameHeader,
-    new: Option<Slot>,
-) -> [Option<Slot>; NUM_REF_FRAMES] {
-    let mut old = [None; NUM_REF_FRAMES];
-    let put =
-        if h.show_existing_frame { slots[usize::from(h.frame_to_show_map_idx & 7)] } else { new };
-    for (i, slot) in slots.iter_mut().enumerate() {
-        if h.refresh_frame_flags >> i & 1 == 1 {
-            old[i] = std::mem::replace(slot, put);
+/// A DPB refusal as the warning the element names it by, the slot index from the header.
+pub(crate) fn refusal(slots: &[Option<Ref>; NUM_REF_FRAMES], h: &FrameHeader, e: DpbError) -> K {
+    let empty = |i: u8| slots[usize::from(i & 7)].is_none();
+    match e {
+        DpbError::MissingReference if h.show_existing_frame => {
+            K::Av1EmptyRefSlot { slot: h.frame_to_show_map_idx & 7 }
         }
+        DpbError::MissingReference => match h.ref_frame_idx.iter().find(|&&i| empty(i)) {
+            Some(&slot) => K::Av1EmptyRefSlot { slot },
+            None => K::Dpb(e),
+        },
+        DpbError::NotShowable => K::Av1Stream(Av1Error::Invalid("show_existing_frame")),
+        e => K::Dpb(e),
     }
-    old
 }
 
 pub(crate) fn stated_color(c: &ColorConfig) -> Color {
@@ -201,9 +206,13 @@ pub struct VaapiAv1Dec {
     display: Option<Display>,
     device: Option<PathBuf>,
 
-    stream: Stream,
-    slots: [Option<Slot>; NUM_REF_FRAMES],
-    awaiting_key: bool,
+    dpb: Dpb,
+    /// the DPB's slots, a row per target surface seen
+    slots: Vec<Pic>,
+    /// per slot, held by the DPB
+    held: Vec<bool>,
+    /// per slot, the picture its next `Output` puts out
+    outs: Vec<Option<PendingOut>>,
     /// The first picture goes at once and holds the next decode until its group put out.
     first: crate::firstout::FirstOut,
     /// Spatial layers shown in the temporal unit in hand, one bit each.
@@ -261,9 +270,10 @@ impl VaapiAv1Dec {
             va: None,
             display: None,
             device: None,
-            stream: Stream::new(),
-            slots: [None; NUM_REF_FRAMES],
-            awaiting_key: true,
+            dpb: Dpb::new(),
+            slots: Vec::with_capacity(32),
+            held: Vec::with_capacity(32),
+            outs: Vec::with_capacity(32),
             first: crate::firstout::FirstOut::new(),
             shown_layers: 0,
             tiles: Vec::with_capacity(64),
@@ -430,7 +440,13 @@ impl VaapiAv1Dec {
     }
 
     fn teardown_session(&mut self, ctx: &Ctx) {
-        self.slots = [None; NUM_REF_FRAMES];
+        // the frames die with the session, the parser keeps its slots for the key frame in hand
+        let mut ev = Events::new();
+        self.dpb.drop_frames(&mut ev);
+        self.apply(&ev);
+        self.slots.clear();
+        self.held.clear();
+        self.outs.clear();
         if !self.output_queue.is_empty() {
             log!(ctx, Level::Debug, "teardown_drop", queued = self.output_queue.len());
         }
@@ -450,7 +466,10 @@ impl VaapiAv1Dec {
     }
 
     fn surface_referenced(&self, id: ffi::VASurfaceID) -> bool {
-        self.slots.iter().flatten().any(|s| s.surface == id || s.display == id)
+        self.slots
+            .iter()
+            .zip(&self.held)
+            .any(|(p, &held)| held && (p.surface == id || p.display == id))
             || self.output_queue.iter().any(|o| o.surface == id)
             || self.in_flight.iter().any(|(s, _)| *s == id)
     }
@@ -467,34 +486,29 @@ impl VaapiAv1Dec {
         }
     }
 
-    fn lose(&mut self, ctx: &mut Ctx, kind: Option<K>) {
-        if let Some(kind) = kind.filter(|_| !self.awaiting_key) {
+    /// A frame that failed, the frames up to the next key frame parse and are skipped. `quiet`
+    /// when the DPB waited for a key frame already.
+    fn lose(&mut self, ctx: &mut Ctx, quiet: bool, kind: Option<K>) {
+        if let Some(kind) = kind.filter(|_| !quiet) {
             self.warn(ctx, kind);
         }
-        self.awaiting_key = true;
-        self.stream.reset();
-        let slots = std::mem::replace(&mut self.slots, [None; NUM_REF_FRAMES]);
-        for s in slots.into_iter().flatten() {
-            self.release_if_unreferenced(s.surface);
-            self.release_if_unreferenced(s.display);
-        }
+        self.dpb.await_key();
     }
 
     fn decode_unit(&mut self, ctx: &mut Ctx, tu: &[u8], pts: Timestamp, duration: Timestamp) {
         let mut at = 0;
         self.shown_layers = 0;
         loop {
-            let frame = match self.stream.next_frame(tu, &mut at) {
+            let quiet = self.dpb.awaiting_key();
+            // a parse error resets the parser and waits for a key frame
+            let frame = match self.dpb.next_frame(tu, &mut at) {
                 Ok(Some(f)) => f,
                 Ok(None) => return,
-                Err(e) => return self.lose(ctx, Some(K::Av1Stream(e))),
+                Err(e) => return self.lose(ctx, quiet, Some(K::Av1Stream(e))),
             };
-            if std::mem::take(&mut self.stream.seq_changed)
-                && frame.header.frame_type != FrameType::Key
-            {
+            if !quiet && self.dpb.awaiting_key() {
                 // A new sequence starts at a key frame, section 7.5.
                 log!(&*ctx, Level::Debug, "seq_change", key = false, pts = pts);
-                return self.lose(ctx, None);
             }
             if !self.frame(ctx, tu, &frame, pts, duration) {
                 return;
@@ -502,6 +516,7 @@ impl VaapiAv1Dec {
         }
     }
 
+    /// False once the element failed.
     fn frame(
         &mut self,
         ctx: &mut Ctx,
@@ -511,33 +526,27 @@ impl VaapiAv1Dec {
         duration: Timestamp,
     ) -> bool {
         let h = &frame.header;
-        if self.awaiting_key && h.frame_type != FrameType::Key {
-            log!(&*ctx, Level::Trace, "await_key", pts = pts);
-            self.stream.finish(frame);
-            return true;
-        }
-        if h.show_existing_frame {
-            let idx = h.frame_to_show_map_idx & 7;
-            let Some(slot) = self.slots[usize::from(idx)] else {
-                self.lose(ctx, Some(K::Av1EmptyRefSlot { slot: idx }));
-                return false;
-            };
-            if !slot.showable || !self.take_shown(frame.spatial_id) {
-                self.lose(ctx, Some(K::Av1Stream(Av1Error::Invalid("show_existing_frame"))));
-                return false;
+        let quiet = self.dpb.awaiting_key();
+        let mut ev = Events::new();
+        let fate = match self.dpb.begin(h, &mut ev) {
+            Ok(fate) => fate,
+            Err(e) => {
+                let kind = refusal(self.dpb.slots(), h, e);
+                self.lose(ctx, quiet, Some(kind));
+                return true;
             }
-            self.queue_output(ctx, slot.display, slot.width, slot.height, pts, duration);
-            self.stream.finish(frame);
-            let old = refresh_slots(&mut self.slots, h, None);
-            self.release_old(old);
-            if h.frame_type == FrameType::Key {
-                self.awaiting_key = false;
+        };
+        if fate == Fate::Skip {
+            if ev.as_slice().is_empty() {
+                log!(&*ctx, Level::Trace, "await_key", pts = pts);
+            } else {
+                self.show_again(ctx, frame.spatial_id, &ev, quiet, pts, duration);
             }
             return true;
         }
-        let Some(seq) = self.stream.seq else {
-            self.lose(ctx, Some(K::Av1Stream(Av1Error::NoSequenceHeader)));
-            return false;
+        let Some(seq) = self.dpb.stream().seq else {
+            self.lose(ctx, quiet, Some(K::Av1Stream(Av1Error::NoSequenceHeader)));
+            return true;
         };
         if !supported(&seq) {
             let c = &seq.color;
@@ -551,34 +560,27 @@ impl VaapiAv1Dec {
                     subsampling_y: c.subsampling_y,
                 },
             );
-            self.lose(ctx, None);
-            return false;
-        }
-        if !h.is_intra()
-            && let Some(&i) =
-                h.ref_frame_idx.iter().find(|&&i| self.slots[usize::from(i & 7)].is_none())
-        {
-            self.lose(ctx, Some(K::Av1EmptyRefSlot { slot: i }));
+            self.dpb.await_key();
             return false;
         }
         if h.show_frame && !self.take_shown(frame.spatial_id) {
-            self.lose(ctx, Some(K::Av1Stream(Av1Error::Invalid("show_frame"))));
-            return false;
+            self.lose(ctx, quiet, Some(K::Av1Stream(Av1Error::Invalid("show_frame"))));
+            return true;
         }
         if !self.ensure_va(ctx, &seq, h.frame_type == FrameType::Key) {
-            self.lose(ctx, None);
-            return false;
+            self.lose(ctx, quiet, None);
+            return !self.failed;
         }
         // A size past the surfaces would overrun the driver's write and the readback row.
         if let Some(va) = &self.va
             && (h.upscaled_width > va.coded_w || h.frame_height > va.coded_h)
         {
-            self.lose(ctx, Some(K::Av1Stream(Av1Error::Invalid("frame_size"))));
-            return false;
+            self.lose(ctx, quiet, Some(K::Av1Stream(Av1Error::Invalid("frame_size"))));
+            return true;
         }
         let Some(target) = self.acquire_surface() else {
-            self.lose(ctx, Some(K::NoFreeSurface));
-            return false;
+            self.lose(ctx, quiet, Some(K::NoFreeSurface));
+            return true;
         };
         let display = match h.film_grain.apply_grain {
             false => Some(target),
@@ -586,33 +588,65 @@ impl VaapiAv1Dec {
         };
         let Some(display) = display else {
             self.release_if_unreferenced(target);
-            self.lose(ctx, Some(K::NoFreeSurface));
-            return false;
+            self.lose(ctx, quiet, Some(K::NoFreeSurface));
+            return true;
         };
         if let Err(e) = self.submit(&seq, frame, tu, target, display) {
             self.picture_failed(ctx, &e, K::Submit(e));
             self.release_if_unreferenced(target);
             self.release_if_unreferenced(display);
-            self.lose(ctx, None);
-            return false;
+            self.lose(ctx, quiet, None);
+            return !self.failed;
         }
-        self.awaiting_key = false;
-        self.stream.finish(frame);
-        let new = Slot {
-            surface: target,
-            display,
-            width: h.upscaled_width,
-            height: h.frame_height,
-            showable: h.showable_frame,
+        let (width, height) = (h.upscaled_width, h.frame_height);
+        let out = match h.show_frame {
+            true => self
+                .goes_out(ctx, pts)
+                .and_then(|preview| self.pending(display, width, height, pts, duration, preview)),
+            false => None,
         };
-        let old = refresh_slots(&mut self.slots, h, Some(new));
-        if h.show_frame {
-            self.queue_output(ctx, display, h.upscaled_width, h.frame_height, pts, duration);
-        }
-        self.release_old(old);
-        self.release_if_unreferenced(target);
-        self.release_if_unreferenced(display);
+        self.decoded(h, Pic { surface: target, display, width, height }, out);
         true
+    }
+
+    /// Ends a frame decoded into `pic`, `out` what it puts out. One shown but without `out` is
+    /// decoded for the references alone.
+    fn decoded(&mut self, h: &FrameHeader, pic: Pic, out: Option<PendingOut>) {
+        let slot = self.slot_of(pic.surface);
+        let i = usize::from(slot.0);
+        self.slots[i] = pic;
+        self.held[i] = true;
+        let mut h = *h;
+        h.show_frame &= out.is_some();
+        self.outs[i] = out;
+        let mut ev = Events::new();
+        self.dpb.end(&h, slot, &mut ev);
+        self.apply(&ev);
+    }
+
+    /// A frame shown again, its `Output` first in `ev`. A key frame took every slot after it.
+    fn show_again(
+        &mut self,
+        ctx: &mut Ctx,
+        spatial_id: u8,
+        ev: &Events,
+        quiet: bool,
+        pts: Timestamp,
+        duration: Timestamp,
+    ) {
+        let shown = self.take_shown(spatial_id);
+        if shown
+            && let Some(&DpbEvent::Output(slot)) = ev.as_slice().first()
+            && let Some(preview) = self.goes_out(ctx, pts)
+        {
+            let i = usize::from(slot.0);
+            let p = self.slots[i];
+            self.outs[i] = self.pending(p.display, p.width, p.height, pts, duration, preview);
+        }
+        self.apply(ev);
+        if !shown {
+            self.lose(ctx, quiet, Some(K::Av1Stream(Av1Error::Invalid("show_existing_frame"))));
+        }
     }
 
     /// One shown frame per spatial layer and temporal unit (7.5). False for a second one,
@@ -624,11 +658,45 @@ impl VaapiAv1Dec {
         first
     }
 
-    fn release_old(&mut self, old: [Option<Slot>; NUM_REF_FRAMES]) {
-        for o in old.into_iter().flatten() {
-            self.release_if_unreferenced(o.surface);
-            self.release_if_unreferenced(o.display);
+    /// Carries out what the DPB asked, in order.
+    fn apply(&mut self, ev: &Events) {
+        for e in ev.as_slice() {
+            match *e {
+                DpbEvent::Output(slot) => {
+                    if let Some(out) = self.outs[usize::from(slot.0)].take() {
+                        self.output_queue.push_back(out);
+                    }
+                }
+                DpbEvent::Release(slot) => {
+                    let i = usize::from(slot.0);
+                    (self.held[i], self.outs[i]) = (false, None);
+                    let p = self.slots[i];
+                    self.release_if_unreferenced(p.surface);
+                    self.release_if_unreferenced(p.display);
+                }
+            }
         }
+    }
+
+    /// The DPB's name of target surface `id`, a slot per surface seen.
+    fn slot_of(&mut self, id: ffi::VASurfaceID) -> Slot {
+        let i = match self.slots.iter().position(|p| p.surface == id) {
+            Some(i) => i,
+            None => {
+                self.slots.push(Pic { surface: id, display: id, width: 0, height: 0 });
+                self.held.push(false);
+                self.outs.push(None);
+                self.slots.len() - 1
+            }
+        };
+        Slot(i as u16)
+    }
+
+    /// Lets go of every frame the DPB holds, the parser starts over at the next key frame.
+    fn discard_dpb(&mut self) {
+        let mut ev = Events::new();
+        self.dpb.discard(&mut ev);
+        self.apply(&ev);
     }
 
     fn submit(
@@ -659,12 +727,14 @@ impl VaapiAv1Dec {
         let (Some(dpy), Some(va)) = (&self.display, &self.va) else {
             return Ok(());
         };
-        let pic = params::pic_param(seq, &frame.header, ref_surfaces(&self.slots), target, display);
+        let refs = ref_surfaces(self.dpb.slots(), &self.slots);
+        let pic = params::pic_param(seq, &frame.header, refs, target, display);
         let pic_buf =
             VaBuffer::new_struct(dpy, &va.context, ffi::VAPictureParameterBufferType, &pic)?;
-        for g in &self.stream.groups {
+        let st = self.dpb.stream();
+        for g in &st.groups {
             self.tiles.clear();
-            let tiles = self.stream.tiles.get(g.first..g.first + g.count).unwrap_or(&[]);
+            let tiles = st.tiles.get(g.first..g.first + g.count).unwrap_or(&[]);
             self.tiles.extend(tiles.iter().map(|t| params::tile_param(t, g)));
             let data = tu.get(g.data_start..g.data_end).unwrap_or(&[]);
             bufs.push(VaBuffer::new_array(
@@ -687,27 +757,32 @@ impl VaapiAv1Dec {
         rendered.and(ended)
     }
 
-    fn queue_output(
-        &mut self,
-        ctx: &mut Ctx,
-        surface: ffi::VASurfaceID,
-        width: u32,
-        height: u32,
-        pts: Timestamp,
-        duration: Timestamp,
-    ) {
+    /// Whether a picture at `pts` goes out, and as a preview. A decode-only one counts a drop.
+    fn goes_out(&mut self, ctx: &mut Ctx, pts: Timestamp) -> Option<bool> {
         let before = self.only || ctx.before_presentation(pts, Timestamp::ZERO);
         let preview = before && !self.only && ctx.take_preview();
         if before && !preview {
             log!(&*ctx, Level::Trace, "decode_only", pts = pts);
             ctx.count_drop();
-            return;
+            return None;
         }
-        let (Some(va), Some(seq)) = (&self.va, &self.stream.seq) else {
-            return;
+        Some(preview)
+    }
+
+    fn pending(
+        &self,
+        surface: ffi::VASurfaceID,
+        width: u32,
+        height: u32,
+        pts: Timestamp,
+        duration: Timestamp,
+        preview: bool,
+    ) -> Option<PendingOut> {
+        let (Some(va), Some(seq)) = (&self.va, &self.dpb.stream().seq) else {
+            return None;
         };
         let color = Color { hdr: self.hdr, dovi: self.side.dovi, ..stated_color(&seq.color) };
-        self.output_queue.push_back(PendingOut {
+        Some(PendingOut {
             surface,
             export: surface,
             pts,
@@ -719,7 +794,7 @@ impl VaapiAv1Dec {
             format: va.format,
             color,
             preview,
-        });
+        })
     }
 
     fn emit_queued(&mut self, ctx: &mut Ctx, keep: usize) -> Result<bool, Error> {
@@ -967,16 +1042,10 @@ impl VaapiAv1Dec {
     }
 
     fn reset_stream(&mut self) {
-        let slots = std::mem::replace(&mut self.slots, [None; NUM_REF_FRAMES]);
         while let Some(o) = self.output_queue.pop_front() {
             self.release_if_unreferenced(o.surface);
         }
-        for s in slots.into_iter().flatten() {
-            self.release_if_unreferenced(s.surface);
-            self.release_if_unreferenced(s.display);
-        }
-        self.stream.reset();
-        self.awaiting_key = true;
+        self.discard_dpb();
         self.first.reset();
     }
 
@@ -990,7 +1059,7 @@ impl VaapiAv1Dec {
     }
 
     fn surfaces_needed(&self, tu: &[u8]) -> usize {
-        let seq = self.stream.seq.as_ref();
+        let seq = self.dpb.stream().seq.as_ref();
         let reduced = seq.is_some_and(|s| s.reduced_still_picture_header);
         let per_frame = 1 + usize::from(seq.is_some_and(|s| s.film_grain_params_present));
         let want = stream::decoded_frames(tu, reduced).max(1) * per_frame;
@@ -1117,9 +1186,10 @@ impl Element for VaapiAv1Dec {
         }
         self.in_flight.clear();
         self.output_queue.clear();
-        self.slots = [None; NUM_REF_FRAMES];
-        self.stream = Stream::new();
-        self.awaiting_key = true;
+        self.dpb = Dpb::new();
+        self.slots.clear();
+        self.held.clear();
+        self.outs.clear();
         self.first.reset();
         self.va = None;
         self.display = None;

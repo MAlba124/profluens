@@ -105,7 +105,8 @@ fn the_encoder_frame_headers_round_trip() {
         assert_eq!((groups[0].data_start, groups[0].data_end), (tile_at, tile_at + 100));
         assert_eq!(tiles, &[obu::Tile { offset: 0, size: 100, row: 0, col: 0 }]);
         let refs = ref_surfaces(
-            &[Some(Slot { surface: 3, display: 3, width: 320, height: 240, showable: true }); 8],
+            &[Some(Ref { slot: Slot(0), showable: true }); 8],
+            &[Pic { surface: 3, display: 3, width: 320, height: 240 }],
         );
         let p = params::pic_param(stream.seq.as_ref().unwrap(), h, refs, 9, 9);
         assert_eq!((p.frame_width_minus1, p.frame_height_minus1), (319, 239));
@@ -309,30 +310,119 @@ fn a_key_frame_shown_again_reloads_every_slot() {
     assert_eq!((slots[2].order_hint, slots[2].valid), (9, true));
 }
 
+fn enc_frame(key: bool, order_hint: u8, refresh_frame_flags: u8) -> EncFrame {
+    EncFrame {
+        key,
+        order_hint,
+        refresh_frame_flags,
+        primary_ref_frame: 0,
+        ref_frame_idx: [0; 7],
+        base_q_idx: 40,
+        tx_mode_select: false,
+    }
+}
+
+/// The headers of a 64x64 unit of `frames`, each one tile, as the element's DPB parses them.
+fn parsed(d: &mut VaapiAv1Dec, frames: &[EncFrame]) -> Vec<FrameHeader> {
+    let s = seq(64, 64, false);
+    let t = Tiles::single(64, 64).unwrap();
+    let mut tu = enc::sequence_header(&s, 4);
+    for f in frames {
+        tu.extend_from_slice(&enc::frame_header(&s, f, &t, 4).bytes);
+        tu.extend_from_slice(&enc::tile_group(&[0; 8], 4));
+    }
+    let mut at = 0;
+    let mut out = Vec::new();
+    while let Some(f) = d.dpb.next_frame(&tu, &mut at).unwrap() {
+        out.push(f.header);
+    }
+    out
+}
+
+fn out(surface: ffi::VASurfaceID) -> PendingOut {
+    PendingOut {
+        surface,
+        export: surface,
+        pts: Timestamp::ZERO,
+        duration: Timestamp::ZERO,
+        width: 64,
+        height: 64,
+        coded_w: 64,
+        coded_h: 64,
+        format: SurfaceFormat::NV12,
+        color: Color::default(),
+        preview: false,
+    }
+}
+
+fn pic(surface: ffi::VASurfaceID, display: ffi::VASurfaceID) -> Pic {
+    Pic { surface, display, width: 64, height: 64 }
+}
+
+fn queued(d: &VaapiAv1Dec) -> Vec<ffi::VASurfaceID> {
+    d.output_queue.iter().map(|o| o.surface).collect()
+}
+
 #[test]
 fn the_slots_take_the_surfaces_the_header_names() {
-    let mut h = header::parse_frame_header(
-        &[0b1011_0000],
-        &super::seq::parse_sequence_header(&enc::sequence_header(&seq(64, 64, false), 4)[5..])
-            .unwrap(),
-        &[RefFrame { valid: true, ..RefFrame::EMPTY }; 8],
-        0,
-        0,
-    )
-    .unwrap();
-    let mut slots = [None; 8];
-    let a = Slot { surface: 1, display: 2, width: 64, height: 64, showable: true };
-    h.show_existing_frame = false;
-    h.refresh_frame_flags = 0b0000_1001;
-    assert_eq!(refresh_slots(&mut slots, &h, Some(a)), [None; 8]);
-    assert_eq!((slots[0], slots[3], slots[1]), (Some(a), Some(a), None));
-    assert_eq!(ref_surfaces(&slots)[0], 1, "the reference is the ungrained surface");
-    h.show_existing_frame = true;
-    h.frame_to_show_map_idx = 3;
-    h.refresh_frame_flags = ALL_FRAMES;
-    let old = refresh_slots(&mut slots, &h, None);
-    assert_eq!((old[0], old[1]), (Some(a), None));
-    assert!(slots.iter().all(|s| *s == Some(a)));
+    let mut d = VaapiAv1Dec::new();
+    let h = parsed(&mut d, &[enc_frame(true, 0, 0xff), enc_frame(false, 1, 0x02)]);
+    let mut ev = Events::new();
+    assert_eq!(d.dpb.begin(&h[0], &mut ev), Ok(Fate::Shown));
+    d.decoded(&h[0], pic(1, 2), Some(out(2)));
+    assert_eq!(queued(&d), [2], "the grained surface goes out");
+    assert_eq!(ref_surfaces(d.dpb.slots(), &d.slots), [1; 8], "the references are ungrained");
+    assert!(d.surface_referenced(1) && d.surface_referenced(2));
+    // a hidden frame into slot 1
+    let mut hidden = h[1];
+    (hidden.show_frame, hidden.showable_frame) = (false, true);
+    assert_eq!(d.dpb.begin(&hidden, &mut ev), Ok(Fate::Hidden));
+    d.decoded(&hidden, pic(3, 4), None);
+    assert_eq!(queued(&d), [2]);
+    let refs = ref_surfaces(d.dpb.slots(), &d.slots);
+    assert_eq!((refs[0], refs[1], refs[2]), (1, 3, 1));
+    // shown again from its slot
+    let mut again = hidden;
+    (again.show_existing_frame, again.frame_to_show_map_idx, again.refresh_frame_flags) =
+        (true, 1, 0);
+    assert_eq!(d.dpb.begin(&again, &mut ev), Ok(Fate::Skip));
+    assert_eq!(ev.as_slice(), [DpbEvent::Output(Slot(1))]);
+    d.outs[1] = Some(out(4));
+    d.apply(&ev);
+    assert_eq!(queued(&d), [2, 4]);
+    // decode only, shown but put out nowhere, and no slot takes it
+    let mut only = h[1];
+    only.refresh_frame_flags = 0;
+    assert_eq!(d.dpb.begin(&only, &mut ev), Ok(Fate::Shown));
+    d.decoded(&only, pic(5, 5), None);
+    assert_eq!(queued(&d), [2, 4]);
+    assert!(!d.surface_referenced(5));
+    assert_eq!(d.slot_of(5), Slot(2), "the row stays for the surface");
+    // a reused surface keeps its row
+    assert_eq!(d.slot_of(3), Slot(1));
+    d.discard_dpb();
+    assert!(d.held.iter().all(|&h| !h));
+    assert!(!d.surface_referenced(1) && !d.surface_referenced(3));
+    assert!(d.surface_referenced(2), "a queued picture stays");
+}
+
+#[test]
+fn a_dpb_refusal_names_the_slot() {
+    let mut d = VaapiAv1Dec::new();
+    let mut h = parsed(&mut d, &[enc_frame(true, 0, 0xff), enc_frame(false, 1, 0x02)])[1];
+    let mut slots = [Some(Ref { slot: Slot(0), showable: true }); 8];
+    slots[5] = None;
+    let missing = DpbError::MissingReference;
+    h.ref_frame_idx = [0, 1, 5, 5, 0, 0, 0];
+    assert_eq!(refusal(&slots, &h, missing), K::Av1EmptyRefSlot { slot: 5 });
+    h.ref_frame_idx = [0; 7];
+    assert_eq!(refusal(&slots, &h, missing), K::Dpb(missing));
+    (h.show_existing_frame, h.frame_to_show_map_idx) = (true, 5);
+    assert_eq!(refusal(&slots, &h, missing), K::Av1EmptyRefSlot { slot: 5 });
+    assert_eq!(
+        refusal(&slots, &h, DpbError::NotShowable),
+        K::Av1Stream(Av1Error::Invalid("show_existing_frame"))
+    );
 }
 
 #[test]

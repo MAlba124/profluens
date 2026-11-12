@@ -1068,6 +1068,11 @@ fn recycle_park(free: &mut Vec<Vec<u8>>, buf: Vec<u8>) {
     }
 }
 
+/// Whether a linked pad takes the frames of track `number`.
+fn taken(pads: &[PadTrack], number: u64) -> bool {
+    pads.iter().any(|pt| pt.linked && pt.track_number == number)
+}
+
 struct Carry {
     stamp: Stamp,
     bytes: Vec<u8>,
@@ -1710,7 +1715,8 @@ impl MkvDemux {
             return Some(out);
         }
         if !pulled {
-            return self.reader.next_frame().map(Out::owned);
+            let pads = &self.pad_tracks;
+            return self.reader.next_frame_of(|number| taken(pads, number)).map(Out::owned);
         }
         while let Some(f) = self.up.as_mut().and_then(Cued::pop) {
             if let Some(out) = self.cued_out(f) {
@@ -1740,6 +1746,8 @@ impl MkvDemux {
             let coded = self.seek.parsed.tracks.iter().find(|t| t.track_number == track_number);
             let bytes = match coded.map(|t| &t.coding).filter(|c| c.transforms()) {
                 None => Bytes::View(view, whole),
+                // a coded frame no pad takes is dropped undecoded
+                Some(_) if !taken(&self.pad_tracks, track_number) => continue,
                 Some(coding) => {
                     match self.reader.decode_frame(track_number, &coding.frames, view.data()) {
                         Some(data) => Bytes::Owned(data),

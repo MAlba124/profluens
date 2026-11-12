@@ -9,6 +9,7 @@ use pf_mkv::ebml::{self, id};
 use pf_mkv::inflate::adler32;
 use pf_mkv::{MatroskaReader, MkvDemux, MkvExtras, Refusal};
 use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
     Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
@@ -405,6 +406,75 @@ fn the_demuxer_puts_out_decoded_frames_alike_pulled_and_pushed() {
     assert_eq!(pushed[2].last().unwrap().2.len(), 40_000);
     let le: Vec<u8> = pcm_be(0, 64).chunks(2).flat_map(|s| [s[1], s[0]]).collect();
     assert_eq!(pushed[3][0].2, le);
+}
+
+/// The film with stream `left` given no pad, what the other pads took and the warnings said.
+fn demux_without(name: &str, pull: bool, left: Option<u32>) -> (Vec<Vec<Buf>>, Vec<String>) {
+    let (file, _) = film();
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mkv_content");
+    std::fs::create_dir_all(&dir).expect("a tmp dir");
+    let path = dir.join(name);
+    std::fs::write(&path, &file).expect("write the fixture");
+    let mut p = pf_reactor::pipeline();
+    p.set_select_all(false);
+    let src = FileSrc::new(path.to_str().expect("utf-8"));
+    let src = p.add(if pull { src } else { src.push_only() });
+    let demux = p.add(MkvDemux::new(header(&file)));
+    p.link(src.src(FileSrc::OUT), demux.sink(MkvDemux::IN)).expect("link");
+    p.preroll().expect("preroll");
+    let mut got = Vec::new();
+    for stream in (0..p.streams(demux).len() as u32).filter(|s| Some(*s) != left) {
+        let pad = p.select(demux, stream).expect("a pad");
+        let g: Got = Arc::default();
+        let rec = p.add(Rec(Arc::clone(&g)));
+        p.link(demux.src(pad), rec.sink(SinkPad(0))).expect("link");
+        got.push(g);
+    }
+    p.run().expect("run");
+    let mut warnings = Vec::new();
+    while let Some(m) = p.bus().try_recv() {
+        if let BusMessage::Warning { error, .. } = m {
+            warnings.push(error.to_string());
+        }
+    }
+    (got.iter().map(|g| g.lock().unwrap().clone()).collect(), warnings)
+}
+
+#[test]
+fn a_coded_frame_of_a_track_no_one_takes_is_dropped_undecoded() {
+    let (file, _) = film();
+    let read = |takes: fn(u64) -> bool| {
+        let mut r = MatroskaReader::new();
+        r.push(&file).expect("the file reads");
+        let frames: Vec<(u64, u64, Vec<u8>)> = std::iter::from_fn(|| r.next_frame_of(takes))
+            .map(|f| (f.track_number, f.pts_ns, f.data))
+            .collect();
+        (frames, r.take_undecoded().map(|(track, _)| track))
+    };
+    let (all, said) = read(|_| true);
+    assert_eq!(said, Some(3), "read, the broken zlib frame is said");
+    let (rest, said) = read(|track| track != 3);
+    assert_eq!(said, None, "not taken, it was never inflated");
+    let want: Vec<_> = all.into_iter().filter(|f| f.0 != 3).collect();
+    assert!(want.iter().any(|f| f.0 == 2), "the stripped AC-3 track is coded too and still read");
+    assert_eq!(rest, want, "every other track reads alike");
+}
+
+#[test]
+fn the_demuxer_inflates_no_frame_of_a_stream_without_a_pad() {
+    const UNDONE: &str = "content encoding does not undo";
+    for pull in [true, false] {
+        let name = |what: &str| format!("{what}_{}.mkv", if pull { "pulled" } else { "pushed" });
+        let (all, warnings) = demux_without(&name("every"), pull, None);
+        assert_eq!(all.len(), 6);
+        assert!(warnings.iter().any(|w| w.contains(UNDONE)), "linked, the broken frame is said");
+        // stream 2 is the zlib captions, with one frame that does not inflate
+        let (rest, warnings) = demux_without(&name("no_captions"), pull, Some(2));
+        assert!(!warnings.iter().any(|w| w.contains(UNDONE)), "unlinked, nothing inflated it");
+        let want: Vec<_> = all.into_iter().enumerate().filter(|(n, _)| *n != 2).collect();
+        let want: Vec<Vec<Buf>> = want.into_iter().map(|(_, bufs)| bufs).collect();
+        assert_eq!(rest, want, "the other pads play alike, pull {pull}");
+    }
 }
 
 #[test]

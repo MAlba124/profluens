@@ -389,6 +389,12 @@ impl MatroskaReader {
     }
 
     pub fn next_frame(&mut self) -> Option<Frame> {
+        self.next_frame_of(|_| true)
+    }
+
+    /// The next frame, a coded one of a track `takes` refuses dropped undecoded. Nothing reads
+    /// that track, so inflating its frames is work thrown away.
+    pub fn next_frame_of(&mut self, takes: impl Fn(u64) -> bool) -> Option<Frame> {
         let budget = self.free_budget();
         while let Some(Queued { mut frame, coded }) = self.pending.pop_front() {
             self.queued -= frame.data.len();
@@ -396,7 +402,7 @@ impl MatroskaReader {
                 return Some(frame);
             }
             let number = frame.track_number;
-            let track = self.tracks.iter().find(|t| t.track_number == number);
+            let track = self.tracks.iter().find(|t| t.track_number == number && takes(number));
             let Some(steps) = track.map(|t| &t.coding.frames) else {
                 self.free.put(frame.data, budget);
                 self.free.put(frame.t35, budget);

@@ -41,6 +41,8 @@ pub const MIN_REGION_BYTES: usize = 64 << 10;
 pub const SMALL_REGION_SLOTS: u32 = 64;
 /// Acquires between the takes that keep the high water within its bound.
 const TAKE_SPAN: u32 = 32;
+/// Idle regions closed to make room for one mapped past a reserve, at most.
+const EVICT_MOST: usize = 8;
 /// Charge bit of a sized slot counted under the count cap.
 const COUNTED: u32 = 1 << 31;
 /// Read bytes a pool's reactor credits keep in flight, see [`Pool::io_depth`].
@@ -516,7 +518,7 @@ enum Keep {
     Budget,
     /// Never, mapped by [`Pool::reserve_sized`].
     Reserved,
-    /// At once, a burst past a reserve.
+    /// Past a reserve, kept while class bytes are within the budget.
     Burst,
 }
 
@@ -529,11 +531,13 @@ struct Held {
     out: u32,
     locked: bool,
     keep: Keep,
+    /// [`Regions::releases`] when a slot last came back under the lock.
+    idle_at: u64,
 }
 
 impl Held {
     fn new(region: NonNull<Region>, locked: bool, keep: Keep) -> Held {
-        Held { region, free: 0, spare: END, out: 0, locked, keep }
+        Held { region, free: 0, spare: END, out: 0, locked, keep, idle_at: 0 }
     }
 }
 
@@ -650,6 +654,44 @@ fn from_reserve(
     None
 }
 
+/// A free slot kept past a reserve, of the nearest class above `class` and at most twice its
+/// size. Frames of one stream vary by less from one to the next, so they share what is mapped
+/// in place of each class keeping slots for its own peak.
+fn from_bursts(
+    small: &mut [Vec<Held>; SMALL_CLASSES],
+    class: usize,
+) -> Option<(NonNull<Region>, u32)> {
+    let near = small.iter_mut().skip(class + 1).take(4).flatten();
+    near.filter(|h| h.keep == Keep::Burst).find_map(|h| pop(h).map(|slot| (h.region, slot)))
+}
+
+/// Closes regions kept past a reserve with nothing out, the longest idle first, until `need`
+/// more class bytes fit `budget`. What a stream stopped asking for makes room for what it asks
+/// now, and a region in use is never the one to go. The closed are unmapped once the lock is
+/// gone.
+fn evict_idle(
+    reg: &mut Regions,
+    need: usize,
+    budget: u64,
+) -> [Option<NonNull<Region>>; EVICT_MOST] {
+    let mut closed = [None; EVICT_MOST];
+    for gone in &mut closed {
+        if (reg.class_bytes + need) as u64 <= budget {
+            break;
+        }
+        let idle = reg.small.iter().enumerate().flat_map(|(class, list)| {
+            let kept = list.iter().enumerate().filter(|(_, h)| h.keep == Keep::Burst && h.out == 0);
+            kept.map(move |(at, h)| (h.idle_at, class, at))
+        });
+        let Some((_, class, at)) = idle.min() else { break };
+        let h = reg.small[class].swap_remove(at);
+        // SAFETY: a held region is mapped.
+        reg.class_bytes -= unsafe { h.region.as_ref() }.len;
+        *gone = close(h, &mut reg.counts);
+    }
+    closed
+}
+
 /// Pops the free slot whose touched bytes fit `want` most tightly, else the most touched.
 fn pop_fit(h: &mut Held, want: u32) -> Option<u32> {
     // SAFETY: a held region is mapped.
@@ -754,20 +796,23 @@ fn release_locked(region: NonNull<Region>, slot: u32) {
         drop(regions);
         return drain(region, slot);
     }
-    let Regions { small, counts, class_bytes, .. } = &mut *regions;
+    let Regions { small, counts, class_bytes, releases, .. } = &mut *regions;
     let list = &mut small[class as usize];
     let at = list.iter().position(|h| h.region == region).expect("an attached region is listed");
     let h = &mut list[at];
     r.next[slot as usize].store(h.free, Ordering::Relaxed);
     h.free = slot;
     h.out -= 1;
+    *releases += 1;
+    h.idle_at = *releases;
     let charge = r.sized[slot as usize].charge.load(Ordering::Relaxed);
     counts.bytes_out -= (charge & !COUNTED) as u64;
     counts.sized_out -= (charge & COUNTED != 0) as u64;
+    let past = *class_bytes as u64 > pool.bytes_budget;
     let shed = match h.keep {
-        Keep::Budget => at > 0 && *class_bytes as u64 > pool.bytes_budget,
+        Keep::Budget => at > 0 && past,
         Keep::Reserved => false,
-        Keep::Burst => true,
+        Keep::Burst => past,
     };
     let mut closed = None;
     if h.out == 0 && shed {
@@ -909,6 +954,8 @@ struct Regions {
     classes: u128,
     reserves: u128,
     class_bytes: usize,
+    /// Slots that came back under the lock, the clock a kept region's idle time is read on.
+    releases: u64,
     counts: Counts,
 }
 
@@ -1085,6 +1132,7 @@ impl Pool {
             classes: 0,
             reserves: 0,
             class_bytes: 0,
+            releases: 0,
             counts: Counts::default(),
         };
         Self {
@@ -1394,19 +1442,27 @@ impl Pool {
             true => reg.reserves & !((1u128 << class) - 1),
             false => reg.reserves & (1u128 << class),
         };
-        let (region, slot) = match own.or_else(|| from_reserve(&mut reg.small, above, size as u32))
-        {
+        let kept = |small: &mut _| if above != 0 { from_bursts(small, class) } else { None };
+        let held = own
+            .or_else(|| kept(&mut reg.small))
+            .or_else(|| from_reserve(&mut reg.small, above, size as u32));
+        let (region, slot) = match held {
             Some(taken) => taken,
             None => {
                 let list = &mut reg.small[class];
                 let (pool, kind) = (Arc::downgrade(&self.inner), Kind::Small(class as u8));
                 let doubled = CLASS_FIRST_SLOTS << list.len().min(16);
                 let slots = doubled.min((CLASS_REGION_BYTES / size) as u32).max(1);
-                // A burst past the budget, or one large slot, releases under the lock.
+                // Past a reserve or the budget, or one large slot, releases under the lock.
                 let past = (reg.class_bytes + size * slots as usize) as u64 > inner.bytes_budget;
                 let keep = if above != 0 { Keep::Burst } else { Keep::Budget };
                 let locked = above != 0 || (!list.is_empty() && (past || slots == 1));
+                let idle = match past && above != 0 {
+                    true => evict_idle(reg, size * slots as usize, inner.bytes_budget),
+                    false => [None; EVICT_MOST],
+                };
                 drop(regions);
+                unmap_closed(idle.into_iter().flatten(), &inner.bytes_mapped);
                 let region =
                     Region::map(Allocator::HEAP, size, slots, MIN_ALIGN, kind, locked, pool);
                 regions = inner.lock();
@@ -2487,24 +2543,94 @@ mod tests {
     }
 
     #[test]
-    fn a_burst_past_a_reserve_goes_at_its_release() {
+    fn a_burst_past_a_reserve_is_kept_within_the_budget() {
         let pool = Pool::with_config(PoolConfig { bytes: 64 << 20, ..PoolConfig::heap(64, 24) });
         pool.reserve_sized(2 << 20, 2).unwrap();
-        let held: Vec<Memory> =
-            (0..3).map(|_| pool.try_acquire_sized(2 << 20).unwrap().unwrap()).collect();
+        let three = || -> Vec<Memory> {
+            (0..3).map(|_| pool.try_acquire_sized(2 << 20).unwrap().unwrap()).collect()
+        };
+        let held = three();
         let s = pool.stats();
         assert_eq!((s.regions, s.slot_allocations), (2, 2), "the third maps a burst region");
         drop(held);
         let s = pool.stats();
-        assert_eq!(
-            (s.regions, s.bytes_mapped),
-            (1, 2 * (2 << 20)),
-            "the burst went, the reserve stays"
-        );
+        assert_eq!((s.regions, s.bytes_mapped), (2, 3 * (2 << 20)), "the burst stays mapped");
+        for _ in 0..100 {
+            drop(three());
+        }
+        let s = pool.stats();
+        assert_eq!(s.slot_allocations, 2, "a buffer past the reserve maps nothing again");
+        assert_eq!((s.bytes_out, s.outstanding), (0, 0), "every charge came back");
         let big = pool.try_acquire_sized(4 << 20).unwrap().unwrap();
         let small = pool.try_acquire_sized(1000).unwrap().unwrap();
         assert_eq!((big.capacity(), small.capacity()), (4 << 20, 1024));
         assert_eq!(pool.stats().slot_allocations, 4);
+    }
+
+    #[test]
+    fn a_kept_burst_serves_the_classes_down_to_half_its_size() {
+        let pool = Pool::with_config(PoolConfig { bytes: 64 << 20, ..PoolConfig::heap(64, 24) });
+        pool.reserve_sized(4 << 20, 1).unwrap();
+        let reserved = pool.try_acquire_sized(4 << 20).unwrap().unwrap();
+        let burst = pool.try_acquire_sized(1 << 20).unwrap().unwrap();
+        let (slot, maps) = (burst.slot_id(), pool.stats().slot_allocations);
+        drop(burst);
+        for size in [1 << 20, 900 << 10, 640 << 10, 512 << 10] {
+            let m = pool.try_acquire_sized(size).unwrap().unwrap();
+            assert_eq!(m.slot_id(), slot, "{size} bytes go where the megabyte was");
+            let class = small_class(size).unwrap().1 as u64;
+            assert_eq!(pool.stats().bytes_out, (4 << 20) + class, "charged at its own class");
+        }
+        assert_eq!(pool.stats().slot_allocations, maps, "nothing mapped for them");
+        let small = pool.try_acquire_sized(448 << 10).unwrap().unwrap();
+        assert_eq!(small.capacity(), 448 << 10, "under half the slot, a slot of its own class");
+        assert_eq!(pool.stats().slot_allocations, maps + 1);
+        drop((small, reserved));
+        assert_eq!(pool.stats().bytes_out, 0);
+    }
+
+    #[test]
+    fn a_burst_past_the_budget_takes_the_room_of_the_longest_idle() {
+        let pool = Pool::with_config(PoolConfig { bytes: 2 << 20, ..PoolConfig::heap(64, 24) });
+        pool.reserve_sized(2 << 20, 1).unwrap();
+        let reserved = pool.try_acquire_sized(256 << 10).unwrap().unwrap();
+        // the megabyte is left idle the longest
+        for size in [384 << 10, 1 << 20, 384 << 10] {
+            drop(pool.try_acquire_sized(size).unwrap().unwrap());
+        }
+        let s = pool.stats();
+        let kept = (2 << 20) + (384 << 10) + (1 << 20);
+        assert_eq!((s.regions, s.slot_allocations, s.bytes_mapped), (3, 3, kept), "both stay");
+        // larger than either kept, so neither serves it, and past the budget with both
+        let wide = 1280 << 10;
+        for _ in 0..10 {
+            drop(pool.try_acquire_sized(wide).unwrap().unwrap());
+        }
+        let s = pool.stats();
+        assert_eq!((s.regions, s.slot_allocations), (3, 4), "mapped once, the megabyte gone");
+        assert_eq!(s.bytes_mapped, (2 << 20) + (384 << 10) + wide as u64);
+        drop(pool.try_acquire_sized(384 << 10).unwrap().unwrap());
+        assert_eq!(pool.stats().slot_allocations, 4, "the one used since is still mapped");
+        drop(reserved);
+        assert_eq!(pool.stats().bytes_out, 0);
+    }
+
+    #[test]
+    fn a_burst_past_the_budget_with_none_idle_goes_at_its_release() {
+        // Exact buffers are outside the byte budget, so the class bytes out can pass it.
+        let pool =
+            Pool::with_config(PoolConfig { bytes: 2 << 20, ..PoolConfig::heap(4 << 20, 24) });
+        pool.reserve_sized(2 << 20, 1).unwrap();
+        let mut held: Vec<Memory> =
+            (0..4).map(|_| pool.acquire_exact(768 << 10).expect("exact")).collect();
+        let s = pool.stats();
+        assert_eq!((s.regions, s.slot_allocations), (4, 4), "the reserve and three bursts");
+        held.pop();
+        assert_eq!(pool.stats().regions, 3, "nothing idle made room, so the last one went");
+        drop(held);
+        let s = pool.stats();
+        let kept = (2 << 20) + 2 * (768 << 10);
+        assert_eq!((s.regions, s.bytes_mapped), (3, kept), "the two within the budget stay");
     }
 
     #[test]

@@ -1158,6 +1158,13 @@ impl PocState {
         *self = PocState::default();
     }
 
+    /// The state after a frame with memory_management_control_operation 5 (8.2.1.1, 8.2.1.2).
+    /// `top` is its TopFieldOrderCnt less tempPicOrderCnt, the prevPicOrderCntLsb of the next
+    /// picture, everything else counts from 0.
+    pub fn reset_after_mmco5(&mut self, top: i32) {
+        *self = PocState { prev_poc_lsb: top, ..PocState::default() };
+    }
+
     /// POC (8.2.1) as (TopFieldOrderCnt, BottomFieldOrderCnt). Frames only. `ref_idc` is the
     /// NAL's nal_ref_idc, a non-reference picture leaves the prev state and counts apart.
     pub fn compute(
@@ -1167,10 +1174,30 @@ impl PocState {
         is_idr: bool,
         ref_idc: u8,
     ) -> (i32, i32) {
+        let frame_num = sh.frame_num as i32;
         match sps.pic_order_cnt_type {
             0 => self.compute_type0(sps, sh, is_idr, ref_idc),
-            2 => self.compute_type2(sps, sh, is_idr, ref_idc),
-            _ => self.compute_type1(sps, sh, is_idr, ref_idc),
+            2 => self.compute_type2(sps, frame_num, is_idr, ref_idc),
+            _ => self.compute_type1(
+                sps,
+                frame_num,
+                is_idr,
+                sh.is_idr,
+                ref_idc,
+                sh.delta_pic_order_cnt,
+            ),
+        }
+    }
+
+    /// POC of a non-existing reference frame of a frame_num gap (8.2.5.2), which types 1 and 2
+    /// count like a frame without delta_pic_order_cnt. None with type 0, which leaves the state
+    /// and gives such frames no order count of their own.
+    pub fn compute_gap(&mut self, sps: &Sps, frame_num: u32) -> Option<(i32, i32)> {
+        let frame_num = frame_num as i32;
+        match sps.pic_order_cnt_type {
+            0 => None,
+            2 => Some(self.compute_type2(sps, frame_num, false, 1)),
+            _ => Some(self.compute_type1(sps, frame_num, false, false, 1, [0; 2])),
         }
     }
 
@@ -1206,12 +1233,11 @@ impl PocState {
     fn compute_type2(
         &mut self,
         sps: &Sps,
-        sh: &SliceHeader,
+        frame_num: i32,
         is_idr: bool,
         ref_idc: u8,
     ) -> (i32, i32) {
         let max_frame_num = sps.max_frame_num() as i32;
-        let frame_num = sh.frame_num as i32;
         let frame_num_offset = if is_idr {
             0
         } else if self.prev_frame_num > frame_num {
@@ -1233,15 +1259,17 @@ impl PocState {
         (poc, poc)
     }
 
+    /// `is_idr` is the NAL's, `sh_idr` the header's, both from the unit type when parsed.
     fn compute_type1(
         &mut self,
         sps: &Sps,
-        sh: &SliceHeader,
+        frame_num: i32,
         is_idr: bool,
+        sh_idr: bool,
         ref_idc: u8,
+        delta_pic_order_cnt: [i32; 2],
     ) -> (i32, i32) {
         let max_frame_num = sps.max_frame_num() as i32;
-        let frame_num = sh.frame_num as i32;
         let frame_num_offset = if is_idr {
             0
         } else if self.prev_frame_num > frame_num {
@@ -1253,7 +1281,7 @@ impl PocState {
         let mut expected = 0i32;
         let abs_frame_num =
             if num_in_cycle != 0 { frame_num_offset.wrapping_add(frame_num) } else { 0 };
-        let abs_frame_num = if sh.is_idr { 0 } else { abs_frame_num };
+        let abs_frame_num = if sh_idr { 0 } else { abs_frame_num };
         // 8.2.1.2, a non-reference picture counts one frame back.
         let abs_frame_num = if ref_idc == 0 { abs_frame_num - 1 } else { abs_frame_num }.max(0);
         if num_in_cycle != 0 && abs_frame_num > 0 {
@@ -1268,10 +1296,10 @@ impl PocState {
         if ref_idc == 0 {
             expected = expected.wrapping_add(sps.offset_for_non_ref_pic);
         }
-        let top = expected.wrapping_add(sh.delta_pic_order_cnt[0]);
+        let top = expected.wrapping_add(delta_pic_order_cnt[0]);
         let bottom = top
             .wrapping_add(sps.offset_for_top_to_bottom_field)
-            .wrapping_add(sh.delta_pic_order_cnt[1]);
+            .wrapping_add(delta_pic_order_cnt[1]);
         self.prev_frame_num = frame_num;
         self.prev_frame_num_offset = frame_num_offset;
         (top, bottom)

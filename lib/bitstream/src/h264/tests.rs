@@ -132,6 +132,7 @@ fn current(frame_num: u16, poc: i32) -> Picture {
         bottom_poc: poc,
         gop: 1,
         poc,
+        key: false,
         key_now: false,
     }
 }
@@ -627,4 +628,325 @@ fn bump_one_lets_the_smallest_waiting_picture_out_ahead_of_the_reorder() {
     assert_eq!(ev.as_slice(), [Output(Slot(1))]);
     assert!(!d.bump_one(&mut ev));
     assert!(ev.as_slice().is_empty());
+}
+
+#[test]
+fn an_mmco5_frame_with_a_negative_bottom_delta_sets_the_next_prev_poc_lsb() {
+    use SliceType::*;
+    let s = sps(0, 4, 2);
+    let mut d = Dpb::new();
+    picture(&mut d, &s, true, &idr(0), 0);
+    // bottom first, tempPicOrderCnt 16 leaves top 4, which is prevPicOrderCntLsb (8.2.1.1)
+    let mut sh = with_mmco(header(P, 1, 20), &[(5, 0, 0)]);
+    sh.delta_pic_order_cnt_bottom = -4;
+    let (pic, _) = picture(&mut d, &s, true, &sh, 1);
+    assert_eq!((pic.top_poc, pic.bottom_poc, pic.poc), (20, 16, 0));
+    assert_eq!((d.refs()[0].top_poc, d.refs()[0].bottom_poc), (4, 0));
+    // 132 is 128 past 4, no MSB step, it would be one cycle back from 0
+    let (pic, _) = picture(&mut d, &s, true, &header(P, 1, 132), 2);
+    assert_eq!(pic.poc, 132);
+}
+
+#[test]
+fn mmco_2_and_4_unmark_long_term_frames() {
+    let mut d = with_refs(&[(1, 2, 0, Some(0)), (2, 3, 2, Some(2)), (3, 4, 4, None)], 5);
+    let mut ev = Events::new();
+    // MMCO 2 unmarks LongTermPicNum 0
+    let sh = with_mmco(header(SliceType::P, 5, 10), &[(2, 0, 0)]);
+    d.end(&current(5, 10), Slot(9), &sh, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), [Release(Slot(1))]);
+    assert_eq!(slots(&d), [(2, 3, Some(2)), (3, 4, None), (9, 5, None)]);
+    // MMCO 4 with max_long_term_frame_idx_plus1 2 keeps index 0 and 1, 2 goes
+    let mut d = with_refs(&[(1, 2, 0, Some(0)), (2, 3, 2, Some(2)), (3, 4, 4, Some(1))], 5);
+    let sh = with_mmco(header(SliceType::P, 5, 10), &[(4, 2, 0)]);
+    d.end(&current(5, 10), Slot(9), &sh, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), [Release(Slot(2))]);
+    assert_eq!(slots(&d), [(1, 2, Some(0)), (3, 4, Some(1)), (9, 5, None)]);
+    // 0 means no long-term frames at all
+    let sh = with_mmco(header(SliceType::P, 6, 12), &[(4, 0, 0)]);
+    d.end(&current(6, 12), Slot(8), &sh, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), [Release(Slot(1)), Release(Slot(3)), Output(Slot(9))]);
+    assert_eq!(slots(&d), [(9, 5, None), (8, 6, None)]);
+}
+
+#[test]
+fn an_idr_marked_long_term_survives_the_sliding_window() {
+    use SliceType::*;
+    let s = sps(0, 2, 1);
+    let mut d = Dpb::new();
+    let mut h = idr(0);
+    h.long_term_reference_flag = true;
+    picture(&mut d, &s, true, &h, 0);
+    assert_eq!(slots(&d), [(0, 0, Some(0))]);
+    picture(&mut d, &s, true, &header(P, 1, 4), 1);
+    // two references, the short-term one leaves
+    let mut sh = header(P, 2, 8);
+    sh.num_ref_idx_l0_active_minus1 = 1;
+    let mut ev = Events::new();
+    let pic = d.begin(&s, &nal(false, true), &sh, false, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), [Output(Slot(1))]);
+    let (l0, _) = lists(&d, &pic, &sh);
+    assert_eq!(named(&d, &l0, |r| i32::from(r.frame_num)), [1, 0]);
+    d.end(&pic, Slot(2), &sh, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), [Release(Slot(1))]);
+    assert_eq!(slots(&d), [(0, 0, Some(0)), (2, 2, None)]);
+}
+
+#[test]
+fn a_dpb_of_long_term_frames_does_not_store_the_picture() {
+    let refs: Vec<_> = (0..MAX_REFS as u16).map(|i| (i, i, i32::from(i), Some(i as u8))).collect();
+    let mut d = with_refs(&refs, 16);
+    let sh = header(SliceType::P, 16, 32);
+    let mut ev = Events::new();
+    // shown, it waits for output and is released once out
+    d.end(&current(16, 32), Slot(99), &sh, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), []);
+    assert_eq!(d.refs().len(), MAX_REFS);
+    assert!(d.refs().iter().all(|r| r.slot != Slot(99)));
+    assert_eq!(flush(&mut d), [Output(Slot(99)), Release(Slot(99))]);
+    // hidden, it is released at once
+    let mut pic = current(16, 32);
+    pic.fate = Fate::Hidden;
+    d.end(&pic, Slot(98), &sh, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), [Release(Slot(98))]);
+}
+
+#[test]
+fn a_full_output_queue_refuses_the_picture_and_changes_nothing() {
+    let mut d = with_refs(&[(1, 2, 0, None)], 3);
+    d.n_waiting = MAX_WAITING as u8;
+    let sh = header(SliceType::P, 3, 6);
+    let mut ev = Events::new();
+    assert_eq!(d.end(&current(3, 6), Slot(9), &sh, &mut ev), Err(DpbError::Full));
+    assert_eq!(ev.as_slice(), []);
+    assert_eq!((d.n_waiting as usize, slots(&d)), (MAX_WAITING, vec![(1, 2, None)]));
+    // a hidden picture needs no room for output
+    let mut pic = current(3, 6);
+    pic.fate = Fate::Hidden;
+    d.end(&pic, Slot(9), &sh, &mut ev).unwrap();
+    assert_eq!(slots(&d), [(1, 2, None), (9, 3, None)]);
+}
+
+#[test]
+fn poc_type_1_counts_from_the_cycle_and_fills_gaps() {
+    use SliceType::*;
+    let mut s = sps(1, 4, 2);
+    s.offsets_for_ref_frame = vec![4];
+    s.offset_for_non_ref_pic = -2;
+    s.delta_pic_order_always_zero_flag = true;
+    let mut d = Dpb::new();
+    let (pic, _) = picture(&mut d, &s, true, &idr(0), 0);
+    assert_eq!(pic.poc, 0);
+    let (pic, _) = picture(&mut d, &s, true, &header(P, 1, 0), 1);
+    assert_eq!(pic.poc, 4);
+    // a non-reference picture counts one frame back plus offset_for_non_ref_pic
+    let (pic, ev) = picture(&mut d, &s, false, &header(B, 2, 0), 2);
+    assert_eq!((pic.poc, ev), (2, vec![Output(Slot(0))]));
+    let (pic, ev) = picture(&mut d, &s, true, &header(P, 2, 0), 3);
+    assert_eq!((pic.poc, ev), (8, vec![Output(Slot(2)), Release(Slot(2))]));
+    // frame_num 3 is missing, its filler counts like a reference frame
+    let (pic, ev) = picture(&mut d, &s, true, &header(P, 4, 0), 4);
+    assert_eq!((pic.poc, ev), (16, vec![Output(Slot(1)), Release(Slot(0))]));
+    let pocs: Vec<_> = d.refs().iter().map(|r| (r.frame_num, r.poc(), r.non_existing)).collect();
+    assert_eq!(pocs, [(1, 4, false), (2, 8, false), (3, 12, true), (4, 16, false)]);
+    assert_eq!(flush(&mut d), [Output(Slot(3)), Output(Slot(4))]);
+}
+
+#[test]
+fn fillers_of_poc_type_0_take_the_last_reference_order_count_into_b_lists() {
+    use SliceType::*;
+    let s = sps(0, 4, 2);
+    let mut d = Dpb::new();
+    picture(&mut d, &s, true, &idr(0), 0);
+    picture(&mut d, &s, true, &header(P, 1, 8), 1);
+    // frame_num 2 is missing, the filler shares slot and order count 8 with frame_num 1
+    let mut sh = header(B, 3, 4);
+    sh.num_ref_idx_l0_active_minus1 = 2;
+    sh.num_ref_idx_l1_active_minus1 = 2;
+    let mut ev = Events::new();
+    let pic = d.begin(&s, &nal(false, true), &sh, false, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), [Output(Slot(0))]);
+    let filler = d.refs()[2];
+    assert_eq!(
+        (filler.slot, filler.frame_num, filler.poc(), filler.non_existing),
+        (Slot(1), 2, 8, true)
+    );
+    let (l0, l1) = lists(&d, &pic, &sh);
+    assert_eq!(named(&d, &l0, Ref::poc), [0, 8, 8]);
+    assert_eq!(named(&d, &l1, Ref::poc), [8, 8, 0]);
+    assert_eq!(named(&d, &l1, |r| i32::from(r.frame_num)), [1, 2, 0]);
+    d.end(&pic, Slot(2), &sh, &mut ev).unwrap();
+    assert_eq!(slots(&d), [(0, 0, None), (1, 1, None), (1, 2, None), (2, 3, None)]);
+}
+
+#[test]
+fn an_mmco5_picture_fills_its_frame_num_gap_first() {
+    use SliceType::*;
+    let s = sps(2, 3, 0);
+    let mut d = Dpb::new();
+    picture(&mut d, &s, true, &idr(0), 0);
+    picture(&mut d, &s, true, &header(P, 1, 0), 1);
+    let sh = with_mmco(header(P, 4, 0), &[(5, 0, 0)]);
+    let mut ev = Events::new();
+    let pic = d.begin(&s, &nal(false, true), &sh, false, &mut ev).unwrap();
+    // fillers 2 and 3 push frame_num 0 out of the window, then the MMCO 5 puts 1 out
+    assert_eq!(ev.as_slice(), [Release(Slot(0)), Output(Slot(1))]);
+    assert!(pic.mmco5);
+    let fillers: Vec<_> =
+        d.refs().iter().map(|r| (r.slot.0, r.frame_num, r.non_existing)).collect();
+    assert_eq!(fillers, [(1, 1, false), (1, 2, true), (1, 3, true)]);
+    d.end(&pic, Slot(2), &sh, &mut ev).unwrap();
+    // everything is unmarked, slot 1 released once its last filler goes
+    assert_eq!(ev.as_slice(), [Release(Slot(1))]);
+    assert_eq!(slots(&d), [(2, 0, None)]);
+    // frame_num goes on from 0, no gap
+    let (_, ev) = picture(&mut d, &s, true, &header(P, 1, 0), 3);
+    assert_eq!(ev, [Output(Slot(2))]);
+    assert_eq!(slots(&d), [(2, 0, None), (3, 1, None)]);
+}
+
+#[test]
+fn list_1_takes_its_own_modifications() {
+    let d = with_refs(&[(1, 0, 0, None), (2, 1, 2, None), (3, 2, 8, None)], 3);
+    let mut sh = header(SliceType::B, 3, 4);
+    sh.num_ref_idx_l0_active_minus1 = 2;
+    sh.num_ref_idx_l1_active_minus1 = 2;
+    let (l0, l1) = lists(&d, &current(3, 4), &sh);
+    assert_eq!(named(&d, &l0, Ref::poc), [2, 0, 8]);
+    assert_eq!(named(&d, &l1, Ref::poc), [8, 2, 0]);
+    // picNum 0 (abs_diff_pic_num_minus1 2 below 3) goes first in list 1 only
+    sh.ref_list_mods_l1.push(RefListMod { op: 0, value: 2 });
+    let (l0, l1) = lists(&d, &current(3, 4), &sh);
+    assert_eq!(named(&d, &l0, Ref::poc), [2, 0, 8]);
+    assert_eq!(named(&d, &l1, Ref::poc), [0, 8, 2]);
+}
+
+#[test]
+fn a_gap_filler_borrowing_the_slot_the_window_evicts_releases_it_once() {
+    use SliceType::*;
+    // one reference frame, the filler takes the IDR's slot as the IDR leaves
+    let s = sps(2, 1, 0);
+    let mut d = Dpb::new();
+    let (_, ev) = picture(&mut d, &s, true, &idr(0), 0);
+    assert_eq!(ev, [Output(Slot(0))]);
+    let mut ev = Events::new();
+    let sh = header(P, 3, 0);
+    let pic = d.begin(&s, &nal(false, true), &sh, false, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), []);
+    assert_eq!(slots(&d), [(0, 2, None)]);
+    assert!(d.refs()[0].non_existing);
+    d.end(&pic, Slot(1), &sh, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), [Release(Slot(0))]);
+    assert_eq!(slots(&d), [(1, 3, None)]);
+    assert_eq!(flush(&mut d), [Output(Slot(1))]);
+}
+
+#[test]
+fn a_skipped_leading_picture_may_carry_the_releases_of_its_gap() {
+    use SliceType::*;
+    let s = sps(0, 2, 2);
+    let mut d = Dpb::new();
+    let mut ev = Events::new();
+    d.discard(&mut ev);
+    let (_, ev) = picture(&mut d, &s, true, &header(I, 5, 32), 1);
+    assert_eq!(ev, [Output(Slot(1))]);
+    let (pic, ev) = picture(&mut d, &s, true, &header(B, 6, 28), 2);
+    assert_eq!((pic.fate, ev), (Fate::Hidden, vec![]));
+    // frame_num 7 and 8 are missing, their fillers push the key out of the window
+    let (pic, ev) = picture(&mut d, &s, false, &header(B, 9, 26), 3);
+    assert_eq!((pic.fate, ev), (Fate::Skip, vec![Release(Slot(1))]));
+    assert_eq!(slots(&d), [(2, 7, None), (2, 8, None)]);
+}
+
+#[test]
+fn an_abandoned_reference_picture_leaves_a_gap_the_next_picture_fills() {
+    use SliceType::*;
+    let s = sps(2, 3, 0);
+    let mut d = Dpb::new();
+    picture(&mut d, &s, true, &idr(0), 0);
+    let sh = header(P, 1, 0);
+    let mut ev = Events::new();
+    let pic = d.begin(&s, &nal(false, true), &sh, false, &mut ev).unwrap();
+    d.abandon(&pic, &sh, &mut ev);
+    assert_eq!(ev.as_slice(), []);
+    assert_eq!(slots(&d), [(0, 0, None)]);
+    let mut sh = header(P, 2, 0);
+    sh.num_ref_idx_l0_active_minus1 = 1;
+    let pic = d.begin(&s, &nal(false, true), &sh, false, &mut ev).unwrap();
+    let fillers: Vec<_> =
+        d.refs().iter().map(|r| (r.slot.0, r.frame_num, r.non_existing)).collect();
+    assert_eq!(fillers, [(0, 0, false), (0, 1, true)]);
+    let (l0, _) = lists(&d, &pic, &sh);
+    assert_eq!(named(&d, &l0, |r| i32::from(r.frame_num)), [1, 0]);
+    d.end(&pic, Slot(2), &sh, &mut ev).unwrap();
+    // an abandoned non-reference picture changes nothing
+    let sh = header(B, 3, 0);
+    let pic = d.begin(&s, &nal(false, false), &sh, false, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), [Output(Slot(2))]);
+    d.abandon(&pic, &sh, &mut ev);
+    assert_eq!(ev.as_slice(), []);
+    let (_, ev) = picture(&mut d, &s, true, &header(P, 3, 0), 3);
+    assert_eq!(ev, []);
+    assert_eq!(slots(&d), [(0, 1, None), (2, 2, None), (3, 3, None)]);
+    assert_eq!(flush(&mut d), [Output(Slot(3))]);
+}
+
+#[test]
+fn an_abandoned_reference_picture_applies_its_marking() {
+    use SliceType::*;
+    let s = sps(2, 4, 0);
+    let mut d = Dpb::new();
+    picture(&mut d, &s, true, &idr(0), 0);
+    picture(&mut d, &s, true, &header(P, 1, 0), 1);
+    // MMCO 1 unmarks frame_num 0, MMCO 3 makes frame_num 1 long-term 0
+    let sh = with_mmco(header(P, 2, 0), &[(1, 1, 0), (3, 0, 0)]);
+    let mut ev = Events::new();
+    let pic = d.begin(&s, &nal(false, true), &sh, false, &mut ev).unwrap();
+    d.abandon(&pic, &sh, &mut ev);
+    assert_eq!(ev.as_slice(), [Release(Slot(0))]);
+    assert_eq!(slots(&d), [(1, 1, Some(0))]);
+}
+
+#[test]
+fn an_abandoned_key_waits_for_a_key_again() {
+    use SliceType::*;
+    let s = sps(0, 4, 2);
+    let mut d = Dpb::new();
+    picture(&mut d, &s, true, &idr(0), 0);
+    picture(&mut d, &s, true, &header(P, 1, 8), 1);
+    // an IDR that was never decoded, the pictures after it have nothing to reference
+    let mut ev = Events::new();
+    let pic = d.begin(&s, &nal(true, true), &idr(0), true, &mut ev).unwrap();
+    assert_eq!(
+        ev.as_slice(),
+        [Output(Slot(0)), Output(Slot(1)), Release(Slot(0)), Release(Slot(1))]
+    );
+    d.abandon(&pic, &idr(0), &mut ev);
+    assert_eq!(ev.as_slice(), []);
+    let (pic, got) = picture(&mut d, &s, true, &header(P, 1, 8), 2);
+    assert_eq!((pic.fate, got), (Fate::Skip, vec![]));
+    let (pic, _) = picture(&mut d, &s, true, &idr(0), 3);
+    assert_eq!(pic.fate, Fate::Shown);
+    picture(&mut d, &s, true, &header(P, 1, 8), 4);
+    // an MMCO 5 picture likewise, the references it would have unmarked go
+    let sh = with_mmco(header(P, 2, 12), &[(5, 0, 0)]);
+    let pic = d.begin(&s, &nal(false, true), &sh, false, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), [Output(Slot(3)), Output(Slot(4))]);
+    d.abandon(&pic, &sh, &mut ev);
+    assert_eq!(ev.as_slice(), [Release(Slot(3)), Release(Slot(4))]);
+    let (pic, _) = picture(&mut d, &s, true, &header(P, 1, 8), 5);
+    assert_eq!(pic.fate, Fate::Skip);
+    // and the non-IDR key decoding restarted at
+    let (pic, got) = picture(&mut d, &s, true, &header(I, 5, 32), 6);
+    assert_eq!((pic.fate, got), (Fate::Shown, vec![Output(Slot(6))]));
+    let pic = d.begin(&s, &nal(false, true), &header(P, 6, 40), false, &mut ev).unwrap();
+    assert_eq!(pic.fate, Fate::Shown);
+    d.end(&pic, Slot(7), &header(P, 6, 40), &mut ev).unwrap();
+    d.discard(&mut ev);
+    assert_eq!(ev.as_slice(), [Release(Slot(6)), Release(Slot(7))]);
+    let pic = d.begin(&s, &nal(false, true), &header(I, 9, 60), true, &mut ev).unwrap();
+    assert_eq!(pic.fate, Fate::Shown);
+    d.abandon(&pic, &header(I, 9, 60), &mut ev);
+    let (pic, _) = picture(&mut d, &s, true, &header(P, 10, 64), 8);
+    assert_eq!(pic.fate, Fate::Skip);
 }

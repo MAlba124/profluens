@@ -28,27 +28,35 @@ pub const MAX_EVENTS: usize = 2 * (16 + 17);
 pub struct Events {
     buf: [Event; MAX_EVENTS],
     len: u8,
+    overflowed: bool,
 }
 
 impl Events {
     pub const fn new() -> Self {
-        Events { buf: [Event::Release(Slot(0)); MAX_EVENTS], len: 0 }
+        Events { buf: [Event::Release(Slot(0)); MAX_EVENTS], len: 0, overflowed: false }
     }
 
     pub fn clear(&mut self) {
         self.len = 0;
+        self.overflowed = false;
     }
 
     pub fn as_slice(&self) -> &[Event] {
         &self.buf[..self.len as usize]
     }
 
+    /// Whether the call dropped events past `MAX_EVENTS`. No DPB gets there on its own, only a
+    /// caller handing one slot to two live pictures, and a dropped `Release` leaks its slot.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
     pub(crate) fn push(&mut self, e: Event) {
-        // only a caller handing one slot to two pictures goes past the bound
-        debug_assert!((self.len as usize) < MAX_EVENTS, "events past the bound");
         if (self.len as usize) < MAX_EVENTS {
             self.buf[self.len as usize] = e;
             self.len += 1;
+        } else {
+            self.overflowed = true;
         }
     }
 }
@@ -74,7 +82,8 @@ pub enum Fate {
 pub enum DpbError {
     /// a reference the picture uses is not in the DPB, it is dropped until the next key
     MissingReference,
-    /// more pictures than the DPB holds
+    /// no room for the picture, more wait for output than the reorder bound (h264) or every
+    /// frame store is a reference (h265), the DPB does not track the stream's dpb size
     Full,
     /// field pictures
     Fields,
@@ -86,7 +95,7 @@ impl fmt::Display for DpbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             DpbError::MissingReference => "a reference picture is missing",
-            DpbError::Full => "more pictures than the DPB holds",
+            DpbError::Full => "no room in the DPB for the picture",
             DpbError::Fields => "field pictures are not supported",
             DpbError::NotShowable => "a frame shown again is not showable",
         })
@@ -94,3 +103,23 @@ impl fmt::Display for DpbError {
 }
 
 impl std::error::Error for DpbError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn events_past_the_bound_are_dropped_and_flagged() {
+        let mut ev = Events::new();
+        for i in 0..MAX_EVENTS {
+            ev.push(Event::Output(Slot(i as u16)));
+        }
+        assert!(!ev.overflowed());
+        ev.push(Event::Release(Slot(0)));
+        assert!(ev.overflowed());
+        assert_eq!(ev.as_slice().len(), MAX_EVENTS);
+        assert_eq!(ev.as_slice()[MAX_EVENTS - 1], Event::Output(Slot(MAX_EVENTS as u16 - 1)));
+        ev.clear();
+        assert!(!ev.overflowed() && ev.as_slice().is_empty());
+    }
+}

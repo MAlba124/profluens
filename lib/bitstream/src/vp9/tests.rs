@@ -218,7 +218,7 @@ fn run(d: &mut Dpb, h: &Vp9FrameHeader, slot: u16) -> (Fate, Vec<Event>) {
     let fate = d.begin(h, &mut ev).unwrap();
     let mut all = ev.as_slice().to_vec();
     if fate != Fate::Skip {
-        d.end(h, Slot(slot), &mut ev);
+        d.end(h, fate, Slot(slot), &mut ev);
         all.extend_from_slice(ev.as_slice());
     }
     (fate, all)
@@ -517,6 +517,82 @@ fn after_a_failed_frame_frames_parse_and_skip_until_a_key() {
     d.drop_slots(&mut ev);
     assert_eq!(ev.as_slice(), [Release(Slot(1))]);
     assert_eq!((held(&d), *d.state()), (vec![None; NUM_SLOTS], st));
-    d.end(&key, Slot(3), &mut ev);
+    d.end(&key, Fate::Shown, Slot(3), &mut ev);
     assert_eq!(ev.as_slice(), [Output(Slot(3))]);
+}
+
+#[test]
+fn a_segment_level_past_32_keeps_the_frame_level_delta_shift() {
+    let t = Tail { lf_level: 30, lf_delta_enabled: true, base_q: 10, ..Tail::default() };
+    let mut hd = parse::parse_uncompressed_header(&key_frame(0, 64, 64, &t)).unwrap();
+    hd.segmentation.enabled = true;
+    hd.segmentation.update_data = true;
+    hd.segmentation.feature_enabled[1][SEG_LVL_ALT_L] = true;
+    hd.segmentation.feature_data[1][SEG_LVL_ALT_L] = 10;
+    let mut st = StreamState::default();
+    st.fold(&hd);
+    // the segment filters at 40, its deltas shift by the frame's 30 >> 5, not at all
+    assert_eq!(st.filter_levels(&hd, 0), [[31, 31], [30, 30], [29, 29], [29, 29]]);
+    assert_eq!(st.filter_levels(&hd, 1), [[41, 41], [40, 40], [39, 39], [39, 39]]);
+}
+
+#[test]
+fn segment_features_outlive_a_frame_without_segmentation() {
+    let t = Tail { base_q: 100, ..Tail::default() };
+    let mut hd = parse::parse_uncompressed_header(&key_frame(0, 64, 64, &t)).unwrap();
+    hd.segmentation.enabled = true;
+    hd.segmentation.update_data = true;
+    hd.segmentation.feature_enabled[1][SEG_LVL_ALT_Q] = true;
+    hd.segmentation.feature_data[1][SEG_LVL_ALT_Q] = -30;
+    let mut st = StreamState::default();
+    st.fold(&hd);
+    assert_eq!(st.qindex(&hd, 1), 70);
+    let mut off = hd;
+    off.frame_type = FrameType::NonKeyFrame;
+    off.segmentation.enabled = false;
+    off.segmentation.update_data = false;
+    off.segmentation.feature_enabled = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
+    st.fold(&off);
+    assert_eq!(st.qindex(&off, 1), 100);
+    // on again without new data, the held features apply
+    let mut on = off;
+    on.segmentation.enabled = true;
+    st.fold(&on);
+    assert_eq!(st.qindex(&on, 1), 70);
+}
+
+#[test]
+fn a_skipped_frame_ends_with_nothing() {
+    let (_, mut d) = feature_key_frame();
+    let shown = d.parse(&show_existing(5)).unwrap();
+    let mut ev = Events::new();
+    assert_eq!(d.begin(&shown, &mut ev), Ok(Fate::Skip));
+    assert_eq!(ev.as_slice(), [Output(Slot(1))]);
+    d.end(&shown, Fate::Skip, Slot(9), &mut ev);
+    assert_eq!(ev.as_slice(), []);
+    assert_eq!(held(&d), [Some(1); NUM_SLOTS]);
+}
+
+#[test]
+fn an_abandoned_frame_empties_its_slots_and_waits_for_a_key() {
+    let (_, mut d) = feature_key_frame();
+    let mut h = d.parse(&inter_frame(false, &Tail::default())).unwrap();
+    h.refresh_frame_flags = 0b0000_0110;
+    let mut ev = Events::new();
+    assert_eq!(d.begin(&h, &mut ev), Ok(Fate::Shown));
+    d.abandon(&h, &mut ev);
+    // the key frame stays in its other slots
+    assert_eq!(ev.as_slice(), []);
+    assert_eq!(held(&d), [Some(1), None, None, Some(1), Some(1), Some(1), Some(1), Some(1)]);
+    assert!(d.awaits_key());
+    assert_eq!(run(&mut d, &h, 2), (Fate::Skip, vec![]));
+    let (fate, got) = frame(&mut d, &key_frame(0, 64, 64, &Tail::default()), 3);
+    assert_eq!((fate, got), (Fate::Shown, vec![Output(Slot(3)), Release(Slot(1))]));
+    // a frame that would have taken every slot lets the key frame go
+    let mut all = d.parse(&inter_frame(false, &Tail::default())).unwrap();
+    all.refresh_frame_flags = 0xff;
+    assert_eq!(d.begin(&all, &mut ev), Ok(Fate::Shown));
+    d.abandon(&all, &mut ev);
+    assert_eq!(ev.as_slice(), [Release(Slot(3))]);
+    assert_eq!(held(&d), [None; NUM_SLOTS]);
 }

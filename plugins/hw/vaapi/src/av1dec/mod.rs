@@ -545,7 +545,7 @@ impl VaapiAv1Dec {
             return true;
         }
         let Some(seq) = self.dpb.stream().seq else {
-            self.lose(ctx, quiet, Some(K::Av1Stream(Av1Error::NoSequenceHeader)));
+            self.abandon(ctx, h, Some(K::Av1Stream(Av1Error::NoSequenceHeader)));
             return true;
         };
         if !supported(&seq) {
@@ -560,26 +560,26 @@ impl VaapiAv1Dec {
                     subsampling_y: c.subsampling_y,
                 },
             );
-            self.dpb.await_key();
+            self.abandon(ctx, h, None);
             return false;
         }
         if h.show_frame && !self.take_shown(frame.spatial_id) {
-            self.lose(ctx, quiet, Some(K::Av1Stream(Av1Error::Invalid("show_frame"))));
+            self.abandon(ctx, h, Some(K::Av1Stream(Av1Error::Invalid("show_frame"))));
             return true;
         }
         if !self.ensure_va(ctx, &seq, h.frame_type == FrameType::Key) {
-            self.lose(ctx, quiet, None);
+            self.abandon(ctx, h, None);
             return !self.failed;
         }
         // A size past the surfaces would overrun the driver's write and the readback row.
         if let Some(va) = &self.va
             && (h.upscaled_width > va.coded_w || h.frame_height > va.coded_h)
         {
-            self.lose(ctx, quiet, Some(K::Av1Stream(Av1Error::Invalid("frame_size"))));
+            self.abandon(ctx, h, Some(K::Av1Stream(Av1Error::Invalid("frame_size"))));
             return true;
         }
         let Some(target) = self.acquire_surface() else {
-            self.lose(ctx, quiet, Some(K::NoFreeSurface));
+            self.abandon(ctx, h, Some(K::NoFreeSurface));
             return true;
         };
         let display = match h.film_grain.apply_grain {
@@ -588,14 +588,14 @@ impl VaapiAv1Dec {
         };
         let Some(display) = display else {
             self.release_if_unreferenced(target);
-            self.lose(ctx, quiet, Some(K::NoFreeSurface));
+            self.abandon(ctx, h, Some(K::NoFreeSurface));
             return true;
         };
         if let Err(e) = self.submit(&seq, frame, tu, target, display) {
             self.picture_failed(ctx, &e, K::Submit(e));
             self.release_if_unreferenced(target);
             self.release_if_unreferenced(display);
-            self.lose(ctx, quiet, None);
+            self.abandon(ctx, h, None);
             return !self.failed;
         }
         let (width, height) = (h.upscaled_width, h.frame_height);
@@ -605,13 +605,24 @@ impl VaapiAv1Dec {
                 .and_then(|preview| self.pending(display, width, height, pts, duration, preview)),
             false => None,
         };
-        self.decoded(h, Pic { surface: target, display, width, height }, out);
+        self.decoded(h, fate, Pic { surface: target, display, width, height }, out);
         true
     }
 
-    /// Ends a frame decoded into `pic`, `out` what it puts out. One shown but without `out` is
-    /// decoded for the references alone.
-    fn decoded(&mut self, h: &FrameHeader, pic: Pic, out: Option<PendingOut>) {
+    /// A frame the DPB began that was never decoded. The slots it would have taken are let go,
+    /// so a frame naming one of them fails instead of decoding against the frame before.
+    fn abandon(&mut self, ctx: &mut Ctx, h: &FrameHeader, kind: Option<K>) {
+        if let Some(kind) = kind {
+            self.warn(ctx, kind);
+        }
+        let mut ev = Events::new();
+        self.dpb.abandon(h, &mut ev);
+        self.apply(&ev);
+    }
+
+    /// Ends a frame decoded into `pic` with `fate`, `out` what it puts out. One shown but
+    /// without `out` is decoded for the references alone.
+    fn decoded(&mut self, h: &FrameHeader, fate: Fate, pic: Pic, out: Option<PendingOut>) {
         let slot = self.slot_of(pic.surface);
         let i = usize::from(slot.0);
         self.slots[i] = pic;
@@ -620,7 +631,7 @@ impl VaapiAv1Dec {
         h.show_frame &= out.is_some();
         self.outs[i] = out;
         let mut ev = Events::new();
-        self.dpb.end(&h, slot, &mut ev);
+        self.dpb.end(&h, fate, slot, &mut ev);
         self.apply(&ev);
     }
 

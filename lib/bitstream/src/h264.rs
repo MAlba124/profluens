@@ -149,6 +149,8 @@ pub struct Picture {
     pub gop: u32,
     /// PicOrderCnt for output, 0 for an MMCO 5 picture
     pub poc: i32,
+    /// the key decoding started at, from `new` or `discard`
+    key: bool,
     /// the key decoding started at with nothing to reorder before it, it goes out at once
     key_now: bool,
 }
@@ -164,6 +166,7 @@ impl Picture {
         bottom_poc: 0,
         gop: 0,
         poc: 0,
+        key: false,
         key_now: false,
     };
 }
@@ -300,6 +303,8 @@ pub struct Dpb {
 }
 
 impl Dpb {
+    /// Waits for a key. Unlike after `discard`, a non-IDR key's leading pictures go out before
+    /// it as the stream orders them, so the first picture is out later than after a seek.
     pub fn new() -> Self {
         Dpb {
             refs: [Ref::EMPTY; MAX_REFS],
@@ -321,7 +326,9 @@ impl Dpb {
     /// a frame_num gap is filled with non-existing frames (8.2.5.2), then POC (8.2.1). Puts out
     /// what the reorder rule lets go before this picture, so a key is out before the next
     /// decode is queued behind it. Pictures before the first key and non-reference leading
-    /// pictures of a non-IDR key are `Fate::Skip`.
+    /// pictures of a non-IDR key are `Fate::Skip`, a leading one after its frame_num gap is
+    /// filled, so `ev` may hold releases for a `Skip` picture. A picture taken here is ended
+    /// with `end` or `abandon`.
     pub fn begin(
         &mut self,
         sps: &Sps,
@@ -395,13 +402,16 @@ impl Dpb {
             bottom_poc: bottom,
             gop: self.gop,
             poc,
+            key,
             key_now: key && (no_reorder(sps) || !(idr || mmco5)),
         })
     }
 
     /// Puts out what `begin` would let go before the picture whose first slice header `sh`
     /// just came, ahead of its other slices, so a key goes out before the next picture is
-    /// parsed whole. Changes nothing else, `begin` then finds those out already.
+    /// parsed whole. Changes nothing else, `begin` then finds those out already. Call it after
+    /// the previous picture's `end` or `abandon` and before this picture's `begin`, with the
+    /// SPS `begin` will see, it derives the order count from the same state.
     pub fn ahead(&mut self, sps: &Sps, nal: &Nal, sh: &SliceHeader, ev: &mut Events) {
         ev.clear();
         if nal.unit_type == hp::NAL_SLICE_IDR {
@@ -491,8 +501,10 @@ impl Dpb {
 
     /// Ends a decoded picture in `slot`. A reference picture is marked (sliding window or
     /// MMCO, 8.2.5) and stored, a shown one queued for output, then bumps (C.4.5.3). A
-    /// `Fate::Skip` picture changes nothing. `Full` when more pictures wait for output than
-    /// the DPB holds, nothing changes then.
+    /// `Fate::Skip` picture changes nothing. `Full` when 17 pictures wait for output already,
+    /// which `bump_one` relieves, nothing changes then and the picture is lost unless the
+    /// caller calls `abandon`. The DPB does not track the stream's dpb size, C.4.5.3's "no
+    /// empty frame buffer" is the caller's.
     pub fn end(
         &mut self,
         pic: &Picture,
@@ -517,6 +529,29 @@ impl Dpb {
         }
         self.bump(pic.key_now, ev);
         Ok(())
+    }
+
+    /// A picture `begin` took that was never decoded, in place of `end`. The caller keeps its
+    /// slot. A key (an IDR, an MMCO 5 picture or the picture decoding started at) drops the
+    /// references and waits for a key again, so what followed it is `Skip` instead of decoding
+    /// against nothing. Any other reference picture applies its marking and leaves a frame_num
+    /// gap the next picture fills with a non-existing frame (8.2.5.2), a non-reference one
+    /// changes nothing.
+    pub fn abandon(&mut self, pic: &Picture, sh: &SliceHeader, ev: &mut Events) {
+        ev.clear();
+        if pic.fate == Fate::Skip {
+            return;
+        }
+        if pic.idr || pic.mmco5 || pic.key {
+            self.discard(ev);
+            return;
+        }
+        if pic.reference && sh.adaptive_ref_pic_marking_mode_flag {
+            let cur = i32::from(pic.frame_num);
+            for op in sh.mmco_ops.iter() {
+                self.mmco(op, cur, ev);
+            }
+        }
     }
 
     /// A seek or a stream error. Releases every picture without output and waits for a key.
@@ -566,23 +601,16 @@ impl Dpb {
         }
         let last = self.refs[self.n_refs as usize - 1];
         let gap = (cur - prev - 1).rem_euclid(max);
-        // types 1 and 2 count the fillers like frames without delta_pic_order_cnt
-        let mut counted = (sps.pic_order_cnt_type != 0).then(|| sh.clone());
-        if let Some(s) = &mut counted {
-            s.delta_pic_order_cnt = [0; 2];
-        }
         // fillers before the last max_refs leave through the sliding window anyway
         for k in (gap - i32::from(self.max_refs)).max(0)..gap {
             let f = (prev + 1 + k) % max;
-            let (top, bottom) = match &mut counted {
-                Some(s) => {
-                    s.frame_num = f as u32;
-                    self.poc.compute(sps, s, false, 1)
-                }
-                None => (last.top_poc, last.bottom_poc),
-            };
+            // types 1 and 2 count the fillers, type 0 gives them the last reference's
+            let (top, bottom) =
+                self.poc.compute_gap(sps, f as u32).unwrap_or((last.top_poc, last.bottom_poc));
+            // the window may evict the reference whose slot the filler borrows, which is
+            // then released once the last filler leaves
             if self.n_refs >= self.max_refs {
-                self.evict_oldest(f, self.n_refs as usize, ev);
+                self.evict_oldest(f, self.n_refs as usize, Some(last.slot), ev);
             }
             if self.n_refs as usize == MAX_REFS {
                 break;
@@ -618,19 +646,20 @@ impl Dpb {
                 long_term = Some(op.arg1 as u8);
             }
         } else if self.n_refs >= self.max_refs {
-            self.evict_oldest(cur, self.n_refs as usize, ev);
+            self.evict_oldest(cur, self.n_refs as usize, None, ev);
         }
         let (mut top, mut bottom, mut frame_num) = (pic.top_poc, pic.bottom_poc, pic.frame_num);
         if pic.mmco5 {
-            // 8.2.1, the frame stored after an MMCO 5 counts from 0
+            // 8.2.1, the frame stored after an MMCO 5 counts from 0 and the next picture's
+            // prevPicOrderCntLsb is its top count after that (8.2.1.1)
             let t = top.min(bottom);
             top -= t;
             bottom -= t;
             frame_num = 0;
-            self.poc.reset();
+            self.poc.reset_after_mmco5(top);
         }
         if self.n_refs as usize == MAX_REFS
-            && !self.evict_oldest(i32::from(frame_num), MAX_REFS, ev)
+            && !self.evict_oldest(i32::from(frame_num), MAX_REFS, None, ev)
         {
             return false;
         }
@@ -646,7 +675,7 @@ impl Dpb {
         self.n_refs += 1;
         // at most max_refs frames are marked (7.4.3.3), past it the oldest short-term goes
         while self.n_refs > self.max_refs
-            && self.evict_oldest(i32::from(frame_num), self.n_refs as usize - 1, ev)
+            && self.evict_oldest(i32::from(frame_num), self.n_refs as usize - 1, None, ev)
         {}
         self.prev_ref_frame_num = Some(frame_num);
         true
@@ -677,8 +706,14 @@ impl Dpb {
     }
 
     /// Unmarks the short-term frame of smallest FrameNumWrap among the first `upto`, false
-    /// when there is none.
-    fn evict_oldest(&mut self, cur: i32, upto: usize, ev: &mut Events) -> bool {
+    /// when there is none. `borrowed` is a slot a filler is about to take, never released.
+    fn evict_oldest(
+        &mut self,
+        cur: i32,
+        upto: usize,
+        borrowed: Option<Slot>,
+        ev: &mut Events,
+    ) -> bool {
         let max = self.max_frame_num;
         let Some(at) = self.refs[..upto]
             .iter()
@@ -689,7 +724,7 @@ impl Dpb {
         else {
             return false;
         };
-        self.remove_ref(at, ev);
+        self.remove_ref(at, borrowed, ev);
         true
     }
 
@@ -701,13 +736,13 @@ impl Dpb {
         self.refs().iter().any(|r| r.slot == slot)
     }
 
-    /// Removes reference `at` in DPB order, releasing its slot unless a filler shares it or
-    /// it waits for output.
-    fn remove_ref(&mut self, at: usize, ev: &mut Events) {
+    /// Removes reference `at` in DPB order, releasing its slot unless a filler shares or is
+    /// about to take it (`borrowed`) or it waits for output.
+    fn remove_ref(&mut self, at: usize, borrowed: Option<Slot>, ev: &mut Events) {
         let slot = self.refs[at].slot;
         self.refs.copy_within(at + 1..self.n_refs as usize, at);
         self.n_refs -= 1;
-        if !self.waits(slot) && !self.is_ref(slot) {
+        if !self.waits(slot) && !self.is_ref(slot) && borrowed != Some(slot) {
             ev.push(Event::Release(slot));
         }
     }
@@ -719,7 +754,7 @@ impl Dpb {
             if keep(&self.refs[i]) {
                 i += 1;
             } else {
-                self.remove_ref(i, ev);
+                self.remove_ref(i, None, ev);
             }
         }
     }

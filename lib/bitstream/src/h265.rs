@@ -176,7 +176,8 @@ pub fn prior_pics_out(nal_type: u8, no_output_of_prior_pics_flag: bool, after_eo
 }
 
 /// The key a discard restarts at, put out as decoded ahead of the reorder, so a seek's first
-/// picture is not queued behind the decodes after it.
+/// picture is not queued behind the decodes after it. `new` starts `Off`, so a stream's first
+/// key waits for its RADL pictures and goes out after them, as the stream orders it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Lead {
     Off,
@@ -296,6 +297,8 @@ pub struct Dpb {
 }
 
 impl Dpb {
+    /// Waits for an IRAP. Unlike after `discard`, its RADL pictures go out before it as the
+    /// stream orders them, so the first picture is out later than after a seek.
     pub const fn new() -> Self {
         Dpb {
             refs: [Ref { slot: Slot(0), poc: 0, long_term: false, set: RpsSet::None }; MAX_DPB],
@@ -316,8 +319,9 @@ impl Dpb {
     /// is P or B. Derives POC (8.3.1), marks the RPS (8.3.2) releasing what left it, and puts
     /// out or drops what an IRAP ends (C.5.2.2). Pictures before the first IRAP and RASL ones
     /// of an IRAP decoding started at are `Fate::Skip`, with nothing changed. A used reference
-    /// missing is `MissingReference`, the marking stays as the stream has it and `ev` holds
-    /// what it let go.
+    /// missing is `MissingReference`, the one error that changes state: the marking, the order
+    /// count and the sequence count stay as the stream has them and `ev` holds what the
+    /// marking let go. A picture taken here is ended with `end` or `abandon`.
     pub fn begin(
         &mut self,
         seq: &Seq,
@@ -415,7 +419,9 @@ impl Dpb {
 
     /// Ends a decoded picture in `slot`. Stores it, queues it for output when it is
     /// `Fate::Shown` and bumps (C.5.2.3). A `Fate::Skip` picture changes nothing. `Full` when
-    /// the stream holds more than the DPB, nothing changes then.
+    /// every frame store holds a reference or 17 pictures wait for output, nothing changes then
+    /// and the picture is lost unless the caller calls `abandon`. The DPB does not track the
+    /// stream's dpb size, C.5.2.2's "no empty frame buffer" is the caller's, with `bump_one`.
     pub fn end(&mut self, pic: &Picture, slot: Slot, ev: &mut Events) -> Result<(), DpbError> {
         ev.clear();
         if pic.fate == Fate::Skip {
@@ -443,6 +449,17 @@ impl Dpb {
         }
         self.bump(pic.key_now || ahead, ev);
         Ok(())
+    }
+
+    /// A picture `begin` took that was never decoded, in place of `end`. The caller keeps its
+    /// slot. The picture never enters the DPB, so a later RPS using it is `MissingReference`.
+    /// An IRAP with NoRaslOutputFlag waits for an IRAP again, so what followed it is `Skip`
+    /// instead of failing one by one.
+    pub fn abandon(&mut self, pic: &Picture, ev: &mut Events) {
+        ev.clear();
+        if pic.fate != Fate::Skip && pic.irap && pic.no_rasl_output {
+            self.awaiting_irap = true;
+        }
     }
 
     /// An end of sequence or bitstream NAL. The next IRAP has NoRaslOutputFlag, and a CRA then

@@ -59,7 +59,7 @@ fn run(d: &mut Dpb, h: &FrameHeader, slot: u16) -> (Fate, Vec<Event>) {
     let fate = d.begin(h, &mut ev).unwrap();
     let mut all = ev.as_slice().to_vec();
     if fate != Fate::Skip {
-        d.end(h, Slot(slot), &mut ev);
+        d.end(h, fate, Slot(slot), &mut ev);
         all.extend_from_slice(ev.as_slice());
     }
     (fate, all)
@@ -275,4 +275,58 @@ fn the_sequence_header_of_a_unit() {
     let mut bad = vec![0x80];
     bad.extend(sequence_header(&SEQ, 2));
     assert_eq!(sequence_of(&bad), None);
+}
+
+#[test]
+fn a_skipped_frame_ends_with_nothing() {
+    let h = headers(&tu(&[key(), inter(1, 0x02, [0; 7])]));
+    let mut d = Dpb::new();
+    run(&mut d, &h[0], 0);
+    let mut hidden = h[1];
+    (hidden.show_frame, hidden.showable_frame) = (false, true);
+    assert_eq!(run(&mut d, &hidden, 1), (Fate::Hidden, vec![]));
+    let mut again = h[1];
+    again.show_existing_frame = true;
+    again.frame_to_show_map_idx = 1;
+    again.refresh_frame_flags = 0;
+    let mut ev = Events::new();
+    assert_eq!(d.begin(&again, &mut ev), Ok(Fate::Skip));
+    assert_eq!(ev.as_slice(), [Output(Slot(1))]);
+    d.end(&again, Fate::Skip, Slot(9), &mut ev);
+    assert_eq!(ev.as_slice(), []);
+    assert_eq!(held(&d), [Some(0), Some(1), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)]);
+    // before the first key frame likewise
+    let mut d = Dpb::new();
+    assert_eq!(d.begin(&h[1], &mut ev), Ok(Fate::Skip));
+    d.end(&h[1], Fate::Skip, Slot(9), &mut ev);
+    assert_eq!(ev.as_slice(), []);
+    assert_eq!(held(&d), [None; NUM_SLOTS]);
+}
+
+#[test]
+fn an_abandoned_frame_empties_its_slots() {
+    let h = headers(&tu(&[
+        key(),
+        inter(1, 0x02, [0; 7]),
+        inter(2, 0, [0, 1, 0, 0, 0, 0, 0]),
+        inter(3, 0, [0; 7]),
+    ]));
+    let mut d = Dpb::new();
+    run(&mut d, &h[0], 0);
+    let mut ev = Events::new();
+    assert_eq!(d.begin(&h[1], &mut ev), Ok(Fate::Shown));
+    d.abandon(&h[1], &mut ev);
+    assert_eq!(ev.as_slice(), []);
+    assert_eq!(held(&d)[1], None);
+    assert!(!d.awaiting_key());
+    // a frame naming the emptied slot is refused, one naming the others decodes
+    assert_eq!(d.begin(&h[2], &mut ev), Err(DpbError::MissingReference));
+    assert_eq!(run(&mut d, &h[3], 1), (Fate::Shown, vec![Output(Slot(1)), Release(Slot(1))]));
+    // what no slot holds any more is released
+    let mut all = h[3];
+    all.refresh_frame_flags = 0xff;
+    assert_eq!(d.begin(&all, &mut ev), Ok(Fate::Shown));
+    d.abandon(&all, &mut ev);
+    assert_eq!(ev.as_slice(), [Release(Slot(0))]);
+    assert_eq!(held(&d), [None; NUM_SLOTS]);
 }

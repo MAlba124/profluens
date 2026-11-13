@@ -200,6 +200,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "dpb"
+path = "fuzz_targets/dpb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "libav_dec"
 path = "fuzz_targets/libav_dec.rs"
 test = false

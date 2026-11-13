@@ -444,3 +444,132 @@ fn skips_names_what_begin_skips_before_the_headers() {
     picture(&mut d, &SEQ, hp::NAL_CRA_NUT, &intra(0), 0);
     assert!(d.skips(hp::NAL_RASL_N) && !d.skips(hp::NAL_TRAIL_R));
 }
+
+#[test]
+fn a_long_term_entry_with_its_msb_names_one_cycle_apart() {
+    // 17 and 1 share lsb 1, cur 20
+    let mut d = with_refs(&[entry(0, 17), entry(1, 1), entry(2, 16)]);
+    let mut sh = header(4, SliceType::B, &[(-4, true)], &[], &[]);
+    sh.long_term_refs.push(hp::LongTermRef {
+        poc_lsb: 1,
+        used_by_curr_pic: true,
+        delta_poc_msb_present: true,
+        delta_poc_msb_cycle: 1,
+    });
+    assert!(d.mark(&sh, 20, 16));
+    let sets: Vec<_> = d.refs().iter().map(|r| (r.set, r.long_term)).collect();
+    assert_eq!(
+        sets,
+        [(RpsSet::None, false), (RpsSet::LtCurr, true), (RpsSet::StCurrBefore, false)]
+    );
+    assert_eq!(d.curr_sets(&sh, 20, 16).lt(), &[1]);
+    // without the MSB the first picture with that lsb takes it
+    let mut d = with_refs(&[entry(0, 17), entry(1, 1), entry(2, 16)]);
+    sh.long_term_refs.clear();
+    sh.long_term_refs.push(hp::LongTermRef {
+        poc_lsb: 1,
+        used_by_curr_pic: true,
+        delta_poc_msb_present: false,
+        delta_poc_msb_cycle: 0,
+    });
+    assert!(d.mark(&sh, 20, 16));
+    assert_eq!(d.curr_sets(&sh, 20, 16).lt(), &[0]);
+}
+
+#[test]
+fn a_picture_of_a_higher_temporal_layer_is_not_prev_tid0_pic() {
+    let mut p = PocState::default();
+    assert_eq!(p.compute(16, 0, hp::NAL_IDR_W_RADL, 0, true), 0);
+    assert_eq!(p.compute(16, 7, hp::NAL_TRAIL_R, 1, false), 7);
+    // from 7 this would be 15, prevTid0Pic is still the IDR
+    assert_eq!(p.compute(16, 15, hp::NAL_TRAIL_R, 0, false), -1);
+    let mut d = Dpb::new();
+    picture(&mut d, &SEQ, hp::NAL_IDR_W_RADL, &intra(0), 0);
+    let mut ev = Events::new();
+    let p7 = header(7, SliceType::P, &[(-7, true)], &[], &[]);
+    let n = Nal { nal_type: hp::NAL_TRAIL_R, temporal_id: 1, start: 0, end: 0 };
+    let p = d.begin(&SEQ, &n, &p7, true, &mut ev).unwrap();
+    assert_eq!(p.poc, 7);
+    d.end(&p, Slot(1), &mut ev).unwrap();
+    let p15 = header(15, SliceType::P, &[], &[(1, true)], &[]);
+    let p = d.begin(&SEQ, &nal(hp::NAL_TRAIL_R), &p15, true, &mut ev).unwrap();
+    assert_eq!((p.poc, p.sets.after()), (-1, &[0u8][..]));
+}
+
+#[test]
+fn rasl_pictures_of_a_cra_mid_stream_are_decoded_and_shown() {
+    let mut d = Dpb::new();
+    picture(&mut d, &SEQ, hp::NAL_IDR_W_RADL, &intra(0), 0);
+    let p4 = header(4, SliceType::P, &[(-4, true)], &[], &[]);
+    picture(&mut d, &SEQ, hp::NAL_TRAIL_R, &p4, 1);
+    let cra = header(8, SliceType::I, &[(-4, false)], &[], &[]);
+    let (p, ev) = picture(&mut d, &SEQ, hp::NAL_CRA_NUT, &cra, 2);
+    assert!(p.irap && !p.no_rasl_output);
+    assert_eq!((p.fate, p.gop, ev), (Fate::Shown, 1, vec![Release(Slot(0)), Output(Slot(1))]));
+    assert!(!d.skips(hp::NAL_RASL_N));
+    let rasl = header(6, SliceType::B, &[(-2, true)], &[(2, true)], &[]);
+    let (p, ev) = picture(&mut d, &SEQ, hp::NAL_RASL_N, &rasl, 3);
+    assert_eq!((p.fate, p.poc), (Fate::Shown, 6));
+    assert_eq!((p.sets.before(), p.sets.after()), (&[0u8][..], &[1u8][..]));
+    assert_eq!(ev, [Output(Slot(3))]);
+}
+
+#[test]
+fn after_a_discard_an_idr_or_bla_with_radl_goes_out_ahead_and_hides_them() {
+    for t in [hp::NAL_IDR_W_RADL, hp::NAL_BLA_W_RADL] {
+        let mut d = Dpb::new();
+        picture(&mut d, &SEQ, hp::NAL_IDR_W_RADL, &intra(0), 0);
+        let mut ev = Events::new();
+        d.discard(&mut ev);
+        let (p, ev) = picture(&mut d, &SEQ, t, &intra(0), 5);
+        assert_eq!((p.fate, ev), (Fate::Shown, vec![Output(Slot(5))]), "type {t}");
+        let radl = header(15, SliceType::P, &[], &[(1, true)], &[]);
+        let (p, ev) = picture(&mut d, &SEQ, hp::NAL_RADL_R, &radl, 6);
+        assert_eq!((p.poc, p.fate, ev), (-1, Fate::Hidden, vec![]), "type {t}");
+    }
+}
+
+#[test]
+fn a_picture_not_for_output_leaves_the_rps_without_going_out() {
+    let mut d = Dpb::new();
+    picture(&mut d, &SEQ, hp::NAL_IDR_W_RADL, &intra(0), 0);
+    let mut p4 = header(4, SliceType::P, &[(-4, true)], &[], &[]);
+    p4.pic_output_flag = false;
+    let (p, ev) = picture(&mut d, &SEQ, hp::NAL_TRAIL_R, &p4, 1);
+    assert_eq!((p.fate, ev), (Fate::Hidden, vec![]));
+    assert_eq!(slots(&d), [0, 1]);
+    let p8 = header(8, SliceType::P, &[(-8, true)], &[], &[]);
+    let (_, ev) = picture(&mut d, &SEQ, hp::NAL_TRAIL_R, &p8, 2);
+    assert_eq!(ev, [Release(Slot(1)), Output(Slot(0))]);
+    assert_eq!(slots(&d), [0, 2]);
+}
+
+#[test]
+fn an_abandoned_picture_is_missing_and_an_abandoned_key_waits_for_an_irap() {
+    use SliceType::P;
+    let mut d = Dpb::new();
+    picture(&mut d, &SEQ, hp::NAL_IDR_W_RADL, &intra(0), 0);
+    let mut ev = Events::new();
+    let p4 = header(4, P, &[(-4, true)], &[], &[]);
+    let p = d.begin(&SEQ, &nal(hp::NAL_TRAIL_R), &p4, true, &mut ev).unwrap();
+    d.abandon(&p, &mut ev);
+    assert_eq!(ev.as_slice(), []);
+    assert_eq!(slots(&d), [0]);
+    let p8 = header(8, P, &[(-4, true)], &[], &[]);
+    let r = d.begin(&SEQ, &nal(hp::NAL_TRAIL_R), &p8, true, &mut ev);
+    assert_eq!(r, Err(DpbError::MissingReference));
+    assert!(!d.skips(hp::NAL_TRAIL_R));
+    // a CRA mid-stream abandoned leaves decoding on
+    let cra = d.begin(&SEQ, &nal(hp::NAL_CRA_NUT), &intra(12), false, &mut ev).unwrap();
+    assert!(!cra.no_rasl_output);
+    d.abandon(&cra, &mut ev);
+    assert!(!d.skips(hp::NAL_TRAIL_R));
+    // an IDR abandoned waits for an IRAP again
+    let idr = d.begin(&SEQ, &nal(hp::NAL_IDR_W_RADL), &intra(0), false, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), [Output(Slot(0)), Release(Slot(0))]);
+    d.abandon(&idr, &mut ev);
+    assert_eq!(ev.as_slice(), []);
+    assert!(d.skips(hp::NAL_TRAIL_R) && !d.skips(hp::NAL_IDR_N_LP));
+    let (p, ev) = picture(&mut d, &SEQ, hp::NAL_IDR_N_LP, &intra(0), 3);
+    assert_eq!((p.fate, ev), (Fate::Shown, vec![Output(Slot(3))]));
+}

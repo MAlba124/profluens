@@ -369,7 +369,7 @@ fn the_slots_take_the_surfaces_the_header_names() {
     let h = parsed(&mut d, &[enc_frame(true, 0, 0xff), enc_frame(false, 1, 0x02)]);
     let mut ev = Events::new();
     assert_eq!(d.dpb.begin(&h[0], &mut ev), Ok(Fate::Shown));
-    d.decoded(&h[0], pic(1, 2), Some(out(2)));
+    d.decoded(&h[0], Fate::Shown, pic(1, 2), Some(out(2)));
     assert_eq!(queued(&d), [2], "the grained surface goes out");
     assert_eq!(ref_surfaces(d.dpb.slots(), &d.slots), [1; 8], "the references are ungrained");
     assert!(d.surface_referenced(1) && d.surface_referenced(2));
@@ -377,7 +377,7 @@ fn the_slots_take_the_surfaces_the_header_names() {
     let mut hidden = h[1];
     (hidden.show_frame, hidden.showable_frame) = (false, true);
     assert_eq!(d.dpb.begin(&hidden, &mut ev), Ok(Fate::Hidden));
-    d.decoded(&hidden, pic(3, 4), None);
+    d.decoded(&hidden, Fate::Hidden, pic(3, 4), None);
     assert_eq!(queued(&d), [2]);
     let refs = ref_surfaces(d.dpb.slots(), &d.slots);
     assert_eq!((refs[0], refs[1], refs[2]), (1, 3, 1));
@@ -394,7 +394,7 @@ fn the_slots_take_the_surfaces_the_header_names() {
     let mut only = h[1];
     only.refresh_frame_flags = 0;
     assert_eq!(d.dpb.begin(&only, &mut ev), Ok(Fate::Shown));
-    d.decoded(&only, pic(5, 5), None);
+    d.decoded(&only, Fate::Shown, pic(5, 5), None);
     assert_eq!(queued(&d), [2, 4]);
     assert!(!d.surface_referenced(5));
     assert_eq!(d.slot_of(5), Slot(2), "the row stays for the surface");

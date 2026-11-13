@@ -663,6 +663,7 @@ impl VaapiH264Dec {
         };
         let sessions = self.sessions;
         if !self.ensure_va(ctx, &sps, p.idr) {
+            self.abandon(&p, sh0);
             return;
         }
         if self.sessions != sessions && !self.dpb.refs().is_empty() {
@@ -684,6 +685,7 @@ impl VaapiH264Dec {
                 out = out
             );
             self.warn(ctx, K::NoFreeSurface);
+            self.abandon(&p, sh0);
             return;
         };
 
@@ -696,6 +698,7 @@ impl VaapiH264Dec {
                 None => (target, v.width, v.height, v.crop_x, v.crop_y, v.coded_w, v.coded_h),
             })
         else {
+            self.abandon(&p, sh0);
             return;
         };
         if let Err(e) = self.submit_picture(
@@ -710,6 +713,7 @@ impl VaapiH264Dec {
         ) {
             self.picture_failed(ctx, &e, K::Submit(e));
             self.release_surface(target);
+            self.abandon(&p, sh0);
             return;
         }
 
@@ -749,8 +753,17 @@ impl VaapiH264Dec {
                 (self.held[i], self.outs[i]) = (false, None);
                 self.release_if_unreferenced(target);
                 self.warn(ctx, K::Dpb(e));
+                self.abandon(&p, sh0);
             }
         }
+    }
+
+    /// A picture the DPB began that was never decoded, so the pictures after it do not decode
+    /// against what it would have been.
+    fn abandon(&mut self, p: &bs::Picture, sh: &SliceHeader) {
+        let mut ev = Events::new();
+        self.dpb.abandon(p, sh, &mut ev);
+        self.apply(&ev);
     }
 
     /// Carries out what the DPB asked, in order.

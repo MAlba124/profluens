@@ -679,6 +679,7 @@ impl VaapiH265Dec {
         let cvs = p.irap && p.no_rasl_output;
         let sessions = self.sessions;
         if !self.ensure_va(ctx, &sps, cvs) {
+            self.abandon(&p);
             return;
         }
         if self.sessions != sessions && !cvs {
@@ -689,6 +690,7 @@ impl VaapiH265Dec {
 
         let Some(target) = self.acquire_surface() else {
             self.warn(ctx, K::NoFreeSurface);
+            self.abandon(&p);
             return;
         };
 
@@ -704,6 +706,7 @@ impl VaapiH265Dec {
                 }
             })
         else {
+            self.abandon(&p);
             return;
         };
         if let Err(e) = self.submit_picture(
@@ -719,6 +722,7 @@ impl VaapiH265Dec {
         ) {
             self.picture_failed(ctx, &e, K::Submit(e));
             self.release_surface(target);
+            self.abandon(&p);
             return;
         }
 
@@ -759,8 +763,17 @@ impl VaapiH265Dec {
                 (self.held[i], self.outs[i]) = (false, None);
                 self.release_if_unreferenced(target);
                 self.warn(ctx, K::Dpb(e));
+                self.abandon(&p);
             }
         }
+    }
+
+    /// A picture the DPB began that was never decoded, so the pictures after it do not decode
+    /// against what it would have been.
+    fn abandon(&mut self, p: &bs::Picture) {
+        let mut ev = Events::new();
+        self.dpb.abandon(p, &mut ev);
+        self.apply(&ev);
     }
 
     /// Carries out what the DPB asked, in order.

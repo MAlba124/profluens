@@ -269,11 +269,15 @@ impl Dpb {
         &self.state
     }
 
-    /// Ends a decoded frame in `slot`. `Output` when shown, then the slots refresh_frame_flags
-    /// names take it and a frame no slot holds any more is released, the frame itself too
-    /// when no slot takes it.
-    pub fn end(&mut self, h: &Vp9FrameHeader, slot: Slot, ev: &mut Events) {
+    /// Ends a decoded frame in `slot`, `fate` what `begin` gave it. `Output` when shown, then
+    /// the slots refresh_frame_flags names take it and a frame no slot holds any more is
+    /// released, the frame itself too when no slot takes it. A `Fate::Skip` frame changes
+    /// nothing.
+    pub fn end(&mut self, h: &Vp9FrameHeader, fate: Fate, slot: Slot, ev: &mut Events) {
         ev.clear();
+        if fate == Fate::Skip {
+            return;
+        }
         if h.show_frame {
             ev.push(Event::Output(slot));
         }
@@ -288,6 +292,24 @@ impl Dpb {
         if !self.holds(slot) {
             ev.push(Event::Release(slot));
         }
+    }
+
+    /// A frame `begin` took that was never decoded, in place of `end`. The caller keeps its
+    /// slot. The slots refresh_frame_flags names are emptied, a frame no slot holds any more
+    /// released, and frames up to the next key frame are `Fate::Skip`, as the probability
+    /// context the lost frame would have refreshed (refresh_frame_context) lives in the decoder,
+    /// not in a slot, and the frames after it count on it. The held state keeps what `begin`
+    /// folded, the frames between still parse.
+    pub fn abandon(&mut self, h: &Vp9FrameHeader, ev: &mut Events) {
+        ev.clear();
+        let mut old = [None; NUM_SLOTS];
+        for (i, s) in self.slots.iter_mut().enumerate() {
+            if h.refresh_frame_flags >> i & 1 == 1 {
+                old[i] = s.take();
+            }
+        }
+        self.release_unheld(&old, ev);
+        self.awaiting_key = true;
     }
 
     /// A seek or a stream error. Empties the slots and the held state, decoding resumes at

@@ -700,37 +700,48 @@ impl VaapiVp9Dec {
             return;
         }
         // takes the frame's state, a slot it names empty refuses it
-        if let Err(e) = self.dpb.begin(&h, &mut ev) {
-            let empty = |i: &&u8| self.dpb.slots()[usize::from(**i & 7)].is_none();
-            match h.ref_frame_idx.as_ref().and_then(|idx| idx.iter().find(empty)) {
-                Some(&slot) if e == DpbError::MissingReference => {
-                    self.warn(ctx, K::EmptyRefSlot { slot })
+        let fate = match self.dpb.begin(&h, &mut ev) {
+            Ok(fate) => fate,
+            Err(e) => {
+                let empty = |i: &&u8| self.dpb.slots()[usize::from(**i & 7)].is_none();
+                match h.ref_frame_idx.as_ref().and_then(|idx| idx.iter().find(empty)) {
+                    Some(&slot) if e == DpbError::MissingReference => {
+                        self.warn(ctx, K::EmptyRefSlot { slot })
+                    }
+                    _ => self.warn(ctx, K::Dpb(e)),
                 }
-                _ => self.warn(ctx, K::Dpb(e)),
+                self.dpb.await_key();
+                return;
             }
-            self.dpb.await_key();
-            return;
-        }
+        };
         if !self.ensure_va(ctx, &h) {
-            self.dpb.await_key();
+            self.abandon(ctx, &h, pts, duration);
             return;
         }
         let Some(target) = self.acquire_surface() else {
             self.warn(ctx, K::NoFreeSurface);
-            self.dpb.await_key();
+            self.abandon(ctx, &h, pts, duration);
             return;
         };
         if let Err(e) = self.submit(&h, frame, target) {
             self.picture_failed(ctx, &e, K::Submit(e));
             self.release_if_unreferenced(target);
-            self.dpb.await_key();
+            self.abandon(ctx, &h, pts, duration);
             return;
         }
         let slot = self.slot_of(target);
         self.held[usize::from(slot.0)] = true;
-        self.dpb.end(&h, slot, &mut ev);
+        self.dpb.end(&h, fate, slot, &mut ev);
         let cur = (slot, h.frame_width, h.frame_height);
         self.apply(ctx, &ev, Some(cur), pts, duration);
+    }
+
+    /// A frame the DPB began that was never decoded, the frames up to the next key frame are
+    /// skipped and the slots it would have taken are let go.
+    fn abandon(&mut self, ctx: &mut Ctx, h: &Vp9FrameHeader, pts: Timestamp, duration: Timestamp) {
+        let mut ev = Events::new();
+        self.dpb.abandon(h, &mut ev);
+        self.apply(ctx, &ev, None, pts, duration);
     }
 
     /// Carries out what the DPB asked. A picture goes out with the current frame's timestamps,

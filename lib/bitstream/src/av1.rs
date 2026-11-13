@@ -128,11 +128,15 @@ impl Dpb {
         &self.slots
     }
 
-    /// Ends a decoded frame in `slot`. `Output` when shown, then the slots refresh_frame_flags
-    /// names take it and a frame no slot holds any more is released, the frame itself too
-    /// when no slot takes it.
-    pub fn end(&mut self, h: &FrameHeader, slot: Slot, ev: &mut Events) {
+    /// Ends a decoded frame in `slot`, `fate` what `begin` gave it. `Output` when shown, then
+    /// the slots refresh_frame_flags names take it and a frame no slot holds any more is
+    /// released, the frame itself too when no slot takes it. A `Fate::Skip` frame changes
+    /// nothing, a frame shown again took its slots in `begin`.
+    pub fn end(&mut self, h: &FrameHeader, fate: Fate, slot: Slot, ev: &mut Events) {
         ev.clear();
+        if fate == Fate::Skip {
+            return;
+        }
         if h.show_frame {
             ev.push(Event::Output(slot));
         }
@@ -141,6 +145,22 @@ impl Dpb {
         if !self.holds(slot) {
             ev.push(Event::Release(slot));
         }
+    }
+
+    /// A frame `begin` took that was never decoded, in place of `end`. The caller keeps its
+    /// slot. The slots refresh_frame_flags names are emptied, a frame no slot holds any more
+    /// released, so a frame naming one of them is `MissingReference` instead of decoding
+    /// against the frame before the lost one. The parser's slots take the lost frame as the
+    /// stream counts on.
+    pub fn abandon(&mut self, h: &FrameHeader, ev: &mut Events) {
+        ev.clear();
+        let mut old = [None; NUM_SLOTS];
+        for (i, s) in self.slots.iter_mut().enumerate() {
+            if h.refresh_frame_flags >> i & 1 == 1 {
+                old[i] = s.take();
+            }
+        }
+        self.release_unheld(&old, ev);
     }
 
     /// A seek or a stream error. Empties the slots and the parser's, decoding resumes at the

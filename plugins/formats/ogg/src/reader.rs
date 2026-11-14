@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
-use crate::page::{CAPTURE_PATTERN, HEADER_FIXED_LEN, PageError, PageHeader};
+use crate::page::{CAPTURE_PATTERN, HEADER_FIXED_LEN, PageError, PageHeader, stated_len};
 
 /// A reassembled packet handed out by the demuxer.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -57,6 +57,12 @@ const SPARE_MAX_COUNT: usize = 512;
 /// How far the page parser runs ahead of the consumer, in queued packets.
 const READY_AHEAD: usize = 32;
 
+/// The bytes of candidate pages failing their CRC since the last good page after which only a
+/// candidate followed by a capture pattern or the end is checked, and one failing is skipped
+/// whole. Capture patterns every few bytes, each naming a page of up to 64 KiB, would otherwise
+/// cost a CRC of that page per byte.
+const RESYNC_CRC_MAX: usize = 1 << 20;
+
 // Cold, only reached when the recycle list is empty.
 #[allow(clippy::disallowed_methods)]
 fn take_spare(spare: &mut Spare, want: usize) -> Vec<u8> {
@@ -87,6 +93,12 @@ pub struct OggReader {
     pages_parsed: u64,
     dropped: u64,
     max_packet: usize,
+    /// Bytes of failed candidates since the last good page.
+    crc_gap: usize,
+    /// Bytes of failed candidates in all.
+    crc_wasted: u64,
+    /// No more input comes, a candidate is not waited on.
+    ended: bool,
 }
 
 impl OggReader {
@@ -103,6 +115,9 @@ impl OggReader {
             pages_parsed: 0,
             dropped: 0,
             max_packet: MAX_PACKET_BYTES,
+            crc_gap: 0,
+            crc_wasted: 0,
+            ended: false,
         }
     }
 
@@ -115,8 +130,21 @@ impl OggReader {
     /// Signal end of input.
     pub fn finish(&mut self) -> usize {
         // Unbounded, or the look-ahead cap would silently discard queued input.
+        self.ended = true;
         self.drive(usize::MAX);
-        let leftover = self.buf.len() - self.pos;
+        let mut leftover = self.buf.len() - self.pos;
+        // a candidate stating more than is left hides the pages behind it
+        while self.buf.len() - self.pos >= HEADER_FIXED_LEN
+            && self.buf[self.pos..].starts_with(&CAPTURE_PATTERN)
+        {
+            let pages = self.pages_parsed;
+            self.resync_one();
+            self.drive(usize::MAX);
+            if self.pages_parsed > pages {
+                leftover = self.buf.len() - self.pos;
+            }
+        }
+        self.ended = false;
         self.buf.clear();
         self.pos = 0;
         leftover
@@ -127,6 +155,7 @@ impl OggReader {
     pub fn reset(&mut self) {
         self.buf.clear();
         self.pos = 0;
+        self.crc_gap = 0;
         self.streams.clear();
         while let Some(p) = self.ready.pop_front() {
             self.recycle(p.data);
@@ -165,6 +194,11 @@ impl OggReader {
         self.dropped
     }
 
+    /// Bytes of candidate pages whose CRC failed so far, the work resyncing took.
+    pub fn crc_wasted(&self) -> u64 {
+        self.crc_wasted
+    }
+
     /// Number of pages successfully parsed so far.
     pub fn pages_parsed(&self) -> u64 {
         self.pages_parsed
@@ -190,6 +224,22 @@ impl OggReader {
             if remaining.len() < HEADER_FIXED_LEN {
                 break; // wait for more bytes
             }
+            // past the budget a candidate is checked only when a page or the end follows it
+            if self.crc_gap > RESYNC_CRC_MAX
+                && let Some(len) = stated_len(remaining).filter(|len| *len <= remaining.len())
+            {
+                let next = remaining.get(len..len + CAPTURE_PATTERN.len());
+                match (next, len == remaining.len()) {
+                    (Some(n), _) if n == CAPTURE_PATTERN => {}
+                    (None, true) => {}
+                    (None, false) if !self.ended => break,
+                    _ => {
+                        self.resync_one();
+                        self.maybe_compact();
+                        continue;
+                    }
+                }
+            }
             match PageHeader::parse(remaining) {
                 Ok(page) => {
                     let len = page.len();
@@ -205,6 +255,7 @@ impl OggReader {
                         &mut self.dropped,
                     );
                     self.pos += len;
+                    self.crc_gap = 0;
                 }
                 Err(PageError::NeedMoreHeader) | Err(PageError::NeedMoreBody) => {
                     // Wait only when byte 0 really is a capture pattern, else resync.
@@ -213,9 +264,15 @@ impl OggReader {
                     }
                     self.resync_one();
                 }
-                Err(PageError::BadCapturePattern)
-                | Err(PageError::BadVersion(_))
-                | Err(PageError::BadCrc { .. }) => {
+                Err(PageError::BadCrc { len, .. }) => {
+                    self.crc_wasted += len as u64;
+                    self.crc_gap = self.crc_gap.saturating_add(len);
+                    match self.crc_gap > RESYNC_CRC_MAX {
+                        true => self.resync_from(self.pos + len),
+                        false => self.resync_one(),
+                    }
+                }
+                Err(PageError::BadCapturePattern) | Err(PageError::BadVersion(_)) => {
                     self.resync_one();
                 }
             }
@@ -225,8 +282,12 @@ impl OggReader {
     }
 
     fn resync_one(&mut self) {
+        self.resync_from(self.pos + 1);
+    }
+
+    /// Resyncs at the first capture pattern from `start` on.
+    fn resync_from(&mut self, start: usize) {
         self.resyncs += 1;
-        let start = self.pos + 1;
         let hay = &self.buf[start..];
         match find_capture(hay) {
             Some(rel) => self.pos = start + rel,
@@ -392,6 +453,22 @@ pub fn demux_all(stream: &[u8]) -> Vec<Packet> {
 mod tests {
     use super::*;
     use crate::writer::mux_packets;
+
+    /// Capture patterns every 8 bytes, each naming a page of about 14 KiB whose CRC fails.
+    #[test]
+    fn a_run_of_capture_patterns_costs_a_bounded_crc_and_the_page_after_is_read() {
+        let pattern = *b"OggS\x00\xFF\xFF\xFF";
+        let mut stream: Vec<u8> = pattern.iter().copied().cycle().take(1 << 20).collect();
+        stream.extend_from_slice(&[0; 64]);
+        stream.extend_from_slice(&mux_packets(7, &[(&[1, 2, 3], 10)]));
+        let mut reader = OggReader::new();
+        reader.push(&stream);
+        reader.finish();
+        let packets: Vec<Packet> = std::iter::from_fn(|| reader.next_packet()).collect();
+        assert_eq!(packets.iter().map(|p| p.data.as_slice()).collect::<Vec<_>>(), [[1, 2, 3]]);
+        let wasted = reader.crc_wasted();
+        assert!(wasted < 4 << 20, "{wasted} bytes checked for 1 MiB of patterns");
+    }
 
     #[test]
     fn find_capture_locates_pattern() {

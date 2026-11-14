@@ -45,7 +45,12 @@ pub enum PageError {
     BadCapturePattern,
     BadVersion(u8),
     NeedMoreBody,
-    BadCrc { stored: u32, computed: u32 },
+    /// A whole page of `len` bytes whose CRC is not the one stored.
+    BadCrc {
+        stored: u32,
+        computed: u32,
+        len: usize,
+    },
 }
 
 impl<'a> PageHeader<'a> {
@@ -77,7 +82,7 @@ impl<'a> PageHeader<'a> {
         let computed = page_crc(bytes);
         let stored = u32::from_le_bytes([bytes[22], bytes[23], bytes[24], bytes[25]]);
         if stored != computed {
-            return Err(PageError::BadCrc { stored, computed });
+            return Err(PageError::BadCrc { stored, computed, len: page_len });
         }
 
         Ok(PageHeader { bytes, n_segments })
@@ -160,6 +165,13 @@ impl<'a> PageHeader<'a> {
     pub fn raw(&self) -> &'a [u8] {
         self.bytes
     }
+}
+
+/// The length the page header at `data[0]` states, `None` while the header is cut.
+pub fn stated_len(data: &[u8]) -> Option<usize> {
+    let n_segments = usize::from(*data.get(26)?);
+    let table = data.get(HEADER_FIXED_LEN..HEADER_FIXED_LEN + n_segments)?;
+    Some(HEADER_FIXED_LEN + n_segments + table.iter().map(|&b| usize::from(b)).sum::<usize>())
 }
 
 /// The page CRC over `page` with the CRC field at offset 22 taken as zero (section 6, field 7).

@@ -10,6 +10,7 @@ use pf_mkv::index::PRE_ROLL_BYTES;
 use pf_mkv::{
     Cues, MatroskaReader, MatroskaWriter, MkvDemux, Parsed, TrackConfig, parse_seek_head,
 };
+use pf_sim::prng::Prng;
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::BufferFlags;
 use profluens_core::bus::BusMessage;
@@ -25,6 +26,7 @@ use profluens_core::id::{SinkPad, SrcPad};
 use profluens_core::log::DebugSpec;
 use profluens_core::pipeline::Index;
 use profluens_core::pipeline::{Pipeline, SeekMode};
+use profluens_core::sched::Outcome;
 use profluens_core::time::Timestamp;
 use profluens_video::rap::{NalSyntax, length_size, random_access};
 
@@ -62,9 +64,13 @@ const OUT: SrcPad = SrcPad(0);
 /// The source's place in what was seen, its asks and flushes.
 const SOURCE: usize = usize::MAX;
 
+/// Serves each ask after up to `delay` passes, drawn by `prng`, in the order asked.
 struct MemSrc {
     file: Arc<[u8]>,
     out: Arc<Mutex<Vec<(usize, Seen)>>>,
+    delay: u8,
+    prng: Prng,
+    held: Vec<(profluens_core::pull::Ask, u8)>,
 }
 
 impl Element for MemSrc {
@@ -79,19 +85,34 @@ impl Element for MemSrc {
 
     fn process(&mut self, ctx: &mut Ctx, _inputs: Inputs<'_>) -> Result<Flow, Error> {
         while let Some(ask) = ctx.next_ask(OUT) {
-            let profluens_core::pull::Ask { offset, len, tag, mut buf } = ask;
-            self.out.lock().unwrap().push((SOURCE, Seen::Ask { offset, len }));
+            self.out.lock().unwrap().push((SOURCE, Seen::Ask { offset: ask.offset, len: ask.len }));
+            let wait = self.prng.below(u64::from(self.delay) + 1) as u8;
+            self.held.push((ask, wait));
+        }
+        let mut i = 0;
+        while i < self.held.len() {
+            if self.held[i].1 > 0 {
+                self.held[i].1 -= 1;
+                i += 1;
+                continue;
+            }
+            let (profluens_core::pull::Ask { offset, len, tag, mut buf }, _) = self.held.remove(i);
             let from = offset.min(self.file.len() as u64) as usize;
             let n = (len as usize).min(self.file.len() - from).min(buf.memory.capacity());
             buf.memory.as_mut_full()[..n].copy_from_slice(&self.file[from..from + n]);
             buf.memory.set_len(n);
             ctx.serve(OUT, tag, buf);
         }
+        if !self.held.is_empty() {
+            ctx.wake_within(std::time::Duration::ZERO);
+            return Ok(Flow::Ok);
+        }
         Ok(if ctx.asks_over(OUT) { Flow::Eos } else { Flow::Ok })
     }
 
     fn event(&mut self, _ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
         if matches!(event, Event::FlushStart) {
+            self.held.clear();
             self.out.lock().unwrap().push((SOURCE, Seen::Flush));
         }
         Ok(())
@@ -146,6 +167,8 @@ type When = dyn Fn(&[(usize, Seen)]) -> bool;
 struct Ran {
     seen: Vec<(usize, Seen)>,
     index: Option<Arc<Index>>,
+    /// Every group ran to its end.
+    ended: bool,
 }
 
 impl Ran {
@@ -194,20 +217,42 @@ fn play(
     play_seeks(file, link, &seeks)
 }
 
+/// The demuxer's pool as `(slot, slots, bytes)`, and the passes the source holds an ask at most,
+/// drawn by `seed`.
+#[derive(Clone, Copy, Debug)]
+struct Setup {
+    pool: (usize, u32, u64),
+    delay: u8,
+    seed: u64,
+}
+
+const ROOMY: Setup = Setup { pool: (128 << 10, 1024, 64 << 20), delay: 0, seed: 0 };
+
 /// [`play`] with a seek for each condition in turn.
 fn play_seeks(
     file: &[u8],
     link: &dyn Fn(usize) -> bool,
     seeks: &[(Timestamp, SeekMode, &When)],
 ) -> Ran {
+    play_set(file, link, seeks, ROOMY)
+}
+
+fn play_set(
+    file: &[u8],
+    link: &dyn Fn(usize) -> bool,
+    seeks: &[(Timestamp, SeekMode, &When)],
+    set: Setup,
+) -> Ran {
     let clock = MockClock::new();
     let shared: Arc<dyn Clock> = Arc::new(clock.clone());
     let mut p = Pipeline::with(DebugSpec::default(), false, Arc::clone(&shared));
     let out = Arc::new(Mutex::new(Vec::new()));
-    let src = p.add(MemSrc { file: Arc::from(file), out: Arc::clone(&out) });
+    let (delay, prng, held) = (set.delay, Prng::new(set.seed), Vec::new());
+    let src = p.add(MemSrc { file: Arc::from(file), out: Arc::clone(&out), delay, prng, held });
     let demux = p.add(MkvDemux::with_parsed(Arc::new(parsed(file))).without_extras());
     p.set_element_pool(src, 1 << 20, 8);
-    p.set_element_pool_bytes(demux, 128 << 10, 1024, 64 << 20);
+    let (slot, slots, bytes) = set.pool;
+    p.set_element_pool_bytes(demux, slot, slots, bytes);
     p.link(src.src(OUT), demux.sink(MkvDemux::IN)).unwrap();
     let added = p.preroll().unwrap();
     for (n, a) in added.srcs.iter().enumerate().filter(|(n, _)| link(*n)) {
@@ -236,6 +281,7 @@ fn play_seeks(
         }
         run.pass(ready[passes as usize % ready.len()]).expect("a pass");
     }
+    let ended = (0..run.groups()).all(|g| run.outcome(g) == Some(Outcome::Exit));
     let _ = run.finish();
     let index = p.index(demux);
     while let Some(m) = p.bus().try_recv() {
@@ -245,7 +291,7 @@ fn play_seeks(
     }
     drop(p);
     let seen = Arc::try_unwrap(out).unwrap().into_inner().unwrap();
-    Ran { seen, index }
+    Ran { seen, index, ended }
 }
 
 /// A film by its name, none when ffmpeg could not make it.
@@ -541,4 +587,52 @@ fn a_seek_beside_opus_reads_from_the_keyframes_cluster() {
 
     let sound = ran.after_flush(1).first().expect("sound after the seek").0;
     assert!((key..=key + 20 * MS).contains(&sound), "sound at {sound}, the picture at {key}");
+}
+
+/// `secs` of `picture` octet pictures each 40 ms, a keyframe each 2 s, beside 20 ms Opus
+/// packets, with no Cues.
+fn paced(secs: u64, picture: usize) -> Vec<u8> {
+    const OPUS_HEAD: &[u8; 19] = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00";
+    let opus = TrackConfig::audio(2, "A_OPUS", OPUS_HEAD.to_vec(), 48_000.0, 2, 0);
+    let mut w = MatroskaWriter::new(vec![TrackConfig::vp8(1, 320, 240), opus]);
+    let mut out = Vec::new();
+    w.write_header(&mut out).unwrap();
+    let mut packet = [0u8; 160];
+    packet[0] = 0xFC;
+    for ms in (0..secs * 1_000).step_by(20) {
+        if ms % 40 == 0 {
+            w.write_frame(&mut out, 1, ms * MS, &vec![0x10; picture], ms % 2_000 == 0).unwrap();
+        }
+        w.write_frame(&mut out, 2, ms * MS, &packet, true).unwrap();
+    }
+    w.finalize(&mut out);
+    sized(out)
+}
+
+/// The fuzz rig's smallest pool, six 4 KiB slots and 128 KiB.
+const TIGHT: (usize, u32, u64) = (4096, 6, 128 << 10);
+
+/// The walk read a window and the chain behind it in one pass and stopped for room its frames
+/// held, with nothing asked. Only a drain of those frames frees it, and the demuxer had drained
+/// before the walk, so the run sat idle.
+#[test]
+fn a_walk_stopped_for_room_its_frames_hold_drains_them_and_reads_on() {
+    let file = paced(2, 6_000);
+    let ran = play_set(&file, &|_| true, &[], Setup { pool: TIGHT, delay: 0, seed: 0 });
+    assert!(ran.ended, "the run ended");
+    assert_eq!(ran.after_flush(0).len(), 50, "every picture");
+    assert_eq!(ran.after_flush(1).len(), 100, "every packet");
+}
+
+/// Answers held back left the walk a window, the chain, a frame joined from them and a window
+/// read again for an element across their seam, every slot of the pool. The copy of the next
+/// frame out then waited on a slot only it would give back.
+#[test]
+fn the_walks_reads_leave_the_pool_room_for_its_frames_copies() {
+    let file = paced(4, 2_000);
+    for seed in [1, 3] {
+        let ran = play_set(&file, &|n| n == 0, &[], Setup { pool: TIGHT, delay: 7, seed });
+        assert!(ran.ended, "seed {seed}, the run ended");
+        assert_eq!(ran.after_flush(0).len(), 100, "seed {seed}, every picture");
+    }
 }

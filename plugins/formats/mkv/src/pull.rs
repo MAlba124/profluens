@@ -585,14 +585,16 @@ impl Plan {
         Some(Window { base: l.offset, eof: mem.len() < l.len as usize, mem })
     }
 
-    /// Room under `caps` for a range the walk needs. The chain's windows and the one walked are
-    /// left out, the walk waiting on that range never reaches them to free theirs.
+    /// Room under `caps` for a range the walk needs, the rest of the pool left for the copies
+    /// of its frames, which alone give back the windows those frames hold. With nothing held
+    /// but the chain's windows and the one walked there is always room, the walk waiting on
+    /// that range never reaches them to free theirs.
     pub(crate) fn room(&self, len: u32, (bytes, ranges): (u64, u32)) -> bool {
         let ahead: u64 = self.links.iter().map(|l| u64::from(l.len)).sum();
         let walked = self.walking.map_or(0, |w| u64::from(w.1));
-        let held = self.held - ahead - walked;
         let others = self.links.len() as u32 + u32::from(self.walking.is_some());
-        self.ranges - others < ranges && (held == 0 || held + u64::from(len) <= bytes)
+        let framed = self.held - ahead - walked > 0 || self.ranges > others;
+        !framed || (self.ranges < ranges && self.held + u64::from(len) <= bytes)
     }
 
     pub(crate) fn asked(&mut self, len: u32) -> u64 {
@@ -647,8 +649,13 @@ impl Plan {
         Ok(())
     }
 
+    /// Whether the front frame waits on no read.
+    pub(crate) fn ready(&self) -> bool {
+        self.items.front().is_some_and(|p| !matches!(p.state, State::Waiting { .. }))
+    }
+
     pub(crate) fn pop_ready(&mut self) -> Option<Planned> {
-        if self.items.front().is_none_or(|p| matches!(p.state, State::Waiting { .. })) {
+        if !self.ready() {
             return None;
         }
         let p = self.items.pop_front()?;
@@ -958,10 +965,10 @@ mod tests {
     }
 
     #[test]
-    fn room_leaves_out_the_window_walked_and_the_chain() {
+    fn room_leaves_out_the_window_walked_and_the_chain_only_when_nothing_else_is_held() {
         let (pool, file) = (Pool::new(4096), vec![0; 64]);
         let (mut p, mut w) = (Plan::default(), Walk::new());
-        let caps = (8 << 20, 64);
+        let caps = (8 << 20, 5);
         p.linked(&mut w, 0, 2 << 20);
         p.link_in(p.next_tag - 1, window(&pool, &file, 0, 64).mem);
         p.enter_front().expect("served");
@@ -969,8 +976,10 @@ mod tests {
         p.linked(&mut w, 4 << 20, 2 << 20);
         assert!(p.room(8 << 20, caps), "nothing else held");
         p.asked(1 << 20);
-        assert!(p.room(7 << 20, caps));
-        assert!(!p.room(7 << 20 | 1, caps), "a frame waiting counts");
+        assert!(p.room(1 << 20, caps));
+        assert!(!p.room(1 << 20 | 1, caps), "the chain counts once a frame holds room");
+        p.asked(1);
+        assert!(!p.room(1, caps), "and so do its ranges");
     }
 
     #[test]

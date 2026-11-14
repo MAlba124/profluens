@@ -2582,13 +2582,23 @@ impl MkvDemux {
             }
             Read::Walk => {}
         }
-        if !self.drain(ctx) {
-            self.reserve_when_held(ctx);
-            ctx.hold_end();
-            return Ok(Flow::Ok);
+        let mut left = usize::MAX;
+        loop {
+            if !self.drain(ctx) {
+                self.reserve_when_held(ctx);
+                ctx.hold_end();
+                return Ok(Flow::Ok);
+            }
+            if self.pull.plan.items.len() >= left {
+                break;
+            }
+            self.settle_up(ctx);
+            // a walk waiting on room only its ready frames free has no read out to run it again
+            if !self.walk_on(ctx)? || !self.pull.plan.ready() {
+                break;
+            }
+            left = self.pull.plan.items.len();
         }
-        self.settle_up(ctx);
-        self.walk_on(ctx)?;
         if self.seek.due {
             self.publish(ctx);
         }
@@ -2737,8 +2747,9 @@ impl MkvDemux {
     }
 
     /// One Warning per drive names the last damage walked past, as the push path does. A run of
-    /// junk is a spoilt element every few octets, a message each would flood the bus.
-    fn walk_on(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+    /// junk is a spoilt element every few octets, a message each would flood the bus. True when
+    /// the walk waits on room under the caps, see [`crate::pull::Plan::room`].
+    fn walk_on(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
         let walked = self.walk_steps(ctx);
         Self::ask_ahead(&mut self.pull, ctx);
         if let Some(cause) = self.pull.walk.damage.take() {
@@ -2767,7 +2778,7 @@ impl MkvDemux {
         }
     }
 
-    fn walk_steps(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+    fn walk_steps(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
         let caps = self.pull.caps;
         loop {
             let pull = &mut self.pull;
@@ -2784,7 +2795,7 @@ impl MkvDemux {
                 Step::Skip { to } => pull.walk.pos = to,
                 Step::Block { from, to, next, keyframe, duration_ns, additions, discard_ns } => {
                     let (Some(win), Some((tag, _))) = (pull.win.as_ref(), pull.plan.walking) else {
-                        return Ok(());
+                        return Ok(false);
                     };
                     let items = &mut pull.plan.items;
                     let (pads, tracks) = (&self.pad_tracks, &seek.parsed.tracks);
@@ -2813,15 +2824,15 @@ impl MkvDemux {
                     pull.walk.pos = next;
                 }
                 // a block of the captions up may still be to ask
-                Step::End if self.up.is_some() => return Ok(()),
+                Step::End if self.up.is_some() => return Ok(false),
                 Step::End => {
                     if !pull.plan.asked_all {
                         pull.plan.asked_all = true;
                         ctx.end_asks(Self::IN);
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
-                Step::Window { .. } if pull.plan.window.is_some() => return Ok(()),
+                Step::Window { .. } if pull.plan.window.is_some() => return Ok(false),
                 Step::Frame { track, pts_ns, keyframe, to, .. }
                     if !self.pad_tracks.iter().any(|pt| pt.linked && pt.track_number == track) =>
                 {
@@ -2839,15 +2850,17 @@ impl MkvDemux {
                     let (at, rest) = match span {
                         Span::Wait => {
                             pull.stash = Some(step);
-                            return Ok(());
+                            return Ok(false);
                         }
                         Span::Held => (to, 0),
                         Span::Rest { offset, len } => (offset, len),
                     };
-                    // what the walked window and the chain hold of it is in memory already
-                    if rest > 0 && !pull.plan.room(rest, caps) {
+                    // what the walked window and the chain hold of it is in memory already, a
+                    // copy joined from them takes the frame's length
+                    let need = if at > offset { len } else { rest };
+                    if need > 0 && !pull.plan.room(need, caps) {
                         pull.stash = Some(step);
-                        return Ok(());
+                        return Ok(true);
                     }
                     let bufs = walk_buf(ctx, at > offset, len)
                         .and_then(|f| Ok((f, walk_buf(ctx, rest > 0, rest)?)));
@@ -2856,7 +2869,7 @@ impl MkvDemux {
                         Err(None) => {
                             pull.stash = Some(step);
                             if grow_pool(ctx).is_none() {
-                                return Ok(());
+                                return Ok(false);
                             }
                             continue;
                         }
@@ -2873,7 +2886,7 @@ impl MkvDemux {
                         && ctx.ask(Self::IN, Ask { offset: at, len: rest, tag, buf }).is_err()
                     {
                         pull.stash = Some(step);
-                        return Ok(());
+                        return Ok(false);
                     }
                     let head = frame.zip(pull.win.as_ref()).map(|(buf, win)| {
                         let mut mem = buf.memory;
@@ -2928,7 +2941,7 @@ impl MkvDemux {
                                 Self::ask_ahead(pull, ctx);
                                 continue;
                             }
-                            None => return Ok(()),
+                            None => return Ok(false),
                         },
                         Need::Alone { offset, len } | Need::Link { offset, len } => (offset, len),
                     };
@@ -2939,12 +2952,12 @@ impl MkvDemux {
                         Some(Ok(Some(buf))) => buf,
                         None => {
                             pull.stash = Some(step);
-                            return Ok(());
+                            return Ok(true);
                         }
                         Some(Ok(None)) => {
                             pull.stash = Some(step);
                             if grow_pool(ctx).is_none() {
-                                return Ok(());
+                                return Ok(false);
                             }
                             continue;
                         }
@@ -2952,7 +2965,7 @@ impl MkvDemux {
                             refused(ctx, e);
                             match whole {
                                 Some(to) => pull.walk.pos = to,
-                                None => return Ok(()),
+                                None => return Ok(false),
                             }
                             continue;
                         }
@@ -2960,7 +2973,7 @@ impl MkvDemux {
                     let tag = pull.plan.next_tag;
                     if ctx.ask(Self::IN, Ask { offset, len, tag, buf }).is_err() {
                         pull.stash = Some(step);
-                        return Ok(());
+                        return Ok(false);
                     }
                     if let Need::Link { .. } = need {
                         pull.plan.linked(&mut pull.walk, offset, len);
@@ -2968,7 +2981,7 @@ impl MkvDemux {
                     }
                     pull.plan.asked(len);
                     pull.plan.window = Some((tag, len, offset));
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }

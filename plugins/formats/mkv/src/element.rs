@@ -24,14 +24,13 @@ use profluens_video::rap::{NalSyntax, length_size, random_access};
 use crate::codec::{self, Reframer};
 use crate::config::{self, ConfigError, NalCodec, ParamSets};
 use crate::cued::{Cued, CuedFrame};
+use crate::cues::Cues;
 use crate::error::{DemuxError, MkvError, MuxError};
 use crate::extras::{Extras, MkvExtras, parse_attachments, parse_chapters};
 use crate::index::{CaptionSpan, CueEnd, Grown, cue_end, cue_ends, cue_entries_of, placed, up_at};
 use crate::parsed::Parsed;
 use crate::pull::{Need, Plan, Planned, Span, State, Step, Walk, Window};
-use crate::reader::{
-    Cue, Frame, MatroskaReader, PTS_NONE, Track, cues_typical, parse_cue_tracks, seek_head_pos,
-};
+use crate::reader::{Frame, MatroskaReader, PTS_NONE, Track, cues_typical, seek_head_pos};
 use crate::writer::{MatroskaWriter, MuxOut, TrackConfig};
 
 const TRACK: u64 = 1;
@@ -921,7 +920,7 @@ impl Side {
     }
 }
 
-/// Bytes or entries the demuxer owns, or shares with the other runs over one file.
+/// Bytes the demuxer owns, or shares with the other runs over one file.
 enum Held<T: 'static> {
     Own(Vec<T>),
     Shared(std::sync::Arc<[T]>),
@@ -944,7 +943,8 @@ struct Seek {
     tick: u64,
     segment_data_start: u64,
     read: CuesRead,
-    cues: Held<Cue>,
+    /// Shared with the other runs over the file when the open read them.
+    cues: std::sync::Arc<Cues>,
     /// The caption cues' ends, from `cues` and the tracks.
     ends: Vec<CueEnd>,
     /// Each cued track's last cue and the widest gap between two of its cues.
@@ -1191,7 +1191,7 @@ impl MkvDemux {
                 tick: crate::DEFAULT_TIMESTAMP_SCALE,
                 segment_data_start: 0,
                 read: CuesRead::Done,
-                cues: Held::Own(Vec::new()),
+                cues: std::sync::Arc::default(),
                 ends: Vec::new(),
                 tails: Vec::new(),
                 of_cues: OfCues::default(),
@@ -1333,16 +1333,12 @@ impl MkvDemux {
         self
     }
 
-    pub fn with_cues(self, cues: Vec<Cue>, at: Option<u64>) -> Self {
-        self.cued_by(Held::Own(cues), at)
+    pub fn with_cues(self, cues: Cues, at: Option<u64>) -> Self {
+        self.with_shared_cues(std::sync::Arc::new(cues), at)
     }
 
     /// [`MkvDemux::with_cues`] over Cues shared with the other runs over the file, not copied.
-    pub fn with_shared_cues(self, cues: std::sync::Arc<[Cue]>, at: Option<u64>) -> Self {
-        self.cued_by(Held::Shared(cues), at)
-    }
-
-    fn cued_by(mut self, cues: Held<Cue>, at: Option<u64>) -> Self {
+    pub fn with_shared_cues(mut self, cues: std::sync::Arc<Cues>, at: Option<u64>) -> Self {
         self.seek.whole = !cues.is_empty();
         self.seek.reserve = at.filter(|_| self.seek.whole);
         self.seek.cues = cues;
@@ -1514,7 +1510,7 @@ impl MkvDemux {
             }
             return;
         }
-        let cues = parse_cue_tracks(data, self.seek.segment_data_start, self.seek.tick);
+        let cues = Cues::parse(data, self.seek.segment_data_start, self.seek.tick);
         log!(
             &*ctx,
             Level::Debug,
@@ -1530,13 +1526,13 @@ impl MkvDemux {
         }
         log!(&*ctx, Level::Info, "cues", positions = cues.len(), whole = whole);
         self.seek.reserve = Some(at);
-        (self.seek.cues, self.seek.whole) = (Held::Own(cues), whole);
+        (self.seek.cues, self.seek.whole) = (std::sync::Arc::new(cues), whole);
         self.cues_changed(ctx);
         self.reader.mark(None);
         self.publish(ctx);
     }
 
-    fn reserve(ctx: &Ctx, cues: &[Cue], cues_at: u64, file_len: Option<u64>) {
+    fn reserve(ctx: &Ctx, cues: &Cues, cues_at: u64, file_len: Option<u64>) {
         // the clusters most blocks sit in, a rarer larger one takes a slot of its own class
         let size = cues_typical(cues, cues_at, file_len.unwrap_or(cues_at));
         if !(RESERVE_FLOOR as u64..=SIZED_TOP as u64).contains(&size) {
@@ -2152,17 +2148,18 @@ impl MkvDemux {
         let near = |t: u64| t.abs_diff(pts) <= tick;
         let before = match self.seek.cues.is_empty() {
             false => {
-                let cues = &self.seek.cues;
-                let false_cue = |c: &Cue| Some(c.track) == key && near(c.time_ns);
-                let dropped = cues.iter().any(false_cue);
-                if dropped {
-                    let kept: Vec<Cue> = cues.iter().filter(|c| !false_cue(c)).copied().collect();
-                    self.seek.cues = Held::Own(kept);
+                let dropped = key
+                    .and_then(|k| self.seek.cues.track(k))
+                    .is_some_and(|v| v.times().iter().any(|&t| near(t)));
+                if let Some(k) = key.filter(|_| dropped) {
+                    self.seek.cues = std::sync::Arc::new(self.seek.cues.without(k, &near));
                     self.cues_changed(ctx);
                 }
-                let prior =
-                    self.seek.cues.iter().filter(|c| Some(c.track) == key && c.time_ns < pts);
-                dropped.then(|| prior.max_by_key(|c| c.time_ns).map(|c| (c.byte, c.time_ns)))
+                let prior = key.and_then(|k| self.seek.cues.track(k)).and_then(|v| {
+                    let i = v.times().partition_point(|&t| t < pts).checked_sub(1)?;
+                    Some((v.clusters()[i], v.times()[i]))
+                });
+                dropped.then_some(prior)
             }
             true => {
                 let entries = &mut self.seek.grown.entries;
@@ -3050,23 +3047,14 @@ fn over_now(pt: &PadTrack, at: u64, from: u64, tails: &[Tail]) -> bool {
     at > last.saturating_add(margin)
 }
 
-/// Each cued track's last cue and widest gap between cues, the Cues in any order.
-// Cold path, once per Cues read.
-#[allow(clippy::disallowed_methods)]
-fn tails(cues: &[Cue]) -> Vec<Tail> {
-    let mut times: Vec<(u64, u64)> = cues.iter().map(|c| (c.track, c.time_ns)).collect();
-    times.sort_unstable();
-    let mut out: Vec<Tail> = Vec::new();
-    for (track, t) in times {
-        match out.last_mut() {
-            Some(tail) if tail.0 == track => {
-                tail.2 = tail.2.max(t - tail.1);
-                tail.1 = t;
-            }
-            _ => out.push((track, t, 0)),
-        }
-    }
-    out
+/// Each cued track's last cue and widest gap between cues.
+fn tails(cues: &Cues) -> Vec<Tail> {
+    let tail = |v: crate::cues::TrackView<'_>| {
+        let times = v.times();
+        let gap = times.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+        (v.track(), times.last().copied().unwrap_or(0), gap)
+    };
+    cues.tracks().map(tail).collect()
 }
 
 /// A walked block's keyframe flag by its NAL types where its bytes are read and stored plain.

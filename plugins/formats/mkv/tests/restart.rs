@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use pf_mkv::ebml::{self, id};
-use pf_mkv::{MkvDemux, Parsed, parse_cue_tracks, parse_seek_head};
+use pf_mkv::{Cues, MkvDemux, Parsed, parse_seek_head};
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::BufferFlags;
 use profluens_core::bus::BusMessage;
@@ -172,9 +172,9 @@ fn parsed(file: &[u8]) -> Parsed {
     let info = parse_seek_head(head).expect("a Segment");
     let at = info.cues_pos.map(|c| (c + info.segment_data_start) as usize);
     if let Some(bytes) = at.and_then(|at| file.get(at..)) {
-        let cues = parse_cue_tracks(bytes, info.segment_data_start, info.timestamp_scale);
+        let cues = Cues::parse(bytes, info.segment_data_start, info.timestamp_scale);
         if !cues.is_empty() {
-            (p.cues, p.cued_at) = (Arc::from(cues), at.map(|at| at as u64));
+            (p.cues, p.cued_at) = (Arc::new(cues), at.map(|at| at as u64));
         }
     }
     p

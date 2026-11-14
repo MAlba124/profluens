@@ -8,8 +8,7 @@ use std::sync::{Arc, Mutex};
 use pf_mkv::ebml::id;
 use pf_mkv::index::PRE_ROLL_BYTES;
 use pf_mkv::{
-    MatroskaReader, MatroskaWriter, MkvDemux, Parsed, TrackConfig, parse_cue_tracks,
-    parse_seek_head,
+    Cues, MatroskaReader, MatroskaWriter, MkvDemux, Parsed, TrackConfig, parse_seek_head,
 };
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::BufferFlags;
@@ -175,9 +174,8 @@ fn parsed(file: &[u8]) -> Parsed {
     let mut p = Parsed::of(&head).expect("a head");
     let info = parse_seek_head(&head).expect("a Segment");
     if let Some(at) = info.cues_pos.map(|c| c + info.segment_data_start) {
-        let cues =
-            parse_cue_tracks(&file[at as usize..], info.segment_data_start, info.timestamp_scale);
-        p.cues = Arc::from(cues);
+        let cues = Cues::parse(&file[at as usize..], info.segment_data_start, info.timestamp_scale);
+        p.cues = Arc::new(cues);
         p.cued_at = Some(at);
     }
     p

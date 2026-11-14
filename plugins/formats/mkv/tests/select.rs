@@ -7,9 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use pf_mkv::ebml;
-use pf_mkv::{
-    MatroskaWriter, MkvDemux, TrackConfig, parse_cue_tracks, parse_cues, parse_seek_head,
-};
+use pf_mkv::{Cues, MatroskaWriter, MkvDemux, TrackConfig, parse_cues, parse_seek_head};
 use profluens_core::batch::Inputs;
 use profluens_core::clock::{Clock, MockClock};
 use profluens_core::ctx::{Ctx, StreamKind};
@@ -184,10 +182,10 @@ struct Rig {
 }
 
 /// Every track's cues of `stream`, as an open hands them to the demuxer.
-fn every_cue(stream: &[u8]) -> Vec<pf_mkv::Cue> {
+fn every_cue(stream: &[u8]) -> Cues {
     let info = parse_seek_head(&header_of(stream)).expect("a SeekHead");
     let at = (info.segment_data_start + info.cues_pos.expect("it names the Cues")) as usize;
-    parse_cue_tracks(&stream[at..], info.segment_data_start, info.timestamp_scale)
+    Cues::parse(&stream[at..], info.segment_data_start, info.timestamp_scale)
 }
 
 /// The events a run logged.

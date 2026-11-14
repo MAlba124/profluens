@@ -96,15 +96,15 @@ pub(crate) fn places(p: &Parsed) -> (Option<u64>, Passed) {
 /// The Cues at the start of `b`, the held bytes from where the SeekHead puts them, as
 /// `pf_mkv::CuesAt` reads them. None when `b` holds less than that read and is not the end of the
 /// file.
-pub(crate) fn cues_in(b: &[u8], eof: bool, max: u64, p: &Parsed) -> Option<Vec<pf_mkv::Cue>> {
+pub(crate) fn cues_in(b: &[u8], eof: bool, max: u64, p: &Parsed) -> Option<pf_mkv::Cues> {
     let hd = &b[..b.len().min(EL_HEAD)];
     if hd.len() < EL_HEAD && !eof {
         return None;
     }
-    let Ok(h) = read_element_header(hd, 0) else { return Some(Vec::new()) };
+    let Ok(h) = read_element_header(hd, 0) else { return Some(pf_mkv::Cues::default()) };
     let len = h.size.and_then(|s| (h.data_start as u64).checked_add(s));
     let Some(len) = len.filter(|&len| h.id == id::CUES && len <= max) else {
-        return Some(Vec::new());
+        return Some(pf_mkv::Cues::default());
     };
     let len = usize::try_from(len).ok()?;
     if b.len() < len && !eof {
@@ -112,7 +112,7 @@ pub(crate) fn cues_in(b: &[u8], eof: bool, max: u64, p: &Parsed) -> Option<Vec<p
     }
     let sh = p.seek_head?;
     let body = &b[..len.min(b.len())];
-    Some(pf_mkv::parse_cue_tracks(body, sh.segment_data_start, sh.timestamp_scale))
+    Some(pf_mkv::Cues::parse(body, sh.segment_data_start, sh.timestamp_scale))
 }
 
 fn kind_of(family: &str) -> TrackKind {

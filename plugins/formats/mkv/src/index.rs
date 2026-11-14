@@ -9,8 +9,9 @@ use profluens_core::pipeline::IndexEntry;
 
 use crate::codec::{family_for, is_audio_family, is_video_family, lead_of};
 use crate::cued::{IN_FLIGHT, Ref};
+use crate::cues::{Cues, TrackView};
 use crate::element::LEAD_MIN;
-use crate::reader::{Cue, Track};
+use crate::reader::Track;
 
 /// A caption track's cue as `(track, start, end, byte)`.
 pub type CaptionSpan = (u64, u64, u64, u64);
@@ -35,8 +36,8 @@ pub const PRE_ROLL_BYTES: u64 = LEAD_MIN as u64;
 pub const CAPTION_BYTES: u64 = 8 << 20;
 
 /// The first video track the Cues name (RFC 9559 section 22.1), else the first audio track.
-pub fn key_track(cues: &[Cue], tracks: &[Track]) -> Option<u64> {
-    let cued = |t: &&Track| cues.iter().any(|c| c.track == t.track_number);
+pub fn key_track(cues: &Cues, tracks: &[Track]) -> Option<u64> {
+    let cued = |t: &&Track| cues.track(t.track_number).is_some();
     let of =
         |is: fn(&str) -> bool| tracks.iter().filter(|t| is(family_for(&t.codec_id))).find(cued);
     of(is_video_family).or_else(|| of(is_audio_family)).map(|t| t.track_number)
@@ -47,8 +48,13 @@ pub fn audio_lead(track: &Track, tick: u64) -> u64 {
     lead.pre_roll.saturating_add(lead.packet).saturating_add(tick)
 }
 
+/// A track's cues as `(time, Cluster)`.
+fn points<'a>(v: TrackView<'a>) -> impl Iterator<Item = (u64, u64)> + 'a {
+    v.times().iter().copied().zip(v.clusters().iter().copied())
+}
+
 pub fn cue_entries(
-    cues: &[Cue],
+    cues: &Cues,
     tracks: &[Track],
     linked: &dyn Fn(u64) -> bool,
     tick: u64,
@@ -63,18 +69,18 @@ pub fn cue_entries(
 // Cold path, once per linked set.
 #[allow(clippy::disallowed_methods)]
 pub fn cue_entries_of(
-    cues: &[Cue],
+    cues: &Cues,
     tracks: &[Track],
     (spans, left_out): (&[CaptionSpan], &[u64]),
     key: Option<u64>,
     linked: &dyn Fn(u64) -> bool,
     tick: u64,
 ) -> Vec<IndexEntry> {
-    let mut keys: Vec<(u64, u64)> = cues
-        .iter()
-        .filter(|c| key.is_none_or(|k| c.track == k))
-        .map(|c| (c.time_ns, c.byte))
-        .collect();
+    let of = |track: u64| cues.track(track).into_iter().flat_map(points);
+    let mut keys: Vec<(u64, u64)> = match key {
+        Some(k) => of(k).collect(),
+        None => cues.iter().map(|c| (c.time_ns, c.byte)).collect(),
+    };
     keys.dedup_by_key(|k| k.0);
     let on = |t: &&Track| linked(t.track_number);
     let video = tracks.iter().filter(on).any(|t| is_video_family(family_for(&t.codec_id)));
@@ -83,14 +89,7 @@ pub fn cue_entries_of(
         .filter(on)
         .filter(|t| is_audio_family(family_for(&t.codec_id)))
         .filter(|t| !video || lead_of(t).pre_roll > SHORT_PRE_ROLL)
-        .map(|t| {
-            let own: Vec<(u64, u64)> = cues
-                .iter()
-                .filter(|c| c.track == t.track_number)
-                .map(|c| (c.time_ns, c.byte))
-                .collect();
-            (own, audio_lead(t, tick))
-        })
+        .map(|t| (of(t.track_number).collect(), audio_lead(t, tick)))
         .collect();
     let mut captions: Vec<(u64, u64, u64)> = spans
         .iter()
@@ -181,21 +180,20 @@ fn is_caption(t: &Track) -> bool {
 /// until its track's next cue.
 // Cold path, once per stream and link change.
 #[allow(clippy::disallowed_methods)]
-pub fn captions(cues: &[Cue], tracks: &[Track]) -> (Vec<CaptionSpan>, Vec<u64>) {
+pub fn captions(cues: &Cues, tracks: &[Track]) -> (Vec<CaptionSpan>, Vec<u64>) {
     let (mut spans, mut left_out) = (Vec::new(), Vec::new());
     for t in tracks.iter().filter(|t| is_caption(t)) {
-        let own: Vec<&Cue> = cues.iter().filter(|c| c.track == t.track_number).collect();
-        if own.is_empty() {
+        let Some(own) = cues.track(t.track_number) else {
             left_out.push(t.track_number);
-        }
-        for (i, c) in own.iter().enumerate() {
-            let end = match c.duration_ns {
-                Some(d) => c.time_ns.saturating_add(d),
-                None => {
-                    own.get(i + 1).map_or(c.time_ns.saturating_add(CAPTION_REACH), |n| n.time_ns)
-                }
+            continue;
+        };
+        let times = own.times();
+        for (i, (time, byte)) in points(own).enumerate() {
+            let end = match own.duration_ns(i) {
+                Some(d) => time.saturating_add(d),
+                None => times.get(i + 1).map_or(time.saturating_add(CAPTION_REACH), |&n| n),
             };
-            spans.push((t.track_number, c.time_ns, end.max(c.time_ns), c.byte));
+            spans.push((t.track_number, time, end.max(time), byte));
         }
     }
     (spans, left_out)
@@ -205,12 +203,9 @@ pub fn captions(cues: &[Cue], tracks: &[Track]) -> (Vec<CaptionSpan>, Vec<u64>) 
 /// reads their captions up at its point by the cue alone, so no restart goes back for them.
 // Cold path, once per Cues.
 #[allow(clippy::disallowed_methods)]
-pub(crate) fn placed(cues: &[Cue], tracks: &[Track]) -> Vec<u64> {
-    let all = |t: u64| {
-        let mut own = cues.iter().filter(|c| c.track == t).peekable();
-        own.peek().is_some() && own.all(|c| c.relative.is_some())
-    };
-    tracks.iter().filter(|t| is_caption(t)).map(|t| t.track_number).filter(|&t| all(t)).collect()
+pub(crate) fn placed(cues: &Cues, tracks: &[Track]) -> Vec<u64> {
+    let all = |t: &u64| cues.track(*t).is_some_and(|v| v.placed());
+    tracks.iter().filter(|t| is_caption(t)).map(|t| t.track_number).filter(all).collect()
 }
 
 /// The blocks a restart at `byte` reads past of the `aside` tracks' captions still to show at
@@ -219,27 +214,28 @@ pub(crate) fn placed(cues: &[Cue], tracks: &[Track]) -> Vec<u64> {
 // Cold path, once per restart.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn up_at(
-    cues: &[Cue],
+    cues: &Cues,
     ends: &[CueEnd],
     aside: &dyn Fn(u64) -> bool,
     byte: u64,
     point: u64,
 ) -> Vec<Ref> {
     let reach = |start: u64| start.saturating_add(CAPTION_REACH);
-    let end = |c: &Cue| match c.duration_ns {
-        Some(d) => c.time_ns.saturating_add(d),
-        None => cue_end(ends, c.track, c.time_ns).unwrap_or(reach(c.time_ns)),
-    };
-    let mut refs: Vec<Ref> = cues
-        .iter()
-        .filter(|c| c.byte < byte && c.time_ns < reach(point) && aside(c.track))
-        .filter(|c| end(c) > point)
-        .filter_map(|c| {
-            let (track, time_ns, cluster, duration_ns) =
-                (c.track, c.time_ns, c.byte, c.duration_ns);
-            Some(Ref { track, time_ns, cluster, relative: c.relative?, duration_ns })
-        })
-        .collect();
+    let mut refs: Vec<Ref> = Vec::new();
+    for v in cues.tracks().filter(|v| aside(v.track())) {
+        let track = v.track();
+        let within = v.times().partition_point(|&t| t < reach(point));
+        for (i, (time_ns, cluster)) in points(v).take(within).enumerate() {
+            let duration_ns = v.duration_ns(i);
+            let end = match duration_ns {
+                Some(d) => time_ns.saturating_add(d),
+                None => cue_end(ends, track, time_ns).unwrap_or(reach(time_ns)),
+            };
+            if let Some(relative) = v.relative(i).filter(|_| cluster < byte && end > point) {
+                refs.push(Ref { track, time_ns, cluster, relative, duration_ns });
+            }
+        }
+    }
     refs.sort_unstable_by_key(|r| (r.time_ns, r.cluster, r.relative));
     refs.dedup_by_key(|r| (r.cluster, r.relative));
     refs.drain(..refs.len().saturating_sub(IN_FLIGHT));
@@ -253,15 +249,16 @@ pub(crate) type CueEnd = (u64, u64, Option<u64>);
 /// track's next cue. A track's last cue without a duration has no end.
 // Cold path, once per Cues read.
 #[allow(clippy::disallowed_methods)]
-pub(crate) fn cue_ends(cues: &[Cue], tracks: &[Track]) -> Vec<CueEnd> {
-    let captions: Vec<u64> =
-        tracks.iter().filter(|t| is_caption(t)).map(|t| t.track_number).collect();
-    let mut ends: Vec<CueEnd> = cues
-        .iter()
-        .filter(|c| captions.contains(&c.track))
-        .map(|c| (c.track, c.time_ns, c.duration_ns.map(|d| c.time_ns.saturating_add(d))))
-        .collect();
-    ends.sort_unstable_by_key(|&(track, start, _)| (track, start));
+pub(crate) fn cue_ends(cues: &Cues, tracks: &[Track]) -> Vec<CueEnd> {
+    let caption = |n: u64| tracks.iter().any(|t| t.track_number == n && is_caption(t));
+    let mut ends: Vec<CueEnd> = Vec::new();
+    // by track then start as the tables hold them
+    for v in cues.tracks().filter(|v| caption(v.track())) {
+        let end = |(i, &start): (usize, &u64)| {
+            (v.track(), start, v.duration_ns(i).map(|d| start.saturating_add(d)))
+        };
+        ends.extend(v.times().iter().enumerate().map(end));
+    }
     ends.dedup_by_key(|&mut (track, start, _)| (track, start));
     for i in 1..ends.len() {
         let (track, start, _) = ends[i];
@@ -339,8 +336,18 @@ impl Grown {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::reader::Cue;
 
     const S: u64 = 1_000_000_000;
+
+    fn cue_entries(
+        cues: &[Cue],
+        tracks: &[Track],
+        linked: &dyn Fn(u64) -> bool,
+        tick: u64,
+    ) -> Vec<IndexEntry> {
+        super::cue_entries(&Cues::of(cues), tracks, linked, tick)
+    }
 
     fn track(track_number: u64, codec: &str) -> Track {
         Track {
@@ -623,7 +630,7 @@ mod tests {
         cues.push(cue(4, 6 * S, 4_000, Some(S / 2)));
         cues.push(cue(4, 7 * S, 4_500, None));
         cues.sort_by_key(|c| c.time_ns);
-        let ends = cue_ends(&cues, &tracks);
+        let ends = cue_ends(&Cues::of(&cues), &tracks);
         assert_eq!(cue_end(&ends, 3, 55 * S / 10), Some(9 * S), "up until the next composition");
         assert_eq!(cue_end(&ends, 3, 9 * S), None, "the last one");
         assert_eq!(cue_end(&ends, 4, 6 * S), Some(65 * S / 10), "its CueDuration");
@@ -702,7 +709,7 @@ mod tests {
     fn audio_alone_is_its_own_index_and_restarts_its_pre_roll_ahead() {
         let tracks = vec![track(2, "A_OPUS")];
         let cues: Vec<Cue> = (0..4).map(|n| cue(2, n * S, 100 + n * 100, None)).collect();
-        assert_eq!(key_track(&cues, &tracks), Some(2));
+        assert_eq!(key_track(&Cues::of(&cues), &tracks), Some(2));
         let entries = cue_entries(&cues, &tracks, &|_| true, 1_000_000);
         assert_eq!(restarts(&entries), [(100, 0), (100, 0), (200, 10), (300, 20)]);
     }
@@ -776,10 +783,11 @@ mod tests {
             cue(4, 12, None, 100, Some(50)),
             cue(3, 13, Some(1), 200, Some(10)),
         ];
-        assert_eq!(placed(&cues, &tracks), [3, 4]);
-        let ends = cue_ends(&cues, &tracks);
+        let packed = Cues::of(&cues);
+        assert_eq!(placed(&packed, &tracks), [3, 4]);
+        let ends = cue_ends(&packed, &tracks);
         let up = |on: &dyn Fn(u64) -> bool, byte: u64, at: u64| -> Vec<(u64, u64)> {
-            let refs = up_at(&cues, &ends, on, byte, at * S);
+            let refs = up_at(&packed, &ends, on, byte, at * S);
             refs.iter().map(|r| (r.track, r.time_ns / S)).collect()
         };
         let both = |_: u64| true;
@@ -792,6 +800,6 @@ mod tests {
         assert_eq!(up(&both, 300, 40), [], "the last bitmap is past its reach");
         let mut unplaced = cues;
         unplaced[3].relative = None;
-        assert_eq!(placed(&unplaced, &tracks), [4]);
+        assert_eq!(placed(&Cues::of(&unplaced), &tracks), [4]);
     }
 }

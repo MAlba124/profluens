@@ -7,8 +7,9 @@ use std::collections::VecDeque;
 
 use profluens_core::memory::Memory;
 
+use crate::cues::Cues;
 use crate::ebml::{self, id};
-use crate::reader::{Cue, cluster_timestamp, cued_block};
+use crate::reader::{cluster_timestamp, cued_block};
 
 pub(crate) const HEAD: u32 = 64;
 pub(crate) const BLOCK_FIRST: u32 = 4 << 10;
@@ -71,19 +72,16 @@ pub(crate) struct Cued {
 impl Cued {
     // Cold path, once per cued read.
     #[allow(clippy::disallowed_methods)]
-    pub(crate) fn refs(cues: &[Cue], tracks: &[u64]) -> Option<Vec<Ref>> {
+    pub(crate) fn refs(cues: &Cues, tracks: &[u64]) -> Option<Vec<Ref>> {
         let mut refs = Vec::new();
-        for &t in tracks {
-            let of = || cues.iter().filter(|c| c.track == t);
-            if of().next().is_none() || of().any(|c| c.relative.is_none()) {
-                return None;
-            }
-            refs.extend(of().map(|c| Ref {
-                track: t,
-                time_ns: c.time_ns,
-                cluster: c.byte,
-                relative: c.relative.unwrap_or(0),
-                duration_ns: c.duration_ns,
+        for &track in tracks {
+            let v = cues.track(track).filter(|v| v.placed())?;
+            refs.extend((0..v.len()).map(|i| Ref {
+                track,
+                time_ns: v.times()[i],
+                cluster: v.clusters()[i],
+                relative: v.relative(i).unwrap_or(0),
+                duration_ns: v.duration_ns(i),
             }));
         }
         refs.sort_by_key(|r| (r.cluster, r.relative, r.time_ns));
@@ -322,6 +320,7 @@ fn head_of(at: u64, data: &[u8]) -> Head {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::reader::Cue;
     use profluens_core::memory::Pool;
 
     fn file(clusters: &[(u64, &[(i16, &str)])], pad: usize) -> (Vec<u8>, Vec<Cue>) {
@@ -394,7 +393,7 @@ mod tests {
             relative: Some(1),
         };
         let open = [cue(3, 1_000, None), cue(3, 3_000, None), cue(3, 5_000, None)];
-        let refs = Cued::refs(&open, &[3]).expect("placed");
+        let refs = Cued::refs(&Cues::of(&open), &[3]).expect("placed");
         let c = Cued::new(refs.clone(), 1_000_000, 4_000_000_000);
         assert_eq!(c.resume_time(), Some(3_000_000_000), "the one up at 4 s");
         let c = Cued::new(refs.clone(), 1_000_000, 5_000_000_000);
@@ -402,18 +401,26 @@ mod tests {
         let c = Cued::new(refs, 1_000_000, 40_000_000_000);
         assert_eq!(c.resume_time(), None, "past the reach");
         let timed = [cue(3, 1_000, Some(500)), cue(3, 3_000, Some(500)), cue(3, 5_000, Some(500))];
-        let c = Cued::new(Cued::refs(&timed, &[3]).expect("placed"), 1_000_000, 4_000_000_000);
+        let c = Cued::new(
+            Cued::refs(&Cues::of(&timed), &[3]).expect("placed"),
+            1_000_000,
+            4_000_000_000,
+        );
         assert_eq!(c.resume_time(), Some(5_000_000_000), "the one from 3 s ended");
         let two =
             [cue(3, 1_000, None), cue(7, 2_000, None), cue(3, 3_000, None), cue(7, 6_000, None)];
-        let c = Cued::new(Cued::refs(&two, &[3, 7]).expect("placed"), 1_000_000, 4_000_000_000);
+        let c = Cued::new(
+            Cued::refs(&Cues::of(&two), &[3, 7]).expect("placed"),
+            1_000_000,
+            4_000_000_000,
+        );
         assert_eq!(c.resume_time(), Some(2_000_000_000), "track 7's last before 4 s too");
     }
 
     #[test]
     fn blocks_are_read_at_their_cues_in_order() {
         let (f, cues) = file(&[(1_000, &[(0, "a"), (700, "b")]), (5_000, &[(10, "c")])], 100);
-        let refs = Cued::refs(&cues, &[3]).expect("all placed");
+        let refs = Cued::refs(&Cues::of(&cues), &[3]).expect("all placed");
         let mut c = Cued::new(refs, 1_000_000, 0);
         let got = read(&mut c, &f);
         let ms = 1_000_000;
@@ -431,7 +438,7 @@ mod tests {
         let long = "x".repeat(BLOCK_FIRST as usize * 2);
         let (f, mut cues) = file(&[(0, &[(0, "a"), (100, &long), (200, "c")])], 0);
         cues[2].relative = cues[2].relative.map(|r| r + 1);
-        let mut c = Cued::new(Cued::refs(&cues, &[3]).expect("placed"), 1_000_000, 0);
+        let mut c = Cued::new(Cued::refs(&Cues::of(&cues), &[3]).expect("placed"), 1_000_000, 0);
         let got = read(&mut c, &f);
         assert_eq!(got[0].1.as_deref(), Some("a"));
         assert_eq!(got[1].1.as_ref().map(|s| s.len()), Some(long.len()), "read again whole");
@@ -439,7 +446,7 @@ mod tests {
         assert_eq!(c.dropped, 1);
         assert!(!c.untrusted(), "blocks read before it");
         cues[0].relative = cues[0].relative.map(|r| r + 1);
-        let mut c = Cued::new(Cued::refs(&cues, &[3]).expect("placed"), 1_000_000, 0);
+        let mut c = Cued::new(Cued::refs(&Cues::of(&cues), &[3]).expect("placed"), 1_000_000, 0);
         read(&mut c, &f);
         assert!(c.untrusted(), "the first dropped");
     }
@@ -457,7 +464,7 @@ mod tests {
             duration_ns: None,
             relative: Some(0),
         }));
-        let mut c = Cued::new(Cued::refs(&cues, &[3]).expect("placed"), 1_000_000, 0);
+        let mut c = Cued::new(Cued::refs(&Cues::of(&cues), &[3]).expect("placed"), 1_000_000, 0);
         let got = read(&mut c, &f);
         assert_eq!(got.len(), n as usize + 1);
         assert_eq!(got[0].1.as_deref(), Some("a"));
@@ -469,12 +476,16 @@ mod tests {
     #[test]
     fn a_track_with_a_cue_that_does_not_place_its_block_is_walked() {
         let (_, mut cues) = file(&[(0, &[(0, "a"), (100, "b")])], 0);
-        assert!(Cued::refs(&cues, &[3]).is_some());
-        assert!(Cued::refs(&cues, &[4]).is_none(), "a track with no cue");
+        assert!(Cued::refs(&Cues::of(&cues), &[3]).is_some());
+        assert!(Cued::refs(&Cues::of(&cues), &[4]).is_none(), "a track with no cue");
         let twice = cues[0];
         cues.push(twice);
-        assert_eq!(Cued::refs(&cues, &[3]).map(|r| r.len()), Some(2), "a block cued twice once");
+        assert_eq!(
+            Cued::refs(&Cues::of(&cues), &[3]).map(|r| r.len()),
+            Some(2),
+            "a block cued twice once"
+        );
         cues[1].relative = None;
-        assert!(Cued::refs(&cues, &[3]).is_none());
+        assert!(Cued::refs(&Cues::of(&cues), &[3]).is_none());
     }
 }

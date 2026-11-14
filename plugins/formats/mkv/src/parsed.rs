@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
+use crate::cues::Cues;
 use crate::error::DemuxError;
-use crate::reader::{Cue, MatroskaReader, SeekHeadInfo, Track, parse_seek_head};
+use crate::reader::{MatroskaReader, SeekHeadInfo, Track, parse_seek_head};
 use crate::tags::{SegmentIndex, index_segment};
 
 /// The reader takes the head in pieces, so an element it skips, attached fonts as a rule, is
@@ -28,7 +29,7 @@ pub struct Parsed {
     /// The head's length unless whoever read the head walked to the Cluster past a cut.
     pub first_cluster: u64,
     /// Every track's CuePoints, empty when not read or absent.
-    pub cues: Arc<[Cue]>,
+    pub cues: Arc<Cues>,
     /// Where the Cues were read, None for none.
     pub cued_at: Option<u64>,
 }
@@ -53,7 +54,7 @@ impl Parsed {
             index: index_segment(head),
             segment_end: crate::index::segment_end(head),
             first_cluster: head.len() as u64,
-            cues: Arc::from([]),
+            cues: Arc::default(),
             cued_at: None,
         })
     }
@@ -87,6 +88,6 @@ impl Parsed {
                 + t.language.len()
                 + t.name.len()
         };
-        size_of_val(&*self.cues) + self.tracks.iter().map(track).sum::<usize>()
+        self.cues.bytes() + self.tracks.iter().map(track).sum::<usize>()
     }
 }

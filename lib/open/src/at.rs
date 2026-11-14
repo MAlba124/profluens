@@ -423,12 +423,8 @@ impl OpenAt {
         }
     }
 
-    fn mkv_cued(
-        &mut self,
-        cues: Vec<pf_mkv::Cue>,
-        at: Option<u64>,
-    ) -> Result<Option<Need>, OpenError> {
-        (self.mkv.parsed.cues, self.mkv.parsed.cued_at) = (Arc::from(cues), at);
+    fn mkv_cued(&mut self, cues: pf_mkv::Cues, at: Option<u64>) -> Result<Option<Need>, OpenError> {
+        (self.mkv.parsed.cues, self.mkv.parsed.cued_at) = (Arc::new(cues), at);
         self.mkv_meta()
     }
 

@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 
+use crate::cues::Cues;
 use crate::ebml::{self, ReadError, id};
 use crate::encoding::{self, Coding};
 use crate::inflate::InflateError;
@@ -1609,7 +1610,7 @@ pub fn parse_cues(
     out
 }
 
-fn cues_body(cues_bytes: &[u8]) -> Option<&[u8]> {
+pub(crate) fn cues_body(cues_bytes: &[u8]) -> Option<&[u8]> {
     let h = ebml::read_element_header(cues_bytes, 0).ok()?;
     if h.id != id::CUES {
         return None;
@@ -1630,7 +1631,8 @@ pub struct Cue {
     pub relative: Option<u64>,
 }
 
-/// Every position of every CuePoint with its track, ascending by time.
+/// Every position of every CuePoint with its track, ascending by time, a struct per cue.
+/// [`Cues::parse`] reads the same into the tables a demuxer holds.
 // Cold path, once per stream.
 #[allow(clippy::disallowed_methods)]
 pub fn parse_cue_tracks(
@@ -1664,7 +1666,7 @@ pub fn parse_cue_tracks(
 /// A file's Cues as read once, every track's, for every demuxer of it to take.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CueIndex {
-    pub cues: Vec<Cue>,
+    pub cues: Cues,
     /// Where the Cues element starts, `None` when none were read.
     pub at: Option<u64>,
 }
@@ -1746,8 +1748,7 @@ impl profluens_core::fetch::Fetch for CuesAt {
             CuesState::Body => {
                 self.state = CuesState::Start;
                 self.body.truncate(self.got);
-                let cues =
-                    parse_cue_tracks(&self.body, self.segment_data_start, self.timestamp_scale);
+                let cues = Cues::parse(&self.body, self.segment_data_start, self.timestamp_scale);
                 self.body = Vec::new();
                 Ok(Step::Done(CueIndex { at: (!cues.is_empty()).then_some(at), cues }))
             }
@@ -1770,8 +1771,8 @@ impl profluens_core::fetch::Fetch for CuesAt {
 /// fewer than two.
 // Cold path, once per open.
 #[allow(clippy::disallowed_methods)]
-fn cue_spans(cues: &[Cue], cues_at: u64, file_len: u64) -> Vec<u64> {
-    let mut at: Vec<u64> = cues.iter().map(|c| c.byte).collect();
+fn cue_spans(cues: &Cues, cues_at: u64, file_len: u64) -> Vec<u64> {
+    let mut at: Vec<u64> = cues.tracks().flat_map(|v| v.clusters()).copied().collect();
     at.sort_unstable();
     at.dedup();
     let (Some(&last), true) = (at.last(), at.len() > 1) else {
@@ -1788,7 +1789,7 @@ fn cue_spans(cues: &[Cue], cues_at: u64, file_len: u64) -> Vec<u64> {
 }
 
 /// The largest span between cued Clusters bounds a block, `None` with fewer than two.
-pub fn cues_demand(cues: &[Cue], cues_at: u64, file_len: u64) -> Demand {
+pub fn cues_demand(cues: &Cues, cues_at: u64, file_len: u64) -> Demand {
     match cue_spans(cues, cues_at, file_len).into_iter().max() {
         Some(largest) => Demand { known: Known::Clusters, largest, peak: 0, window: 0 },
         None => Demand::unknown(),
@@ -1797,7 +1798,7 @@ pub fn cues_demand(cues: &[Cue], cues_at: u64, file_len: u64) -> Demand {
 
 /// The span nine in ten cued Clusters fit in, what the demuxer's blocks are sized for, 0 with
 /// fewer than two.
-pub fn cues_typical(cues: &[Cue], cues_at: u64, file_len: u64) -> u64 {
+pub fn cues_typical(cues: &Cues, cues_at: u64, file_len: u64) -> u64 {
     let mut spans = cue_spans(cues, cues_at, file_len);
     if spans.is_empty() {
         return 0;
@@ -2084,7 +2085,7 @@ mod tests {
             duration_ns: None,
             relative: None,
         };
-        let cues = [cue(100, 1), cue(1000, 1), cue(1000, 2), cue(5000, 1), cue(7000, 1)];
+        let cues = Cues::of(&[cue(100, 1), cue(1000, 1), cue(1000, 2), cue(5000, 1), cue(7000, 1)]);
         let d = cues_demand(&cues, 9000, 10_000);
         assert_eq!(d, Demand { known: Known::Clusters, largest: 4000, peak: 0, window: 0 });
         assert_eq!(
@@ -2097,11 +2098,11 @@ mod tests {
             13_000,
             "Cues up front, to the file's end"
         );
-        assert_eq!(cues_demand(&[], 9000, 10_000), Demand::unknown());
+        assert_eq!(cues_demand(&Cues::default(), 9000, 10_000), Demand::unknown());
         assert_eq!(cues_typical(&cues, 9000, 10_000), 2000, "the spans 900, 4000, 2000, 2000");
-        assert_eq!(cues_typical(&[cue(100, 1)], 9000, 10_000), 0);
+        assert_eq!(cues_typical(&Cues::of(&[cue(100, 1)]), 9000, 10_000), 0);
         assert_eq!(
-            cues_demand(&[cue(100, 1), cue(100, 2)], 9000, 10_000),
+            cues_demand(&Cues::of(&[cue(100, 1), cue(100, 2)]), 9000, 10_000),
             Demand::unknown(),
             "one Cluster"
         );

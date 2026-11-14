@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pf_mkv::ebml::{self, id};
-use pf_mkv::{MatroskaWriter, MkvDemux, TrackConfig, parse_cue_tracks, parse_seek_head};
+use pf_mkv::{Cues, MatroskaWriter, MkvDemux, TrackConfig, parse_seek_head};
 use profluens_core::batch::Inputs;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
@@ -375,7 +375,7 @@ fn a_pushed_stream_grows_its_index_and_publishes_it_as_it_goes() {
 fn cues_handed_over_are_published_at_preroll() {
     let file = film(1_600, 400, false, true);
     let info = parse_seek_head(&header(&file)).expect("a Segment");
-    let cues = parse_cue_tracks(
+    let cues = Cues::parse(
         &file[cues_at(&file) as usize..],
         info.segment_data_start,
         info.timestamp_scale,
@@ -399,7 +399,7 @@ fn cues_handed_over_are_published_at_preroll() {
 #[test]
 fn shared_cues_and_head_are_published_as_handed_over() {
     let file = film(1_600, 400, false, true);
-    let cues: Arc<[pf_mkv::Cue]> = cues_of(&file).into();
+    let cues: Arc<Cues> = cues_of(&file).into();
     let head: Arc<[u8]> = header(&file).into();
     let mut p = Pipeline::new();
     let src = p.add(MemSrc { data: file.clone(), chunk: 4096, pos: 0, pull: None });
@@ -648,7 +648,7 @@ fn a_held_start_reads_nothing_until_its_seek() {
     }
 }
 
-fn cues_of(file: &[u8]) -> Vec<pf_mkv::Cue> {
+fn cues_of(file: &[u8]) -> Cues {
     let info = parse_seek_head(&header(file)).expect("a Segment");
-    parse_cue_tracks(&file[cues_at(file) as usize..], info.segment_data_start, info.timestamp_scale)
+    Cues::parse(&file[cues_at(file) as usize..], info.segment_data_start, info.timestamp_scale)
 }

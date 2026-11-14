@@ -357,14 +357,19 @@ impl Opened {
     /// for other containers.
     pub fn cue_before(&self, track: u64, t_ns: u64) -> Option<u64> {
         let Index::Mkv(p) = &self.index else { return None };
-        let (first_cluster, cues) = (&p.first_cluster, &p.cues);
-        let own = cues.iter().any(|c| c.track == track);
-        let at = cues
-            .iter()
-            .filter(|c| (!own || c.track == track) && c.time_ns <= t_ns)
-            .map(|c| (c.time_ns, c.byte))
-            .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-        Some(at.map_or(*first_cluster, |c| c.1))
+        // a track's latest cue at or before the time, the lowest Cluster of those at one time
+        let last = |v: pf_mkv::TrackView<'_>| {
+            let time = v.times()[v.floor(t_ns)?];
+            let from = v.times().partition_point(|&t| t < time);
+            let same = v.times()[from..].iter().take_while(|&&t| t == time).count();
+            let byte = v.clusters()[from..from + same].iter().copied().min()?;
+            Some((time, std::cmp::Reverse(byte)))
+        };
+        let at = match p.cues.track(track) {
+            Some(own) => last(own),
+            None => p.cues.tracks().filter_map(last).max(),
+        };
+        Some(at.map_or(p.first_cluster, |c| c.1.0))
     }
 }
 

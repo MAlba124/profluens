@@ -7,6 +7,7 @@ pub mod codec;
 mod color_map;
 pub mod config;
 pub(crate) mod cued;
+pub mod cues;
 pub mod drain;
 pub mod ebml;
 pub mod element;
@@ -27,6 +28,7 @@ pub use codec::{
     EMITS, Lead, ReframeError, Reframer, config_depth, family_for, is_audio_family,
     is_video_family, lead_of, nal_head_from_config, stored_family, track_family, track_offers,
 };
+pub use cues::{Cues, TrackView};
 pub use element::{MkvDemux, MkvMux};
 
 pub fn track_colour(track: &Track) -> profluens_video::color::StreamColor {

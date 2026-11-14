@@ -171,3 +171,46 @@ fn head_through_moov(file: &[u8]) -> Vec<u8> {
     }
     file.to_vec()
 }
+
+/// Where the `nth` box of `kind` starts, its size field.
+fn box_at(file: &[u8], kind: &[u8; 4], nth: usize) -> usize {
+    let found = file.windows(4).enumerate().filter(|(_, w)| w == kind).nth(nth);
+    found.map(|(at, _)| at - 4).unwrap_or_else(|| panic!("no {nth}th {kind:?}"))
+}
+
+#[test]
+fn a_negative_version_0_composition_offset_is_read_signed() {
+    use pf_mp4::reader::{Limits, Tables};
+    let mut file = fixture_bytes("bframes_h264.mp4");
+    let ctts = box_at(&file, b"ctts", 0);
+    assert_eq!(file[ctts + 8], 0, "the fixture writes version 0");
+    // the first run's sample_offset, after the box and full box heads, entry_count and count
+    let at = ctts + 20;
+    file[at..at + 4].copy_from_slice(&(-1000i32).to_be_bytes());
+    let tables = Tables::resolve(&file, &[], Limits::default()).expect("the movie resolves");
+    let first = tables.samples().iter().find(|s| s.track_index == 0).expect("a sample");
+    assert_eq!(first.pts - first.dts, -1000, "not 2^32 - 1000");
+}
+
+#[test]
+fn a_track_whose_sample_entries_do_not_resolve_is_skipped_and_the_rest_open() {
+    use pf_mp4::reader::{Limits, Tables};
+    let file = fixture_bytes("tiny_av.mp4");
+    let whole = Tables::resolve(&file, &[], Limits::default()).expect("the fixture resolves");
+    assert_eq!((whole.tracks().len(), whole.skipped_tracks()), (2, 0));
+    // the second trak's stsd entry_count to 0
+    let mut broken = file.clone();
+    let at = box_at(&file, b"stsd", 1) + 12;
+    broken[at..at + 4].copy_from_slice(&0u32.to_be_bytes());
+    let tables = Tables::resolve(&broken, &[], Limits::default()).expect("the video still opens");
+    assert_eq!((tables.tracks().len(), tables.skipped_tracks()), (1, 1));
+    assert_eq!(tables.tracks()[0].track_id, whole.tracks()[0].track_id);
+    let video = whole.samples().iter().filter(|s| s.track_index == 0).count();
+    assert_eq!(tables.samples().len(), video, "the video's samples, all of them");
+    // with no track left the first track's own error is said
+    let mut none = broken;
+    let at = box_at(&file, b"stsd", 0) + 12;
+    none[at..at + 4].copy_from_slice(&0u32.to_be_bytes());
+    let err = Tables::resolve(&none, &[], Limits::default()).err().map(|e| e.to_string());
+    assert!(err.as_deref().is_some_and(|e| e.contains("stsd with no sample entries")), "{err:?}");
+}

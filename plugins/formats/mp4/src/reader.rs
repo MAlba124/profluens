@@ -1806,13 +1806,22 @@ fn resolve_moov(moov_body: &[u8], limits: Option<Limits>) -> Result<Movie, Mp4Er
     let mut tracks = Vec::new();
     let mut stbls = Vec::new();
     let mut skipped = 0u32;
+    // A trak that does not resolve is skipped like one with no tables, its error said when no
+    // track is left.
+    let mut first_error = None;
     for trak in &trak_boxes {
         let trak_body = trak.body(moov_body);
-        let Some((track, stbl)) =
-            resolve_track(trak_body, tracks.len(), mvex.is_some(), movie_scale)?
-        else {
-            skipped += 1;
-            continue;
+        let resolved = resolve_track(trak_body, tracks.len(), mvex.is_some(), movie_scale);
+        let (track, stbl) = match resolved {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                skipped += 1;
+                continue;
+            }
+            Err(e) => {
+                (skipped, first_error) = (skipped + 1, first_error.or(Some(e)));
+                continue;
+            }
         };
         if tracks.len() == MAX_TRACKS {
             return Err(Mp4Error::TooManyTracks { limit: MAX_TRACKS });
@@ -1822,7 +1831,7 @@ fn resolve_moov(moov_body: &[u8], limits: Option<Limits>) -> Result<Movie, Mp4Er
     }
 
     if tracks.is_empty() {
-        return Err(Mp4Error::Missing("no resolvable track in moov"));
+        return Err(first_error.unwrap_or(Mp4Error::Missing("no resolvable track in moov")));
     }
 
     let mut samples = SampleIndex::default();

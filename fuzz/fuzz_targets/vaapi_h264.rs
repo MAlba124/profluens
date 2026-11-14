@@ -202,7 +202,7 @@ fn de_emulate(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len());
     let mut zeros = 0;
     for (i, &b) in body.iter().enumerate() {
-        if zeros >= 2 && b == 3 && body.get(i + 1).is_some_and(|&n| n <= 3) {
+        if zeros >= 2 && b == 3 && body.get(i + 1).is_none_or(|&n| n <= 3) {
             zeros = 0;
             continue;
         }

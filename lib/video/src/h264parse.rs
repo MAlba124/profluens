@@ -178,6 +178,11 @@ pub struct Sps {
 }
 
 impl Sps {
+    /// ChromaArrayType (7.4.2.1.1), 0 for separate colour planes.
+    pub fn chroma_array_type(&self) -> u32 {
+        if self.separate_colour_plane_flag { 0 } else { self.chroma_format_idc }
+    }
+
     /// MaxDpbFrames (A.3.1 eq. A-2). Unknown levels get 16.
     pub fn max_dpb_frames(&self) -> u32 {
         let max_dpb_mbs: u32 = match self.level_idc {
@@ -206,14 +211,22 @@ impl Sps {
         frames.max(self.max_num_ref_frames).clamp(1, 16)
     }
 
-    /// Reorder depth. Without VUI E.2.1 infers MaxDpbFrames, up to 16 frames of latency, so
-    /// `max_num_ref_frames + 1` is used instead. At least one so readback overlaps decode.
-    pub fn reorder_frames(&self) -> u32 {
+    /// max_num_reorder_frames, 0 to 16. Without VUI it is what E.2.1 infers, 0 for the intra
+    /// profiles and the DPB size otherwise, a stream may reorder that deep.
+    pub fn num_reorder_frames(&self) -> u32 {
+        let intra = self.constraint_set3_flag
+            && matches!(self.profile_idc, 44 | 86 | 100 | 110 | 122 | 244);
         let depth = match self.max_num_reorder_frames {
             Some(n) => n.min(self.dpb_frames()),
-            None => self.max_num_ref_frames + 1,
+            None if intra => 0,
+            None => self.dpb_frames(),
         };
-        depth.clamp(1, 16)
+        depth.min(16)
+    }
+
+    /// [`Sps::num_reorder_frames`], at least one so readback overlaps decode.
+    pub fn reorder_frames(&self) -> u32 {
+        self.num_reorder_frames().max(1)
     }
 
     pub fn width(&self) -> u32 {
@@ -959,7 +972,7 @@ fn parse_slice_header_rbsp(
     {
         pred_weights = Some(parse_pred_weight_table(
             &mut r,
-            sps.chroma_format_idc,
+            sps.chroma_array_type(),
             num_ref_idx_l0_active_minus1,
             num_ref_idx_l1_active_minus1,
             slice_type,
@@ -1025,6 +1038,12 @@ fn parse_slice_header_rbsp(
     let qp = 26i64 + i64::from(pps.pic_init_qp_minus26) + i64::from(slice_qp_delta);
     if cabac_init_idc > 2 || !(-6 * i64::from(sps.bit_depth_luma_minus8)..=51).contains(&qp) {
         return None;
+    }
+    if matches!(slice_type, SliceType::Sp | SliceType::Si) {
+        if slice_type == SliceType::Sp {
+            r.flag(); // sp_for_switch_flag
+        }
+        r.se(); // slice_qs_delta
     }
 
     let mut disable_deblocking_filter_idc = 0;
@@ -1101,13 +1120,13 @@ fn weight_in_range(v: i32) -> bool {
 
 fn parse_pred_weight_table(
     r: &mut BitReader,
-    chroma_format_idc: u32,
+    chroma_array_type: u32,
     num_ref_l0: u32,
     num_ref_l1: u32,
     slice_type: SliceType,
 ) -> Option<PredWeightTable> {
     let luma_log2_weight_denom = r.ue();
-    let chroma_log2_weight_denom = if chroma_format_idc != 0 { r.ue() } else { 0 };
+    let chroma_log2_weight_denom = if chroma_array_type != 0 { r.ue() } else { 0 };
     if luma_log2_weight_denom > 7 || chroma_log2_weight_denom > 7 {
         return None;
     }
@@ -1123,7 +1142,7 @@ fn parse_pred_weight_table(
                 }
                 e.luma = Some((w, o));
             }
-            if chroma_format_idc != 0 && r.flag() {
+            if chroma_array_type != 0 && r.flag() {
                 let c = [(r.se(), r.se()), (r.se(), r.se())];
                 if c.iter().any(|&(w, o)| !weight_in_range(w) || !weight_in_range(o)) {
                     return None;
@@ -1282,8 +1301,10 @@ impl PocState {
         let abs_frame_num =
             if num_in_cycle != 0 { frame_num_offset.wrapping_add(frame_num) } else { 0 };
         let abs_frame_num = if sh_idr { 0 } else { abs_frame_num };
-        // 8.2.1.2, a non-reference picture counts one frame back.
-        let abs_frame_num = if ref_idc == 0 { abs_frame_num - 1 } else { abs_frame_num }.max(0);
+        // 8.2.1.2, a non-reference picture counts one frame back. A FrameNumOffset wrapped
+        // negative counts no cycles.
+        let abs_frame_num =
+            if ref_idc == 0 && abs_frame_num > 0 { abs_frame_num - 1 } else { abs_frame_num };
         if num_in_cycle != 0 && abs_frame_num > 0 {
             let sum_cycle = sps.offsets_for_ref_frame.iter().fold(0i32, |s, o| s.wrapping_add(*o));
             let poc_cycle_cnt = (abs_frame_num - 1) / num_in_cycle;
@@ -1309,6 +1330,25 @@ impl PocState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poc_type_1_survives_a_frame_num_offset_wrapped_to_the_minimum() {
+        let mut sps = parse_sps(&hex(SPS_1080P_HIGH)).expect("parses");
+        sps.pic_order_cnt_type = 1;
+        (sps.offsets_for_ref_frame, sps.offset_for_non_ref_pic) = (vec![2, 2], -1);
+        assert_eq!(sps.max_frame_num(), 16);
+        // frame_num 0 after 5 adds MaxFrameNum, FrameNumOffset wraps to i32::MIN
+        let mut st = PocState {
+            prev_frame_num: 5,
+            prev_frame_num_offset: i32::MIN.wrapping_sub(16),
+            ..PocState::default()
+        };
+        assert_eq!(st.compute_type1(&sps, 0, false, false, 0, [3, 0]), (2, 2));
+        assert_eq!(st.prev_frame_num_offset, i32::MIN);
+        // the same picture one frame further counts as usual
+        let mut st = PocState::default();
+        assert_eq!(st.compute_type1(&sps, 2, false, false, 0, [0; 2]), (1, 1));
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
@@ -1338,23 +1378,29 @@ mod tests {
         assert_eq!(sps.max_num_ref_frames, 1);
         assert_eq!((sps.max_num_reorder_frames, sps.max_dec_frame_buffering), (Some(0), Some(1)));
         assert_eq!(sps.reorder_frames(), 1, "no reorder still keeps one picture in flight");
+        assert_eq!(sps.num_reorder_frames(), 0, "as the VUI states it");
         // Level 5.1 at 2160p, 184320 / (240 * 135) = 5.
         assert_eq!(sps.max_dpb_frames(), 5);
     }
 
     #[test]
-    fn without_a_vui_the_level_sizes_the_dpb_and_refs_bound_the_reorder() {
+    fn without_a_vui_the_level_sizes_the_dpb_and_the_reorder() {
         let mut sps = parse_sps(&hex(SPS_1080P_HIGH)).expect("parses");
         sps.max_num_reorder_frames = None;
         sps.max_dec_frame_buffering = None;
         assert_eq!(sps.dpb_frames(), 4, "MaxDpbFrames of level 4.0 at 1080p");
-        assert_eq!(sps.reorder_frames(), 5, "max_num_ref_frames + 1");
+        assert_eq!(sps.reorder_frames(), 4, "E.2.1 infers MaxDpbFrames");
         sps.level_idc = 51;
         assert_eq!(sps.max_dpb_frames(), 16, "184320 / 8160 = 22, capped at the syntax's 16");
+        // MR4_TANDBERG_C reorders deeper than its 5 references
+        assert_eq!(sps.reorder_frames(), 16, "not max_num_ref_frames + 1");
         sps.level_idc = 0;
         assert_eq!(sps.max_dpb_frames(), 16, "an unknown level is not undersized");
         sps.max_num_ref_frames = 16;
         assert_eq!(sps.reorder_frames(), 16, "capped at 16");
+        sps.constraint_set3_flag = true;
+        assert_eq!(sps.reorder_frames(), 1, "an intra profile infers no reorder");
+        assert_eq!(sps.num_reorder_frames(), 0);
         sps.level_idc = 30;
         sps.max_num_ref_frames = 6;
         assert_eq!(sps.dpb_frames(), 6, "never below max_num_ref_frames");
@@ -1742,5 +1788,133 @@ mod tests {
         let raster = raster_4x4(&DEFAULT_4X4_INTRA);
         assert_eq!(raster, [6, 13, 20, 28, 13, 20, 28, 32, 20, 28, 32, 37, 28, 32, 37, 42]);
         assert_eq!(&raster_8x8(&DEFAULT_8X8_INTRA)[..8], &[6, 10, 13, 16, 18, 23, 25, 27]);
+    }
+
+    /// A 176x144 SPS, profile 88 or 4:4:4 Predictive with separate colour planes.
+    fn sps_of(profile: u32) -> Sps {
+        let mut w = crate::bits::BitWriter::new();
+        w.u(profile, 8);
+        w.u(0, 8); // constraint flags
+        w.u(30, 8); // level_idc
+        w.ue(0); // seq_parameter_set_id
+        if profile == 244 {
+            w.ue(3); // chroma_format_idc
+            w.flag(true); // separate_colour_plane_flag
+            w.ue(0); // bit_depth_luma_minus8
+            w.ue(0); // bit_depth_chroma_minus8
+            w.flag(false); // qpprime_y_zero_transform_bypass_flag
+            w.flag(false); // seq_scaling_matrix_present_flag
+        }
+        w.ue(0); // log2_max_frame_num_minus4
+        w.ue(2); // pic_order_cnt_type
+        w.ue(1); // max_num_ref_frames
+        w.flag(false); // gaps_in_frame_num_value_allowed_flag
+        w.ue(10); // pic_width_in_mbs_minus1
+        w.ue(8); // pic_height_in_map_units_minus1
+        w.flag(true); // frame_mbs_only_flag
+        w.flag(true); // direct_8x8_inference_flag
+        w.flag(false); // frame_cropping_flag
+        w.flag(false); // vui_parameters_present_flag
+        w.rbsp_trailing_bits();
+        let mut nal = vec![0x67];
+        nal.extend_from_slice(w.as_bytes());
+        parse_sps(&nal).expect("sps")
+    }
+
+    /// A CAVLC PPS with deblocking control, weighted P prediction when asked.
+    fn cavlc_pps(weighted: bool) -> Pps {
+        let mut w = crate::bits::BitWriter::new();
+        w.ue(0); // pic_parameter_set_id
+        w.ue(0); // seq_parameter_set_id
+        w.flag(false); // entropy_coding_mode_flag
+        w.flag(false); // bottom_field_pic_order_in_frame_present_flag
+        w.ue(0); // num_slice_groups_minus1
+        w.ue(0); // num_ref_idx_l0_default_active_minus1
+        w.ue(0); // num_ref_idx_l1_default_active_minus1
+        w.flag(weighted); // weighted_pred_flag
+        w.u(0, 2); // weighted_bipred_idc
+        w.se(0); // pic_init_qp_minus26
+        w.se(0); // pic_init_qs_minus26
+        w.se(0); // chroma_qp_index_offset
+        w.flag(true); // deblocking_filter_control_present_flag
+        w.flag(false); // constrained_intra_pred_flag
+        w.flag(false); // redundant_pic_cnt_present_flag
+        w.rbsp_trailing_bits();
+        let mut nal = vec![0x68];
+        nal.extend_from_slice(w.as_bytes());
+        parse_pps(&nal).expect("pps")
+    }
+
+    #[test]
+    fn sp_and_si_slices_read_their_switching_fields() {
+        let (sps, pps) = (sps_of(88), cavlc_pps(false));
+        for (raw, kind) in [(3, SliceType::Sp), (4, SliceType::Si), (0, SliceType::P)] {
+            let mut w = crate::bits::BitWriter::new();
+            w.ue(0); // first_mb_in_slice
+            w.ue(raw); // slice_type
+            w.ue(0); // pic_parameter_set_id
+            w.u(1, 4); // frame_num
+            if kind != SliceType::Si {
+                w.flag(false); // num_ref_idx_active_override_flag
+                w.flag(false); // ref_pic_list_modification_flag_l0
+            }
+            w.flag(false); // adaptive_ref_pic_marking_mode_flag
+            w.se(0); // slice_qp_delta
+            if kind == SliceType::Sp {
+                w.flag(true); // sp_for_switch_flag
+            }
+            if kind != SliceType::P {
+                w.se(-7); // slice_qs_delta
+            }
+            w.ue(0); // disable_deblocking_filter_idc
+            w.se(2); // slice_alpha_c0_offset_div2
+            w.se(-3); // slice_beta_offset_div2
+            let bits = w.bit_len() as usize;
+            w.rbsp_trailing_bits();
+            let sh = parse_slice_header_rbsp(w.as_bytes(), 1, 1, &sps, &pps).expect("parses");
+            assert_eq!(sh.slice_type, kind);
+            let deblocking = (sh.disable_deblocking_filter_idc, sh.slice_alpha_c0_offset_div2);
+            assert_eq!((deblocking, sh.slice_beta_offset_div2), ((0, 2), -3), "{kind:?}");
+            assert_eq!(sh.header_bits_in_rbsp, bits, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn separate_colour_planes_weigh_no_chroma() {
+        let (sps, pps) = (sps_of(244), cavlc_pps(true));
+        assert_eq!((sps.chroma_format_idc, sps.chroma_array_type()), (3, 0));
+        let mut w = crate::bits::BitWriter::new();
+        w.ue(0); // first_mb_in_slice
+        w.ue(5); // slice_type P
+        w.ue(0); // pic_parameter_set_id
+        w.u(2, 2); // colour_plane_id
+        w.u(1, 4); // frame_num
+        w.flag(false); // num_ref_idx_active_override_flag
+        w.flag(false); // ref_pic_list_modification_flag_l0
+        w.ue(2); // luma_log2_weight_denom
+        w.flag(true); // luma_weight_l0_flag
+        w.se(5); // luma_weight_l0
+        w.se(-1); // luma_offset_l0
+        w.flag(false); // adaptive_ref_pic_marking_mode_flag
+        w.se(0); // slice_qp_delta
+        w.ue(1); // disable_deblocking_filter_idc
+        let bits = w.bit_len() as usize;
+        w.rbsp_trailing_bits();
+        let sh = parse_slice_header_rbsp(w.as_bytes(), 1, 1, &sps, &pps).expect("parses");
+        let weights = sh.pred_weights.expect("weighted");
+        assert_eq!((weights.luma_log2_weight_denom, weights.chroma_log2_weight_denom), (2, 0));
+        assert_eq!((weights.l0[0].luma, weights.l0[0].chroma), (Some((5, -1)), None));
+        assert_eq!((sh.disable_deblocking_filter_idc, sh.header_bits_in_rbsp), (1, bits));
+    }
+
+    #[test]
+    fn a_last_emulation_byte_is_dropped() {
+        let mut out = [0xAA; 8];
+        let cabac_zero_word = [0x80, 0x00, 0x00, 0x03];
+        assert_eq!(de_emulate(&cabac_zero_word, &mut out), 3);
+        assert_eq!(&out[..3], &[0x80, 0, 0]);
+        let mid = [0x80, 0x00, 0x00, 0x03, 0x01];
+        assert_eq!(de_emulate(&mid, &mut out), 4);
+        assert_eq!(&out[..4], &[0x80, 0, 0, 1]);
     }
 }

@@ -1,12 +1,12 @@
 /// Copies `body` into `out` without its emulation prevention bytes (H.264 7.4.1), the length
-/// written.
+/// written. A last `00 00 03` loses its 0x03 too, the one that follows a cabac_zero_word.
 pub fn de_emulate(body: &[u8], out: &mut [u8]) -> usize {
     let mut n = 0;
     let mut zeros = 0;
     let mut idx = 0;
     while idx < body.len() && n < out.len() {
         let b = body[idx];
-        if zeros >= 2 && b == 0x03 && idx + 1 < body.len() && body[idx + 1] <= 0x03 {
+        if zeros >= 2 && b == 0x03 && body.get(idx + 1).is_none_or(|&next| next <= 0x03) {
             zeros = 0;
             idx += 1;
             continue;

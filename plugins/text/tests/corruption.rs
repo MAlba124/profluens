@@ -192,7 +192,8 @@ fn pcs(video: (u16, u16), objects: &[(u16, bool, u16, u16)]) -> Segment {
     body.extend_from_slice(&[0x10, 0, 1, 0x80, 0, 0, objects.len() as u8]);
     for &(id, cropped, x, y) in objects {
         body.extend_from_slice(&id.to_be_bytes());
-        body.extend_from_slice(&[0, if cropped { 0x40 } else { 0 }]);
+        // Bit 7 is object_cropped_flag.
+        body.extend_from_slice(&[0, if cropped { 0x80 } else { 0 }]);
         body.extend_from_slice(&x.to_be_bytes());
         body.extend_from_slice(&y.to_be_bytes());
         if cropped {
@@ -752,14 +753,21 @@ fn overlay_survives_hostile_cues_and_bitmaps() {
 
 #[test]
 fn fixtures_are_valid() {
-    for (fixture, (width, height)) in pgs_fixtures().iter().zip([(24, 4), (200, 3), (20, 2)]) {
+    // The object's size, then the crop of it drawn, the third crops (1, 1, 4, 2) to 4x1.
+    let sizes = [((24, 4), (0, 0, 24, 4)), ((200, 3), (0, 0, 200, 3)), ((20, 2), (1, 1, 4, 1))];
+    for (fixture, ((w, h), (cx, cy, cw, ch))) in pgs_fixtures().iter().zip(sizes) {
         let ds = pgs::parse_display_set(&fixture.bytes).expect(fixture.name);
-        assert_eq!((ds.width, ds.height), (width, height), "{}", fixture.name);
-        let want = pattern(width as usize, height as usize);
-        for (px, index) in ds.rgba.chunks(4).zip(&want) {
-            assert_eq!(px[3], if *index == 0 { 0 } else { 255 }, "{}", fixture.name);
+        assert_eq!((ds.width, ds.height), (cw as u32, ch as u32), "{}", fixture.name);
+        let want = pattern(w, h);
+        for (i, px) in ds.rgba.chunks(4).enumerate() {
+            let index = want[(cy + i / cw) * w + cx + i % cw];
+            assert_eq!(px[3], if index == 0 { 0 } else { 255 }, "{}", fixture.name);
         }
     }
+    let mut state = pgs::PgsState::new();
+    let two = pgs::parse_display_set_in(&pgs_fixtures()[2].bytes, &mut state).expect("two");
+    let rects: Vec<_> = two.rects().collect();
+    assert_eq!(rects, [(10, 20, 4, 1), (30, 40, 12, 3)], "both objects, the first cropped");
     let clear = pgs::parse_display_set(&pgs_fixtures()[3].bytes).expect("clear");
     assert!(clear.is_clear());
     let sup = frame("sup", &caption(24, 4, 2), true);
@@ -844,6 +852,7 @@ fn pgs_object_larger_than_its_video_is_refused() {
 
 fn many_objects(count: u16) -> Vec<u8> {
     let mut set = PCS_ONE_OBJECT.to_vec();
+    set.extend_from_slice(&[SEG_PDS, 0, 7, 0, 0, 1, 235, 128, 128, 255]);
     for id in 0..count {
         set.extend_from_slice(&[SEG_ODS, 0x00, 0x0E]);
         set.extend_from_slice(&id.to_be_bytes());

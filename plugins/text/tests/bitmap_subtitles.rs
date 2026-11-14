@@ -8,8 +8,8 @@ use std::process::Command;
 
 use pf_harness::Harness;
 use pf_mkv::reader::MatroskaReader;
-use pf_text::pgs::{DisplaySet, decode_bitmap};
-use pf_text::{DvbSubDec, VobSubDec};
+use pf_text::pgs::{self, DisplaySet, decode_bitmap, decode_rects};
+use pf_text::{DvbSubDec, PgsDec, VobSubDec};
 use profluens_core::buffer::BufferFlags;
 use profluens_core::element::Element;
 use profluens_core::time::Timestamp;
@@ -298,6 +298,92 @@ fn dvb_from_ffmpeg_matches_ffmpegs_render() {
     );
     assert_eq!(shown[1].pts, Timestamp::from_secs(3), "the clear");
     check_against_ffmpeg(&mkv, &shown);
+}
+
+/// Two objects in two windows, then a palette update that fades them, as a `.sup` ffmpeg reads.
+fn sup_two_objects_and_a_fade() -> Vec<u8> {
+    let (top, bottom) = (rle_line(&[(1, 120)]).repeat(10), rle_line(&[(2, 80)]).repeat(6));
+    let ods = |id: u8, w: u16, h: u16, rle: &[u8]| {
+        let mut body = vec![0, id, 0, 0xC0];
+        body.extend_from_slice(&((rle.len() + 4) as u32).to_be_bytes()[1..]);
+        body.extend_from_slice(&w.to_be_bytes());
+        body.extend_from_slice(&h.to_be_bytes());
+        body.extend_from_slice(rle);
+        body
+    };
+    let pcs = |state: u8, update: u8, objects: &[(u8, u16, u16)]| {
+        let mut p = Vec::new();
+        p.extend_from_slice(&1920u16.to_be_bytes());
+        p.extend_from_slice(&1080u16.to_be_bytes());
+        p.extend_from_slice(&[0x10, 0, 0, state, update, 0, objects.len() as u8]);
+        for &(id, x, y) in objects {
+            p.extend_from_slice(&[0, id, id, 0]);
+            p.extend_from_slice(&x.to_be_bytes());
+            p.extend_from_slice(&y.to_be_bytes());
+        }
+        p
+    };
+    let wds = [2, 0, 0, 100, 0, 100, 0, 120, 0, 10, 1, 0, 200, 3, 0xE8, 0, 80, 0, 6];
+    let both = [(0, 100, 100), (1, 200, 1000)];
+    let (t1, t2, t3) = (90_000, 270_000, 450_000);
+    [
+        sup_segment(0x16, t1, &pcs(0x80, 0, &both)),
+        sup_segment(0x17, t1, &wds),
+        sup_segment(0x14, t1, &[0, 0, 1, 235, 128, 128, 255, 2, 81, 90, 240, 255]),
+        sup_segment(0x15, t1, &ods(0, 120, 10, &top)),
+        sup_segment(0x15, t1, &ods(1, 80, 6, &bottom)),
+        sup_segment(0x80, t1, &[]),
+        sup_segment(0x16, t2, &pcs(0, 0x80, &both)),
+        sup_segment(0x14, t2, &[0, 1, 1, 235, 128, 128, 128, 2, 81, 90, 240, 64]),
+        sup_segment(0x80, t2, &[]),
+        sup_segment(0x16, t3, &pcs(0, 0, &[])),
+        sup_segment(0x17, t3, &wds),
+        sup_segment(0x80, t3, &[]),
+    ]
+    .concat()
+}
+
+/// Every rect of a set over black, straight alpha.
+fn composite_all(rects: &[DisplaySet], w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h * 3];
+    for ds in rects {
+        let one = composite(ds);
+        for (d, s) in out.iter_mut().zip(&one) {
+            *d = (*d).max(*s);
+        }
+    }
+    out
+}
+
+#[test]
+fn pgs_two_objects_and_a_fade_match_ffmpegs_render() {
+    if ffmpeg().is_none() {
+        eprintln!("skipping, ffmpeg does not run here");
+        return;
+    }
+    let sup = sup_two_objects_and_a_fade();
+    let path = tmp_dir().join("two-objects-fade.sup");
+    std::fs::write(&path, &sup).expect("write sup");
+    let mut h = Harness::new(PgsDec::new());
+    let mut shown = Vec::new();
+    for (pts, _, set) in pgs::split_sup(&sup) {
+        let mut b = h.alloc(&set);
+        b.pts = Timestamp::from_nanos(u64::from(pts) * 100_000 / 9);
+        h.push(b).expect("push");
+        for out in h.drain_outputs() {
+            shown.push(decode_rects(out.memory.data()).expect("a bitmap"));
+        }
+    }
+    let counts: Vec<usize> = shown.iter().map(Vec::len).collect();
+    assert_eq!(counts, [2, 2, 0], "both objects, both again faded, a clear");
+    // ffmpeg starts the `.sup` at its first set, 1 s earlier than its stamps.
+    for (set, secs) in [(&shown[0], 1.0), (&shown[1], 3.0)] {
+        let ours = composite_all(set, 1920, 1080);
+        let theirs = ffmpeg_render(&path, "s", secs, 1920, 1080);
+        let (share, worst) = mismatch(&ours, &theirs, 4);
+        assert!(share == 0.0, "at {secs} s {:.4} % differs, by up to {worst}", share * 100.0);
+        assert!(rgb_at(&ours, 1920, 260, 1003)[2] > 60, "the bottom object at {secs} s");
+    }
 }
 
 #[test]

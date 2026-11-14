@@ -85,8 +85,8 @@ impl Nal {
 /// Header parse window. A header past it is parsed again from the whole NAL.
 const HEADER_PREFIX: usize = 2048;
 
-/// Split an Annex-B access unit into its NALs (B.2.2). The trailing 0x00 of a 4-byte start code is
-/// trimmed.
+/// Split an Annex-B access unit into its base layer NALs (B.2.2). The trailing 0x00 of a 4-byte
+/// start code is trimmed.
 // Cold, tests and one-off callers.
 #[allow(clippy::disallowed_methods)]
 pub fn split_nals(au: &[u8]) -> Vec<Nal> {
@@ -143,8 +143,16 @@ pub fn split_framed_into(au: &[u8], head: bool, framing: &mut Framing, out: &mut
     }
 }
 
+/// nuh_layer_id of a 2-byte NAL header (7.3.1.2).
+#[inline]
+pub fn layer_id(header: [u8; 2]) -> u8 {
+    (header[0] & 1) << 5 | header[1] >> 3
+}
+
+/// Keeps base layer NALs only. A version 1 decoder ignores nuh_layer_id above 0 (7.4.2.2), such
+/// as the second view of MV-HEVC.
 fn push_nal(au: &[u8], start: usize, end: usize, out: &mut Vec<Nal>) {
-    if end < start + 2 {
+    if end < start + 2 || layer_id([au[start], au[start + 1]]) != 0 {
         return;
     }
     let nal_type = (au[start] >> 1) & 0x3f;
@@ -171,7 +179,7 @@ fn emulation_bytes_before(body: &[u8], at: usize) -> u16 {
     let (mut emu, mut zeros, mut kept, mut idx) = (0u16, 0, 0usize, 0);
     while idx < body.len() && kept <= at {
         let b = body[idx];
-        if zeros >= 2 && b == 0x03 && idx + 1 < body.len() && body[idx + 1] <= 0x03 {
+        if zeros >= 2 && b == 0x03 && body.get(idx + 1).is_none_or(|&next| next <= 0x03) {
             emu = emu.saturating_add(1);
             zeros = 0;
             idx += 1;
@@ -184,14 +192,19 @@ fn emulation_bytes_before(body: &[u8], at: usize) -> u16 {
     emu
 }
 
-/// Tile column widths or row heights in CTBs minus one (6.5.1).
+/// Most tile columns and rows of a picture (A.4.2, Table A.8).
+pub const TILE_COLUMNS_MAX: u32 = 20;
+pub const TILE_ROWS_MAX: u32 = 22;
+
+/// Tile column widths or row heights in CTBs minus one (6.5.1). An `out` one short of `count`,
+/// as VA's arrays are, leaves out the last, which the rest implies.
 pub fn tile_sizes_minus1(uniform: bool, coded: &[u32], count: u32, ctbs: u32, out: &mut [u16]) {
     let n = (count as usize).min(out.len());
     let mut used = 0u32;
     for (i, slot) in out.iter_mut().enumerate().take(n) {
         let size = if uniform {
             ((i as u32 + 1) * ctbs) / count - (i as u32 * ctbs) / count
-        } else if i + 1 < n {
+        } else if (i as u32) + 1 < count {
             coded.get(i).map_or(1, |m| m.saturating_add(1))
         } else {
             ctbs.saturating_sub(used).max(1)
@@ -242,6 +255,8 @@ pub struct Sps {
     /// DPB size minus one and reorder depth of the highest sub-layer (7.4.3.2.1).
     pub sps_max_dec_pic_buffering_minus1: u32,
     pub sps_max_num_reorder_pics: u32,
+    /// 0 for no latency bound, see `max_latency_pictures`
+    pub sps_max_latency_increase_plus1: u32,
     pub log2_min_luma_coding_block_size_minus3: u32,
     pub log2_diff_max_min_luma_coding_block_size: u32,
     pub log2_min_transform_block_size_minus2: u32,
@@ -284,6 +299,10 @@ const RANGE_EXT_REFUSED: u32 = 1 << 4 | 1 << 8;
 pub const RANGE_EXT_HIGH_PRECISION_OFFSETS: u32 = 1 << 6;
 
 impl Sps {
+    /// ChromaArrayType (7.4.3.2.1), 0 for separate colour planes.
+    pub fn chroma_array_type(&self) -> u32 {
+        if self.separate_colour_plane_flag { 0 } else { self.chroma_format_idc }
+    }
     pub fn ref_frames(&self) -> u32 {
         self.sps_max_dec_pic_buffering_minus1.clamp(1, 16)
     }
@@ -291,6 +310,11 @@ impl Sps {
     /// decode.
     pub fn reorder_frames(&self) -> u32 {
         self.sps_max_num_reorder_pics.min(self.sps_max_dec_pic_buffering_minus1).clamp(1, 16)
+    }
+    /// SpsMaxLatencyPictures of the highest sub-layer (7-9), None when unbounded.
+    pub fn max_latency_pictures(&self) -> Option<u32> {
+        let plus1 = self.sps_max_latency_increase_plus1.checked_sub(1)?;
+        Some(self.sps_max_num_reorder_pics.saturating_add(plus1))
     }
     pub fn ctb_log2_size_y(&self) -> u32 {
         self.log2_min_luma_coding_block_size_minus3
@@ -530,6 +554,7 @@ pub struct LongTermRef {
     pub poc_lsb: u32,
     pub used_by_curr_pic: bool,
     pub delta_poc_msb_present: bool,
+    /// DeltaPocMsbCycleLt, the sum of eq. 7-52, kept by entries without their MSB too
     pub delta_poc_msb_cycle: u32,
 }
 
@@ -1127,10 +1152,11 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
         if sps_sub_layer_ordering_info_present_flag { 0 } else { sps_max_sub_layers_minus1 };
     let mut sps_max_dec_pic_buffering_minus1 = 0;
     let mut sps_max_num_reorder_pics = 0;
+    let mut sps_max_latency_increase_plus1 = 0;
     for _ in start..=sps_max_sub_layers_minus1 {
         sps_max_dec_pic_buffering_minus1 = r.ue();
         sps_max_num_reorder_pics = r.ue();
-        r.ue(); // sps_max_latency_increase_plus1
+        sps_max_latency_increase_plus1 = r.ue();
     }
 
     if sps_max_dec_pic_buffering_minus1 > 15
@@ -1257,6 +1283,7 @@ pub fn parse_sps(nal: &[u8]) -> Option<Sps> {
         log2_max_pic_order_cnt_lsb_minus4,
         sps_max_dec_pic_buffering_minus1,
         sps_max_num_reorder_pics,
+        sps_max_latency_increase_plus1,
         log2_min_luma_coding_block_size_minus3,
         log2_diff_max_min_luma_coding_block_size,
         log2_min_transform_block_size_minus2,
@@ -1341,8 +1368,12 @@ pub fn parse_pps(nal: &[u8]) -> Option<Pps> {
     let mut row_height_minus1 = Vec::new();
     let mut loop_filter_across_tiles_enabled_flag = true;
     if tiles_enabled_flag {
-        num_tile_columns_minus1 = r.ue().min(18);
-        num_tile_rows_minus1 = r.ue().min(20);
+        num_tile_columns_minus1 = r.ue();
+        num_tile_rows_minus1 = r.ue();
+        // A.4.2, level 6.2 allows 20 columns and 22 rows.
+        if num_tile_columns_minus1 >= TILE_COLUMNS_MAX || num_tile_rows_minus1 >= TILE_ROWS_MAX {
+            return None;
+        }
         uniform_spacing_flag = r.flag();
         if !uniform_spacing_flag {
             for _ in 0..num_tile_columns_minus1 {
@@ -1444,12 +1475,12 @@ fn offset_in_range(v: i32) -> bool {
 fn parse_pred_weight_table(
     r: &mut BitReader,
     slice_type: SliceType,
-    chroma_format_idc: u32,
+    chroma_array_type: u32,
     num_l0: usize,
     num_l1: usize,
 ) -> Option<PredWeightTable> {
     let mut t = PredWeightTable { luma_log2_weight_denom: r.ue(), ..Default::default() };
-    if chroma_format_idc != 0 {
+    if chroma_array_type != 0 {
         t.delta_chroma_log2_weight_denom = r.se();
     }
     // Both denominators 0 to 7 (7.4.7.3).
@@ -1464,7 +1495,7 @@ fn parse_pred_weight_table(
         for i in 0..n {
             luma_flags[i] = r.flag();
         }
-        if chroma_format_idc != 0 {
+        if chroma_array_type != 0 {
             for i in 0..n {
                 chroma_flags[i] = r.flag();
             }
@@ -1708,18 +1739,17 @@ fn parse_slice_header_rbsp(
                         lt.used_by_curr_pic = r.flag();
                     }
                     lt.delta_poc_msb_present = r.flag();
-                    if lt.delta_poc_msb_present {
-                        let cycle = r.ue();
-                        // 7.4.7.1 range, then eq. 7-52 accumulates across the entries of
-                        // each of the two lists.
-                        if cycle >= 1 << (32 - lsb_bits) {
-                            return None;
-                        }
-                        lt.delta_poc_msb_cycle = match i == 0 || i == num_long_term_sps {
-                            true => cycle,
-                            false => prev_msb_cycle.checked_add(cycle)?,
-                        };
+                    // inferred 0 when absent, eq. 7-52 still carries the sum past the entry
+                    let cycle = if lt.delta_poc_msb_present { r.ue() } else { 0 };
+                    // 7.4.7.1 range
+                    if cycle >= 1 << (32 - lsb_bits) {
+                        return None;
                     }
+                    // eq. 7-52 accumulates across the entries of each of the two lists
+                    lt.delta_poc_msb_cycle = match i == 0 || i == num_long_term_sps {
+                        true => cycle,
+                        false => prev_msb_cycle.checked_add(cycle)?,
+                    };
                     prev_msb_cycle = lt.delta_poc_msb_cycle;
                     long_term_refs.push(lt);
                 }
@@ -1732,7 +1762,7 @@ fn parse_slice_header_rbsp(
 
         if sps.sample_adaptive_offset_enabled_flag {
             slice_sao_luma_flag = r.flag();
-            if sps.chroma_format_idc != 0 {
+            if sps.chroma_array_type() != 0 {
                 slice_sao_chroma_flag = r.flag();
             }
         }
@@ -1796,7 +1826,7 @@ fn parse_slice_header_rbsp(
                 pred_weights = Some(parse_pred_weight_table(
                     &mut r,
                     slice_type,
-                    sps.chroma_format_idc,
+                    sps.chroma_array_type(),
                     num_ref_idx_l0_active_minus1 as usize + 1,
                     num_ref_idx_l1_active_minus1 as usize + 1,
                 )?);
@@ -1928,11 +1958,11 @@ impl PocState {
         &mut self,
         sps: &Sps,
         sh: &SliceHeader,
-        is_idr: bool,
+        nal_type: u8,
         is_irap_no_rasl: bool,
         temporal_id: u8,
     ) -> i32 {
-        if is_idr {
+        if is_idr(nal_type) {
             self.prev_poc_lsb = 0;
             self.prev_poc_msb = 0;
             return 0;
@@ -1954,9 +1984,10 @@ impl PocState {
             }
         };
         let poc = poc_msb.wrapping_add(poc_lsb);
-        // Spec updates prev only for TId 0 non-RASL/RADL/sub-layer pictures (8.3.1). Approximated
-        // by TId 0.
-        if temporal_id == 0 {
+        // prevTid0Pic is TemporalId 0 and no RASL, RADL or sub-layer non-reference picture.
+        let sub_layer_non_ref = nal_type <= 14 && nal_type.is_multiple_of(2);
+        let leading = (NAL_RADL_N..=NAL_RASL_R).contains(&nal_type);
+        if temporal_id == 0 && !sub_layer_non_ref && !leading {
             self.prev_poc_lsb = poc_lsb;
             self.prev_poc_msb = poc_msb;
         }
@@ -2043,6 +2074,13 @@ mod tests {
         assert_eq!(sps.reorder_frames(), 1, "one picture stays in flight");
         sps.sps_max_dec_pic_buffering_minus1 = 0;
         assert_eq!(sps.ref_frames(), 1);
+        // SpsMaxLatencyPictures (7-9)
+        assert_eq!(sps.max_latency_pictures(), None, "0 bounds nothing");
+        sps.sps_max_num_reorder_pics = 2;
+        sps.sps_max_latency_increase_plus1 = 1;
+        assert_eq!(sps.max_latency_pictures(), Some(2));
+        sps.sps_max_latency_increase_plus1 = 4;
+        assert_eq!(sps.max_latency_pictures(), Some(5));
     }
 
     #[test]
@@ -2188,7 +2226,7 @@ mod tests {
             if let Some(s) = open {
                 walk.push((s, au.len()));
             }
-            walk.retain(|&(s, e)| e >= s + 2);
+            walk.retain(|&(s, e)| e >= s + 2 && au[s] & 1 == 0 && au[s + 1] >> 3 == 0);
             split_nals_into(&au, &mut out);
             let got: Vec<_> = out.iter().map(|n| (n.start as usize, n.end as usize)).collect();
             assert_eq!(got, walk, "{au:?}");
@@ -2306,7 +2344,7 @@ mod tests {
         let mut poc = PocState::new();
         let sps = stub_sps();
         let sh = stub_slice(0);
-        let v = poc.compute(&sps, &sh, true, true, 0);
+        let v = poc.compute(&sps, &sh, NAL_IDR_W_RADL, true, 0);
         assert_eq!(v, 0, "IDR POC must reset to 0");
     }
 
@@ -2315,11 +2353,11 @@ mod tests {
         let mut poc = PocState::new();
         let sps = stub_sps(); // log2_max_poc_lsb_minus4 = 0 -> max_poc_lsb = 16
         // Step via lsb 8 first, 14 - 0 > 8 would spuriously wrap.
-        let _ = poc.compute(&sps, &stub_slice(0), true, true, 0);
-        let _ = poc.compute(&sps, &stub_slice(8), false, false, 0); // poc 8
-        let _ = poc.compute(&sps, &stub_slice(14), false, false, 0); // poc 14
+        let _ = poc.compute(&sps, &stub_slice(0), NAL_IDR_W_RADL, true, 0);
+        let _ = poc.compute(&sps, &stub_slice(8), NAL_TRAIL_R, false, 0); // poc 8
+        let _ = poc.compute(&sps, &stub_slice(14), NAL_TRAIL_R, false, 0); // poc 14
         // prev_lsb 14, 14 - 1 >= 8, so msb += 16 and poc is 17.
-        let v = poc.compute(&sps, &stub_slice(1), false, false, 0);
+        let v = poc.compute(&sps, &stub_slice(1), NAL_TRAIL_R, false, 0);
         assert_eq!(v, 17, "POC MSB must advance on lsb wrap");
     }
 
@@ -2340,6 +2378,7 @@ mod tests {
             log2_max_pic_order_cnt_lsb_minus4: 0, // max_poc_lsb = 16
             sps_max_dec_pic_buffering_minus1: 4,
             sps_max_num_reorder_pics: 2,
+            sps_max_latency_increase_plus1: 0,
             log2_min_luma_coding_block_size_minus3: 0,
             log2_diff_max_min_luma_coding_block_size: 3,
             log2_min_transform_block_size_minus2: 0,
@@ -2569,5 +2608,204 @@ mod tests {
         assert_eq!((r[4], r[1], r[0], r[15]), (1, 2, 0, 15));
         let flat = to_raster(&[16u8; 64]);
         assert_eq!(flat, [16; 64]);
+    }
+
+    /// A PPS NAL with deblocking control present and disabled, tiles as `tiles` gives them as
+    /// columns minus one, rows minus one and uniform spacing. Explicit sizes are all one CTB.
+    fn pps_nal(tiles: Option<(u32, u32, bool)>) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.ue(0); // pps_pic_parameter_set_id
+        w.ue(0); // pps_seq_parameter_set_id
+        w.flag(false); // dependent_slice_segments_enabled_flag
+        w.flag(false); // output_flag_present_flag
+        w.u(0, 3); // num_extra_slice_header_bits
+        w.flag(false); // sign_data_hiding_enabled_flag
+        w.flag(false); // cabac_init_present_flag
+        w.ue(0); // num_ref_idx_l0_default_active_minus1
+        w.ue(0); // num_ref_idx_l1_default_active_minus1
+        w.se(0); // init_qp_minus26
+        w.flag(false); // constrained_intra_pred_flag
+        w.flag(false); // transform_skip_enabled_flag
+        w.flag(false); // cu_qp_delta_enabled_flag
+        w.se(0); // pps_cb_qp_offset
+        w.se(0); // pps_cr_qp_offset
+        w.flag(false); // pps_slice_chroma_qp_offsets_present_flag
+        w.flag(false); // weighted_pred_flag
+        w.flag(false); // weighted_bipred_flag
+        w.flag(false); // transquant_bypass_enabled_flag
+        w.flag(tiles.is_some()); // tiles_enabled_flag
+        w.flag(false); // entropy_coding_sync_enabled_flag
+        if let Some((cols, rows, uniform)) = tiles {
+            w.ue(cols);
+            w.ue(rows);
+            w.flag(uniform);
+            if !uniform {
+                for _ in 0..cols + rows {
+                    w.ue(0);
+                }
+            }
+            w.flag(true); // loop_filter_across_tiles_enabled_flag
+        }
+        w.flag(false); // pps_loop_filter_across_slices_enabled_flag
+        w.flag(true); // deblocking_filter_control_present_flag
+        w.flag(false); // deblocking_filter_override_enabled_flag
+        w.flag(true); // pps_deblocking_filter_disabled_flag
+        w.flag(false); // pps_scaling_list_data_present_flag
+        w.flag(false); // lists_modification_present_flag
+        w.ue(0); // log2_parallel_merge_level_minus2
+        w.flag(false); // slice_segment_header_extension_present_flag
+        w.flag(false); // pps_extension_present_flag
+        w.rbsp_trailing_bits();
+        let mut nal = vec![NAL_PPS << 1, 1];
+        crate::bits::push_ebsp(w.as_bytes(), &mut nal);
+        nal
+    }
+
+    #[test]
+    fn a_pps_takes_the_level_6_tile_grid_and_refuses_past_it() {
+        for uniform in [false, true] {
+            let pps = parse_pps(&pps_nal(Some((19, 21, uniform)))).expect("20 by 22 tiles");
+            assert_eq!((pps.num_tile_columns_minus1, pps.num_tile_rows_minus1), (19, 21));
+            let explicit = if uniform { (0, 0) } else { (19, 21) };
+            let sizes = (pps.column_width_minus1.len(), pps.row_height_minus1.len());
+            assert_eq!(sizes, explicit, "uniform {uniform}");
+            assert!(pps.deblocking_filter_control_present_flag, "uniform {uniform}");
+            assert!(pps.pps_deblocking_filter_disabled_flag, "uniform {uniform}");
+            assert!(parse_pps(&pps_nal(Some((20, 0, uniform)))).is_none(), "21 columns");
+            assert!(parse_pps(&pps_nal(Some((0, 22, uniform)))).is_none(), "23 rows");
+        }
+    }
+
+    /// VA's 19 widths of 20 columns are the coded ones, the last column left to the rest.
+    #[test]
+    fn twenty_tile_columns_fill_the_19_va_widths_with_the_coded_ones() {
+        let coded: Vec<u32> = (0..19).map(|i| i % 3).collect();
+        let mut cols = [0xAAAAu16; 19];
+        tile_sizes_minus1(false, &coded, 20, 200, &mut cols);
+        let want: Vec<u16> = coded.iter().map(|&c| c as u16).collect();
+        assert_eq!(cols.to_vec(), want);
+        tile_sizes_minus1(true, &[], 20, 200, &mut cols);
+        assert_eq!(cols, [9; 19], "the first 19 of 20 uniform columns of 10 CTBs");
+    }
+
+    #[test]
+    // Test code.
+    #[allow(clippy::disallowed_methods)]
+    fn layer_1_nals_are_dropped_and_the_base_layer_kept() {
+        // MV-HEVC style, the second view's PPS and slice behind the base ones, nuh_layer_id 1.
+        let base_pps = pps_nal(None);
+        let mut view_pps = pps_nal(None);
+        view_pps[1] |= 1 << 3;
+        let units: [&[u8]; 6] = [
+            &[NAL_VPS << 1, 1, 0xAA],
+            &[NAL_SPS << 1, 1, 0xAA],
+            &base_pps,
+            &view_pps,
+            &[NAL_IDR_W_RADL << 1, 1, 0xA0],
+            &[NAL_IDR_W_RADL << 1, 1 << 3 | 1, 0x90],
+        ];
+        assert_eq!(layer_id([units[3][0], units[3][1]]), 1);
+        assert_eq!(layer_id([1, 0]), 32, "the high bit sits in the first byte");
+        let annexb: Vec<u8> = units.iter().flat_map(|n| [&[0, 0, 0, 1][..], n].concat()).collect();
+        let nals = split_nals(&annexb);
+        let raw: Vec<&[u8]> = nals.iter().map(|n| n.raw(&annexb)).collect();
+        assert_eq!(raw, [units[0], units[1], units[2], units[4]]);
+        let lengths: Vec<u8> =
+            units.iter().flat_map(|n| [&(n.len() as u32).to_be_bytes()[..], n].concat()).collect();
+        let mut out = Vec::new();
+        split_prefixed_into(&lengths, 4, &mut out);
+        let raw: Vec<&[u8]> = out.iter().map(|n| n.raw(&lengths)).collect();
+        assert_eq!(raw, [units[0], units[1], units[2], units[4]]);
+        let slices = || nals.iter().filter(|n| is_slice_nal(n.nal_type));
+        assert_eq!(slices().count(), 1, "one picture, the base view's");
+    }
+
+    #[test]
+    fn non_reference_and_leading_pictures_are_no_prev_tid0_pic() {
+        let sps = stub_sps(); // MaxPicOrderCntLsb 16
+        for (nal_type, want) in [
+            (NAL_TRAIL_N, 11),
+            (NAL_RADL_R, 11),
+            (NAL_RASL_R, 11),
+            (14, 11), // RSV_VCL_N14
+            (NAL_TRAIL_R, 27),
+        ] {
+            let mut poc = PocState::new();
+            poc.compute(&sps, &stub_slice(0), NAL_IDR_W_RADL, true, 0);
+            assert_eq!(poc.compute(&sps, &stub_slice(8), NAL_TRAIL_R, false, 0), 8);
+            assert_eq!(poc.compute(&sps, &stub_slice(14), NAL_TRAIL_R, false, 0), 14);
+            // past the LSB wrap, prevTid0Pic only when it is one
+            assert_eq!(poc.compute(&sps, &stub_slice(3), nal_type, false, 0), 19);
+            let got = poc.compute(&sps, &stub_slice(11), NAL_TRAIL_R, false, 0);
+            assert_eq!(got, want, "after a type {nal_type} picture");
+        }
+    }
+
+    #[test]
+    fn separate_colour_planes_carry_no_sao_chroma_flag() {
+        let mut sps = stub_sps();
+        (sps.chroma_format_idc, sps.separate_colour_plane_flag) = (3, true);
+        let pps = parse_pps(&pps_nal(None)).expect("pps");
+        let mut w = BitWriter::new();
+        w.flag(true); // first_slice_segment_in_pic_flag
+        w.flag(false); // no_output_of_prior_pics_flag
+        w.ue(0); // slice_pic_parameter_set_id
+        w.ue(2); // slice_type I
+        w.u(1, 2); // colour_plane_id
+        w.flag(true); // slice_sao_luma_flag
+        w.se(-4); // slice_qp_delta
+        w.rbsp_trailing_bits(); // byte_alignment()
+        let mut nal = vec![NAL_IDR_W_RADL << 1, 1];
+        nal.extend_from_slice(w.as_bytes());
+        let sh = parse_slice_header(&nal, NAL_IDR_W_RADL, &sps, &pps).expect("parses");
+        assert!(sh.slice_sao_luma_flag && !sh.slice_sao_chroma_flag);
+        assert_eq!((sh.slice_qp_delta, sh.slice_data_byte_offset as usize), (-4, nal.len()));
+    }
+
+    /// RPS_D_ericsson, a long-term entry without its MSB keeps the eq. 7-52 sum for the next.
+    #[test]
+    fn delta_poc_msb_cycles_sum_across_an_entry_without_one() {
+        let mut sps = stub_sps();
+        sps.long_term_ref_pics_present_flag = true;
+        (sps.sps_temporal_mvp_enabled_flag, sps.sample_adaptive_offset_enabled_flag) =
+            (false, false);
+        let pps = parse_pps(&pps_nal(None)).expect("pps");
+        let mut w = BitWriter::new();
+        w.flag(true); // first_slice_segment_in_pic_flag
+        w.ue(0); // slice_pic_parameter_set_id
+        w.ue(2); // slice_type I
+        w.u(8, 4); // slice_pic_order_cnt_lsb
+        w.flag(false); // short_term_ref_pic_set_sps_flag
+        w.ue(0); // num_negative_pics
+        w.ue(0); // num_positive_pics
+        w.ue(4); // num_long_term_pics
+        // poc_lsb_lt, used_by_curr_pic_lt_flag, delta_poc_msb_present_flag, cycle
+        for (lsb, cycle) in [(1, Some(1)), (2, None), (3, Some(2)), (4, Some(0))] {
+            w.u(lsb, 4);
+            w.flag(false);
+            w.flag(cycle.is_some());
+            if let Some(c) = cycle {
+                w.ue(c);
+            }
+        }
+        w.se(0); // slice_qp_delta
+        w.rbsp_trailing_bits(); // byte_alignment()
+        let mut nal = vec![NAL_TRAIL_R << 1, 1];
+        nal.extend_from_slice(w.as_bytes());
+        let sh = parse_slice_header(&nal, NAL_TRAIL_R, &sps, &pps).expect("parses");
+        let got: Vec<_> = sh
+            .long_term_refs
+            .iter()
+            .map(|l| (l.delta_poc_msb_present, l.delta_poc_msb_cycle))
+            .collect();
+        assert_eq!(got, [(true, 1), (false, 1), (true, 3), (true, 3)]);
+        assert_eq!(sh.slice_data_byte_offset as usize, nal.len());
+    }
+
+    #[test]
+    fn a_last_emulation_byte_is_counted() {
+        assert_eq!(emulation_bytes(&[0x80, 0, 0, 3]), 1, "behind a cabac_zero_word");
+        let (rbsp, emu) = rbsp_of(&[NAL_TRAIL_R << 1, 1, 0x80, 0, 0, 3]);
+        assert_eq!((rbsp, emu), (vec![0x80, 0, 0], 1));
     }
 }

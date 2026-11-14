@@ -124,6 +124,7 @@ fn check_split(au: &[u8], nals: &[Nal]) {
         assert_eq!(au[s - 3..s], [0, 0, 1], "a NAL not behind a start code");
         assert_eq!(n.nal_type, au[s] >> 1 & 0x3f);
         assert_eq!(n.temporal_id, (au[s + 1] & 7).wrapping_sub(1));
+        assert_eq!(p::layer_id([au[s], au[s + 1]]), 0, "a NAL past the base layer");
         assert!(au[s..e].windows(3).all(|w| w != [0, 0, 1]), "a start code inside a NAL");
         last = e;
     }
@@ -195,7 +196,8 @@ fn check_pps(q: &Pps) {
     assert!((-12..=12).contains(&q.pps_cb_qp_offset) && (-12..=12).contains(&q.pps_cr_qp_offset));
     assert!((-6..=6).contains(&q.pps_beta_offset_div2) && (-6..=6).contains(&q.pps_tc_offset_div2));
     assert!(q.log2_parallel_merge_level_minus2 <= 4);
-    assert!(q.num_tile_columns_minus1 <= 18 && q.num_tile_rows_minus1 <= 20);
+    assert!(q.num_tile_columns_minus1 < p::TILE_COLUMNS_MAX);
+    assert!(q.num_tile_rows_minus1 < p::TILE_ROWS_MAX);
     if q.tiles_enabled_flag && !q.uniform_spacing_flag {
         assert_eq!(q.column_width_minus1.len(), q.num_tile_columns_minus1 as usize);
         assert_eq!(q.row_height_minus1.len(), q.num_tile_rows_minus1 as usize);
@@ -242,7 +244,7 @@ fn slice(nal: &[u8], t: u8, temporal_id: u8, sps: &Sps, pps: &Pps, poc: &mut Poc
     let again = parse_slice_header(&longer, t, sps, pps)
         .expect("a header that parsed refused with more bytes behind it");
     assert_eq!(key(&again), key(&sh), "bytes past the header changed it");
-    let got = poc.compute(sps, &sh, is_idr(t), is_irap(t), temporal_id);
+    let got = poc.compute(sps, &sh, t, is_irap(t), temporal_id);
     if is_idr(t) {
         assert_eq!(got, 0);
     } else {
@@ -298,7 +300,7 @@ fn de_emulate(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len());
     let mut zeros = 0;
     for (i, &b) in body.iter().enumerate() {
-        if zeros >= 2 && b == 3 && body.get(i + 1).is_some_and(|&n| n <= 3) {
+        if zeros >= 2 && b == 3 && body.get(i + 1).is_none_or(|&n| n <= 3) {
             zeros = 0;
             continue;
         }
@@ -314,26 +316,33 @@ fn helpers(b: &[u8]) {
     c[..n].copy_from_slice(&b[..n]);
     let rest = &b[n..];
 
-    // Tiles as the decoder asks for them, at most 19 columns of a 1024 CTB picture.
+    // Tiles as the decoder asks for them into VA's 19 widths or 21 heights, up to 20 columns or
+    // 22 rows of a 1024 CTB picture. A full grid leaves its last tile to the rest.
     let uniform = c[0] & 1 != 0;
-    let count = u32::from(c[1]) % 19 + 1;
+    let (len, most) = if c[0] & 2 == 0 { (19, p::TILE_COLUMNS_MAX) } else { (21, p::TILE_ROWS_MAX) };
+    let count = u32::from(c[1]) % most + 1;
     let ctbs = (u32::from(u16::from_le_bytes([c[2], c[3]])) % 1024 + 1).max(count);
     let coded: Vec<u32> = rest.chunks(2).map(|w| u32::from(w[0]) % 64).collect();
-    let mut out = [0xAAAAu16; 19];
-    tile_sizes_minus1(uniform, &coded, count, ctbs, &mut out);
-    let n = count as usize;
+    let mut out = [0xAAAAu16; 21];
+    tile_sizes_minus1(uniform, &coded, count, ctbs, &mut out[..len]);
+    let n = (count as usize).min(len);
+    let whole = n == count as usize;
     assert!(out[n..].iter().all(|&v| v == 0xAAAA), "a tile past the count written");
     let sizes: Vec<u32> = out[..n].iter().map(|&v| u32::from(v) + 1).collect();
     if uniform {
-        assert_eq!(sizes.iter().sum::<u32>(), ctbs, "uniform tiles {sizes:?} of {ctbs}");
         let (lo, hi) = (ctbs / count, ctbs.div_ceil(count));
         assert!(sizes.iter().all(|s| (lo..=hi).contains(s)), "{sizes:?} of {ctbs}");
+        let left = ctbs.checked_sub(sizes.iter().sum()).expect("uniform tiles past the picture");
+        assert!(if whole { left == 0 } else { (lo..=hi).contains(&left) }, "{sizes:?} of {ctbs}");
     } else {
-        for (i, s) in sizes[..n - 1].iter().enumerate() {
+        let explicit = if whole { n - 1 } else { n };
+        for (i, s) in sizes[..explicit].iter().enumerate() {
             assert_eq!(*s, coded.get(i).map_or(1, |c| c + 1));
         }
-        let used: u32 = sizes[..n - 1].iter().sum();
-        assert_eq!(sizes[n - 1], ctbs.saturating_sub(used).max(1));
+        if whole {
+            let used: u32 = sizes[..n - 1].iter().sum();
+            assert_eq!(sizes[n - 1], ctbs.saturating_sub(used).max(1));
+        }
     }
 
     // The diagonal scan is a permutation that walks anti-diagonals.

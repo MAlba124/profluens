@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use pf_mkv::ebml::id;
+use pf_mkv::ebml::{self, id};
 use pf_mkv::index::PRE_ROLL_BYTES;
 use pf_mkv::{
     Cues, MatroskaReader, MatroskaWriter, MkvDemux, Parsed, TrackConfig, parse_seek_head,
@@ -634,5 +634,157 @@ fn the_walks_reads_leave_the_pool_room_for_its_frames_copies() {
         let ran = play_set(&file, &|n| n == 0, &[], Setup { pool: TIGHT, delay: 7, seed });
         assert!(ran.ended, "seed {seed}, the run ended");
         assert_eq!(ran.after_flush(0).len(), 100, "seed {seed}, every picture");
+    }
+}
+
+/// The fuzz rig's pools, the second four 1 KiB slots and 64 KiB.
+const RIG: [(usize, u32, u64); 4] =
+    [TIGHT, (1024, 4, 64 << 10), (64 << 10, 16, 2 << 20), (256 << 10, 24, 32 << 20)];
+
+/// Plays `file` with every pad linked in each of the rig's pools, asserting the run ended.
+fn play_rig(file: &[u8]) -> Vec<((usize, u32, u64), Ran)> {
+    let ran = |pool| (pool, play_set(file, &|_| true, &[], Setup { pool, delay: 0, seed: 0 }));
+    let runs: Vec<_> = RIG.into_iter().map(ran).collect();
+    runs.iter().for_each(|(pool, ran)| assert!(ran.ended, "{pool:?}, the run ended"));
+    runs
+}
+
+/// The walk joined a frame from the window walked and the next past the caps while the window
+/// after them stayed asked, the pool's every slot. The Opus head then waited on a slot that
+/// only the frames behind it would give back.
+#[test]
+fn a_join_past_the_caps_gives_back_the_window_ahead_it_does_not_need() {
+    for (pool, ran) in play_rig(&paced(1, 1_000)) {
+        assert_eq!(ran.after_flush(0).len(), 25, "{pool:?}, every picture");
+        assert_eq!(ran.after_flush(1).len(), 50, "{pool:?}, every packet");
+    }
+}
+
+/// Pictures past the window's cap span the window walked and the chain, and their copy does not
+/// fit beside those in 64 KiB. Each is read whole on its own instead, its buffer the whole pool
+/// once the windows and the chain past it go back.
+#[test]
+fn a_frame_that_does_not_fit_beside_its_windows_is_read_whole() {
+    for (pool, ran) in play_rig(&paced(1, 60_000)) {
+        assert_eq!(ran.after_flush(0).len(), 25, "{pool:?}, every picture");
+        assert_eq!(ran.after_flush(1).len(), 50, "{pool:?}, every packet");
+    }
+}
+
+fn bits(out: &mut Vec<u8>, acc: &mut (u64, u32), value: u32, len: u32) {
+    acc.0 |= u64::from(value) << acc.1;
+    acc.1 += len;
+    while acc.1 >= 8 {
+        out.push(acc.0 as u8);
+        (acc.0, acc.1) = (acc.0 >> 8, acc.1 - 8);
+    }
+}
+
+/// A Huffman code goes out most significant bit first (RFC 1951 section 3.1.1).
+fn code(out: &mut Vec<u8>, acc: &mut (u64, u32), value: u32, len: u32) {
+    bits(out, acc, value.reverse_bits() >> (32 - len), len);
+}
+
+/// zlib of `1 + 258 k` zeros in one fixed Huffman block, a literal then `k` matches of 258 at
+/// distance 1 (RFC 1951 section 3.2.6).
+fn zlib_zeros(k: usize) -> Vec<u8> {
+    let (mut out, mut acc) = (vec![0x78, 0x01], (0u64, 0u32));
+    bits(&mut out, &mut acc, 0b011, 3);
+    code(&mut out, &mut acc, 0x30, 8);
+    for _ in 0..k {
+        code(&mut out, &mut acc, 0b1100_0101, 8);
+        code(&mut out, &mut acc, 0, 5);
+    }
+    code(&mut out, &mut acc, 0, 7);
+    if acc.1 > 0 {
+        out.push(acc.0 as u8);
+    }
+    out.extend_from_slice(&pf_mkv::inflate::adler32(&vec![0; 1 + 258 * k]).to_be_bytes());
+    out
+}
+
+/// A zlib text track of frames inflating to `1 + 258 k` zeros for each `k`, four a Cluster, with
+/// `pad` octets of Void after the first Cluster.
+fn inflating(ks: &[usize], pad: usize) -> Vec<u8> {
+    let el = |out: &mut Vec<u8>, i: &[u8], body: &[u8]| ebml::write_binary(out, i, body);
+    let mut comp = Vec::new();
+    ebml::write_uint(&mut comp, id::CONTENT_COMP_ALGO, 0);
+    let mut enc = Vec::new();
+    ebml::write_uint(&mut enc, id::CONTENT_ENCODING_SCOPE, 1);
+    el(&mut enc, id::CONTENT_COMPRESSION, &comp);
+    let mut encs = Vec::new();
+    el(&mut encs, id::CONTENT_ENCODING, &enc);
+    let mut te = Vec::new();
+    ebml::write_uint(&mut te, id::TRACK_NUMBER, 1);
+    ebml::write_uint(&mut te, id::TRACK_TYPE, 0x11);
+    ebml::write_string(&mut te, id::CODEC_ID, "S_TEXT/UTF8");
+    el(&mut te, id::CONTENT_ENCODINGS, &encs);
+    let mut tracks = Vec::new();
+    el(&mut tracks, id::TRACK_ENTRY, &te);
+    let mut info = Vec::new();
+    ebml::write_uint(&mut info, id::TIMESTAMP_SCALE, 1_000_000);
+    let mut file = Vec::new();
+    let mut head = Vec::new();
+    ebml::write_string(&mut head, id::DOC_TYPE, "matroska");
+    el(&mut file, id::EBML, &head);
+    ebml::write_id(&mut file, id::SEGMENT);
+    ebml::write_unknown_size(&mut file);
+    el(&mut file, id::INFO, &info);
+    el(&mut file, id::TRACKS, &tracks);
+    for (c, run) in ks.chunks(4).enumerate() {
+        let mut cluster = Vec::new();
+        ebml::write_uint(&mut cluster, id::TIMESTAMP, c as u64 * 1_000);
+        for (n, k) in run.iter().enumerate() {
+            let mut block = vec![0x81, 0, n as u8 * 50, 0x80];
+            block.extend_from_slice(&zlib_zeros(*k));
+            el(&mut cluster, id::SIMPLE_BLOCK, &block);
+        }
+        el(&mut file, id::CLUSTER, &cluster);
+        if c == 0 && pad > 0 {
+            el(&mut file, id::VOID, &vec![0; pad]);
+        }
+    }
+    file
+}
+
+/// The octets of each frame a pad put out.
+fn lens(ran: &Ran, pad: usize) -> Vec<usize> {
+    let of = |(p, s): &(usize, Seen)| match s {
+        Seen::Frame { len, .. } if *p == pad => Some(*len),
+        _ => None,
+    };
+    ran.seen.iter().filter_map(of).collect()
+}
+
+/// A caption inflating past the quarter of 64 KiB the walk leaves for the frames put out waited
+/// on the windows of the chain asked past the file's end, which nothing would walk.
+#[test]
+fn the_chain_past_the_end_goes_back_for_a_frame_put_out() {
+    let ks = [0, 0, 0, 64, 0, 0, 0, 64];
+    let want: Vec<usize> = ks.iter().map(|k| 1 + 258 * k).collect();
+    for (pool, ran) in play_rig(&inflating(&ks, 0)) {
+        assert_eq!(lens(&ran, 0), want, "{pool:?}, every caption whole");
+    }
+}
+
+/// The same caption out while the chain holds the file past it. Its windows go back for the
+/// caption and are read again after it.
+#[test]
+fn the_chain_ahead_goes_back_for_a_frame_put_out_that_needs_its_room() {
+    let ks = [0, 64, 0, 0, 0, 0, 0, 0];
+    let want: Vec<usize> = ks.iter().map(|k| 1 + 258 * k).collect();
+    for (pool, ran) in play_rig(&inflating(&ks, 100 << 10)) {
+        assert_eq!(lens(&ran, 0), want, "{pool:?}, every caption whole");
+    }
+}
+
+/// A caption inflating to 50 KiB never fits in 64 KiB beside the window its block lies in,
+/// which only the captions after it give back. It goes out in a buffer of its own.
+#[test]
+fn a_frame_put_out_that_never_fits_beside_the_walks_window_goes_out_unpooled() {
+    let ks = [0, 194, 0, 0, 0, 0, 0, 0];
+    let want: Vec<usize> = ks.iter().map(|k| 1 + 258 * k).collect();
+    for (pool, ran) in play_rig(&inflating(&ks, 100 << 10)) {
+        assert_eq!(lens(&ran, 0), want, "{pool:?}, every caption whole");
     }
 }

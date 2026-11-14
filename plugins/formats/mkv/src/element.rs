@@ -29,7 +29,7 @@ use crate::error::{DemuxError, MkvError, MuxError};
 use crate::extras::{Extras, MkvExtras, parse_attachments, parse_chapters};
 use crate::index::{CaptionSpan, CueEnd, Grown, cue_end, cue_ends, cue_entries_of, placed, up_at};
 use crate::parsed::Parsed;
-use crate::pull::{Need, Plan, Planned, Span, State, Step, Walk, Window};
+use crate::pull::{Need, Plan, Planned, Room, Span, State, Step, Walk, Window};
 use crate::reader::{Frame, MatroskaReader, PTS_NONE, Track, cues_typical, seek_head_pos};
 use crate::writer::{MatroskaWriter, MuxOut, TrackConfig};
 
@@ -874,6 +874,10 @@ struct Pulled {
     plan: Plan,
     win: Option<Window>,
     caps: (u64, u32),
+    /// The pool less the share the frames put out need, see [`crate::pull::Plan::room`].
+    most: (u64, u32),
+    /// The pool's bytes and buffers at the start, its buffers grow later.
+    pool: (u64, u64),
     lace: Vec<usize>,
     stash: Option<Step>,
 }
@@ -1178,6 +1182,8 @@ impl MkvDemux {
                 plan: Plan::default(),
                 win: None,
                 caps: (0, 0),
+                most: (0, 0),
+                pool: (0, 0),
                 lace: Vec::new(),
                 stash: None,
             },
@@ -1735,6 +1741,44 @@ impl MkvDemux {
             }
             recycle_park(&mut self.park_free, c.bytes);
         }
+        true
+    }
+
+    /// The parked frame in front waits on the pool, and what the walk holds goes only after it.
+    /// The chain's windows go back for one that would not fit beside them, and one that never
+    /// fits beside the rest goes out in a buffer outside the pool, as a flush puts frames out.
+    /// True when the drain may go on.
+    fn unpark(&mut self, ctx: &mut Ctx) -> bool {
+        let Some(c) = self.pending.front().filter(|c| c.view.is_none()) else {
+            return false;
+        };
+        let n = (c.payload().0.len() - c.off) as u64;
+        // a buffer's class is at most a quarter over its length, or 128 octets
+        let over = |p: &Plan, (budget, slots): (u64, u64)| {
+            let (held, ranges) = (p.held + n, u64::from(p.ranges));
+            held + held / 4 + 128 * (ranges + 1) > budget || ranges >= slots
+        };
+        // the pool's buffers only grow, so one not over the start's is not over now
+        if !over(&self.pull.plan, self.pull.pool) {
+            return false;
+        }
+        let stats = ctx.pool_stats();
+        let (budget, slots) = (stats.bytes_budget, stats.max_slots);
+        let plan = &mut self.pull.plan;
+        if over(plan, (budget, slots)) && plan.give_back(0) {
+            while over(plan, (budget, slots)) && plan.give_back(0) {}
+            return true;
+        }
+        if plan.held + n <= budget && u64::from(plan.ranges) < slots {
+            return false;
+        }
+        let Some(c) = self.pending.pop_front() else {
+            return false;
+        };
+        let (payload, side) = c.payload();
+        log!(&*ctx, Level::Debug, "unpooled", bytes = n, held = plan.held, budget = budget);
+        Self::emit_exact(ctx, c.stamp, &payload[c.off..], side);
+        recycle_park(&mut self.park_free, c.bytes);
         true
     }
 
@@ -2585,6 +2629,9 @@ impl MkvDemux {
         let mut left = usize::MAX;
         loop {
             if !self.drain(ctx) {
+                if self.unpark(ctx) {
+                    continue;
+                }
                 self.reserve_when_held(ctx);
                 ctx.hold_end();
                 return Ok(Flow::Ok);
@@ -2779,7 +2826,7 @@ impl MkvDemux {
     }
 
     fn walk_steps(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
-        let caps = self.pull.caps;
+        let (caps, most) = (self.pull.caps, self.pull.most);
         loop {
             let pull = &mut self.pull;
             let step = match pull.stash.take() {
@@ -2823,9 +2870,14 @@ impl MkvDemux {
                     }
                     pull.walk.pos = next;
                 }
-                // a block of the captions up may still be to ask
-                Step::End if self.up.is_some() => return Ok(false),
+                // the chain past the end holds nothing, a block of the captions up may still
+                // be to ask
+                Step::End if self.up.is_some() => {
+                    while pull.plan.give_back(0) {}
+                    return Ok(false);
+                }
                 Step::End => {
+                    while pull.plan.give_back(0) {}
                     if !pull.plan.asked_all {
                         pull.plan.asked_all = true;
                         ctx.end_asks(Self::IN);
@@ -2858,9 +2910,26 @@ impl MkvDemux {
                     // what the walked window and the chain hold of it is in memory already, a
                     // copy joined from them takes the frame's length
                     let need = if at > offset { len } else { rest };
-                    if need > 0 && !pull.plan.room(need, caps) {
-                        pull.stash = Some(step);
-                        return Ok(true);
+                    let joined = pull.win.is_some();
+                    let room = match need {
+                        0 => Room::Ask,
+                        _ => pull.plan.room(need, caps, most, if joined { to } else { offset }),
+                    };
+                    match room {
+                        Room::Ask => {}
+                        Room::Wait => {
+                            pull.stash = Some(step);
+                            return Ok(true);
+                        }
+                        // read whole on its own once the windows it was to be joined from go
+                        Room::Over if joined => {
+                            pull.stash = Some(step);
+                            pull.win = None;
+                            pull.plan.leave_window();
+                            pull.plan.joined(to);
+                            continue;
+                        }
+                        Room::Over => {}
                     }
                     let bufs = walk_buf(ctx, at > offset, len)
                         .and_then(|f| Ok((f, walk_buf(ctx, rest > 0, rest)?)));
@@ -2947,8 +3016,9 @@ impl MkvDemux {
                     };
                     pull.win = None;
                     pull.plan.leave_window();
-                    let room = pull.plan.room(len, caps);
-                    let buf = match room.then(|| ctx.try_alloc_sized(len as usize)) {
+                    let room = pull.plan.room(len, caps, most, offset + u64::from(len));
+                    let buf = match (room != Room::Wait).then(|| ctx.try_alloc_sized(len as usize))
+                    {
                         Some(Ok(Some(buf))) => buf,
                         None => {
                             pull.stash = Some(step);
@@ -3240,6 +3310,8 @@ impl Element for MkvDemux {
         let most = |n: u64| n - n / 4;
         let bytes = most(stats.bytes_budget).min(profluens_core::memory::IO_DEPTH_BYTES);
         self.pull.caps = (bytes.max(1), most(stats.max_slots).max(1) as u32);
+        self.pull.most = (most(stats.bytes_budget).max(1), self.pull.caps.1);
+        self.pull.pool = (stats.bytes_budget, stats.max_slots);
         self.pull.walk.set_cap((stats.bytes_budget / 4).clamp(256, u32::MAX as u64) as u32);
         (self.cued, self.cued_off, self.cued_from, self.walk_from) = (None, false, 0, 0);
         self.up = None;

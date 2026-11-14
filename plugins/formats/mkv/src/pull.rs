@@ -442,6 +442,17 @@ pub(crate) enum Span {
     Rest { offset: u64, len: u32 },
 }
 
+/// What the walk does about a range it needs, see [`Plan::room`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Room {
+    /// The range fits, under the caps or in the pool's share.
+    Ask,
+    /// The frames put out free what the range needs.
+    Wait,
+    /// Only windows the range needs are held and it does not fit beside them in the pool.
+    Over,
+}
+
 #[derive(Default)]
 pub(crate) struct Plan {
     pub(crate) items: VecDeque<Planned>,
@@ -587,14 +598,47 @@ impl Plan {
 
     /// Room under `caps` for a range the walk needs, the rest of the pool left for the copies
     /// of its frames, which alone give back the windows those frames hold. With nothing held
-    /// but the chain's windows and the one walked there is always room, the walk waiting on
-    /// that range never reaches them to free theirs.
-    pub(crate) fn room(&self, len: u32, (bytes, ranges): (u64, u32)) -> bool {
+    /// but the chain's windows and the one walked the walk goes past the caps, waiting on that
+    /// range never reaches them to free theirs. It stays in `most`, the pool's share the frames
+    /// put out do not need, by giving back the chain's windows from `from` on, and is
+    /// [`Room::Over`] when those do not make room.
+    pub(crate) fn room(&mut self, len: u32, caps: (u64, u32), most: (u64, u32), from: u64) -> Room {
+        loop {
+            let (framed, capped) = self.fits(len, caps);
+            if capped {
+                return Room::Ask;
+            }
+            if framed {
+                return Room::Wait;
+            }
+            if self.fits(len, most).1 {
+                return Room::Ask;
+            }
+            if !self.give_back(from) {
+                return Room::Over;
+            }
+        }
+    }
+
+    /// Whether anything but the chain's windows and the one walked is held, and whether `len`
+    /// more stays under `caps`.
+    fn fits(&self, len: u32, (bytes, ranges): (u64, u32)) -> (bool, bool) {
         let ahead: u64 = self.links.iter().map(|l| u64::from(l.len)).sum();
         let walked = self.walking.map_or(0, |w| u64::from(w.1));
         let others = self.links.len() as u32 + u32::from(self.walking.is_some());
         let framed = self.held - ahead - walked > 0 || self.ranges > others;
-        !framed || (self.ranges < ranges && self.held + u64::from(len) <= bytes)
+        (framed, self.ranges < ranges && self.held + u64::from(len) <= bytes)
+    }
+
+    /// Gives back the chain's last window when it starts at `from` or past it, asked again once
+    /// the walk reaches it. A served one goes at once, one in flight when the source serves it.
+    pub(crate) fn give_back(&mut self, from: u64) -> bool {
+        let Some(l) = self.links.pop_back_if(|l| l.offset >= from) else {
+            return false;
+        };
+        (self.held, self.ranges) = (self.held - u64::from(l.len), self.ranges - 1);
+        self.chain_end = Some(l.offset);
+        true
     }
 
     pub(crate) fn asked(&mut self, len: u32) -> u64 {
@@ -968,18 +1012,39 @@ mod tests {
     fn room_leaves_out_the_window_walked_and_the_chain_only_when_nothing_else_is_held() {
         let (pool, file) = (Pool::new(4096), vec![0; 64]);
         let (mut p, mut w) = (Plan::default(), Walk::new());
-        let caps = (8 << 20, 5);
+        let (caps, most) = ((8 << 20, 5), (48 << 20, 48));
         p.linked(&mut w, 0, 2 << 20);
         p.link_in(p.next_tag - 1, window(&pool, &file, 0, 64).mem);
         p.enter_front().expect("served");
         p.linked(&mut w, 2 << 20, 2 << 20);
         p.linked(&mut w, 4 << 20, 2 << 20);
-        assert!(p.room(8 << 20, caps), "nothing else held");
+        assert_eq!(p.room(8 << 20, caps, most, 0), Room::Ask, "nothing else held");
+        assert_eq!(p.links.len(), 2, "and the pool has room past the caps");
         p.asked(1 << 20);
-        assert!(p.room(1 << 20, caps));
-        assert!(!p.room(1 << 20 | 1, caps), "the chain counts once a frame holds room");
+        assert_eq!(p.room(1 << 20, caps, most, 0), Room::Ask);
+        let wait = p.room(1 << 20 | 1, caps, most, 0);
+        assert_eq!(wait, Room::Wait, "the chain counts once a frame holds room");
         p.asked(1);
-        assert!(!p.room(1, caps), "and so do its ranges");
+        assert_eq!(p.room(1, caps, most, 0), Room::Wait, "and so do its ranges");
+    }
+
+    #[test]
+    fn room_past_the_pool_share_gives_back_the_chain_the_range_does_not_need() {
+        let (pool, file) = (Pool::new(4096), vec![0; 64]);
+        let (mut p, mut w) = (Plan::default(), Walk::new());
+        let caps = (48 << 10, 3);
+        p.linked(&mut w, 0, 16 << 10);
+        p.link_in(p.next_tag - 1, window(&pool, &file, 0, 64).mem);
+        p.enter_front().expect("served");
+        p.linked(&mut w, 16 << 10, 16 << 10);
+        p.linked(&mut w, 32 << 10, 16 << 10);
+        // a frame up to 20 KiB needs the window after the one walked, not the last
+        assert_eq!(p.room(4 << 10, caps, caps, 20 << 10), Room::Ask);
+        assert_eq!((p.links.len(), p.ranges, p.held), (1, 2, 32 << 10));
+        assert_eq!(p.ahead(&w).map(|a| a.0), Some(32 << 10), "asked again from where it went");
+        let over = p.room(24 << 10, caps, caps, 40 << 10);
+        assert_eq!(over, Room::Over, "one that needs it too does not fit beside it");
+        assert_eq!(p.links.len(), 1, "and it stays");
     }
 
     #[test]

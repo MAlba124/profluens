@@ -9,8 +9,8 @@ use profluens_core::memory::Memory;
 use crate::ebml::{self, ReadError, id};
 use crate::reader::{
     MAX_BLOCK, MAX_HELD_ELEMENT, Track, block_addition, block_frames, block_group_parts,
-    block_pts_ns, cluster_led, find_subslice, lace_stamp, parse_block_header, parse_info,
-    read_uint,
+    block_pts_ns, cluster_led, cluster_tick, find_subslice, lace_stamp, parse_block_header,
+    parse_info, parsed_max,
 };
 
 /// The first window after a start or a seek, so the first frames wait on no more.
@@ -31,7 +31,7 @@ pub(crate) const SKIP_MIN: u64 = 1 << 20;
 
 /// What the walk passes unread at Segment or Cluster level (RFC 9559 section 5.1), the raw ones
 /// CRC-32, Position, PrevSize, SilentTracks and EncryptedBlock, and a chained Segment's EBML head.
-const PASSED: [&[u8]; 13] = [
+pub(crate) const PASSED: [&[u8]; 13] = [
     id::SEEK_HEAD,
     id::TRACKS,
     id::CUES,
@@ -224,6 +224,9 @@ impl Walk {
         if block && size > MAX_BLOCK {
             return self.lost(ReadError::Malformed("block larger than any the reader sends on"));
         }
+        if id != id::TRACKS && parsed_max(id).is_some_and(|max| size > max) {
+            return self.lost(ReadError::Malformed("element larger than its kind holds"));
+        }
         let parsed = block || id == id::INFO || id == id::TIMESTAMP;
         // Damage read as an element, its size would take the walk anywhere up to the end.
         if !parsed && !PASSED.contains(&id) {
@@ -254,7 +257,7 @@ impl Walk {
             }
             self.duration_ns = ticks.map(|t| (t * self.scale as f64).round() as u64);
         } else if id == id::TIMESTAMP {
-            self.cluster_base_tick = read_uint(body) as i64;
+            self.cluster_base_tick = cluster_tick(body);
         } else if id == id::SIMPLE_BLOCK {
             return Step::Block {
                 from: data_start,
@@ -1069,6 +1072,29 @@ mod tests {
         d.unlinked = &[9];
         let run = d.walk(0, false);
         assert_eq!(run.blocks() + run.joined.len(), 1 + 60 * 100, "every Cluster after it");
+    }
+
+    #[test]
+    fn a_timestamp_past_eight_octets_is_damage_not_a_read_of_its_size() {
+        let mut file = Vec::new();
+        cluster(&mut file, 0, &[100]);
+        // a Timestamp, a 1-octet ID, whose size says 200 MiB
+        ebml::write_id(&mut file, id::TIMESTAMP);
+        ebml::write_size_fixed(&mut file, 200 << 20, 4);
+        clusters(&mut file, 1, 60);
+        let run = walk(&file, 0, false);
+        assert_eq!(run.blocks() + run.joined.len(), 1 + 60 * 100, "every Cluster after it");
+        assert!(run.reads.iter().all(|r| r.2 < 64 << 20), "{:?}", run.lens(Read::Link));
+    }
+
+    #[test]
+    fn a_cluster_timestamp_past_the_signed_range_clamps_as_cluster_timestamp_does() {
+        let mut file = Vec::new();
+        cluster(&mut file, 1 << 63, &[100]);
+        let mut d = Drive::new(&file, None);
+        assert_eq!(d.walk(0, false).blocks(), 1);
+        assert_eq!(d.w.cluster_base_tick, i64::MAX);
+        assert_eq!(crate::reader::cluster_timestamp(&file[5..]), Some(i64::MAX));
     }
 
     #[test]

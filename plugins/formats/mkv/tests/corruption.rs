@@ -967,6 +967,62 @@ fn an_opaque_element_with_a_huge_declared_size_is_skipped_unbuffered() {
 }
 
 #[test]
+fn a_timestamp_past_eight_octets_is_damage_not_a_buffer() {
+    // a Timestamp inside the unknown-size Cluster whose size says 200 MiB
+    let bad = [0xE7, 0x1C, 0x80, 0x00, 0x00];
+    let mut reader = streaming_reader();
+    let mark = heap_mark();
+    reader.push(&bad).expect("damage is skipped once the tracks are known");
+    for _ in 0..64 {
+        reader.push(&[0xA3; 4096]).expect("what follows is scanned, not buffered");
+    }
+    assert!(matches!(reader.take_damage(), Some(ebml::ReadError::Malformed(_))));
+    assert!(heap_growth(mark) < 64 << 10, "the declared size was buffered");
+    assert!(reader.held() < 4096, "{} octets held", reader.held());
+}
+
+#[test]
+fn damage_read_as_an_element_no_level_holds_is_said_and_resynced_past() {
+    let frame = [0xA3, 0x87, 0x81, 0x00, 0x00, 0x80, 1, 2, 3];
+    let mut file = STREAM_HEAD.to_vec();
+    file.extend(uint(id::TIMESTAMP, 0));
+    file.extend(frame);
+    // ChapterTrack, one damaged octet, its size reaching past the end of the stream
+    file.push(0x8F);
+    ebml::write_size_fixed(&mut file, 1 << 40, 8);
+    for c in 1..50u64 {
+        file.extend(element(
+            id::CLUSTER,
+            &[uint(id::TIMESTAMP, c * 1000), frame.to_vec()].concat(),
+        ));
+    }
+    let mut reader = MatroskaReader::new();
+    for piece in file.chunks(4096) {
+        reader.push(piece).expect("the damage is skipped");
+    }
+    let mut frames = 0;
+    while let Some(f) = reader.next_frame() {
+        reader.recycle(f.data);
+        frames += 1;
+    }
+    assert_eq!(frames, 50, "every Cluster after it");
+    assert!(matches!(reader.take_damage(), Some(ebml::ReadError::Malformed(_))));
+}
+
+#[test]
+fn a_cluster_timestamp_past_the_signed_range_clamps_as_cluster_timestamp_does() {
+    let mut stream = STREAM_HEAD.to_vec();
+    let at = stream.len();
+    stream.extend(uint(id::TIMESTAMP, 1 << 63));
+    stream.extend([0xA3, 0x85, 0x81, 0x00, 0x00, 0x80, 0x42]);
+    assert_eq!(pf_mkv::reader::cluster_timestamp(&stream[at..]), Some(i64::MAX));
+    let mut reader = MatroskaReader::new();
+    reader.push(&stream).expect("the stream reads");
+    let pts = reader.next_frame().map(|f| f.pts_ns);
+    assert!(pts.is_some_and(|p| p > 1 << 62), "{pts:?}, the stamp wrapped below zero");
+}
+
+#[test]
 fn a_block_larger_than_the_reader_buffers_is_malformed() {
     let block = [0xA3, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
     let mut reader = streaming_reader();

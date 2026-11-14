@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use crate::ebml::{self, ReadError, id};
 use crate::encoding::{self, Coding};
 use crate::inflate::InflateError;
+use crate::pull::PASSED;
 use profluens_core::ctx::Disposition;
 use profluens_core::fetch::{Need, Step};
 use profluens_core::memory::{Demand, Known};
@@ -112,6 +113,30 @@ pub(crate) const MAX_BLOCK: u64 = profluens_core::memory::SIZED_TOP as u64;
 
 /// A block's 1-octet track VINT reaches 126, so this is well above any real file.
 const MAX_TRACKS: usize = 256;
+
+/// Largest Info taken, a title and a few apps' names are hundreds of octets.
+pub(crate) const MAX_INFO: u64 = 1 << 20;
+/// Largest Tracks taken, room for [`MAX_TRACKS`] entries with records of tens of KB.
+pub(crate) const MAX_TRACKS_LEN: u64 = 16 << 20;
+
+/// The most a parsed element other than a block holds. A Timestamp is a uint of 8 octets at most
+/// (RFC 9559 section 5.1.3.1), a larger one is damage and not buffered for.
+pub(crate) fn parsed_max(id: &[u8]) -> Option<u64> {
+    if id == id::TIMESTAMP {
+        Some(8)
+    } else if id == id::INFO {
+        Some(MAX_INFO)
+    } else if id == id::TRACKS {
+        Some(MAX_TRACKS_LEN)
+    } else {
+        None
+    }
+}
+
+/// A Cluster Timestamp, clamped as [`cluster_timestamp`] clamps it.
+pub(crate) fn cluster_tick(body: &[u8]) -> i64 {
+    read_uint(body).min(i64::MAX as u64) as i64
+}
 
 /// The chain scratch keeps its peak capacity, so past this it is given back after use.
 const SCRATCH_KEEP: usize = 1 << 20;
@@ -516,8 +541,16 @@ impl MatroskaReader {
         if block && header.size.is_some_and(|size| size > MAX_BLOCK) {
             return Err(ReadError::Malformed("block larger than any the reader sends on"));
         }
+        let max = parsed_max(id);
+        if max.is_some_and(|max| header.size.is_some_and(|size| size > max)) {
+            return Err(ReadError::Malformed("element larger than its kind holds"));
+        }
+        let parsed = max.is_some() || block;
+        // Damage read as an element, its size would skip the stream up to anywhere.
+        if !parsed && self.tracks_ready && !PASSED.contains(&id) {
+            return Err(ReadError::Malformed("no Matroska element at this level"));
+        }
         if data_end > self.buf.len() {
-            let parsed = id == id::INFO || id == id::TRACKS || id == id::TIMESTAMP || block;
             if !parsed {
                 // Opaque, discarded as it arrives so its declared size costs no memory.
                 self.skip = (data_end - self.buf.len()) as u64;
@@ -561,7 +594,7 @@ impl MatroskaReader {
         } else if id == id::TAGS {
             crate::tags::bitrates_in(&self.buf[ds..de], &mut self.tracks);
         } else if id == id::TIMESTAMP {
-            self.cluster_base_tick = read_uint(&self.buf[ds..de]) as i64;
+            self.cluster_base_tick = cluster_tick(&self.buf[ds..de]);
         } else if id == id::SIMPLE_BLOCK || id == id::BLOCK_GROUP {
             let (base, scale, before) =
                 (self.cluster_base_tick, self.timestamp_scale, self.pending.len());
@@ -853,7 +886,9 @@ fn parse_addition_mapping(data: &[u8], track: &mut Track) -> Result<(), ReadErro
     Ok(())
 }
 
-pub(crate) fn block_addition(data: &[u8], want: u64) -> Option<std::ops::Range<usize>> {
+/// The BlockAdditional of BlockAddID `want` in a BlockAdditions body, a BlockMore stating none
+/// is 1 (RFC 9559 section 5.1.3.5.2.3).
+pub fn block_addition(data: &[u8], want: u64) -> Option<std::ops::Range<usize>> {
     let mut at = 0;
     while at < data.len() {
         let h = ebml::read_element_header(data, at).ok()?;
@@ -1260,7 +1295,7 @@ pub fn cluster_timestamp(data: &[u8]) -> Option<i64> {
         let h = ebml::read_element_header(data, at).ok()?;
         let end = h.data_end().ok()??;
         if h.id == id::TIMESTAMP {
-            return Some(read_uint(data.get(h.data_start..end)?).min(i64::MAX as u64) as i64);
+            return Some(cluster_tick(data.get(h.data_start..end)?));
         }
         if h.id == id::SIMPLE_BLOCK || h.id == id::BLOCK_GROUP {
             return None;

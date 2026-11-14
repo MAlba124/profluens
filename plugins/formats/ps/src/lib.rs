@@ -14,7 +14,7 @@ pub mod seek;
 pub mod streams;
 
 pub use demux::{Anomaly, AnomalyKind, Demux, Event, Stats, Unit, key_of};
-pub use element::{EMITS, Head, PsDemux, PsError, Seen, TAIL_LEN, last_ticks, scan_head};
+pub use element::{EMITS, Head, PsDemux, PsError, Seen, TAIL_LEN, last_ticks, lasts, scan_head};
 pub use streams::Codec;
 
 use pf_registry::{Elements, Registry};

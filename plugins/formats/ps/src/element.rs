@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use pf_mpegts::pes::PH_SCRAMBLED;
-use pf_mpegts::{Step as Stepped, Unwrapper};
+use pf_mpegts::{Span, Spans, Step as Stepped, Unwrapper, congruent};
 use pf_tsdemux::index::{Grown, Key, Placed};
 use profluens_audio::{FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE};
 use profluens_core::batch::Inputs;
@@ -36,7 +36,7 @@ use crate::demux::{self, Demux, Unit};
 use crate::es::{Au, Framer, Spu, Stamp};
 use crate::lpcm::{self, Lpcm};
 use crate::pack::PRIVATE_1;
-use crate::seek::{Base, Bisect, Landing, Step};
+use crate::seek::{self, Base, Bisect, Landing, Line, Rate, Step};
 use crate::streams::{self, Codec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +127,9 @@ const AU_MAX: usize = 8 << 20;
 const STREAMS_MAX: usize = 32;
 const SNIFF: usize = 4096;
 const PCM_OUT: usize = 0x1_0000 / 5 * 6 + 2 * lpcm::BLOCK_MAX;
+/// An LPCM stamp this far behind the sample count, or this far past the widest packet ahead of
+/// it, starts the count over. Ticks round to 11 us.
+const COUNT_SLACK_NS: u64 = 1_000_000;
 
 fn ticks_ns(ticks: i64) -> i64 {
     (i128::from(ticks) * 100_000 / 9).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
@@ -147,18 +150,49 @@ pub struct Head {
     pub opening: Option<(i64, i64)>,
     /// Units of streams past `STREAMS_MAX`, left out.
     pub capped: u32,
+    /// The stream whose stamps tell the time bases, the first video else the first audio.
+    pub key: Option<u16>,
+    pub line: Line,
+    /// The pack clock against the bytes.
+    pub rate: Rate,
+}
+
+/// Video, then audio, tells the time bases of a file.
+fn line_class(key: u16) -> Option<u8> {
+    Some(streams::rank(key).0).filter(|class| *class < 2)
 }
 
 #[allow(clippy::disallowed_methods)] // once per element
 pub fn scan_head(head: &[u8]) -> Head {
     let mut demux = Demux::new();
-    let mut out =
-        Head { mpeg2: true, psm: Box::new([0; 256]), seen: Vec::new(), opening: None, capped: 0 };
+    let mut out = Head {
+        mpeg2: true,
+        psm: Box::new([0; 256]),
+        seen: Vec::new(),
+        opening: None,
+        capped: 0,
+        key: None,
+        line: Line::default(),
+        rate: Rate::default(),
+    };
     let (mut clock, mut packed) = (Unwrapper::for_timestamps(), false);
     let mut sink = |event: demux::Event<'_>| match event {
-        demux::Event::Pack { pack, .. } if !packed => (packed, out.mpeg2) = (true, pack.mpeg2),
+        demux::Event::Pack { pack, offset } => {
+            out.rate.note(offset, pack.scr as i64);
+            if !packed {
+                (packed, out.mpeg2) = (true, pack.mpeg2);
+            }
+        }
         demux::Event::Psm(psm) => out.psm.copy_from_slice(&psm.types),
         demux::Event::Unit(u) => {
+            let class = line_class(u.key);
+            let ahead = |key: u16| class < line_class(key);
+            if u.pts.is_some() && class.is_some() && out.key.is_none_or(ahead) {
+                (out.key, out.line) = (Some(u.key), Line::default());
+            }
+            if let (Some(pts), true) = (u.pts, out.key == Some(u.key)) {
+                out.line.note(u.dts.unwrap_or(pts), pts);
+            }
             let at = match out.seen.iter().position(|s| s.key == u.key) {
                 Some(at) => at,
                 None if out.seen.len() < STREAMS_MAX => {
@@ -189,6 +223,32 @@ pub fn scan_head(head: &[u8]) -> Head {
     demux.push(head, &mut sink);
     demux.flush(&mut sink);
     out
+}
+
+/// How long a file lasts from its head's `line` of stream `key` and pack `rate`, and its last
+/// bytes `tail`, ticks from `least`, the head's earliest decode time. `len` the file's length
+/// when known. `None` when the stamps do not tell, a clock set back between head and tail.
+pub fn lasts(
+    head: (Option<u16>, &Line, Rate),
+    least: i64,
+    tail: &[u8],
+    len: Option<u64>,
+) -> Option<i64> {
+    let (key, line, mut rate) = head;
+    let mut demux = Demux::new();
+    let mut end = Line::default();
+    rate.restart();
+    let mut sink = |event: demux::Event<'_>| match event {
+        demux::Event::Pack { pack, offset } => rate.note(offset, pack.scr as i64),
+        demux::Event::Unit(Unit { pts: Some(pts), dts, key: k, .. }) if Some(k) == key => {
+            end.note(dts.unwrap_or(pts), pts)
+        }
+        _ => {}
+    };
+    demux.push(tail, &mut sink);
+    demux.flush(&mut sink);
+    // a file's clock starts near 0, it reads as wrapping when set back
+    seek::extent(line, &end, least, len.and_then(|len| rate.lasts(len)), false)
 }
 
 /// The last stamp in `tail`, the end of a file, in ticks on the line of `base`.
@@ -229,6 +289,43 @@ struct Pcm {
     carry: [u8; lpcm::BLOCK_MAX],
     held: usize,
     out: Vec<u8>,
+    count: Count,
+}
+
+/// An LPCM stream's sample count, which stamps its units. A muxer stamps the first frame that
+/// starts in a packet, ahead of the packet's first sample by up to one of its frames, which
+/// FFmpeg sizes as about a packet and its first access unit pointer never places. A stamp within
+/// the widest packet ahead of the count keeps it, one outside starts it over.
+#[derive(Clone, Copy, Default)]
+struct Count {
+    /// The anchor stamp in stream time ns and the sample frames out since, `None` unanchored.
+    at: Option<(u64, u64)>,
+    /// The most sample frames a packet held.
+    widest: u64,
+}
+
+impl Count {
+    /// The stamp of a unit of `frames` at `rate`, `present` its placed stamp.
+    fn stamp(&mut self, present: Option<u64>, frames: u64, rate: u32) -> Option<u64> {
+        let ns = |n: u64| (u128::from(n) * 1_000_000_000 / u128::from(rate.max(1))) as u64;
+        self.widest = self.widest.max(frames);
+        let ahead = ns(self.widest).saturating_add(COUNT_SLACK_NS);
+        let fits = match (present, self.at) {
+            (Some(p), Some((anchor, n))) => {
+                let at = anchor.saturating_add(ns(n));
+                p.saturating_add(COUNT_SLACK_NS) >= at && p <= at.saturating_add(ahead)
+            }
+            (None, at) => at.is_some(),
+            (Some(_), None) => false,
+        };
+        if !fits {
+            self.at = present.map(|p| (p, 0));
+        }
+        let (anchor, n) = self.at.as_mut()?;
+        let at = anchor.saturating_add(ns(*n));
+        *n = n.saturating_add(frames);
+        Some(at)
+    }
 }
 
 struct Track {
@@ -250,7 +347,7 @@ impl Track {
             s.reset();
         }
         if let Some(p) = &mut self.pcm {
-            p.held = 0;
+            (p.held, p.count) = (0, Count::default());
         }
     }
 }
@@ -273,11 +370,14 @@ impl Park {
     }
 }
 
-/// The file's earliest stamp is zero. A new time base resumes where the last unit out was.
+/// The file's earliest stamp is zero. A new time base resumes where the last unit out was, and a
+/// seek takes up the one read at its byte.
 struct Clock {
     unwrap: Unwrapper,
     scr: Unwrapper,
     shift: i64,
+    /// The time bases read in file bytes.
+    spans: Spans,
     anchor: Option<u64>,
     origin: Option<i64>,
     sought: bool,
@@ -289,13 +389,24 @@ struct Clock {
 }
 
 impl Clock {
-    /// `(decode, presentation)` in stream time ns.
-    fn place(&mut self, stamp: Stamp, last_dts: &mut (u32, i64)) -> (u64, u64) {
+    /// `(decode, presentation)` in stream time ns. `at` is the unit's file byte, `None` when its
+    /// offset is none.
+    fn place(&mut self, stamp: Stamp, last_dts: &mut (u32, i64), at: Option<u64>) -> (u64, u64) {
         let dts = stamp.dts.unwrap_or(stamp.pts);
-        if let (true, Some(origin)) = (std::mem::take(&mut self.sought), self.origin) {
-            let base = Base { origin, slack: ORIGIN_SLACK };
-            self.unwrap.prime(origin + base.ticks(dts));
-            self.shift = ticks_ns(origin);
+        if std::mem::take(&mut self.sought) {
+            match at.and_then(|at| self.spans.at(at)) {
+                Some(span) => {
+                    self.unwrap.prime(congruent(span.ticks - ORIGIN_SLACK, dts));
+                    self.shift = span.shift_ns;
+                }
+                None => {
+                    if let Some(origin) = self.origin {
+                        let base = Base { origin, slack: ORIGIN_SLACK };
+                        self.unwrap.prime(origin + base.ticks(dts));
+                        self.shift = ticks_ns(origin);
+                    }
+                }
+            }
         }
         let placed = self.unwrap.unwrap(dts);
         let back = std::mem::take(&mut self.back);
@@ -309,6 +420,9 @@ impl Clock {
         if let Some(stream) = self.anchor.take() {
             self.shift = decode.saturating_sub(i64::try_from(stream).unwrap_or(i64::MAX));
             self.stretch = self.stretch.wrapping_add(1).max(1);
+            if let Some(byte) = at {
+                self.spans.note(Span { byte, ticks: placed.ticks, shift_ns: self.shift });
+            }
         }
         *last_dts = (self.stretch, placed.ticks);
         let present = ticks_ns(self.unwrap.unwrap(stamp.pts).ticks);
@@ -363,13 +477,22 @@ impl Emit<'_> {
     }
 
     fn unit(&mut self, lane: &mut Lane, au: Au<'_>) {
+        self.counted_unit(lane, au, None);
+    }
+
+    /// `count` is an LPCM unit's sample count, its frames and rate, which stamp it.
+    fn counted_unit(&mut self, lane: &mut Lane, au: Au<'_>, count: Option<(&mut Count, u64, u32)>) {
         let Some(pad) = lane.pad else { return };
         let video = lane.kind == StreamKind::Video;
         // A start needs its time, and a muxer may stamp a key's neighbour and not the key.
         if video && lane.need_key && !(au.key && au.stamp.is_some()) {
             return;
         }
-        let stamps = au.stamp.map(|s| self.clock.place(s, &mut lane.last_dts));
+        let at = (self.grown.placed == Placed::File).then_some(au.offset);
+        let mut stamps = au.stamp.map(|s| self.clock.place(s, &mut lane.last_dts, at));
+        if let Some((count, frames, rate)) = count {
+            stamps = count.stamp(stamps.map(|s| s.1), frames, rate).map(|ns| (ns, ns));
+        }
         let mut flags = match std::mem::take(&mut lane.broke) {
             true => BufferFlags::DISCONT,
             false => BufferFlags::empty(),
@@ -409,6 +532,7 @@ impl Emit<'_> {
         };
         if lane.lpcm != Some(format) {
             (lane.lpcm, lane.started, pcm.held) = (Some(format), false, 0);
+            pcm.count = Count::default();
         }
         let (bin, bout) = format.block();
         let (mut data, mut wrote) = (u.payload, 0);
@@ -426,8 +550,10 @@ impl Emit<'_> {
         let keep = rest.len().min(bin);
         pcm.carry[pcm.held..pcm.held + keep].copy_from_slice(&rest[..keep]);
         pcm.held += keep;
-        let au = Au { bytes: &pcm.out[..wrote + n], stamp, key: true, offset: u.offset };
-        self.unit(lane, au);
+        let Pcm { out, count, .. } = pcm;
+        let frames = ((wrote + n) / (format.width() * usize::from(format.channels))) as u64;
+        let au = Au { bytes: &out[..wrote + n], stamp, key: true, offset: u.offset };
+        self.counted_unit(lane, au, Some((count, frames, format.rate)));
     }
 }
 
@@ -538,7 +664,7 @@ fn on_break(emit: &mut Emit<'_>, tracks: &mut [Track]) {
             s.reset();
         }
         if let Some(p) = pcm {
-            p.held = 0;
+            (p.held, p.count) = (0, Count::default());
         }
         (lane.need_key, lane.broke) = (lane.kind == StreamKind::Video, true);
     }
@@ -568,6 +694,8 @@ pub struct PsDemux {
     ending: bool,
     /// First decode time in the head and the earliest stream's first one, in ticks.
     opening: Option<(i64, i64)>,
+    /// The head's time bases and pack rate, for the duration with the tail.
+    line: (Option<u16>, Line, Rate),
     duration: Option<u64>,
     grown: Grown,
     measured: rate::ByteRate,
@@ -597,6 +725,7 @@ impl PsDemux {
                 unwrap: Unwrapper::for_timestamps(),
                 scr: Unwrapper::for_timestamps(),
                 shift: 0,
+                spans: Spans::default(),
                 anchor: None,
                 origin: None,
                 sought: false,
@@ -610,6 +739,7 @@ impl PsDemux {
             feeding: None,
             ending: false,
             opening: None,
+            line: (None, Line::default(), Rate::default()),
             duration: None,
             grown: Grown::new(),
             measured: rate::ByteRate::default(),
@@ -647,6 +777,14 @@ impl PsDemux {
         let mut d = self.with_len(Some(len));
         (d.tail, d.tail_at) = (tail, Tail::In);
         d
+    }
+
+    /// The duration by the head and `tail`, the end of the file.
+    fn lasts(&self, tail: &[u8]) -> Option<u64> {
+        let (_, least) = self.opening?;
+        let (key, line, rate) = &self.line;
+        let ticks = lasts((*key, line, *rate), least, tail, self.len)?;
+        Some(ticks_ns(ticks).max(0) as u64)
     }
 
     fn base(&self) -> Option<Base> {
@@ -795,8 +933,7 @@ impl PsDemux {
     /// The duration from the tail, once the head gave the origin.
     fn tail_in(&mut self, ctx: &mut Ctx, tail: &[u8]) {
         self.tail_at = Tail::In;
-        let last = self.base().and_then(|base| last_ticks(tail, base));
-        self.duration = last.map(|ticks| ticks_ns(ticks).max(0) as u64);
+        self.duration = self.lasts(tail);
         log_duration(ctx, self.duration, tail.len());
         self.publish(ctx);
     }
@@ -990,6 +1127,7 @@ impl Element for PsDemux {
         let head = scan_head(&self.head);
         self.head = Vec::new();
         self.opening = head.opening;
+        self.line = (head.key, head.line.clone(), head.rate);
         self.clock.origin = head.opening.map(|(_, least)| least);
         let mut seen: Vec<&Seen> = head.seen.iter().collect();
         seen.sort_by_key(|s| streams::rank(s.key));
@@ -1046,6 +1184,7 @@ impl Element for PsDemux {
                     carry: [0; lpcm::BLOCK_MAX],
                     held: 0,
                     out: vec![0; PCM_OUT],
+                    count: Count::default(),
                 }),
             });
         }
@@ -1054,8 +1193,7 @@ impl Element for PsDemux {
         }
         if self.tail_at == Tail::In && self.duration.is_none() {
             let tail = std::mem::take(&mut self.tail);
-            let last = self.base().and_then(|base| last_ticks(&tail, base));
-            self.duration = last.map(|ticks| ticks_ns(ticks).max(0) as u64);
+            self.duration = self.lasts(&tail);
             log_duration(ctx, self.duration, tail.len());
         }
         log!(
@@ -1086,9 +1224,11 @@ impl Element for PsDemux {
         (clock.shift, clock.anchor, clock.sought, clock.last_ns, clock.broke) =
             (0, Some(0), false, 0, false);
         clock.back = false;
+        clock.spans.clear();
         if let Some((first, least)) = self.opening {
             clock.unwrap.prime(first);
             (clock.shift, clock.anchor) = (ticks_ns(least), None);
+            clock.spans.note(Span { byte: 0, ticks: least, shift_ns: ticks_ns(least) });
         }
         (self.feeding, self.ending, self.paired, self.bisect, self.probe) =
             (None, false, false, None, None);
@@ -1169,6 +1309,7 @@ mod tests {
             unwrap: Unwrapper::for_timestamps(),
             scr: Unwrapper::for_timestamps(),
             shift: 0,
+            spans: Spans::default(),
             anchor: None,
             origin: Some(0),
             sought: false,
@@ -1180,18 +1321,55 @@ mod tests {
         let mut last = (0, 0);
         let at = |pts: u64| Stamp { pts, dts: None };
         // A jump the other tracks made moves the line.
-        let first = clock.place(at(200 * SECOND), &mut last);
-        let joined = clock.place(at(400 * SECOND), &mut last);
+        let first = clock.place(at(200 * SECOND), &mut last, None);
+        let joined = clock.place(at(400 * SECOND), &mut last, None);
         assert_eq!(joined.0, first.0);
-        clock.place(at(408 * SECOND), &mut last);
+        clock.place(at(408 * SECOND), &mut last, None);
         (clock.back, clock.stretch) = (true, clock.stretch + 1);
-        let again = clock.place(at(395 * SECOND), &mut last);
+        let again = clock.place(at(395 * SECOND), &mut last, None);
         assert_eq!(again.0 + 5_000_000_000, joined.0);
         // A near restart takes it too, a later jump is a break again.
         (clock.back, clock.stretch) = (true, clock.stretch + 1);
-        let near = clock.place(at(390 * SECOND), &mut last);
+        let near = clock.place(at(390 * SECOND), &mut last, None);
         assert_eq!(near.0 + 5_000_000_000, again.0);
-        let jumped = clock.place(at(600 * SECOND), &mut last);
+        let jumped = clock.place(at(600 * SECOND), &mut last, None);
         assert_eq!(jumped.0, 208_000_000_000, "on from the last stamp out");
     }
+
+    /// A clock that starts 10 h on and restarts at byte 10 000. A seek back into either base
+    /// after the read went past the restart stamps as the read did.
+    #[test]
+    fn a_seek_takes_the_base_of_its_landing() {
+        let origin = (36_000 * SECOND) as i64;
+        let mut clock = Clock {
+            unwrap: Unwrapper::for_timestamps(),
+            scr: Unwrapper::for_timestamps(),
+            shift: ticks_ns(origin),
+            spans: Spans::default(),
+            anchor: None,
+            origin: Some(origin),
+            sought: false,
+            back: false,
+            last_ns: 0,
+            stretch: 1,
+            broke: false,
+        };
+        clock.unwrap.prime(origin);
+        clock.spans.note(Span { byte: 0, ticks: origin, shift_ns: ticks_ns(origin) });
+        let mut last = (0, 0);
+        let at = |pts: u64| Stamp { pts, dts: None };
+        // 20 s from 10 h, then 20 s from 1 s.
+        let read: Vec<(u64, u64, u64)> = (0..20u64)
+            .map(|n| (n * 500, 36_000 * SECOND + n * SECOND))
+            .chain((0..20u64).map(|n| (10_000 + n * 500, SECOND + n * SECOND)))
+            .map(|(byte, pts)| (byte, pts, clock.place(at(pts), &mut last, Some(byte)).1))
+            .collect();
+        assert_eq!((read[19].2, read[20].2, read[39].2), (19 * S, 19 * S, 38 * S));
+        for &(byte, pts, stamp) in [read[5], read[25], read[39], read[0]].iter() {
+            (clock.sought, clock.stretch) = (true, clock.stretch + 1);
+            assert_eq!(clock.place(at(pts), &mut last, Some(byte)).1, stamp, "at byte {byte}");
+        }
+    }
+
+    const S: u64 = 1_000_000_000;
 }

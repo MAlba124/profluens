@@ -110,6 +110,64 @@ fn dvd_lpcm_leaves_as_ffmpeg_decodes_it() {
     }
 }
 
+/// The stream time of `frames` 48 kHz sample frames.
+fn frames_ns(frames: u64) -> u64 {
+    (u128::from(frames) * 1_000_000_000 / 48_000) as u64
+}
+
+/// FFmpeg stamps each LPCM packet with the first of its encoder's frames that starts in it, up to
+/// about a packet past the packet's first sample, and points its first access unit at that
+/// sample. The units go out stamped by the sample count, each packet's stamp within the widest
+/// packet ahead of it.
+#[test]
+fn dvd_lpcm_is_stamped_by_its_sample_count() {
+    for (name, frame) in [("lpcm16.vob", 4), ("lpcm24.vob", 6)] {
+        let rec = &run(&fixture(name), 1000)[0].2;
+        let rows = packets(name);
+        assert_eq!(rec.units.len(), rows.len(), "{name}");
+        let base = origin(name);
+        let (mut frames, mut widest, mut jitter) = (0u64, 0u64, 0u64);
+        for (n, (u, row)) in rec.units.iter().zip(&rows).enumerate() {
+            let at = frames_ns(frames);
+            assert_eq!(u.0, Some(at), "{name} unit {n}");
+            let held = (u.1 / frame) as u64;
+            widest = widest.max(held);
+            let pts = ns(row.pts.expect("stamped"), base);
+            let fits = pts + 20_000 >= at && pts <= at + frames_ns(widest);
+            assert!(fits, "{name} unit {n}: {pts} at {at}");
+            jitter = jitter.max(pts.abs_diff(at));
+            frames += held;
+        }
+        assert!(jitter > 500_000, "{name}: the stamps jitter, {jitter} ns");
+    }
+}
+
+/// An LPCM packet of `frames` 48 kHz stereo `s16` frames stamped `pts`.
+fn lpcm_pes(pts: u64, frames: usize) -> Vec<u8> {
+    let mut payload = vec![0xA0, 1, 0, 4, 0, 0x01, 0x80];
+    payload.extend((0..frames * 4).map(|i| i as u8));
+    pes(PRIVATE_1, Some(pts), &payload)
+}
+
+/// A stamp within the widest packet ahead of the count keeps it, a short last packet's too, a gap
+/// past it starts the count over at the stamp.
+#[test]
+fn an_lpcm_gap_past_the_packet_starts_the_count_over() {
+    // 500 frames are 937.5 ticks. The second stamp is 900 ahead of the count, the third on it,
+    // the fourth 887 ahead with 200 frames, then a gap of a second.
+    let rows = [(90_000, 500), (91_838, 500), (91_875, 500), (93_700, 200)];
+    let rows = rows.into_iter().chain([(180_000, 500), (180_938, 500)]);
+    let mut data = Vec::new();
+    for (pts, frames) in rows {
+        data.extend(pack(pts - 9000));
+        data.extend(lpcm_pes(pts, frames));
+    }
+    let rec = &run(&data, 4096)[0].2;
+    let gap = ns(180_000, 90_000);
+    let counted = [0, 500, 1000, 1500].map(frames_ns);
+    assert_eq!(stamps(rec), [&counted[..], &[gap, gap + frames_ns(500)]].concat());
+}
+
 fn stamps(rec: &pipe::Recorded) -> Vec<u64> {
     rec.units.iter().filter_map(|u| u.0).collect()
 }

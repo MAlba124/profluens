@@ -128,17 +128,24 @@ typedef struct pf_lav_dec pf_lav_dec;
 /* The most frame threads a decoder takes, more are cut to it. */
 #define PF_LAV_MAX_THREADS 16
 
+/* The deepest starting reorder delay pf_lav_open takes, more is cut to it. */
+#define PF_LAV_MAX_REORDER 16
+
 /* Open a decoder. `slots` may be NULL. `parse` adds a parser that frames a byte stream
  * (pf_lav_parse). Vorbis takes its three headers as extradata, Xiph laced or each behind
  * a 16-bit big-endian length. `threads` 1 is single threaded. More runs frame threads on
  * a video codec that has them, its pictures then in libavcodec's memory, never in
- * `slots`, and pf_lav_delay grows by threads - 1. Other codecs stay single threaded. */
+ * `slots`, and pf_lav_delay grows by threads - 1. Other codecs stay single threaded.
+ * `reorder` is the pictures a video decoder holds back for reordering from the start, the
+ * stream's num_reorder_frames, negative for the codec's own guess. H.264 grows it, never
+ * shrinks it, where the stream reorders deeper. */
 int pf_lav_open(pf_lav_dec **out, int codec, const uint8_t *extradata, size_t extradata_len,
-                const pf_lav_slots *slots, int parse, int threads);
+                const pf_lav_slots *slots, int parse, int threads, int reorder);
 void pf_lav_close(pf_lav_dec *d);
 
 /* One packet, copied into padded memory. pts, dts and duration are carried to the
- * frame as given, INT64_MIN for none. */
+ * frame as given, INT64_MIN for none. A frame's duration is INT64_MIN when unknown,
+ * never 0. */
 int pf_lav_send(pf_lav_dec *d, const uint8_t *data, size_t len, int64_t pts, int64_t dts,
                 int64_t duration);
 /* End of stream. Receive until PF_LAV_EOF, then pf_lav_flush to decode again. */

@@ -162,7 +162,7 @@ static int get_buffer2(AVCodecContext *avctx, AVFrame *frame, int flags)
 }
 
 int pf_lav_open(pf_lav_dec **out, int codec, const uint8_t *extradata, size_t extradata_len,
-                const pf_lav_slots *slots, int parse, int threads)
+                const pf_lav_slots *slots, int parse, int threads, int reorder)
 {
     *out = NULL;
     pthread_once(&log_once, quiet);
@@ -215,8 +215,19 @@ int pf_lav_open(pf_lav_dec **out, int codec, const uint8_t *extradata, size_t ex
      * place what follows, so the frame comes out whole with the count beside it. */
     if (id == AV_CODEC_ID_VORBIS)
         ctx->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
+    /* The starting reorder delay, as the ffmpeg tool hands over its probe's (codec_par.c
+     * video_delay). H.264 without VUI bitstream_restriction otherwise starts at 0 and grows on
+     * the first B picture, dropping the pictures already out of order behind the first key
+     * (h264_slice.c h264_select_output_frame, "no picture ooo"). Frame threads copy it at open. */
+    if (c->type == AVMEDIA_TYPE_VIDEO && reorder >= 0)
+        ctx->has_b_frames = reorder > PF_LAV_MAX_REORDER ? PF_LAV_MAX_REORDER : reorder;
     if (c->type == AVMEDIA_TYPE_VIDEO && d->slots.acquire)
         ctx->get_buffer2 = get_buffer2;
+    /* Crops left by the exact amount, else av_frame_apply_cropping rounds crop_left down to
+     * keep the planes aligned, to 0 for a small crop, and junk columns show. The planes are
+     * read through their pointers, not assumed aligned. */
+    if (c->type == AVMEDIA_TYPE_VIDEO)
+        ctx->flags |= AV_CODEC_FLAG_UNALIGNED;
     if (extradata && extradata_len) {
         ctx->extradata = av_mallocz(extradata_len + AV_INPUT_BUFFER_PADDING_SIZE);
         if (!ctx->extradata)
@@ -277,6 +288,7 @@ int pf_lav_send(pf_lav_dec *d, const uint8_t *data, size_t len, int64_t pts, int
     pkt->size = (int)len;
     pkt->pts = pts;
     pkt->dts = dts;
+    /* libavcodec takes 0 for unknown, pf_lav_receive gives it back as INT64_MIN. */
     pkt->duration = duration < 0 ? 0 : duration;
     int ret = avcodec_send_packet(d->ctx, pkt);
     av_packet_unref(pkt);
@@ -402,7 +414,8 @@ int pf_lav_receive(pf_lav_dec *d, pf_lav_frame *f)
         f->linesize[i] = src->linesize[i];
     }
     f->pts = src->pts;
-    f->duration = src->duration;
+    /* libavcodec's 0 is unknown, the host's INT64_MIN. */
+    f->duration = src->duration > 0 ? src->duration : INT64_MIN;
     if (src->flags & AV_FRAME_FLAG_CORRUPT)
         f->flags |= PF_LAV_FRAME_CORRUPT;
     if (src->flags & AV_FRAME_FLAG_KEY)

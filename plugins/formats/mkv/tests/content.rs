@@ -571,3 +571,47 @@ fn a_push_of_zlib_frames_holds_their_coded_size_not_what_they_inflate_to() {
     }
     assert_eq!((frames, r.take_undecoded()), (32, None));
 }
+
+/// Blocks of 256 empty Xiph laced frames behind a header stripping track of `prefix`.
+fn strip_laced(prefix: &[u8]) -> Vec<u8> {
+    let mut seg = Vec::new();
+    master(&mut seg, id::TRACKS, |b| track(b, 1, 1, "V_VP9", |t| compression(t, 1, 3, prefix)));
+    ebml::write_id(&mut seg, id::CLUSTER);
+    ebml::write_unknown_size(&mut seg);
+    ebml::write_uint(&mut seg, id::TIMESTAMP, 0);
+    // 256 frames, the 255 sized ones empty and the last one too
+    let mut lace = vec![0xFF];
+    lace.extend([0; 255]);
+    for k in 0..16 {
+        element(&mut seg, id::SIMPLE_BLOCK, &block(1, k, 0x82, &lace, &[]));
+    }
+    let mut file = Vec::new();
+    master(&mut file, id::EBML, |b| ebml::write_string(b, id::DOC_TYPE, "matroska"));
+    ebml::write_id(&mut file, id::SEGMENT);
+    ebml::write_unknown_size(&mut file);
+    file.extend_from_slice(&seg);
+    file
+}
+
+fn frames_out(file: &[u8]) -> (MatroskaReader, usize, usize) {
+    let mut r = MatroskaReader::new();
+    r.push(file).expect("the file reads");
+    let (mut n, mut octets) = (0, 0);
+    while let Some(f) = r.next_frame() {
+        (n, octets) = (n + 1, octets + f.data.len());
+        r.recycle(f.data);
+    }
+    (r, n, octets)
+}
+
+#[test]
+fn a_strip_prefix_past_the_cap_refuses_the_track_and_lets_no_lace_multiply_it() {
+    let cap = pf_mkv::encoding::MAX_STRIP;
+    let (r, n, octets) = frames_out(&strip_laced(&vec![0x0B; cap]));
+    assert!(r.tracks()[0].coding.transforms());
+    assert_eq!((n, octets), (16 * 256, 16 * 256 * cap), "a prefix up to the cap is undone");
+    let bomb = strip_laced(&vec![0; 1 << 20]);
+    let (r, n, octets) = frames_out(&bomb);
+    assert_eq!(r.tracks()[0].coding.refused, Some(Refusal::Strip(1 << 20)));
+    assert_eq!((n, octets), (16 * 256, 0), "the frames pass as stored, not 4 GiB");
+}

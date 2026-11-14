@@ -16,6 +16,10 @@ pub const MAX_PRIVATE: usize = 1 << 20;
 /// times over.
 pub const MAX_PRIVATE_TOTAL: usize = 16 << 20;
 
+/// Longest header stripping prefix taken. Real ones are a few octets of a codec's sync word, a
+/// longer one is put before every frame, so a laced block of empty frames multiplies it.
+pub const MAX_STRIP: usize = 4 << 10;
+
 const MAX_STEPS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,13 +32,15 @@ pub enum Step {
 pub enum Refusal {
     Encrypted,
     Algo(u64),
+    /// A header stripping prefix of this many octets, past [`MAX_STRIP`].
+    Strip(usize),
 }
 
 impl Refusal {
     pub fn family(self) -> &'static str {
         match self {
             Refusal::Encrypted => "encrypted",
-            Refusal::Algo(_) => "compressed",
+            Refusal::Algo(_) | Refusal::Strip(_) => "compressed",
         }
     }
 }
@@ -46,6 +52,9 @@ impl std::fmt::Display for Refusal {
             Refusal::Algo(1) => f.write_str("compressed with bzlib (ContentCompAlgo 1)"),
             Refusal::Algo(2) => f.write_str("compressed with lzo1x (ContentCompAlgo 2)"),
             Refusal::Algo(n) => write!(f, "compressed with unknown ContentCompAlgo {n}"),
+            Refusal::Strip(n) => {
+                write!(f, "header stripping of {n} octets, past the {MAX_STRIP} the reader takes")
+            }
         }
     }
 }
@@ -126,6 +135,7 @@ fn entry(data: &[u8]) -> Result<Entry, ReadError> {
     })?;
     let step = match (kind, algo) {
         (0, 0) => Ok(Step::Zlib),
+        (0, 3) if settings.len() > MAX_STRIP => Err(Refusal::Strip(settings.len())),
         (0, 3) => Ok(Step::Strip(settings)),
         (0, n) => Err(Refusal::Algo(n)),
         _ => Err(Refusal::Encrypted),
@@ -267,6 +277,16 @@ mod tests {
         assert_eq!(coding.refused, Some(Refusal::Algo(2)));
         assert_eq!(Refusal::Algo(2).to_string(), "compressed with lzo1x (ContentCompAlgo 2)");
         assert_eq!(Refusal::Encrypted.family(), "encrypted");
+    }
+
+    #[test]
+    fn a_strip_prefix_past_the_cap_refuses_the_track() {
+        let (coding, _) = parse(&encoding(0, 1, 0, 3, &[7; MAX_STRIP])).unwrap();
+        assert_eq!(coding.frames, [Step::Strip(vec![7; MAX_STRIP])]);
+        let (coding, private) = parse(&encoding(0, 3, 0, 3, &[7; MAX_STRIP + 1])).unwrap();
+        assert_eq!(coding.refused, Some(Refusal::Strip(MAX_STRIP + 1)));
+        assert!(!coding.transforms() && coding.frames.is_empty() && private.is_empty());
+        assert_eq!(Refusal::Strip(5000).family(), "compressed");
     }
 
     #[test]

@@ -12,7 +12,7 @@ use pf_libav::{
 use profluens_core::buffer::{Buffer, BufferFlags};
 use profluens_core::bus::BusMessage;
 use profluens_core::element::Element;
-use profluens_core::format::Value;
+use profluens_core::format::{Value, ValueDesc};
 use profluens_core::time::Timestamp;
 
 const FRAME_NS: u64 = 40_000_000;
@@ -643,8 +643,11 @@ fn vp9_profile1_444_comes_out_as_i420() {
 #[test]
 fn the_in_tree_fixtures_match_ffmpeg() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
-    let cases: [(&str, bool, &str); 5] = [
+    // ipb_novui.h264 is ipb.h264 with its SPS cut before the VUI, so no bitstream_restriction
+    // states the reorder depth and the B pictures behind the first key come out of order.
+    let cases: [(&str, bool, &str); 6] = [
         ("plugins/libav/tests/fixtures/ipb.h264", false, "yuv420p"),
+        ("plugins/libav/tests/fixtures/ipb_novui.h264", false, "yuv420p"),
         ("plugins/libav/tests/fixtures/ipb.hevc", true, "yuv420p"),
         ("plugins/libav/tests/fixtures/opengop.hevc", true, "yuv420p"),
         ("plugins/libav/tests/fixtures/tiny_i.hevc", true, "yuv420p"),
@@ -674,6 +677,174 @@ fn the_in_tree_fixtures_match_ffmpeg() {
         let frames = oracle.len() / frame;
         check(name, &mut h, &out, &oracle, frame, frames);
     }
+}
+
+/// An H.264 mastering display colour volume SEI (D.1.29), BT.2020 primaries in G, B, R order
+/// and D65, emulation prevented.
+fn mastering_sei(max: u32, min: u32) -> Vec<u8> {
+    let mut rbsp = vec![137u8, 24];
+    for v in [8500u16, 39850, 6550, 2300, 35400, 14600, 15635, 16450] {
+        rbsp.extend(v.to_be_bytes());
+    }
+    rbsp.extend(max.to_be_bytes());
+    rbsp.extend(min.to_be_bytes());
+    rbsp.push(0x80);
+    let mut nal = vec![0x06];
+    let mut zeros = 0;
+    for b in rbsp {
+        if zeros == 2 && b <= 3 {
+            nal.push(3);
+            zeros = 0;
+        }
+        nal.push(b);
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+    }
+    nal
+}
+
+/// Real releases state a 0 cd/m2 mastering minimum. FFmpeg's strict compliance drops such
+/// luminance (h2645_sei.c), the decoder must not run strict.
+#[test]
+fn h264_mastering_luminance_with_a_zero_minimum_survives() {
+    let mut units = support::annexb_units(&fixture("ipb.h264"), false);
+    let mut sei = mastering_sei(10_000_000, 0);
+    sei.extend_from_slice(&[0, 0, 0, 1]);
+    // Every picture states it, one without would announce again without it.
+    for unit in &mut units {
+        let nals = profluens_video::h264parse::split_nals(unit);
+        let slice = nals.iter().find(|n| matches!(n.unit_type, 1 | 5)).expect("a slice");
+        let at = slice.start as usize;
+        unit.splice(at..at, sei.iter().copied());
+    }
+    let mut h = Harness::with_slot_size(LibavH264Dec::new(), SLOT);
+    let out = decode_all(&mut h, &units);
+    assert_eq!(out.len(), units.len(), "every picture");
+    assert_eq!(warnings(&mut h), 0);
+    let lum = announced_int(&h, "mastering-luminance");
+    assert_eq!(lum, Some(10_000_000 << 32), "1000 and 0 cd/m2");
+    let rg = [35400u64, 14600, 8500, 39850].iter().fold(0, |a, w| a << 16 | w) as i64;
+    assert_eq!(announced_int(&h, "mastering-rg"), Some(rg), "red and green primaries");
+}
+
+fn fixture(name: &str) -> Vec<u8> {
+    let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read(path).expect("fixture")
+}
+
+/// A 16x16 fixture's pictures on a link taking `takes`, every one, and what was announced.
+fn decode_taking(
+    element: impl Element + 'static,
+    units: &[Vec<u8>],
+    takes: &[&'static str],
+) -> (Vec<Out>, Option<String>) {
+    let mut h = Harness::with_slot_size(element, SLOT);
+    if !takes.is_empty() {
+        let values: Vec<ValueDesc> = takes.iter().map(|t| ValueDesc::Id(t)).collect();
+        h.fix_src_takes(LibavH265Dec::OUT, "pixfmt", &values);
+    }
+    let out = decode_all(&mut h, units);
+    assert_eq!(warnings(&mut h), 0, "no warning on a clean stream");
+    (out, announced_id(&h, "pixfmt"))
+}
+
+/// A link that takes no p010 or gray8 gets the i420 it takes, narrowed or with neutral chroma,
+/// and one taking i422 gets 4:2:2 as decoded. `main10_i.hevc`, `gray_ip.hevc` (x265 4.2, gray)
+/// and `i422_ip.h264` (x264 core 165, high422) are committed 16x16 fixtures.
+#[test]
+fn what_the_link_does_not_take_goes_out_as_the_i420_it_does() {
+    let units = support::annexb_units(&fixture("main10_i.hevc"), true);
+    let (deep, pixfmt) = decode_taking(LibavH265Dec::new(), &units, &[]);
+    assert_eq!(pixfmt.as_deref(), Some("p010"));
+    let (out, pixfmt) = decode_taking(LibavH265Dec::new(), &units, &["i420"]);
+    assert_eq!(pixfmt.as_deref(), Some("i420"));
+    assert_eq!(out.len(), deep.len(), "every picture");
+    assert!(!out.is_empty());
+    let luma = 16 * 16;
+    for (n, (o, d)) in out.iter().zip(&deep).enumerate() {
+        assert_eq!(o.bytes.len(), i420(16, 16), "picture {n}: tight i420");
+        let want: Vec<u8> = d.bytes[..2 * luma]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|w| ((u32::from(u16::from_le_bytes(*w) >> 6) + 2) >> 2).min(255) as u8)
+            .collect();
+        assert_eq!(o.bytes[..luma], want[..], "picture {n}: luma rounded to 8 bits");
+    }
+
+    let units = support::annexb_units(&fixture("gray_ip.hevc"), true);
+    let (gray, pixfmt) = decode_taking(LibavH265Dec::new(), &units, &[]);
+    assert_eq!(pixfmt.as_deref(), Some("gray8"));
+    let (out, pixfmt) = decode_taking(LibavH265Dec::new(), &units, &["i420"]);
+    assert_eq!(pixfmt.as_deref(), Some("i420"));
+    assert_eq!(out.len(), 2, "every picture");
+    for (n, (o, g)) in out.iter().zip(&gray).enumerate() {
+        assert_eq!(o.bytes.len(), i420(16, 16), "picture {n}: tight i420");
+        assert_eq!(o.bytes[..luma], g.bytes[..], "picture {n}: luma as decoded");
+        assert!(o.bytes[luma..].iter().all(|c| *c == 128), "picture {n}: neutral chroma");
+    }
+
+    let units = support::annexb_units(&fixture("i422_ip.h264"), false);
+    let (reduced, pixfmt) = decode_taking(LibavH264Dec::new(), &units, &[]);
+    assert_eq!(pixfmt.as_deref(), Some("i420"));
+    let (out, pixfmt) = decode_taking(LibavH264Dec::new(), &units, &["i420", "i422"]);
+    assert_eq!(pixfmt.as_deref(), Some("i422"));
+    assert_eq!(out.len(), 2, "every picture");
+    for (n, (o, r)) in out.iter().zip(&reduced).enumerate() {
+        assert_eq!(o.bytes.len(), luma + 2 * 8 * 16, "picture {n}: tight i422");
+        assert_eq!(o.bytes[..luma], r.bytes[..luma], "picture {n}: the same luma");
+    }
+}
+
+/// `ipb_left8.hevc` is `ipb.hevc` with an 8 pixel left conformance window (ffmpeg 9.0.2,
+/// `hevc_metadata=crop_left=8`). Its pictures are the right 8 columns of the uncropped ones.
+#[test]
+fn a_left_conformance_window_crops_exactly() {
+    let units = support::annexb_units(&fixture("ipb.hevc"), true);
+    let mut h = Harness::with_slot_size(LibavH265Dec::new(), SLOT);
+    let whole = decode_all(&mut h, &units);
+    assert_eq!(announced_int(&h, "width"), Some(16));
+    let units = support::annexb_units(&fixture("ipb_left8.hevc"), true);
+    let mut h = Harness::with_slot_size(LibavH265Dec::new(), SLOT);
+    let cropped = decode_all(&mut h, &units);
+    assert_eq!(announced_int(&h, "width"), Some(8), "8 columns cropped off the left");
+    assert_eq!(announced_int(&h, "height"), Some(16));
+    assert_eq!(warnings(&mut h), 0);
+    assert_eq!(cropped.len(), whole.len(), "every picture");
+    assert!(!whole.is_empty());
+    for (n, (c, w)) in cropped.iter().zip(&whole).enumerate() {
+        assert_eq!(c.pts, w.pts, "picture {n} stamp");
+        assert_eq!(c.bytes.len(), i420(8, 16), "picture {n}: tight i420");
+        let mut want = Vec::new();
+        (0..16).for_each(|r| want.extend_from_slice(&w.bytes[r * 16 + 8..r * 16 + 16]));
+        for base in [256, 256 + 64] {
+            (0..8)
+                .for_each(|r| want.extend_from_slice(&w.bytes[base + r * 8 + 4..base + r * 8 + 8]));
+        }
+        assert!(c.bytes == want, "picture {n}: the right columns of the uncropped picture");
+    }
+}
+
+/// A unit stamped without a duration gives a picture without one, not a zero length one.
+#[test]
+fn a_unit_without_a_duration_makes_a_picture_without_one() {
+    let units = support::annexb_units(&fixture("ipb.hevc"), true);
+    let run = |duration: Timestamp| {
+        let mut h = Harness::with_slot_size(LibavH265Dec::new(), SLOT);
+        let mut out = Vec::new();
+        for (i, u) in units.iter().enumerate() {
+            let mut buf = h.alloc(u);
+            buf.pts = at(i);
+            buf.duration = duration;
+            h.push(buf).expect("push");
+            out.extend(h.drain_outputs());
+        }
+        out.extend(h.eos().expect("eos"));
+        assert_eq!(out.len(), units.len(), "every picture");
+        out.iter().map(|b| b.duration).collect::<Vec<_>>()
+    };
+    assert!(run(Timestamp::NONE).iter().all(|d| d.is_none()), "unknown stays unknown");
+    let known = Timestamp::from_nanos(FRAME_NS);
+    assert!(run(known).iter().all(|d| *d == known), "a known duration rides along");
 }
 
 #[test]

@@ -254,7 +254,7 @@ fn mp2_decodes_in_the_mp3_element_as_ffmpeg_mp2float() {
     let (src, out) = (support::tmp("tone.mp2"), support::tmp("tone.mp2.s16"));
     let (src, out) = (src.to_str().expect("utf-8"), out.to_str().expect("utf-8"));
     if !support::ffmpeg(&["-c:a", "mp2float", "-i", src, "-f", "s16le", "-c:a", "pcm_s16le", out]) {
-        return;
+        return support::skip("ffmpeg could not decode tone.mp2");
     }
     let want = std::fs::read(out).expect("the oracle");
     let mut h = Harness::with_slot_size(LibavAudioDec::mp3(), SLOT);
@@ -308,7 +308,7 @@ fn mp1_decodes_in_the_mp3_element_as_ffmpeg_mp1float() {
     let (src, out) = (src.to_str().expect("utf-8"), out.to_str().expect("utf-8"));
     let args = ["-f", "mp3", "-c:a", "mp1float", "-i", src, "-f", "s16le", "-c:a", "pcm_s16le"];
     if !support::ffmpeg(&[args.as_slice(), &[out]].concat()) {
-        return;
+        return support::skip("ffmpeg could not decode tone.mp1");
     }
     let want = std::fs::read(out).expect("the oracle");
     let mut h = Harness::with_slot_size(LibavAudioDec::mp3(), SLOT);
@@ -638,4 +638,46 @@ fn a_rate_change_keeps_the_stamps_running() {
     assert!(stamps.windows(2).all(|w| w[0] <= w[1]), "a stamp stepped back: {stamps:?}");
     let last = stamps.last().expect("stamps").nanos().expect("a stamp");
     assert!(last > 1_800_000_000, "{last} ns, two seconds of sound end near 2 s");
+}
+
+/// One syncframe a stamped unit as a transport stream carries them, frame `lost` missing, the
+/// PCM laid out by its stamps on one timeline.
+fn ac3_by_stamps(lost: Option<usize>) -> (Vec<u8>, Timestamp) {
+    let bytes = include_bytes!("fixtures/st96k_20.ac3");
+    let mut h = Harness::with_slot_size(LibavAudioDec::ac3(), SLOT);
+    let mut out = Vec::new();
+    for k in (0..20).filter(|k| Some(*k) != lost) {
+        let mut b = h.alloc(&bytes[k * 384..(k + 1) * 384]);
+        b.pts = Timestamp::from_nanos(k as u64 * 32_000_000);
+        h.push(b).expect("push");
+        out.extend(h.drain_outputs());
+    }
+    out.extend(h.eos().expect("eos"));
+    let stride = 2 * if announced_sample(&h) == "f32" { 4 } else { 2 };
+    let mut line = vec![0u8; 20 * 1536 * stride];
+    let mut end = Timestamp::ZERO;
+    for b in &out {
+        let at = (u128::from(b.pts.0) * 48_000).div_ceil(1_000_000_000) as usize * stride;
+        line[at..at + b.memory.len()].copy_from_slice(b.memory.data());
+        end = b.pts.saturating_add(b.duration);
+    }
+    (line, end)
+}
+
+#[test]
+fn a_frame_lost_in_transport_leaves_the_audio_after_it_at_its_stamps() {
+    let (whole, whole_end) = ac3_by_stamps(None);
+    let (lossy, end) = ac3_by_stamps(Some(10));
+    assert_eq!((whole_end, end), (Timestamp::from_millis(640), Timestamp::from_millis(640)));
+    let stride = whole.len() / (20 * 1536);
+    assert_eq!(stride, 4, "s16 stereo");
+    // Frame 11 overlaps the lost frame's last block, from frame 12 on the audio is the same but
+    // for the decoder's dither, a step at most. A frame early it differs by thousands.
+    let from = 12 * 1536 * stride;
+    let s16 =
+        |b: &[u8]| b.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)).collect::<Vec<_>>();
+    let (got, want) = (s16(&lossy[from..]), s16(&whole[from..]));
+    let worst = got.iter().zip(&want).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).max();
+    assert!(worst.is_some_and(|d| d <= 2), "the audio after the lost frame moved, {worst:?} apart");
+    assert!(lossy[10 * 1536 * stride..11 * 1536 * stride].iter().all(|b| *b == 0), "silence");
 }

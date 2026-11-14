@@ -33,6 +33,9 @@
             pkgs.nasm
             pkgs.meson
             pkgs.ninja
+            # pf-libav's test streams and oracles, with libx264, libx265, libvpx, libtheora,
+            # libspeex and libmp3lame (plugins/libav/tests/support).
+            pkgs.ffmpeg-headless
           ];
 
           buildInputs = [ pkgs.libva ];

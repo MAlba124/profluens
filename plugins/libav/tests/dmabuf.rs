@@ -244,3 +244,16 @@ fn h264_422_in_dmabuf_mode_is_reduced_then_interleaved_at_four_threads() {
     let Some(got) = dmabuf(h264, 4, &units) else { return };
     check("h264 4:2:2 at 4", (320, 240), &want, &got);
 }
+
+/// Dmabuf mode's descriptor is one constant per codec, not a leaked allocation per decoder built.
+#[test]
+fn dmabuf_mode_shares_one_descriptor_per_codec() {
+    let ch = GpuFrameChannel::new();
+    let a = LibavH264Dec::new().with_dmabuf(Arc::clone(&ch), &formats());
+    let b = LibavH264Dec::new().with_dmabuf(Arc::clone(&ch), &formats());
+    assert!(std::ptr::eq(a.desc(), b.desc()), "the same descriptor");
+    let raw = LibavH264Dec::new();
+    assert!(!std::ptr::eq(a.desc(), raw.desc()), "the src pad probed");
+    assert_eq!(a.desc().name, raw.desc().name);
+    assert_eq!(a.desc().srcs[0].name, "src");
+}

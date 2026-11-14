@@ -147,6 +147,9 @@ const WARNINGS: u32 = 3;
 /// Output buffers hold at least 1/50 s so tiny TrueHD and DTS frames do not cost a buffer each.
 const MIN_OUT_PER_SEC: u32 = 50;
 
+/// Input stamps waiting for the frame that starts at their byte, past it the oldest goes.
+const STAMPS: usize = 16;
+
 /// Empty comment header laced between the other two (Vorbis I 5.2.1). libavcodec skips it.
 const VORBIS_COMMENT: [u8; 16] = *b"\x03vorbis\0\0\0\0\0\0\0\0\x01";
 
@@ -247,6 +250,12 @@ pub struct LibavAudioDec {
     frame_len: usize,
     at: Place,
     rebase: Rebase,
+    /// Parsed input, the byte offset and stamp of each input buffer, oldest first.
+    stamps: std::collections::VecDeque<(u64, Timestamp)>,
+    /// Byte offset past the last parsed frame, where the next one starts.
+    frame_end: u64,
+    /// Times the count moved to an input stamp.
+    resyncs: u64,
     /// Backpressure carry. Nothing is decoded while it holds anything.
     pending: Vec<u8>,
     pending_pos: usize,
@@ -296,6 +305,9 @@ impl LibavAudioDec {
             frame_len: 0,
             at: Place::default(),
             rebase: Rebase::Open,
+            stamps: std::collections::VecDeque::with_capacity(STAMPS),
+            frame_end: 0,
+            resyncs: 0,
             pending: Vec::new(),
             pending_pos: 0,
             errors: 0,
@@ -409,6 +421,8 @@ impl LibavAudioDec {
         self.frame_len = 0;
         self.at = Place::default();
         self.rebase = Rebase::Open;
+        self.stamps.clear();
+        (self.frame_end, self.resyncs) = (0, 0);
         self.pending.clear();
         self.pending_pos = 0;
         self.errors = 0;
@@ -448,7 +462,7 @@ impl LibavAudioDec {
         if self.open_failed {
             return false;
         }
-        match Decoder::open(self.codec, &[], None, true, 1) {
+        match Decoder::open(self.codec, &[], None, true, 1, None) {
             Ok(d) => {
                 log!(&*ctx, Level::Info, "parser_open", codec = self.codec.name());
                 self.decoder = Some(d);
@@ -472,7 +486,7 @@ impl LibavAudioDec {
             }
             return Ok(());
         }
-        match Decoder::open(lav::Codec::Aac, data, None, false, 1) {
+        match Decoder::open(lav::Codec::Aac, data, None, false, 1, None) {
             Ok(d) => {
                 log!(&*ctx, Level::Info, "decoder_open", codec = "aac", config = data.len());
                 self.decoder = Some(d);
@@ -491,7 +505,7 @@ impl LibavAudioDec {
     fn open_alac(&mut self, ctx: &mut Ctx, data: &[u8]) -> Result<(), Error> {
         let fail = |e| Err(Error::element_failed(ctx.element(), LavAudioError::Open(e)));
         let Some(atom) = alac_atom(data) else { return fail(LavError::Argument) };
-        match Decoder::open(lav::Codec::Alac, &atom, None, false, 1) {
+        match Decoder::open(lav::Codec::Alac, &atom, None, false, 1, None) {
             Ok(d) => {
                 log!(&*ctx, Level::Info, "decoder_open", codec = "alac", config = data.len());
                 self.decoder = Some(d);
@@ -548,7 +562,7 @@ impl LibavAudioDec {
     }
 
     fn open_vorbis(&mut self, ctx: &mut Ctx) {
-        match Decoder::open(lav::Codec::Vorbis, &self.vorbis.laced, None, false, 1) {
+        match Decoder::open(lav::Codec::Vorbis, &self.vorbis.laced, None, false, 1, None) {
             Ok(d) => {
                 log!(
                     &*ctx,
@@ -583,7 +597,7 @@ impl LibavAudioDec {
             if self.framing == Framing::SpeexRaw && ident == self.speex.ident.as_slice() {
                 return false;
             }
-            match Decoder::open(lav::Codec::Speex, ident, None, false, 1) {
+            match Decoder::open(lav::Codec::Speex, ident, None, false, 1, None) {
                 Ok(d) => {
                     log!(&*ctx, Level::Info, "decoder_open", codec = "speex", extra = extra);
                     self.decoder = Some(d);
@@ -696,6 +710,7 @@ impl LibavAudioDec {
                     );
                     Self::warn(ctx, LavAudioError::Parse(e));
                     self.drop_front(self.buf.len());
+                    self.frame_end = self.base;
                     if let Some(clock) = &mut self.clock {
                         clock.lost();
                     }
@@ -705,13 +720,82 @@ impl LibavAudioDec {
             self.drop_front(parsed.used);
             match parsed.sent {
                 Some((sent, _)) => {
+                    let due = self.frame_stamp(self.base);
+                    let cut = self.restamp(ctx, due);
+                    let before = self.pending.len();
                     self.after_send(ctx, sent);
+                    if cut > 0 && !self.reformat {
+                        let end = (before + cut * self.stride()).min(self.pending.len());
+                        self.pending.drain(before..end);
+                    }
                     return true;
                 }
                 None if parsed.used == 0 => return false,
                 None => {}
             }
         }
+    }
+
+    /// The stamp of the frame parsed out up to byte `end`, that of an input buffer which began at
+    /// the frame's first byte. A buffer that began inside a frame stamps the next one in a
+    /// transport stream, so it is not taken.
+    fn frame_stamp(&mut self, end: u64) -> Timestamp {
+        let start = std::mem::replace(&mut self.frame_end, end);
+        let mut due = Timestamp::NONE;
+        while let Some(&(at, pts)) = self.stamps.front()
+            && at < end
+        {
+            self.stamps.pop_front();
+            if at == start {
+                due = pts;
+            }
+        }
+        due
+    }
+
+    /// Moves the count to the frame's stamp `due` when they part by more than half a frame, a
+    /// lost packet in a transport stream. A gap is filled with silence, an overlap returns the
+    /// frames to cut from the frame's start. Past a second the count jumps instead.
+    fn restamp(&mut self, ctx: &mut Ctx, due: Timestamp) -> usize {
+        let counting = self.rebase == Rebase::Counting && self.at.lead == 0;
+        if due.is_none() || !counting || self.reformat || self.held.is_some() {
+            return 0;
+        }
+        if self.rate == 0 || self.channels == 0 || self.frame_len == 0 || self.coded.is_some() {
+            return 0;
+        }
+        let stride = self.stride();
+        let counted = self.at.position + ((self.pending.len() - self.pending_pos) / stride) as u64;
+        let delay = profluens_audio::delay_frames(
+            profluens_audio::declared_delay(ctx, SINK_PAD),
+            self.rate,
+        );
+        let stamped = profluens_audio::position_at(due, self.rate).saturating_sub(delay);
+        let diff = i128::from(stamped) - i128::from(counted);
+        if diff.unsigned_abs() <= (self.frame_len / 2) as u128 {
+            return 0;
+        }
+        self.resyncs += 1;
+        log!(
+            &*ctx,
+            Level::Debug,
+            "resync",
+            counted = counted,
+            stamped = stamped,
+            frames = diff as i64
+        );
+        let frames = diff.unsigned_abs() as usize;
+        if frames > self.rate as usize {
+            self.emit_pending(ctx, false);
+            self.at.position = stamped;
+            return 0;
+        }
+        if diff < 0 {
+            return frames;
+        }
+        let silence = if self.sample == SampleFormat::U8 { 0x80 } else { 0 };
+        self.pending.resize(self.pending.len() + frames * stride, silence);
+        0
     }
 
     fn decode_unit(&mut self, ctx: &mut Ctx, data: &[u8]) {
@@ -1064,6 +1148,12 @@ impl LibavAudioDec {
                 Framing::Parse => {
                     if self.ensure_parser(ctx) {
                         let held = self.buf.len();
+                        if inbuf.pts.is_some() {
+                            if self.stamps.len() == STAMPS {
+                                self.stamps.pop_front();
+                            }
+                            self.stamps.push_back((self.base + held as u64, inbuf.pts));
+                        }
                         self.take_bytes(data);
                         let walked =
                             self.clock.as_mut().filter(|c| !c.seeking()).is_some_and(|clock| {
@@ -1083,7 +1173,7 @@ impl LibavAudioDec {
                     }
                     if changed
                         && data.len() <= HEAD_MAX
-                        && let Ok(d) = Decoder::open(lav::Codec::Aac, data, None, false, 1)
+                        && let Ok(d) = Decoder::open(lav::Codec::Aac, data, None, false, 1, None)
                     {
                         log!(&*ctx, Level::Debug, "aac_reconfig", config = data.len());
                         self.decoder = Some(d);
@@ -1186,6 +1276,8 @@ impl Element for LibavAudioDec {
                 self.primed = false;
                 self.at.lead = 0;
                 self.base = ctx.seek_target().map_or(0, |t| t.to_byte);
+                self.stamps.clear();
+                self.frame_end = self.base;
                 self.coded = None;
                 if let Some(clock) = &mut self.clock {
                     clock.restart();
@@ -1204,6 +1296,9 @@ impl Element for LibavAudioDec {
                     dropped = self.drops,
                     position = self.at.position,
                 );
+                if self.resyncs > 0 {
+                    log!(&*ctx, Level::Warn, "eos_resyncs", count = self.resyncs);
+                }
             }
             Event::FormatChange(_) => {
                 self.rehead =

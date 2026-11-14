@@ -3,9 +3,12 @@
 
 use std::time::Instant;
 
-use pf_libav::lav::{Codec, Decoder, Frame, NONE, Received, Sent, Shape, Supply};
+use pf_libav::lav::{Codec, Decoder, Frame, NONE, Received, Sent, Supply};
 use profluens_core::memory::Pool;
-use profluens_video::decoder::{HeldLayout, pack_gray, pack_p010, pack_planes, pack_reduced};
+use profluens_video::PixelFormats;
+use profluens_video::decoder::{
+    HeldLayout, pack_gray, pack_gray_wide, pack_p010, pack_planes, pack_reduced,
+};
 use profluens_video::geometry::frame_size;
 
 /// Annex B H.264 cut before each access unit's first slice or its leading SEI and parameter sets.
@@ -32,7 +35,7 @@ fn units(bytes: &[u8]) -> Vec<&[u8]> {
 
 /// The copy the element makes of every picture into a pool slot.
 fn pack(f: &Frame, dst: &mut Vec<u8>) {
-    let Shape::Named(pixfmt, layout) = f.shape() else { panic!("unpacked shape") };
+    let (pixfmt, layout) = f.place(PixelFormats::NONE).expect("a packed shape");
     let (w, h) = (f.width(), f.height());
     dst.resize(frame_size(pixfmt, w, h), 0);
     let planes = [f.plane(0), f.plane(1), f.plane(2)];
@@ -43,6 +46,7 @@ fn pack(f: &Frame, dst: &mut Vec<u8>) {
             pack_reduced(dst, w, h, chroma_shift, bits, pixfmt, &planes)
         }
         HeldLayout::Gray => pack_gray(dst, w, h, &planes),
+        HeldLayout::GrayWide { bits } => pack_gray_wide(dst, (w, h), bits, pixfmt, &planes),
     }
     .expect("pack");
 }
@@ -55,7 +59,8 @@ fn main() {
     let units = units(&bytes);
     let pool = Pool::new(64 << 20);
     let supply = Supply::new();
-    let mut dec = Decoder::open(Codec::H264, &[], Some(&supply), false, threads).expect("open");
+    let mut dec =
+        Decoder::open(Codec::H264, &[], Some(&supply), false, threads, None).expect("open");
     let mut direct = |_: usize| Some(pool.acquire());
     let (mut dst, mut frames) = (Vec::new(), 0usize);
     let start = Instant::now();

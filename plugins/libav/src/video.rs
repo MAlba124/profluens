@@ -20,11 +20,18 @@ use profluens_core::time::Timestamp;
 use profluens_video::FAMILY;
 use profluens_video::decoder::{self, Codec, Held, Out, PlaneRef, Scan, Sent, VideoDec};
 use profluens_video::gpuframe::{DmabufFormat, GpuFrameChannel};
+use profluens_video::h264parse;
 
 use crate::lav::{self, Decoder, Frame, LavError, Received, Shape, Supply};
 
-static PIXFMTS: [ValueDesc; 3] =
-    [ValueDesc::Id("i420"), ValueDesc::Id("gray8"), ValueDesc::Id("p010")];
+/// What [`Frame::place`] puts out, as the link takes it.
+static PIXFMTS: [ValueDesc; 5] = [
+    ValueDesc::Id("i420"),
+    ValueDesc::Id("gray8"),
+    ValueDesc::Id("p010"),
+    ValueDesc::Id("i422"),
+    ValueDesc::Id("i422_10"),
+];
 static SRC_FIELDS: [FieldDesc; 13] = decoder::src_fields_stating_color(&PIXFMTS);
 static SRC_OFFERS: [OfferDesc; 1] = [OfferDesc { family: FAMILY, fields: &SRC_FIELDS }];
 static SRCS: [PadDesc; 1] = decoder::src_pad(&SRC_OFFERS);
@@ -73,64 +80,73 @@ pub const DEFAULT_THREADS: u32 = 1;
 // One-time construction.
 #[allow(clippy::disallowed_methods)]
 pub(crate) static H264_DESC: ElementDesc =
-    decoder::desc_with_props("libavh264dec", &H264_SINKS, &SRCS, &PROPS, || {
+    decoder::picking(decoder::desc_with_props("libavh264dec", &H264_SINKS, &SRCS, &PROPS, || {
         Box::new(LibavH264Dec::new())
-    });
+    }));
 #[allow(clippy::disallowed_methods)]
 pub(crate) static H265_DESC: ElementDesc =
-    decoder::desc_with_props("libavh265dec", &H265_SINKS, &SRCS, &PROPS, || {
+    decoder::picking(decoder::desc_with_props("libavh265dec", &H265_SINKS, &SRCS, &PROPS, || {
         Box::new(LibavH265Dec::new())
-    });
+    }));
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VP8_DESC: ElementDesc =
-    decoder::desc_with_props("libavvp8dec", &VP8_SINKS, &SRCS, &PROPS, || {
+    decoder::picking(decoder::desc_with_props("libavvp8dec", &VP8_SINKS, &SRCS, &PROPS, || {
         Box::new(LibavVp8Dec::new())
-    });
+    }));
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VP9_DESC: ElementDesc =
-    decoder::desc_with_props("libavvp9dec", &VP9_SINKS, &SRCS, &PROPS, || {
+    decoder::picking(decoder::desc_with_props("libavvp9dec", &VP9_SINKS, &SRCS, &PROPS, || {
         Box::new(LibavVp9Dec::new())
-    });
+    }));
 #[allow(clippy::disallowed_methods)]
-pub(crate) static MPEG2_DESC: ElementDesc =
-    decoder::desc_with_props("libavmpeg2dec", &MPEG2_SINKS, &SRCS, &PROPS, || {
-        Box::new(LibavMpeg2Dec::new())
-    });
+pub(crate) static MPEG2_DESC: ElementDesc = decoder::picking(decoder::desc_with_props(
+    "libavmpeg2dec",
+    &MPEG2_SINKS,
+    &SRCS,
+    &PROPS,
+    || Box::new(LibavMpeg2Dec::new()),
+));
 #[allow(clippy::disallowed_methods)]
-pub(crate) static MPEG4_DESC: ElementDesc =
-    decoder::desc_with_props("libavmpeg4dec", &MPEG4_SINKS, &SRCS, &PROPS, || {
-        Box::new(LibavMpeg4Dec::new())
-    });
+pub(crate) static MPEG4_DESC: ElementDesc = decoder::picking(decoder::desc_with_props(
+    "libavmpeg4dec",
+    &MPEG4_SINKS,
+    &SRCS,
+    &PROPS,
+    || Box::new(LibavMpeg4Dec::new()),
+));
 #[allow(clippy::disallowed_methods)]
 pub(crate) static FLV1_DESC: ElementDesc =
-    decoder::desc_with_props("libavflv1dec", &FLV1_SINKS, &SRCS, &PROPS, || {
+    decoder::picking(decoder::desc_with_props("libavflv1dec", &FLV1_SINKS, &SRCS, &PROPS, || {
         Box::new(LibavFlv1Dec::new())
-    });
+    }));
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VP6_DESC: ElementDesc =
-    decoder::desc_with_props("libavvp6dec", &VP6_SINKS, &SRCS, &PROPS, || {
+    decoder::picking(decoder::desc_with_props("libavvp6dec", &VP6_SINKS, &SRCS, &PROPS, || {
         Box::new(LibavVp6Dec::new())
-    });
+    }));
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VP6F_DESC: ElementDesc =
-    decoder::desc_with_props("libavvp6fdec", &VP6F_SINKS, &SRCS, &PROPS, || {
+    decoder::picking(decoder::desc_with_props("libavvp6fdec", &VP6F_SINKS, &SRCS, &PROPS, || {
         Box::new(LibavVp6fDec::new())
-    });
+    }));
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VP6A_DESC: ElementDesc =
-    decoder::desc_with_props("libavvp6adec", &VP6A_SINKS, &SRCS, &PROPS, || {
+    decoder::picking(decoder::desc_with_props("libavvp6adec", &VP6A_SINKS, &SRCS, &PROPS, || {
         Box::new(LibavVp6aDec::new())
-    });
+    }));
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VP7_DESC: ElementDesc =
-    decoder::desc_with_props("libavvp7dec", &VP7_SINKS, &SRCS, &PROPS, || {
+    decoder::picking(decoder::desc_with_props("libavvp7dec", &VP7_SINKS, &SRCS, &PROPS, || {
         Box::new(LibavVp7Dec::new())
-    });
+    }));
 #[allow(clippy::disallowed_methods)]
-pub(crate) static THEORA_DESC: ElementDesc =
-    decoder::desc_with_props("libavtheoradec", &THEORA_SINKS, &SRCS, &PROPS, || {
-        Box::new(LibavTheoraDec::new())
-    });
+pub(crate) static THEORA_DESC: ElementDesc = decoder::picking(decoder::desc_with_props(
+    "libavtheoradec",
+    &THEORA_SINKS,
+    &SRCS,
+    &PROPS,
+    || Box::new(LibavTheoraDec::new()),
+));
 
 pub const H264: u8 = 0;
 pub const H265: u8 = 1;
@@ -302,18 +318,32 @@ const fn decode_order(kind: u8) -> bool {
 const STAMPS: usize = 32;
 
 impl<const KIND: u8> LavVideo<KIND> {
-    /// Opens with the held configuration unit as extradata, else with `lead`.
-    fn ensure_open(&mut self, lead: &[u8], out: &mut Out<'_>) -> bool {
-        let LavVideo { decoder, supply, open_failed, late, config, threads, .. } = self;
-        if decoder.is_some() {
+    /// Opens with the held configuration unit as extradata, else with `lead`. H.264 opens at the
+    /// first `unit` with an SPS, whose reorder depth libavcodec starts from.
+    fn ensure_open(&mut self, lead: &[u8], unit: &[u8], out: &mut Out<'_>) -> bool {
+        if self.decoder.is_some() {
             return true;
         }
-        if *open_failed {
+        if self.open_failed {
             return false;
         }
+        let reorder = match KIND {
+            H264 => match h264_head(unit) {
+                Head::Missing => {
+                    if self.count_failed() {
+                        log!(out.ctx(), Level::Debug, "frame_drop", reason = "no_sps");
+                    }
+                    return false;
+                }
+                Head::Unparsed => None,
+                Head::Reorder(n) => Some(n),
+            },
+            _ => None,
+        };
+        let LavVideo { decoder, supply, open_failed, late, config, threads, .. } = self;
         let codec = codec_of(KIND);
         let extradata = if config.is_empty() { lead } else { config.as_slice() };
-        match Decoder::open(codec, extradata, Some(supply), false, *threads) {
+        match Decoder::open(codec, extradata, Some(supply), false, *threads, reorder) {
             Ok(mut d) => {
                 log!(
                     out.ctx(),
@@ -324,6 +354,9 @@ impl<const KIND: u8> LavVideo<KIND> {
                     late = *late,
                     threads = d.threads(),
                 );
+                if let Some(n) = reorder {
+                    log!(out.ctx(), Level::Debug, "reorder_from_sps", frames = n);
+                }
                 d.skip_nonref(*late);
                 *decoder = Some(d);
                 true
@@ -362,7 +395,7 @@ impl<const KIND: u8> LavVideo<KIND> {
         self.open_failed = false;
         self.config.clear();
         self.config.extend_from_slice(unit);
-        self.ensure_open(&[], out);
+        self.ensure_open(&[], &[], out);
     }
 
     fn top_up(&self, out: &mut Out<'_>) -> bool {
@@ -593,6 +626,35 @@ fn config_unit(kind: u8, unit: &[u8]) -> bool {
         && unit.windows(4).any(|w| w[..3] == [0, 0, 1] && w[3] & 0xF0 == 0x20)
 }
 
+/// What an H.264 unit holds for the open, see [`LavVideo::ensure_open`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Head {
+    /// No SPS, libavcodec decodes nothing before one.
+    Missing,
+    /// SPSs our parser refuses, libavcodec guesses the reorder depth.
+    Unparsed,
+    /// The deepest num_reorder_frames of the unit's SPSs (E.2.1). libavcodec otherwise starts
+    /// at 0 without VUI bitstream_restriction and drops the pictures already out of order.
+    Reorder(u32),
+}
+
+fn h264_head(unit: &[u8]) -> Head {
+    let mut head = Head::Missing;
+    h264parse::for_each_nal(unit, |nal| {
+        if nal.unit_type != h264parse::NAL_SPS {
+            return;
+        }
+        let n = h264parse::parse_sps(nal.raw(unit)).map(|s| s.num_reorder_frames());
+        head = match (head, n) {
+            (Head::Reorder(a), Some(b)) => Head::Reorder(a.max(b)),
+            (Head::Reorder(a), None) => Head::Reorder(a),
+            (_, Some(b)) => Head::Reorder(b),
+            (_, None) => Head::Unparsed,
+        };
+    });
+    head
+}
+
 fn from_lav(v: i64) -> Timestamp {
     if v < 0 { Timestamp::NONE } else { Timestamp::from_nanos(v as u64) }
 }
@@ -611,12 +673,14 @@ fn place(
     out: &mut Out<'_>,
 ) -> bool {
     let (width, height) = (frame.width(), frame.height());
-    let (pixfmt, layout) = match frame.shape() {
-        Shape::Named(p, l) => (p, l),
-        Shape::Other { bit_depth, chroma_shift } => {
-            out.fail(LavVideoError::Shape { width, height, bit_depth, chroma_shift });
-            return true;
-        }
+    let Some((pixfmt, layout)) = frame.place(out.takes()) else {
+        let (bit_depth, chroma_shift) = match frame.shape() {
+            Shape::Planar(p) => (p.bits, p.chroma_shift),
+            Shape::Gray => (8, (0, 0)),
+            Shape::Other { bit_depth, chroma_shift } => (bit_depth, chroma_shift),
+        };
+        out.fail(LavVideoError::Shape { width, height, bit_depth, chroma_shift });
+        return true;
     };
     let pts = from_lav(pts);
     let duration = from_lav(frame.duration());
@@ -739,7 +803,7 @@ impl<const KIND: u8> Codec for LavVideo<KIND> {
         if config_unit(KIND, unit) {
             return self.configure(unit, out);
         }
-        if unit.is_empty() || !self.ensure_open(extradata, out) || !self.top_up(out) {
+        if unit.is_empty() || !self.ensure_open(extradata, unit, out) || !self.top_up(out) {
             return;
         }
         let stamp = pts;
@@ -849,6 +913,22 @@ mod tests {
         assert!(!codes_picture(MPEG4, &vol));
         let vop = [0, 0, 1, 0xB0, 0xF5, 0, 0, 1, 0xB6, 0x10];
         assert!(codes_picture(MPEG4, &vop));
+    }
+
+    /// `ipb_novui.h264` is `ipb.h264` with its SPS cut before the VUI.
+    #[test]
+    fn the_open_takes_the_reorder_depth_of_the_units_sps() {
+        let vui = include_bytes!("../tests/fixtures/ipb.h264");
+        let novui = include_bytes!("../tests/fixtures/ipb_novui.h264");
+        assert_eq!(h264_head(vui), Head::Reorder(2), "bitstream_restriction");
+        // 64x48 at level 1.0, MaxDpbFrames 396 / 12 capped at 16
+        assert_eq!(h264_head(novui), Head::Reorder(16), "E.2.1 inferred");
+        assert_eq!(h264_head(&[0, 0, 0, 1, 0x65, 0x88, 0x84]), Head::Missing, "a slice alone");
+        // seq_parameter_set_id 32
+        let bad = [0, 0, 0, 1, 0x67, 66, 0, 30, 0x04, 0x20];
+        assert_eq!(h264_head(&bad), Head::Unparsed);
+        let both: Vec<u8> = bad.iter().chain(&vui[..]).copied().collect();
+        assert_eq!(h264_head(&both), Head::Reorder(2), "the SPS that parses");
     }
 
     /// Lengths in 255s and the rest, the last header's left to the end (xiph.c).

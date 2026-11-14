@@ -1,4 +1,6 @@
-//! Test streams made by the system ffmpeg, and its decode as the oracle.
+//! Test streams made by ffmpeg, and its decode as the oracle. The dev shell brings ffmpeg with
+//! the encoders these tests use. Without it a test fails, unless `PF_ALLOW_ORACLE_SKIP=1` lets
+//! it pass with its oracle checks skipped, each skip said on stderr.
 
 // Test code.
 #![allow(clippy::disallowed_methods, dead_code)]
@@ -14,6 +16,21 @@ pub fn ffmpeg(args: &[&str]) -> bool {
         .args(args)
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// The variable that lets a test pass without ffmpeg.
+pub const ALLOW_SKIP: &str = "PF_ALLOW_ORACLE_SKIP";
+
+/// Fails the test for want of ffmpeg, unless [`ALLOW_SKIP`] is 1. The caller returns after.
+pub fn skip(what: &str) {
+    if std::env::var_os(ALLOW_SKIP).is_some_and(|v| v == "1") {
+        eprintln!("skip: {what}");
+        return;
+    }
+    panic!(
+        "{what}. The oracle checks need ffmpeg with libx264, libx265, libvpx, libtheora, \
+         libspeex and libmp3lame, as the dev shell has it. {ALLOW_SKIP}=1 skips them."
+    );
 }
 
 pub fn tmp(name: &str) -> PathBuf {
@@ -37,11 +54,11 @@ pub fn make(name: &str, args: &[&str]) -> Option<Vec<u8>> {
     let mut all: Vec<&str> = args.to_vec();
     all.push(p);
     if !ffmpeg(&all) {
-        eprintln!("skip: ffmpeg could not make {name}");
+        skip(&format!("ffmpeg could not make {name}"));
         return None;
     }
-    std::fs::rename(&part, tmp(name)).ok()?;
-    std::fs::read(tmp(name)).ok()
+    std::fs::rename(&part, tmp(name)).expect("rename the made stream");
+    Some(std::fs::read(tmp(name)).expect("read the made stream"))
 }
 
 pub fn oracle(input: &str, out_name: &str, args: &[&str]) -> Option<Vec<u8>> {
@@ -53,11 +70,11 @@ pub fn oracle(input: &str, out_name: &str, args: &[&str]) -> Option<Vec<u8>> {
     all.extend_from_slice(args);
     all.push(p);
     if !ffmpeg(&all) {
-        eprintln!("skip: ffmpeg could not decode {input}");
+        skip(&format!("ffmpeg could not decode {input}"));
         return None;
     }
-    std::fs::rename(&part, tmp(out_name)).ok()?;
-    std::fs::read(tmp(out_name)).ok()
+    std::fs::rename(&part, tmp(out_name)).expect("rename the oracle");
+    Some(std::fs::read(tmp(out_name)).expect("read the oracle"))
 }
 
 pub fn ivf_units(bytes: &[u8]) -> Vec<Vec<u8>> {

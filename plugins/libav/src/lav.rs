@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use libav_sys as ffi;
 use profluens_core::memory::Memory;
-use profluens_video::PixelFormat;
 use profluens_video::color::{
     ChromaSite, ContentLight, HdrStatic, Mastering, Matrix, Primaries, Range, TransferFn,
 };
-use profluens_video::decoder::{Color, HeldLayout, PlaneRef};
+use profluens_video::decoder::{self, Color, HeldLayout, Planar, PlaneRef};
+use profluens_video::{PixelFormat, PixelFormats};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
@@ -326,13 +326,15 @@ pub const MAX_THREADS: u32 = ffi::PF_LAV_MAX_THREADS as u32;
 
 impl Decoder {
     /// `threads` past 1 runs frame threads on a video codec that has them, its pictures then in
-    /// libavcodec's memory, never in `supply`.
+    /// libavcodec's memory, never in `supply`. `reorder` is the pictures a video decoder holds
+    /// back from the start, the stream's num_reorder_frames, `None` for libavcodec's own guess.
     pub fn open(
         codec: Codec,
         extradata: &[u8],
         supply: Option<&Supply>,
         parse: bool,
         threads: u32,
+        reorder: Option<u32>,
     ) -> Result<Decoder, LavError> {
         let slots = supply.map(|s| ffi::pf_lav_slots {
             opaque: s.cookie(),
@@ -351,6 +353,7 @@ impl Decoder {
                 slots_ptr,
                 c_int::from(parse),
                 threads.clamp(1, MAX_THREADS) as c_int,
+                reorder.map_or(-1, |n| n.min(ffi::PF_LAV_MAX_REORDER as u32) as c_int),
             )
         };
         if code != ffi::PF_LAV_OK || raw.is_null() {
@@ -643,9 +646,11 @@ impl Drop for Frame {
     }
 }
 
+/// How a picture's planes lie, the link decides what it goes out as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
-    Named(PixelFormat, HeldLayout),
+    Planar(Planar),
+    Gray,
     Other { bit_depth: u8, chroma_shift: (u8, u8) },
 }
 
@@ -674,14 +679,26 @@ impl Frame {
         let bit_depth = self.raw.bit_depth.clamp(0, 255) as u8;
         let chroma_shift = self.chroma_shift();
         match self.raw.pixfmt {
-            ffi::PF_LAV_PIX_I420 => Shape::Named(PixelFormat::I420, HeldLayout::Native),
-            ffi::PF_LAV_PIX_GRAY8 => Shape::Named(PixelFormat::Gray8, HeldLayout::Native),
-            ffi::PF_LAV_PIX_I420_10 => Shape::Named(PixelFormat::P010, HeldLayout::Planar10),
+            ffi::PF_LAV_PIX_I420 => Shape::Planar(Planar { bits: 8, chroma_shift: (1, 1) }),
+            ffi::PF_LAV_PIX_GRAY8 => Shape::Gray,
+            ffi::PF_LAV_PIX_I420_10 => Shape::Planar(Planar { bits: 10, chroma_shift: (1, 1) }),
             ffi::PF_LAV_PIX_YUV if chroma_shift.0 <= 1 && chroma_shift.1 <= 1 => {
-                let pixfmt = if bit_depth > 8 { PixelFormat::P010 } else { PixelFormat::I420 };
-                Shape::Named(pixfmt, HeldLayout::Reduce { chroma_shift, bits: bit_depth })
+                Shape::Planar(Planar { bits: bit_depth, chroma_shift })
             }
             _ => Shape::Other { bit_depth, chroma_shift },
+        }
+    }
+
+    /// The format and pack layout on a link taking `takes`, `None` where none fits. Gray goes
+    /// out as I420 with neutral chroma to a link that takes that and not gray8.
+    pub fn place(&self, takes: PixelFormats) -> Option<(PixelFormat, HeldLayout)> {
+        match self.shape() {
+            Shape::Planar(p) => decoder::place(p, takes),
+            Shape::Gray if !takes.has(PixelFormat::Gray8) && takes.has(PixelFormat::I420) => {
+                Some((PixelFormat::I420, HeldLayout::Gray))
+            }
+            Shape::Gray => Some((PixelFormat::Gray8, HeldLayout::Native)),
+            Shape::Other { .. } => None,
         }
     }
 
@@ -884,7 +901,7 @@ mod tests {
     fn pictures_decode_into_pool_slots() {
         let pool = Pool::new(1 << 20);
         let supply = Supply::new();
-        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false, 1).expect("open");
+        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false, 1, None).expect("open");
         let mut direct = |bytes: usize| {
             pool.resize(bytes.max(pool_slot(&pool)));
             Some(pool.acquire())
@@ -925,7 +942,7 @@ mod tests {
     #[test]
     fn a_dry_pool_falls_back_to_libavcodec_memory() {
         let supply = Supply::new();
-        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false, 1).expect("open");
+        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false, 1, None).expect("open");
         let mut none = |_: usize| None;
         let mut frames = 0;
         for u in units() {
@@ -976,7 +993,7 @@ mod tests {
     fn a_short_slot_is_reported() {
         let pool = Pool::new(1024);
         let supply = Supply::new();
-        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false, 1).expect("open");
+        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false, 1, None).expect("open");
         let mut small = |_: usize| Some(pool.acquire());
         for u in units().iter().take(3) {
             let _ = d.send(u, NONE, NONE, 0, &mut small);
@@ -1007,7 +1024,8 @@ mod tests {
     fn decode_flushed(threads: u32, cut: usize) -> (Pictures, Pictures) {
         let pool = Pool::new(1 << 20);
         let supply = Supply::new();
-        let mut d = Decoder::open(Codec::H264, &[], Some(&supply), false, threads).expect("open");
+        let mut d =
+            Decoder::open(Codec::H264, &[], Some(&supply), false, threads, None).expect("open");
         assert_eq!(d.threads(), threads);
         let mut direct = |bytes: usize| {
             pool.resize(bytes.max(pool_slot(&pool)));

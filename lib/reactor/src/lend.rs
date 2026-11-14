@@ -145,7 +145,21 @@ impl OsReactor {
             }
             false => queue::Op::RecvMulti { fd: Fd::Raw(fd), group },
         };
-        self.push(idx, op)
+        match self.push(idx, op) {
+            Started::Done(result) => {
+                self.disarm(on);
+                Started::Done(result)
+            }
+            started => started,
+        }
+    }
+
+    /// A receive that ends off the queue drops its group and returns the lends, as a landing would.
+    pub(crate) fn unarm(&mut self, idx: u32, on: Handle) {
+        let armed = self.slot(on).ok().and_then(|s| s.lent.as_ref()).is_some_and(|l| l.recv == idx);
+        if armed {
+            self.disarm(on);
+        }
     }
 
     pub(crate) fn landed_many(&mut self, idx: u32, c: &Cqe, on: Handle) {

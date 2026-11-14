@@ -454,7 +454,11 @@ impl OsReactor {
                 (self.queued, self.urgent) = (true, true);
             }
             (State::Waiting, _) => {
+                let (on, many) = (p.on, matches!(p.kind, Op::RecvMany { .. }));
                 self.waiting.retain(|w| *w != idx);
+                if many {
+                    self.unarm(idx, on);
+                }
                 self.finish(idx, IoResult::Cancelled);
             }
             (State::Lent, _) => self.unlend(idx),

@@ -464,6 +464,68 @@ fn many_timers_fire_in_deadline_order_and_each_completes_once() {
     assert!(r.r.due_in().is_none());
 }
 
+/// A reactor whose queue room is taken by receives that never land, so the next push waits.
+fn crowded(pool: &Pool) -> pf_reactor::OsReactor {
+    let mut r = pf_reactor::OsReactor::sized(super::WANT, pf_reactor::MIN_OPS).expect("backend");
+    for i in 0..pf_reactor::MIN_OPS as u64 + 2 {
+        let (h, _) = bound(&mut r, 1000 + 2 * i);
+        one(&mut r, 1001 + 2 * i, Op::Recv { handle: h }, Some(bare(pool)));
+    }
+    r
+}
+
+fn settled(r: &mut pf_reactor::OsReactor, for_how_long: Duration) -> Vec<Completion> {
+    let (mut seen, mut out, start) = (Vec::new(), Vec::new(), Instant::now());
+    while start.elapsed() < for_how_long {
+        r.run_once(&mut out);
+        seen.extend(out.drain(..).map(|(_, c)| c));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    seen
+}
+
+fn result_of(seen: &[Completion], op: u64) -> Option<IoResult> {
+    seen.iter().find(|c| c.op == OpId(op)).map(|c| c.result)
+}
+
+#[test]
+fn a_lent_buffer_comes_back_when_its_socket_closes_under_a_waiting_receive() {
+    let pool = Pool::new(2048);
+    let mut r = crowded(&pool);
+    let (sock, _) = bound(&mut r, 1);
+    one(&mut r, 2, Op::Lend { handle: sock }, Some(bare(&pool)));
+    one(&mut r, 3, Op::RecvMany { handle: sock }, None);
+    one(&mut r, 4, Op::Close { handle: sock }, None);
+    let seen = settled(&mut r, Duration::from_millis(100));
+    assert_eq!(result_of(&seen, 3), Some(IoResult::Cancelled));
+    assert_eq!(result_of(&seen, 4), Some(IoResult::Ok(0)));
+    assert_eq!(result_of(&seen, 2), Some(IoResult::Cancelled), "the lent buffer never came back");
+    // the slot's next socket lends and receives with nothing left over
+    let (next, _) = bound(&mut r, 5);
+    assert_eq!(next.slot(), sock.slot());
+    one(&mut r, 6, Op::Lend { handle: next }, Some(bare(&pool)));
+    one(&mut r, 7, Op::Close { handle: next }, None);
+    let seen = settled(&mut r, Duration::from_millis(50));
+    assert_eq!(result_of(&seen, 6), Some(IoResult::Cancelled));
+}
+
+#[test]
+fn a_lent_buffer_comes_back_on_cancel_once_its_waiting_receive_is_cancelled() {
+    let pool = Pool::new(2048);
+    let mut r = crowded(&pool);
+    let (sock, _) = bound(&mut r, 1);
+    one(&mut r, 2, Op::Lend { handle: sock }, Some(bare(&pool)));
+    one(&mut r, 3, Op::RecvMany { handle: sock }, None);
+    one(&mut r, 4, Op::Cancel { target: OpId(3) }, None);
+    let seen = settled(&mut r, Duration::from_millis(50));
+    assert_eq!(result_of(&seen, 3), Some(IoResult::Cancelled));
+    assert_eq!(
+        result_of(&seen, 2),
+        Some(IoResult::Cancelled),
+        "the receive's end returns the lends"
+    );
+}
+
 #[test]
 fn a_paced_lent_receive_enters_the_kernel_once_a_datagram() {
     const N: u64 = 50;

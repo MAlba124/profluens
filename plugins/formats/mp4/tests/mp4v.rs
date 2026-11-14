@@ -62,7 +62,7 @@ fn mp4v_tracks_take_their_family_and_decoder_specific_info() {
         assert_eq!((t.entry.width, t.entry.height), (W as u32, H as u32), "{name}");
         assert!(matches!(t.reframer(), Reframer::Passthrough), "{name}: plain frames");
         assert_eq!(t.codec_head(), t.entry.config_record, "{name}: the DSI leads in band");
-        let samples = r.samples();
+        let samples: Vec<_> = r.samples().collect();
         assert_eq!(samples.len(), FRAMES, "{name}");
         let sync: Vec<usize> = (0..FRAMES).filter(|&i| samples[i].sync()).collect();
         assert_eq!(sync, SYNC, "{name}: sync samples from stss");
@@ -252,7 +252,7 @@ fn the_demuxer_leads_with_the_decoder_specific_info_and_flags_the_sync_samples()
             (0..FRAMES).filter(|&i| media[i].0.contains(BufferFlags::KEYFRAME)).collect();
         assert_eq!(keys, SYNC, "{name}");
         for (i, (flags, data)) in media.iter().enumerate() {
-            let s = &r.samples()[i];
+            let s = r.samples().nth(i).expect("a sample");
             assert_eq!(data[..], file[s.offset() as usize..][..s.size() as usize], "{name} {i}");
             assert!(!flags.contains(BufferFlags::HEADER), "{name} {i}");
         }

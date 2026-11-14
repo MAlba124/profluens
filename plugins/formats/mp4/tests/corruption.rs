@@ -298,17 +298,15 @@ fn pristine<'a>(bases: &'a [Base], name: &str) -> &'a [u8] {
     bases.iter().find(|b| b.name == name).map_or(&bases[0].data, |b| &b.data)
 }
 
-/// Densest table is `stz2` at two samples an octet, 24 octets each in the index plus merge and
-/// sort.
+/// The tables keep the shape of the boxes, the densest an `stz2` at two samples an octet and
+/// four octets a size, and the boxes parsed beside them while they fold.
 const RESOLVE_HEAP_PER_BYTE: usize = 256;
-/// A run-length table costs the file an octet a sample, 24 index octets each.
-const RESOLVE_INDEX_PER_FILE_OCTET: usize = 24;
 const RESOLVE_HEAP_PER_SAMPLE: usize = 128;
 const RESOLVE_HEAP_SLACK: usize = 16 << 10;
 
-/// The heap and the sample index together, the index lives in its own mapping.
+/// The heap grown and the sample tables, which are on it, each within the limit.
 fn check_resolved(mark: isize, index: usize, limit: usize) -> Result<(), Violation> {
-    let grew = heap_growth(mark) + index;
+    let grew = heap_growth(mark).max(index);
     if grew > limit {
         return Err(Violation::Heap { grew, limit });
     }
@@ -338,9 +336,7 @@ fn drive_reader(case: &Case, bases: &[Base]) -> Result<(), Violation> {
     check_resolved(
         mark,
         reader.tables().index_bytes(),
-        RESOLVE_HEAP_PER_BYTE * head.len()
-            + RESOLVE_INDEX_PER_FILE_OCTET * case.data.len()
-            + RESOLVE_HEAP_SLACK,
+        RESOLVE_HEAP_PER_BYTE * head.len() + RESOLVE_HEAP_SLACK,
     )?;
 
     reader.reset_stream();
@@ -839,8 +835,9 @@ fn run_length_tables_describing_four_billion_samples_are_refused() {
     assert!(heap_growth(mark) < 4096);
 }
 
-/// 76 octets of run-length tables declare `MAX_SAMPLES` one octet samples, a 384 MiB index
-/// once folded. Held to the file length, the index takes only the samples the file holds.
+/// 76 octets of run-length tables declare `MAX_SAMPLES` one octet samples. The tables keep
+/// the boxes' shape, so they stay as small, and held to the file length they give only the
+/// samples the file holds.
 #[test]
 fn a_tiny_table_declaring_max_samples_commits_only_what_the_file_holds() {
     const FILE: usize = 64 << 10;
@@ -861,7 +858,8 @@ fn a_tiny_table_declaring_max_samples_commits_only_what_the_file_holds() {
     let start = std::time::Instant::now();
     let reader = Mp4Reader::bounded(&head, &[], known).expect("the samples in the file resolve");
     assert_eq!(reader.samples().len(), FILE, "the samples past the end are left out");
-    assert_eq!(reader.tables().index_bytes(), size_of::<pf_mp4::Sample>() * FILE);
+    let held = reader.tables().index_bytes();
+    assert!(held < 1024, "{held} octets of tables for a constant size and one chunk");
     assert!(heap_growth(mark) < 4096, "{} heap octets", heap_growth(mark));
     // The tail past the end is stepped over a run at a time, not a sample at a time.
     assert!(start.elapsed() < std::time::Duration::from_secs(1), "{:?}", start.elapsed());

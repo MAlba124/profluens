@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use profluens_core::memory::Memory;
 use profluens_core::pull::RangeError;
 
-use crate::reader::Sample;
+use crate::reader::{Sample, SampleId};
 
 pub(crate) const SMALL: u32 = 64 << 10;
 pub(crate) const RUN: u32 = 256 << 10;
@@ -20,7 +20,7 @@ pub(crate) enum State {
 }
 
 pub(crate) struct Planned {
-    pub(crate) index: usize,
+    pub(crate) index: SampleId,
     pub(crate) sample: Sample,
     pub(crate) tag: u64,
     pub(crate) at: u32,
@@ -40,14 +40,14 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    pub(crate) fn reset(&mut self) -> Option<usize> {
+    pub(crate) fn reset(&mut self) -> Option<SampleId> {
         let first = self.items.front().map(|p| p.index);
         self.items.clear();
         (self.held, self.ranges, self.asked_all) = (0, 0, false);
         first
     }
 
-    pub(crate) fn push(&mut self, index: usize, sample: Sample, at: u32) {
+    pub(crate) fn push(&mut self, index: SampleId, sample: Sample, at: u32) {
         let state = if sample.size() == 0 { State::Empty } else { State::Waiting };
         self.items.push_back(Planned { index, sample, tag: self.next_tag, at, last_of: 0, state });
     }
@@ -61,7 +61,7 @@ impl Plan {
         self.next_tag += 1;
     }
 
-    pub(crate) fn unplan(&mut self) -> Option<usize> {
+    pub(crate) fn unplan(&mut self) -> Option<SampleId> {
         let mut first = None;
         while self.items.back().is_some_and(|p| p.tag == self.next_tag) {
             first = self.items.pop_back().map(|p| p.index);
@@ -120,6 +120,10 @@ mod tests {
     use super::*;
     use profluens_core::memory::Pool;
 
+    fn id(n: u32) -> SampleId {
+        SampleId::new(0, 0, n)
+    }
+
     fn sample(offset: u64, size: u32) -> Sample {
         Sample::new(0, offset, size, 0, 0, true).expect("a sample")
     }
@@ -142,11 +146,11 @@ mod tests {
     fn a_run_of_small_samples_is_sliced_and_waits_for_the_ranges_before_it() {
         let pool = Pool::new(4096);
         let mut plan = Plan::default();
-        plan.push(0, sample(100, 3), 0);
+        plan.push(id(0), sample(100, 3), 0);
         plan.asked(3);
-        plan.push(1, sample(103, 2), 0);
-        plan.push(2, sample(105, 0), 2);
-        plan.push(3, sample(105, 4), 2);
+        plan.push(id(1), sample(103, 2), 0);
+        plan.push(id(2), sample(105, 0), 2);
+        plan.push(id(3), sample(105, 4), 2);
         plan.asked(6);
         assert_eq!((plan.held, plan.ranges), (9, 2));
         plan.served(1, filled(&pool, b"abcdef")).expect("whole");
@@ -170,8 +174,8 @@ mod tests {
     fn a_short_range_drops_what_it_cut_and_says_where() {
         let pool = Pool::new(4096);
         let mut plan = Plan::default();
-        plan.push(0, sample(10, 4), 0);
-        plan.push(1, sample(14, 4), 4);
+        plan.push(id(0), sample(10, 4), 0);
+        plan.push(id(1), sample(14, 4), 4);
         plan.asked(8);
         let err = plan.served(0, filled(&pool, b"abcdef")).unwrap_err();
         assert_eq!(err, RangeError::Short { offset: 10, want: 8, got: 6 });
@@ -184,7 +188,7 @@ mod tests {
     fn a_sample_of_no_bytes_holds_no_range() {
         let mut plan = Plan::default();
         for i in 0..8 {
-            plan.push(i, sample(10, 0), 0);
+            plan.push(id(i), sample(10, 0), 0);
             plan.asked(0);
         }
         assert_eq!((plan.held, plan.ranges), (0, 0), "a range never asked is never let go");
@@ -196,11 +200,11 @@ mod tests {
     fn a_reset_forgets_the_plan_and_a_late_range_is_dropped() {
         let pool = Pool::new(4096);
         let mut plan = Plan::default();
-        plan.push(7, sample(10, 4), 0);
+        plan.push(id(7), sample(10, 4), 0);
         plan.asked(4);
-        plan.push(8, sample(14, 4), 0);
-        assert_eq!(plan.unplan(), Some(8), "a range not asked walks back");
-        assert_eq!(plan.reset(), Some(7));
+        plan.push(id(8), sample(14, 4), 0);
+        assert_eq!(plan.unplan(), Some(id(8)), "a range not asked walks back");
+        assert_eq!(plan.reset(), Some(id(7)));
         plan.served(0, filled(&pool, b"abcd")).expect("a late range is no error");
         assert!(plan.pop_ready().is_none() && plan.items.is_empty());
     }

@@ -158,7 +158,7 @@ fn mp4_units(file: &[u8]) -> Vec<Vec<u8>> {
     let t = r.tables();
     let mut out = vec![t.tracks()[0].codec_head().to_vec()];
     out.extend(
-        t.samples().iter().map(|s| file[s.offset() as usize..][..s.size() as usize].to_vec()),
+        t.samples().map(|s| file[s.offset() as usize..][..s.size() as usize].to_vec()),
     );
     out
 }

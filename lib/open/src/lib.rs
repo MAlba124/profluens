@@ -260,7 +260,7 @@ pub enum Index {
     Mkv(Arc<pf_mkv::Parsed>),
     Avi(Arc<pf_avi::AviIndex>),
     Bare(Arc<pf_bare::BareHead>),
-    /// The MP4 tracks and sample index, the demuxer of each run reads these.
+    /// The MP4 tracks and sample tables, the demuxer of each run reads these.
     Mp4(Arc<pf_mp4::Tables>),
 }
 

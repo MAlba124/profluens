@@ -42,7 +42,7 @@ fn a_faststart_mp4_head_is_the_window_cut_at_the_mdat() {
     assert!(matches!(o.meta, Meta::Moov(_)));
     let Index::Mp4(tables) = &o.index else { panic!("{:?}", o.index) };
     assert_eq!(tables.tracks().len(), 2);
-    assert!(!tables.samples().is_empty() && tables.bytes() > tables.index_bytes());
+    assert!(tables.sample_count() > 0 && tables.bytes() > tables.index_bytes());
     // tracks only, no sample folded
     let (tracks, _) = open_with(&b, Want::TRACKS, Caps::default());
     let tracks = tracks.unwrap();

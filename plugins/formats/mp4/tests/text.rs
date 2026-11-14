@@ -326,7 +326,7 @@ fn a_seek_goes_back_for_the_cue_up_on_a_track_that_is_on() {
     let mut reader = Mp4Reader::new(&file).expect("resolves");
     let tables = reader.tables();
     let offset = |track: usize, n: usize| {
-        let mut of = tables.samples().iter().filter(|s| usize::from(s.track_index()) == track);
+        let mut of = tables.samples().filter(|s| usize::from(s.track_index()) == track);
         of.nth(n).expect("the sample").offset()
     };
     let on = tables.seek_index(&|_| true);

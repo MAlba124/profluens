@@ -327,7 +327,7 @@ impl Mp4Demux {
         d
     }
 
-    /// The sample index `preroll` resolves is held to `limits`. Pass the file length when known.
+    /// The sample tables `preroll` resolves are held to `limits`. Pass the file length when known.
     pub fn limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self
@@ -586,8 +586,8 @@ impl Mp4Demux {
                 }
                 Keyed::Skip => log!(ctx, Level::Debug, "key_wait", track = s.track_index),
                 Keyed::Back => {
-                    let sample = index.unwrap_or(usize::MAX);
-                    log!(ctx, Level::Debug, "key_back", track = s.track_index, sample = sample);
+                    let at = index.map_or(u64::MAX, |id| id.offset());
+                    log!(ctx, Level::Debug, "key_back", track = s.track_index, at = at);
                     self.unplan_all();
                 }
             }
@@ -599,7 +599,7 @@ impl Mp4Demux {
         &mut self,
         ctx: &Ctx,
         pulled: bool,
-    ) -> Option<(ResolvedSample, Own, Option<usize>)> {
+    ) -> Option<(ResolvedSample, Own, Option<crate::reader::SampleId>)> {
         if pulled {
             return loop {
                 let p = self.plan.pop_ready()?;
@@ -1285,7 +1285,7 @@ impl Element for Mp4Demux {
             Level::Info,
             "opened",
             tracks = self.pad_tracks.len(),
-            samples = tables.samples().len(),
+            samples = tables.sample_count(),
             fragmented = reader.is_fragmented(),
             duration = index.duration,
         );

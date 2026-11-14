@@ -120,7 +120,7 @@ fn assert_agrees_with_ffmpeg(name: &str) {
         "{name}: per-track media timescale must match ffmpeg"
     );
 
-    for (i, (o, x)) in ours.samples().iter().zip(oracle.iter()).enumerate() {
+    for (i, (o, x)) in ours.samples().zip(oracle.iter()).enumerate() {
         assert_eq!(o.track_index() as u32, x.stream_index, "{name}: sample {i} track/stream index");
         assert_eq!(o.size() as usize, x.size, "{name}: sample {i} size (mdat slice length)");
         assert_eq!(o.offset(), x.offset, "{name}: sample {i} file offset");
@@ -136,10 +136,10 @@ fn tiny_h264_matches_ffmpeg() {
     let file = fixture_bytes("tiny_h264.mp4");
     let ours = Mp4Reader::new(&head_through_moov(&file)).unwrap();
     assert!(
-        ours.samples().iter().all(|s| s.pts() == s.dts()),
+        ours.samples().all(|s| s.pts() == s.dts()),
         "no ctts box → pts == dts for every sample"
     );
-    let syncs = ours.samples().iter().filter(|s| s.sync()).count();
+    let syncs = ours.samples().filter(|s| s.sync()).count();
     assert_eq!(syncs, 1, "one keyframe (the single IDR)");
     assert_eq!(ours.samples().len(), 15, "15 frames");
 }
@@ -150,7 +150,7 @@ fn bframes_h264_matches_ffmpeg() {
     let file = fixture_bytes("bframes_h264.mp4");
     let ours = Mp4Reader::new(&head_through_moov(&file)).unwrap();
     assert!(
-        ours.samples().iter().any(|s| s.pts() != s.dts()),
+        ours.samples().any(|s| s.pts() != s.dts()),
         "ctts box present → some sample has pts != dts (B-frame reorder)"
     );
 }
@@ -203,7 +203,7 @@ fn ffprobe_second_opinion() {
         let file = fixture_bytes(name);
         let ours = Mp4Reader::new(&head_through_moov(&file)).unwrap();
         assert_eq!(ours.samples().len(), ff_frames, "{name}: frame count vs ffprobe");
-        let our_keys = ours.samples().iter().filter(|s| s.sync()).count();
+        let our_keys = ours.samples().filter(|s| s.sync()).count();
         assert_eq!(our_keys, ff_keys, "{name}: keyframe count vs ffprobe");
         eprintln!("ffprobe agrees on {name}: {ff_frames} frames, {ff_keys} keyframes");
     }

@@ -188,7 +188,7 @@ fn a_negative_version_0_composition_offset_is_read_signed() {
     let at = ctts + 20;
     file[at..at + 4].copy_from_slice(&(-1000i32).to_be_bytes());
     let tables = Tables::resolve(&file, &[], Limits::default()).expect("the movie resolves");
-    let first = tables.samples().iter().find(|s| s.track_index() == 0).expect("a sample");
+    let first = tables.samples().find(|s| s.track_index() == 0).expect("a sample");
     assert_eq!(first.pts() - first.dts(), -1000, "not 2^32 - 1000");
 }
 
@@ -205,7 +205,7 @@ fn a_track_whose_sample_entries_do_not_resolve_is_skipped_and_the_rest_open() {
     let tables = Tables::resolve(&broken, &[], Limits::default()).expect("the video still opens");
     assert_eq!((tables.tracks().len(), tables.skipped_tracks()), (1, 1));
     assert_eq!(tables.tracks()[0].track_id, whole.tracks()[0].track_id);
-    let video = whole.samples().iter().filter(|s| s.track_index() == 0).count();
+    let video = whole.samples().filter(|s| s.track_index() == 0).count();
     assert_eq!(tables.samples().len(), video, "the video's samples, all of them");
     // with no track left the first track's own error is said
     let mut none = broken;

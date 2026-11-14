@@ -119,14 +119,14 @@ pub fn follow(entries: &[ElstEntry], media: u32, movie: u32) -> Option<EditList>
     Some(list)
 }
 
-fn edit_of(edits: &[Edit], m: i64) -> Option<usize> {
+pub(crate) fn edit_of(edits: &[Edit], m: i64) -> Option<usize> {
     let after = edits.partition_point(|e| e.media <= m);
     let k = after.checked_sub(1)?;
     (m < edits[k].end_media()).then_some(k)
 }
 
 /// The start of the first edit presenting media past `m`, or the end of the last edit.
-fn hidden_stamp(edits: &[Edit], m: i64) -> i64 {
+pub(crate) fn hidden_stamp(edits: &[Edit], m: i64) -> i64 {
     let after = edits.partition_point(|e| e.media <= m);
     match edits.get(after) {
         Some(next) => next.start,

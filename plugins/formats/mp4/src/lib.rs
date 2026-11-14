@@ -10,11 +10,14 @@ pub mod codec;
 pub mod edit;
 pub mod element;
 pub mod es;
+#[cfg(test)]
+mod flat;
 pub mod frag;
 pub mod ilst;
 pub mod mux;
 pub(crate) mod pull;
 pub mod reader;
+mod stbl;
 pub mod writer;
 
 pub use codec::{SampleEntry, family_for};
@@ -22,8 +25,8 @@ pub use element::{EMITS, Mp4Demux};
 pub use ilst::{MoovExtent, Mp4Props, locate_moov, parse_moov_tags, props_from_moov};
 pub use mux::{Mode, Mp4Mux};
 pub use reader::{
-    Keyed, Limits, Mp4Error, Mp4Reader, RemuxPool, ResolvedSample, Restart, Sample, SamplePayload,
-    Tables, Track, TrackKind,
+    Keyed, Limits, Mp4Error, Mp4Reader, RemuxPool, ResolvedSample, Restart, Sample, SampleId,
+    SamplePayload, Samples, Tables, Track, TrackKind,
 };
 
 pub use pf_mkv::{ReframeError, Reframer, nal_head_from_config};

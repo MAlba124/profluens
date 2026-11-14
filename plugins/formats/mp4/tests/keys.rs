@@ -253,13 +253,7 @@ impl Video {
     fn of(file: &[u8]) -> Video {
         let tables = Tables::resolve(&head_of(file), &[], Limits::default()).unwrap();
         let track = tables.tracks().iter().position(|t| t.kind() == TrackKind::Video).unwrap();
-        let samples = tables
-            .samples()
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, s)| s.track() == track)
-            .collect();
+        let samples = tables.samples().enumerate().filter(|(_, s)| s.track() == track).collect();
         Video { tables, samples }
     }
 

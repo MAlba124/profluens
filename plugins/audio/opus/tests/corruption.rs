@@ -269,7 +269,8 @@ fn opusenc_target(bytes: &[u8], chunking: Chunking) {
     let mut h = encoder_harness(channels as i64);
     let driven = drive(&mut h, bytes, chunking, flush);
     assert!(!driven.failed, "opusenc failed on PCM");
-    let frames = bytes.len() / (960 * channels * 2) + 1;
+    // The partial tail and one frame of silence that flushes the lookahead.
+    let frames = bytes.len() / (960 * channels * 2) + 2;
     assert!(driven.out_buffers <= frames, "{} packets from {frames} frames", driven.out_buffers);
     assert!(driven.out_bytes <= frames * max_packet_bytes(1), "{} packet bytes", driven.out_bytes);
 }

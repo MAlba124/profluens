@@ -1,5 +1,6 @@
-//! `opusenc`, 48 kHz `s16` PCM to one Opus packet per buffer, the last frame zero padded. Stamps
-//! count from an input that begins a frame, so a gap or seek upstream carries through.
+//! `opusenc`, 48 kHz `s16` PCM to one Opus packet per buffer, the last frame zero padded and
+//! silence after it until the lookahead is out. Stamps count from an input that begins a frame,
+//! so a gap or seek upstream carries through.
 //! `aligned` puts the frames on absolute multiples of the frame duration instead, so a run
 //! started mid-stream cuts and stamps its frames where a full run did. It drops the samples
 //! before the first grid point and starts over on the grid when a stamp slips from the count.
@@ -60,8 +61,17 @@ const MAX_UNFORMATTED_BYTES: usize = OPUS_RATE as usize * 2 * 2;
 
 const DEFAULT_FRAME_TENTHS: u16 = 200;
 
-/// Aligned, a stamp this far from the count starts over on the grid.
+/// A stamp this far from the count starts over, aligned on the grid, else at the stamp.
 const SLIP_NS: i128 = 5_000_000;
+
+/// libopus's lookahead at 48 kHz, what `OPUS_GET_LOOKAHEAD` says (opus_encoder.c), 2.5 ms plus
+/// 4 ms of delay compensation outside the restricted low delay mode.
+const fn lookahead(app: Application) -> u64 {
+    match app {
+        Application::LowDelay => OPUS_RATE as u64 / 400,
+        Application::Voip | Application::Audio => OPUS_RATE as u64 / 400 + OPUS_RATE as u64 / 250,
+    }
+}
 
 static SINK_FIELDS: [FieldDesc; 3] = [
     FieldDesc {
@@ -223,23 +233,78 @@ impl OpusEnc {
         n as usize
     }
 
+    fn stride(&self) -> usize {
+        self.channels.max(1) * 2
+    }
+
     /// Encodes the partial frame in `acc` zero padded, the padding left out of its duration.
     fn pad_tail(&mut self, ctx: &mut Ctx) -> Result<usize, Error> {
         if self.frame_bytes == 0 || self.acc.is_empty() {
             return Ok(0);
         }
         let padded = self.frame_bytes.saturating_sub(self.acc.len());
+        let samples = (self.acc.len() / self.stride()) as u64;
         self.acc.resize(self.frame_bytes, 0);
         let mut carry = std::mem::take(&mut self.acc);
-        let res = self.encode_frame_bytes(ctx, &carry[..self.frame_bytes], padded);
+        let res = self.encode_frame_bytes(ctx, &carry[..self.frame_bytes], samples);
         carry.clear();
         self.acc = carry;
         res.map(|()| padded)
     }
 
-    fn anchor(&mut self, ctx: &Ctx, pts: Timestamp) {
+    /// The end of the stream. The partial frame and silence past it go out until the decoder,
+    /// running the lookahead behind, has put out every input sample. The last packet ends the
+    /// lookahead past the input, where a reader that takes the pre-skip off the stamps ends it.
+    fn finish(&mut self, ctx: &mut Ctx) -> Result<usize, Error> {
+        let fb = self.frame_bytes;
+        if fb == 0 || (self.acc.is_empty() && self.packets == 0) {
+            return Ok(0);
+        }
+        let stride = self.stride();
+        let (frame, carry) = ((fb / stride) as u64, (self.acc.len() / stride) as u64);
+        let mut left = carry + lookahead(self.application);
+        let frames = left.div_ceil(frame);
+        let mut padded = 0;
+        let mut pcm = std::mem::take(&mut self.acc);
+        for _ in 0..frames {
+            padded += fb - pcm.len();
+            pcm.resize(fb, 0);
+            let samples = left.min(frame);
+            let res = self.encode_frame_bytes(ctx, &pcm, samples);
+            left -= samples;
+            pcm.clear();
+            if res.is_err() {
+                self.acc = pcm;
+                return res.map(|()| padded);
+            }
+        }
+        self.acc = pcm;
+        Ok(padded)
+    }
+
+    /// The input stamp `pts` against the count. A whole frame carried takes it as it is, a
+    /// partial one past `SLIP_NS` from it fills the gap with silence when that stays within the
+    /// frame, else pads out and starts over at the stamp.
+    fn anchor(&mut self, ctx: &mut Ctx, pts: Timestamp) -> Result<(), Error> {
+        let stride = self.stride();
+        if !self.acc.is_empty() && pts.is_some() && self.frame_bytes > 0 {
+            let carried = (self.acc.len() / stride) as u64;
+            let expected = self.at(self.sent + carried);
+            let slip = pts.0 as i128 - expected.0 as i128;
+            if slip.abs() <= SLIP_NS {
+                return Ok(());
+            }
+            let gap = (slip.max(0) as u128 * u128::from(OPUS_RATE) / 1_000_000_000) as usize;
+            log!(&*ctx, Level::Debug, "slip", ns = slip as i64, carried = carried);
+            if slip > 0 && self.acc.len() + gap * stride <= self.frame_bytes {
+                // The silence is input now, it takes its place in the count.
+                self.acc.resize(self.acc.len() + gap * stride, 0);
+                return self.encode_carry(ctx);
+            }
+            self.pad_tail(ctx)?;
+        }
         if !self.acc.is_empty() {
-            return;
+            return Ok(());
         }
         if pts.is_some() {
             let expected = self.at(self.sent);
@@ -251,12 +316,33 @@ impl OpusEnc {
         } else if self.origin.is_none() {
             (self.origin, self.sent) = (Timestamp::ZERO, 0);
         }
+        Ok(())
     }
 
     fn at(&self, n: u64) -> Timestamp {
         let ns = (n as u128 * 1_000_000_000 / OPUS_RATE as u128) as u64;
         let origin = if self.origin.is_none() { Timestamp::ZERO } else { self.origin };
         origin.saturating_add(Timestamp::from_nanos(ns))
+    }
+
+    /// A channel count change on the sink. The frame begun goes out padded, then the encoder is
+    /// built again for the new count.
+    fn rechannel(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        if self.enc.is_none() {
+            return Ok(());
+        }
+        let said = ctx.field_id(F_CHANNELS).and_then(|id| ctx.negotiated_sink(Self::IN)?.get(id));
+        let Some(Value::Int(n @ 1..=2)) = said else {
+            return Ok(());
+        };
+        if n as usize == self.channels {
+            return Ok(());
+        }
+        log!(&*ctx, Level::Info, "channels_changed", from = self.channels, to = n);
+        self.pad_tail(ctx)?;
+        (self.enc, self.frame_bytes) = (None, 0);
+        self.build_encoder(ctx);
+        Ok(())
     }
 
     /// Builds the encoder once the sink format is fixed, then encodes the whole frames buffered
@@ -333,8 +419,13 @@ impl OpusEnc {
         }
     }
 
-    /// `pad` is the zero tail bytes added at EOS, left out of the stamped duration.
-    fn encode_frame_bytes(&mut self, ctx: &mut Ctx, frame: &[u8], pad: usize) -> Result<(), Error> {
+    /// `samples` is the duration stamped, padding left out.
+    fn encode_frame_bytes(
+        &mut self,
+        ctx: &mut Ctx,
+        frame: &[u8],
+        samples: u64,
+    ) -> Result<(), Error> {
         let Some(enc) = self.enc.as_mut() else {
             return Err(Error::element_failed(ctx.element(), OpusError::InputFormatUnknown));
         };
@@ -352,7 +443,6 @@ impl OpusEnc {
         let Some(mut buf) = ctx.alloc_exact(n) else { return Err(ctx.exact_refused(n)) };
         buf.memory.as_mut_full()[..n].copy_from_slice(&self.packet);
         buf.memory.set_len(n);
-        let samples = (frame.len().saturating_sub(pad) / (self.channels.max(1) * 2)) as u64;
         buf.pts = self.at(self.sent);
         buf.dts = buf.pts;
         buf.duration = self.at(self.sent + samples).saturating_sub(buf.pts);
@@ -373,8 +463,9 @@ impl OpusEnc {
         let mut carry = std::mem::take(&mut self.acc);
         let mut off = 0;
         let mut res = Ok(());
+        let samples = (fb / self.stride()) as u64;
         while res.is_ok() && off + fb <= carry.len() {
-            res = self.encode_frame_bytes(ctx, &carry[off..off + fb], 0);
+            res = self.encode_frame_bytes(ctx, &carry[off..off + fb], samples);
             off += fb;
         }
         carry.drain(..off);
@@ -405,8 +496,9 @@ impl OpusEnc {
             self.encode_carry(ctx)?;
         }
 
+        let samples = (fb / self.stride()) as u64;
         while off + fb <= data.len() {
-            self.encode_frame_bytes(ctx, &data[off..off + fb], 0)?;
+            self.encode_frame_bytes(ctx, &data[off..off + fb], samples)?;
             off += fb;
         }
         self.acc.extend_from_slice(&data[off..]);
@@ -449,7 +541,7 @@ impl Element for OpusEnc {
         while let Some(buf) = inputs.pop() {
             let data = buf.memory.data();
             if !self.aligned {
-                self.anchor(ctx, buf.pts);
+                self.anchor(ctx, buf.pts)?;
                 self.feed(ctx, data)?;
                 continue;
             }
@@ -462,7 +554,10 @@ impl Element for OpusEnc {
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
         match event {
-            Event::FormatChange(_) => self.build_from_sink(ctx)?,
+            Event::FormatChange(_) => {
+                self.rechannel(ctx)?;
+                self.build_from_sink(ctx)?;
+            }
             Event::PropChanged { name: "bitrate", value: Value::Int(b) } if *b > 0 => {
                 self.bitrate_bps = *b as u32;
                 if let Some(enc) = self.enc.as_mut() {
@@ -484,7 +579,7 @@ impl Element for OpusEnc {
             Event::Eos => {
                 // A format fixed without a FormatChange still gets the buffered input encoded.
                 self.build_from_sink(ctx)?;
-                let padded = self.pad_tail(ctx)?;
+                let padded = self.finish(ctx)?;
                 if self.frame_bytes == 0 && !self.acc.is_empty() {
                     log!(&*ctx, Level::Error, "eos_unformatted", bytes = self.acc.len());
                 }

@@ -11,6 +11,9 @@ use profluens_core::format::ValueDesc;
 use profluens_core::time::Timestamp;
 
 const MS: u64 = 1_000_000;
+/// libopus's lookahead, the last packet ends this far past the input so a reader that takes the
+/// pre-skip off the stamps ends where the input did.
+const LOOKAHEAD: u64 = 312;
 
 fn enc(channels: i64, aligned: bool) -> Harness {
     let e = if aligned { OpusEnc::new().aligned() } else { OpusEnc::new() };
@@ -84,14 +87,14 @@ fn frames_start_on_the_grid_after_the_first_stamp() {
     // 4 * 1536 less the 768 dropped is 5376 samples, five whole frames and a padded tail
     assert_eq!(got.len(), 6);
     assert!(out[..5].iter().all(|b| b.duration.0 == 20 * MS));
-    assert_eq!(out[5].duration.0, 576 * 1_000_000_000 / 48_000);
+    assert_eq!(out[5].duration.0, (576 + LOOKAHEAD) * 1_000_000_000 / 48_000);
 }
 
 #[test]
 fn without_aligned_frames_start_at_the_first_stamp() {
     let mut h = enc(2, false);
     let got = stamps(&run(&mut h, &[(1984 * MS, 1920)]));
-    assert_eq!(got, [1984 * MS, 2004 * MS]);
+    assert_eq!(got, [1984 * MS, 2004 * MS, 2024 * MS], "two frames and the lookahead flush");
 }
 
 #[test]
@@ -153,7 +156,7 @@ fn stamp_jitter_under_the_slip_stays_on_the_count() {
     let chunks: Vec<(u64, usize)> =
         (0..10).map(|i| (i * 32 * MS + (i % 2) * 3 * MS, 1536)).collect();
     let got = stamps(&run(&mut enc(2, true), &chunks));
-    assert_eq!(got, (0..16).map(|k| k * 20 * MS).collect::<Vec<_>>());
+    assert_eq!(got, (0..17).map(|k| k * 20 * MS).collect::<Vec<_>>(), "and the flush");
 }
 
 #[test]
@@ -177,7 +180,7 @@ fn unstamped_input_frames_from_zero() {
     let mut out = Vec::new();
     push(&mut h, None, 960 * 2, &mut out);
     out.extend(h.eos().expect("eos"));
-    assert_eq!(stamps(&out), [0, 20 * MS]);
+    assert_eq!(stamps(&out), [0, 20 * MS, 40 * MS], "two frames and the lookahead flush");
 }
 
 #[test]
@@ -191,13 +194,13 @@ fn input_before_the_format_is_dropped_up_to_the_grid() {
     out.extend(h.drain_outputs());
     push(&mut h, Some(2000 * MS), 960 * 3, &mut out);
     out.extend(h.eos().expect("eos"));
-    assert_eq!(stamps(&out), [2000 * MS, 2020 * MS, 2040 * MS]);
+    assert_eq!(stamps(&out), [2000 * MS, 2020 * MS, 2040 * MS, 2060 * MS], "and the flush");
 }
 
 #[test]
 fn the_tail_is_padded_at_eos() {
     let mut h = enc(2, true);
     let out = run(&mut h, &[(0, 100)]);
-    assert_eq!(stamps(&out), [0]);
-    assert_eq!(out[0].duration.0, 100 * 1_000_000_000 / 48_000);
+    assert_eq!(stamps(&out), [0], "the padding flushes the lookahead");
+    assert_eq!(out[0].duration.0, (100 + LOOKAHEAD) * 1_000_000_000 / 48_000);
 }

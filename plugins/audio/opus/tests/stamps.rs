@@ -10,6 +10,9 @@ use profluens_core::time::Timestamp;
 
 const MS: u64 = 1_000_000;
 const FRAME: usize = 960 * 2;
+/// libopus's lookahead. At EOS silence flushes it, the last packet ending this far past the
+/// input so a reader that takes the pre-skip off the stamps ends where the input did.
+const LOOKAHEAD: usize = 312;
 
 fn mono() -> Harness {
     let mut h = Harness::new(OpusEnc::new());
@@ -49,8 +52,9 @@ fn encode(h: &mut Harness, pcm: &[u8], chunk: usize, from: Option<u64>) -> Vec<(
 fn packets_follow_the_input_stamps_across_ragged_chunks() {
     let mut h = mono();
     let got = encode(&mut h, &tone(FRAME * 10), 777, Some(5_000));
-    let want: Vec<(u64, u64)> = (0..10).map(|k| (5_000 + 20 * k, 20)).collect();
-    assert_eq!(got, want);
+    let mut want: Vec<(u64, u64)> = (0..10).map(|k| (5_000 + 20 * k, 20)).collect();
+    want.push((5_200, 6));
+    assert_eq!(got, want, "ten frames and the lookahead flush");
 }
 
 #[test]
@@ -59,8 +63,8 @@ fn unstamped_input_counts_from_zero() {
     let got = encode(&mut h, &tone(FRAME * 3 + 100), 1000, None);
     assert_eq!(
         got,
-        [(0, 20), (20, 20), (40, 20), (60, 1)],
-        "the tail is stamped with its 50 samples"
+        [(0, 20), (20, 20), (40, 20), (60, 7)],
+        "the tail is stamped with its 50 samples and the lookahead"
     );
 }
 
@@ -73,7 +77,11 @@ fn a_flush_counts_again_from_the_next_stamp() {
     h.push_event(Event::FlushStart).expect("flush");
     h.push_event(Event::FlushStop).expect("flush");
     let got = encode(&mut h, &tone(FRAME * 2), FRAME * 2, Some(30_000));
-    assert_eq!(got, [(30_000, 20), (30_020, 20)], "the carried partial frame went with the flush");
+    assert_eq!(
+        got,
+        [(30_000, 20), (30_020, 20), (30_040, 6)],
+        "the carried partial frame went with the flush"
+    );
 }
 
 #[test]
@@ -103,10 +111,12 @@ fn fix_mono(h: &mut Harness) {
     h.change_sink_format(OpusEnc::IN, "audio/raw", &fields).expect("format change");
 }
 
-/// Packet count, contiguous 20 ms stamps from `from_ms`, the last stamped with its real samples.
+/// Packet count, contiguous 20 ms stamps from `from_ms`, the last ending the lookahead past the
+/// real samples.
 fn assert_covers(got: &[(u64, u64)], from_ms: u64, samples: usize) {
-    let n = samples.div_ceil(960);
-    let rem = (samples - (n - 1) * 960) as u64;
+    let span = samples + LOOKAHEAD;
+    let n = span.div_ceil(960);
+    let rem = (span - (n - 1) * 960) as u64;
     let mut want: Vec<(u64, u64)> = (0..n as u64).map(|k| (from_ms + 20 * k, 20)).collect();
     let (last, real) = (got.last().map_or(0, |p| p.1), rem / 48);
     assert!(last == real || last == real + 1, "last packet {last} ms, {rem} samples");

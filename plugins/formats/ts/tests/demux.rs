@@ -428,6 +428,41 @@ fn pmt_version_change_remaps_the_streams() {
     assert_eq!(video[0].payload, v);
 }
 
+/// A selected stream a new map moves to another PID is read on there in the same push, the one
+/// of its type at its place, and its unit in progress ends at the map. One unselected or told off
+/// stays so.
+#[test]
+fn a_selected_stream_moved_by_a_new_map_is_followed() {
+    let rows = [(0x1B, VIDEO, &[][..]), (0x0F, AUDIO, &[][..]), (0x0F, 0x102, &[][..])];
+    let mut ts = start(&rows, VIDEO);
+    let unit = |pts| pes_bytes(0xE0, Some(pts), None, &pattern(30, 40), true);
+    ts.pes(VIDEO, 0, &pes_bytes(0xE0, Some(1), None, &pattern(30, 40), false));
+    let next = [(0x1B, 0x200, &[][..]), (0x0F, 0x201, &[][..]), (0x0F, 0x202, &[][..])];
+    ts.section(PMT, &pmt_section(1, 1, 0x200, &[], &next));
+    for pid in [0x200, 0x201, 0x202] {
+        ts.pes(pid, 0, &unit(2));
+    }
+    ts.tail();
+    let mut demux = Demux::new(Config { select_all: false, ..Config::default() }).expect("config");
+    demux.select(VIDEO, true);
+    demux.select(AUDIO, true);
+    demux.select(0x202, false);
+    let mut events = Vec::new();
+    common::run_with(&mut demux, &ts.out, || usize::MAX, &mut events);
+    let pts = |pid| units_of(&events, pid).iter().map(|u| u.pts).collect::<Vec<_>>();
+    assert_eq!((pts(VIDEO), pts(0x200), pts(0x201)), (vec![Some(1)], vec![Some(2)], vec![Some(2)]));
+    assert_eq!(pts(0x202), [], "told off");
+    let at = |want: &dyn Fn(&common::Owned) -> bool| events.iter().position(want).expect("found");
+    let ended = at(&|e| matches!(e, common::Owned::Pes(u) if u.pid == VIDEO));
+    let mapped = at(&|e| matches!(e, common::Owned::Pmt { program, .. } if program.version == 1));
+    assert!(ended < mapped, "the unit on the old PID ends at the map");
+    // with nothing selected nothing follows
+    let mut demux = Demux::new(Config { select_all: false, ..Config::default() }).expect("config");
+    let mut events = Vec::new();
+    common::run_with(&mut demux, &ts.out, || usize::MAX, &mut events);
+    assert!(units(&events).is_empty());
+}
+
 #[test]
 fn a_changed_table_with_the_same_version_is_still_a_change() {
     let mut ts = av();

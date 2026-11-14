@@ -425,6 +425,8 @@ pub struct Demux {
     programs_next: Vec<Program>,
     /// `max_streams_per_program` rows per program, indexed by `Program::block`.
     streams: Vec<StreamInfo>,
+    /// A program's map before a new version, PID and stream type of each stream.
+    was: Vec<(u16, u8)>,
     free_blocks: Vec<u16>,
     pes: Vec<PesSlot>,
     stats: Stats,
@@ -780,6 +782,7 @@ impl Demux {
             programs: Vec::with_capacity(programs),
             programs_next: Vec::with_capacity(programs),
             streams: vec![blank_stream; programs * streams],
+            was: Vec::with_capacity(streams),
             free_blocks: Vec::with_capacity(programs),
             pes,
             stats: Stats::default(),
@@ -1573,6 +1576,11 @@ impl Demux {
         let per = usize::from(self.cfg.limits.max_streams_per_program);
         let start = usize::from(p.block) * per;
         let Some(area) = self.streams.get_mut(start..start + per) else { return };
+        self.was.clear();
+        if p.mapped {
+            let old = &area[..usize::from(p.stream_count).min(per)];
+            self.was.extend(old.iter().map(|s| (s.pid, s.stream_type)));
+        }
         let mut count = 0;
         let mut ignored = 0u32;
         let mut truncated = false;
@@ -1620,11 +1628,40 @@ impl Demux {
                 u32::from(h.id),
             );
         }
+        self.follow(start, count, sink);
         self.rebuild(offset, sink);
         if let (Some(program), Some(streams)) =
             (self.programs.get(index), self.streams.get(start..start + count))
         {
             sink(Event::Pmt { program, streams });
+        }
+    }
+
+    /// A selected stream the new map at `start` moved to another PID is selected there, the one
+    /// of its stream type at its place among that type's streams, unless that PID was told. The
+    /// unbounded unit in progress on a PID the map left out ends there.
+    fn follow<F: FnMut(Event<'_>)>(&mut self, start: usize, count: usize, sink: &mut F) {
+        let Some(now) = self.streams.get(start..start + count) else { return };
+        for s in &mut self.pes {
+            let gone = self.was.iter().any(|w| w.0 == s.pid) && !now.iter().any(|n| n.pid == s.pid);
+            if gone && s.state == PesState::Payload && !s.bounded {
+                emit_unit(s, &s.buf, 0, &mut self.stats, sink);
+                s.state = PesState::Free;
+                s.buf.clear();
+            }
+        }
+        for (n, &(pid, kind)) in self.was.iter().enumerate() {
+            let on = self.pids.get(usize::from(pid)).is_some_and(|e| e.flags & EF_ON != 0);
+            if !on || now.iter().any(|s| s.pid == pid) {
+                continue;
+            }
+            let nth = self.was[..n].iter().filter(|w| w.1 == kind).count();
+            let Some(to) = now.iter().filter(|s| s.stream_type == kind).nth(nth) else { continue };
+            if let Some(e) = self.pids.get_mut(usize::from(to.pid))
+                && e.flags & (EF_ON | EF_OFF) == 0
+            {
+                e.flags |= EF_ON;
+            }
         }
     }
 

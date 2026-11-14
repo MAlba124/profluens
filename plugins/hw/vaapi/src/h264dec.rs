@@ -596,13 +596,11 @@ impl VaapiH264Dec {
         let pps_id = bs::peek_pps_id(first.raw(au));
         let Some(pps) = pps_id.and_then(|id| self.pps.get(id as usize).and_then(|p| p.clone()))
         else {
-            self.warn(ctx, K::UnknownPps);
-            return;
+            return self.lose_unbegun(ctx, K::UnknownPps, &sc.slices, &sc.headers);
         };
         let Some(sps) = self.sps.get(pps.seq_parameter_set_id as usize).and_then(|s| s.clone())
         else {
-            self.warn(ctx, K::UnknownSps);
-            return;
+            return self.lose_unbegun(ctx, K::UnknownSps, &sc.slices, &sc.headers);
         };
 
         if sps.separate_colour_plane_flag
@@ -626,16 +624,15 @@ impl VaapiH264Dec {
         // Each slice codes at least one macroblock, and A.3 bounds the count per picture.
         let most = (sps.width_in_mbs() * sps.height_in_mbs()).min(SLICES_MAX);
         if sc.slices.len() > most as usize {
-            self.warn(ctx, K::TooManySlices { slices: sc.slices.len(), most });
-            return;
+            let kind = K::TooManySlices { slices: sc.slices.len(), most };
+            return self.lose_unbegun(ctx, kind, &sc.slices, &sc.headers);
         }
         sc.headers.clear();
         for n in &sc.slices {
             let Some(sh) =
                 h264parse::parse_slice_header(n.raw(au), n.unit_type, n.ref_idc, &sps, &pps)
             else {
-                self.warn(ctx, K::SliceHeader);
-                return;
+                return self.lose_unbegun(ctx, K::SliceHeader, &sc.slices, &sc.headers);
             };
             if sh.field_pic_flag {
                 self.fail(ctx, K::Interlaced);
@@ -755,6 +752,24 @@ impl VaapiH264Dec {
                 self.warn(ctx, K::Dpb(e));
                 self.abandon(&p, sh0);
             }
+        }
+    }
+
+    /// A picture lost before the DPB began it. One with an IDR slice or an MMCO 5 in the
+    /// headers parsed so far resets the DPB as `abandon` does for a key, the pictures before it
+    /// go out first as it would have put them out. Pictures after it wait for a key instead of
+    /// predicting from the GOP before. Any other picture leaves a frame_num gap to `begin`.
+    fn lose_unbegun(&mut self, ctx: &mut Ctx, kind: K, slices: &[Nal], headers: &[SliceHeader]) {
+        self.warn(ctx, kind);
+        let idr = slices.iter().any(|n| n.unit_type == h264parse::NAL_SLICE_IDR);
+        let mmco5 = headers.iter().any(|sh| {
+            sh.adaptive_ref_pic_marking_mode_flag && sh.mmco_ops.iter().any(|o| o.op == 5)
+        });
+        if idr || mmco5 {
+            let mut ev = Events::new();
+            self.dpb.flush(&mut ev);
+            self.apply(&ev);
+            self.discard_dpb();
         }
     }
 
@@ -1617,4 +1632,116 @@ fn pack_pic_fields(sps: &Sps, pps: &Pps, field_pic: bool, is_ref: bool) -> u32 {
     v |= (pps.redundant_pic_cnt_present_flag as u32) << 9;
     v |= (is_ref as u32) << 10; // reference_pic_flag
     v
+}
+
+#[cfg(test)]
+// Test fixtures.
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use profluens_core::bus::Bus;
+    use profluens_core::id::{ElementId, FormatId};
+    use profluens_core::memory::{Pool, PoolConfig};
+
+    use super::*;
+
+    const SPS_1080P: [u8; 27] = [
+        0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x78, 0x02, 0x27, 0xe5, 0xc0, 0x44, 0x00, 0x00,
+        0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc6, 0x58,
+    ];
+
+    fn header(ty: SliceType, frame_num: u32, lsb: u32) -> SliceHeader {
+        SliceHeader {
+            first_mb_in_slice: 0,
+            slice_type: ty,
+            pic_parameter_set_id: 0,
+            frame_num,
+            field_pic_flag: false,
+            bottom_field_flag: false,
+            idr_pic_id: 0,
+            is_idr: frame_num == 0 && ty == SliceType::I,
+            pic_order_cnt_lsb: lsb,
+            delta_pic_order_cnt_bottom: 0,
+            delta_pic_order_cnt: [0; 2],
+            num_ref_idx_l0_active_minus1: 0,
+            num_ref_idx_l1_active_minus1: 0,
+            ref_list_mods_l0: Default::default(),
+            ref_list_mods_l1: Default::default(),
+            cabac_init_idc: 0,
+            slice_qp_delta: 0,
+            disable_deblocking_filter_idc: 0,
+            slice_alpha_c0_offset_div2: 0,
+            slice_beta_offset_div2: 0,
+            direct_spatial_mv_pred_flag: false,
+            no_output_of_prior_pics_flag: false,
+            long_term_reference_flag: false,
+            adaptive_ref_pic_marking_mode_flag: false,
+            mmco_ops: Default::default(),
+            pred_weights: None,
+            header_bits_in_rbsp: 0,
+        }
+    }
+
+    fn nal(unit_type: u8, end: u32) -> Nal {
+        Nal { ref_idc: 2, unit_type, start: 0, end }
+    }
+
+    /// An IDR into surface 1 and a P into surface 2, both references.
+    fn two_refs() -> (VaapiH264Dec, Sps) {
+        let mut sps = h264parse::parse_sps(&SPS_1080P).unwrap();
+        sps.max_num_ref_frames = 4;
+        let mut d = VaapiH264Dec::new();
+        let mut ev = Events::new();
+        for (unit_type, sh, surface) in [
+            (h264parse::NAL_SLICE_IDR, header(SliceType::I, 0, 0), 1),
+            (h264parse::NAL_SLICE_NON_IDR, header(SliceType::P, 1, 2), 2),
+        ] {
+            let n = nal(unit_type, 0);
+            let p = d.dpb.begin(&sps, &n, &sh, sh.slice_type == SliceType::I, &mut ev).unwrap();
+            d.apply(&ev);
+            let slot = d.slot_of(surface);
+            d.held[slot.0 as usize] = true;
+            d.dpb.end(&p, slot, &sh, &mut ev).unwrap();
+            d.apply(&ev);
+        }
+        assert_eq!(d.dpb.refs().len(), 2);
+        (d, sps)
+    }
+
+    /// An access unit of one slice naming PPS 0, which the decoder has not seen.
+    fn lost(d: &mut VaapiH264Dec, slice: &[u8]) {
+        let (bus_tx, _bus) = Bus::channel();
+        let pool = Pool::with_config(PoolConfig::heap(64, 1));
+        let mut ctx = Ctx::new(pool, bus_tx, ElementId(0), FormatId(0), 1);
+        let mut sc = AuScratch::default();
+        sc.nals.push(Nal {
+            ref_idc: slice[0] >> 5 & 3,
+            unit_type: slice[0] & 31,
+            start: 0,
+            end: 3,
+        });
+        d.decode_picture(&mut ctx, slice, Timestamp::ZERO, Timestamp::ZERO, &mut sc);
+    }
+
+    #[test]
+    fn an_idr_lost_before_begin_resets_the_dpb() {
+        let (mut d, sps) = two_refs();
+        // first_mb 0, slice_type 7 (I), pps 0
+        lost(&mut d, &[0x65, 0x88, 0x80]);
+        assert!(d.dpb.refs().is_empty());
+        assert!(d.held.iter().all(|&h| !h));
+        // the P after it waits for a key instead of predicting from the GOP before
+        let sh = header(SliceType::P, 1, 2);
+        let mut ev = Events::new();
+        let n = nal(h264parse::NAL_SLICE_NON_IDR, 0);
+        assert_eq!(d.dpb.begin(&sps, &n, &sh, false, &mut ev).unwrap().fate, Fate::Skip);
+    }
+
+    #[test]
+    fn a_reference_lost_before_begin_leaves_a_gap() {
+        let (mut d, _) = two_refs();
+        // first_mb 0, slice_type 5 (P), pps 0
+        lost(&mut d, &[0x41, 0x9a, 0x80]);
+        assert_eq!(d.dpb.refs().len(), 2);
+        assert!(d.held[0] && d.held[1]);
+    }
 }

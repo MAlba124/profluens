@@ -1,7 +1,6 @@
 //! A tail's time-limited links grow to the interleave of its tracks, so a far-ahead track never
 //! starves another.
 
-use crate::level::Limit;
 use crate::sched::DownLink;
 use crate::time::Timestamp;
 
@@ -36,7 +35,7 @@ impl Default for Weave {
 }
 
 pub(crate) fn timed(d: &DownLink) -> bool {
-    d.limited && d.base.is_some() && !d.sparse
+    d.base.is_some() && !d.sparse
 }
 
 /// A timed link drained whose next data lies behind what `full` holds past its own limit.
@@ -71,7 +70,8 @@ impl Weave {
 
     pub(crate) fn join(&self, d: &DownLink) {
         if timed(d) {
-            d.level.set_limit(Limit { time: self.limit_of(d), ..d.level.limit() });
+            // The time bound alone, the app's byte bound is its own.
+            d.level.set_limit_time(self.limit_of(d));
         }
     }
 

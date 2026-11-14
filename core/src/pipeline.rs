@@ -149,6 +149,8 @@ struct Pending {
     latency: Vec<(u32, Timestamp)>,
     pads: Vec<(u32, (usize, usize))>,
     leaky: Vec<(u32, Option<crate::ring::Leaky>)>,
+    /// The new links' levels, put in view once the change lands.
+    levels: Vec<(ElementId, SinkPad, Arc<Gauge>)>,
 }
 
 struct LiveRun {
@@ -2259,7 +2261,8 @@ impl Pipeline {
                 return Err(Error::Graph(GraphError::NonTailBranch { src, sink }));
             }
             let (down, up) = self.ring(edge, link, &stations[gs], &stations[gd]);
-            note_level((&mut self.rows, &mut self.dirty.0), edge, &down.level);
+            let (slot, pad) = (edge.slots[1] as usize, edge.sink_pad);
+            note_level((&mut self.rows, &mut self.dirty.0), slot, pad, &down.level);
             downstream[gs].push(down);
             upstream[gd].push(up);
         }
@@ -2926,7 +2929,6 @@ impl Pipeline {
         level.set_limit(tune.limit.unwrap_or(Limit::NONE));
         let pad = edge.src_pad;
         let room_up = Arc::clone(&room);
-        let limited = level.limit() != Limit::NONE;
         if let Some((low, high)) = tune.marks {
             level.set_marks(low, high);
         }
@@ -2944,7 +2946,6 @@ impl Pipeline {
             room,
             staged,
             level,
-            limited,
             base,
             sparse,
             mark,
@@ -3037,7 +3038,7 @@ impl Pipeline {
         let Some(done) = run.flight.take() else {
             return;
         };
-        let Pending { journal, groups, leaving, latency, pads, leaky, .. } = done;
+        let Pending { journal, groups, leaving, latency, pads, leaky, levels, .. } = done;
         let mut gone: Vec<ElementId> = leaving.iter().map(|(el, _)| *el).collect();
         let mut ran = groups;
         if how.is_err() {
@@ -3055,6 +3056,13 @@ impl Pipeline {
             };
             gone = journal.iter().filter_map(made).collect();
             self.revert(journal);
+        } else if !levels.is_empty() {
+            for (el, pad, level) in &levels {
+                if let Some(slot) = self.slot(*el) {
+                    note_level((&mut self.rows, &mut self.dirty.0), slot, *pad, level);
+                }
+            }
+            self.publish();
         }
         for el in gone {
             self.forget(el);
@@ -3274,6 +3282,8 @@ impl Pipeline {
         let mut up: Vec<Vec<UpLink>> = new_groups.iter().map(|_| Vec::new()).collect();
         let (mut wait, mut prerolls) = (Vec::new(), true);
         let mut pad_counts: Vec<(u32, (usize, usize))> = Vec::new();
+        // A level goes in view once the change lands, the live link's stays until then.
+        let mut levels = Vec::new();
         for el in fresh.iter().flat_map(|(_, e)| [e.src, e.sink]).filter(|el| stays(*el).is_some())
         {
             put(&mut pad_counts, el, self.pad_count(el));
@@ -3320,7 +3330,7 @@ impl Pipeline {
                 continue;
             }
             let (d, u) = self.ring(e, LinkId(*i as u32), station(from), station(to));
-            note_level((&mut self.rows, &mut self.dirty.0), e, &d.level);
+            levels.push((e.sink, e.sink_pad, Arc::clone(&d.level)));
             match from {
                 Place::New(g) => down[g].push(d),
                 Place::Run(g) => {
@@ -3511,8 +3521,16 @@ impl Pipeline {
                 self.bus_sender.send(BusMessage::Inserted { element: *element, link: *link });
             }
         }
-        run.flight =
-            Some(Pending { change, journal, groups: before, leaving, latency, pads, leaky: held });
+        run.flight = Some(Pending {
+            change,
+            journal,
+            groups: before,
+            leaving,
+            latency,
+            pads,
+            leaky: held,
+            levels,
+        });
         self.control.topology.stage(flight, steps, setups, &heads);
         self.control.topology.advance(&self.control, &self.bus_sender);
         Ok(change)
@@ -3525,11 +3543,13 @@ impl Default for Pipeline {
     }
 }
 
-fn note_level((rows, dirty): (&mut [Row], &mut Vec<usize>), edge: &Edge, level: &Arc<Gauge>) {
-    dirty.push(edge.slots[1] as usize / CHUNK);
-    if let Some(row) = rows.get_mut(edge.slots[1] as usize) {
-        row.levels.retain(|(pad, _)| *pad != edge.sink_pad);
-        row.levels.push((edge.sink_pad, Arc::clone(level)));
+type Rows<'a> = (&'a mut [Row], &'a mut Vec<usize>);
+
+fn note_level((rows, dirty): Rows<'_>, slot: usize, pad: SinkPad, level: &Arc<Gauge>) {
+    dirty.push(slot / CHUNK);
+    if let Some(row) = rows.get_mut(slot) {
+        row.levels.retain(|(p, _)| *p != pad);
+        row.levels.push((pad, Arc::clone(level)));
     }
 }
 

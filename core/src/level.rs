@@ -200,6 +200,16 @@ impl Gauge {
         self.bounds.max_time.store(limit.time.0, Relaxed);
     }
 
+    /// The byte bound alone. The app sets it while the tail grows the time bound.
+    pub fn set_limit_bytes(&self, bytes: u64) {
+        self.bounds.max_bytes.store(bytes, Relaxed);
+    }
+
+    /// The time bound alone, the one the tail grows.
+    pub fn set_limit_time(&self, time: Timestamp) {
+        self.bounds.max_time.store(time.0, Relaxed);
+    }
+
     /// Set the low and high marks. A level with none never says a [`Fill`].
     pub fn set_marks(&self, low: Limit, high: Limit) {
         let b = &self.bounds;
@@ -590,6 +600,22 @@ mod loom_tests {
             }
             feeder.join().unwrap();
             assert!(level.held().time <= t(20));
+        });
+    }
+
+    // The app bounds the bytes while the tail grows the time limit. Neither undoes the other.
+    #[test]
+    fn loom_a_byte_bound_and_a_grown_time_limit_set_at_once_both_hold() {
+        loom::model(|| {
+            let level = Arc::new(Gauge::default());
+            level.set_limit(Limit::time(Timestamp(10)));
+            let app = {
+                let level = Arc::clone(&level);
+                loom::thread::spawn(move || level.set_limit_bytes(64))
+            };
+            level.set_limit_time(Timestamp(20));
+            app.join().unwrap();
+            assert_eq!(level.limit(), Limit { bytes: 64, time: Timestamp(20) });
         });
     }
 

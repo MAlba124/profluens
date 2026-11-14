@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::batch::{Batch, Inputs};
+use crate::buffer::BufferFlags;
 use crate::bus::{BusMessage, BusSender};
 use crate::clock::{Clock, Nap};
 use crate::command::{Command, Control, Cursor, Finish, PLAYING};
@@ -251,7 +252,6 @@ pub(crate) struct DownLink {
     pub(crate) room: Arc<Room>,
     pub(crate) staged: Option<Batch>,
     pub(crate) level: Arc<Gauge>,
-    pub(crate) limited: bool,
     /// The time limit set on the link, `NONE` for none. The tail grows it to the interleave.
     pub(crate) base: Timestamp,
     /// It carries a sparse stream, which never measures, starves or rests by time.
@@ -1308,7 +1308,7 @@ impl Group {
     fn resting(&mut self) -> Option<SrcPad> {
         for j in 0..self.downstream.len() {
             let d = &self.downstream[j];
-            if !(d.limited && d.level.full()) {
+            if !d.level.full() {
                 continue;
             }
             match self.weave.full(j, &self.downstream) {
@@ -1335,8 +1335,8 @@ impl Group {
     }
 
     fn room(&self) -> Timestamp {
-        let limited = self.downstream.iter().filter(|d| d.limited && !d.sparse);
-        limited.map(|d| d.level.room()).min().unwrap_or(Timestamp::NONE)
+        let dense = self.downstream.iter().filter(|d| !d.sparse);
+        dense.map(|d| d.level.room()).min().unwrap_or(Timestamp::NONE)
     }
 
     fn tell_room(&mut self, cap: usize) {
@@ -1424,10 +1424,13 @@ impl Group {
         }
         let leaving = self.leaving.is_some();
         for d in self.downstream.iter_mut() {
-            if d.staged.is_some() && d.limited && d.level.full() {
-                // staged behind a full level, the take that makes room signals the group
+            if d.staged.is_some() && d.level.full() {
+                // Staged behind a full level. Raised before the second look, so the next take
+                // signals this group.
                 d.room.raise();
-                continue;
+                if d.level.full() {
+                    continue;
+                }
             }
             let Some(out) = d.staged.take() else { continue };
             if !(leaving && d.data.is_closed()) {
@@ -1755,11 +1758,14 @@ impl Group {
                 out.pushed_at = Some(self.shared.trace_ns());
             }
             *progressed = true;
-            // A codec head or a bare event is no media, only a stamped row says the tail is back
-            // where the ring filled.
+            // A codec head or a bare event is no media. A stamped row says the tail is back where
+            // the ring filled, and so does any other row of a stream that carries no stamps.
             let newest = out.newest();
+            let media = self.restart == Restart::Reading
+                && (newest.is_some()
+                    || out.rows().iter().any(|b| !b.flags.contains(BufferFlags::HEADER)));
             let d = &mut self.downstream[j];
-            let full = d.staged.is_some() || (d.limited && d.level.full());
+            let full = d.staged.is_some() || d.level.full();
             // A restart runs the tail on a full level, its output waits staged like one a full
             // ring refused, the level is a bound the ring does not keep.
             let sent = if d.staged.is_some() {
@@ -1773,8 +1779,8 @@ impl Group {
             };
             // The tail fed media read behind the restart to a full ring, so the group rests on
             // it from the next pass.
-            let caught_up = newest.is_some() && (full || !matches!(sent, Sent::Pushed));
-            if self.restart == Restart::Reading && caught_up {
+            let caught_up = media && (full || !matches!(sent, Sent::Pushed));
+            if caught_up {
                 crate::log!(
                     &self.ctxs[tail],
                     Level::Debug,
@@ -2311,7 +2317,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
 
-    use crate::buffer::{Buffer, BufferFlags};
+    use crate::buffer::Buffer;
     use crate::bus::Bus;
     use crate::clock::MockClock;
     use crate::command::{ALL, COMMAND_LOG_CAP, CommandError};
@@ -2763,7 +2769,6 @@ mod tests {
                 room,
                 staged: None,
                 level,
-                limited: false,
                 base: Timestamp::NONE,
                 sparse: false,
                 mark: None,
@@ -4389,6 +4394,36 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_of_a_byte_source_ends_on_the_first_unstamped_row_it_feeds_the_full_ring() {
+        let mut r = rig(vec![source(100)], &[], &[0]);
+        assert_eq!(settle(&mut r), ring(0));
+        let made = r.group.counters[0].snapshot().buffers_out;
+        r.group.restart = Restart::Handed;
+        assert_eq!(r.group.pass().unwrap(), Outcome::Progressed, "the member ran on the full ring");
+        assert_eq!(r.group.counters[0].snapshot().buffers_out, made + 1);
+        assert_eq!(r.group.restart, Restart::Idle, "bytes read behind the restart end it");
+        assert_eq!(r.group.pass().unwrap(), ring(0), "and the group rests on the ring again");
+        assert_eq!(r.group.counters[0].snapshot().buffers_out, made + 1, "no element ran");
+    }
+
+    #[test]
+    fn a_codec_head_does_not_end_a_restart() {
+        let head = Probe { pts_step: MS(10), ..source(100) };
+        let tail = Probe { outs: &[0], ..probe(&FILTER) };
+        let mut r = rig(vec![head, tail], &[], &[0]);
+        for _ in 0..4 {
+            assert!(r.group.downstream[0].data.try_push(timed(&r.pool, 0, 1)).is_ok());
+        }
+        r.group.restart = Restart::Reading;
+        let mut config = buf(&r.pool);
+        config.flags = BufferFlags::HEADER;
+        r.group.ctxs[1].output_on(OUT).push(config);
+        r.group.route(&mut false);
+        assert_eq!(r.group.downstream[0].staged.as_ref().map(Batch::len), Some(1));
+        assert_eq!(r.group.restart, Restart::Reading, "a codec head is no media");
+    }
+
+    #[test]
     fn what_the_tail_held_from_before_a_restart_does_not_end_it() {
         let gate = Arc::new(AtomicBool::new(false));
         let head = Probe { pts_step: MS(10), gate: Some(Arc::clone(&gate)), ..source(100) };
@@ -5522,7 +5557,6 @@ mod tests {
 
     fn limit(r: &mut Rig, limit: Limit) {
         r.group.downstream[0].level.set_limit(limit);
-        r.group.downstream[0].limited = true;
     }
 
     fn feed(r: &Rig, link: usize, b: Batch) {
@@ -5574,6 +5608,30 @@ mod tests {
         assert_eq!(r.group.pass().unwrap(), Outcome::Progressed);
         assert_eq!(settle(&mut r), ring(0));
         assert_eq!(r.group.counters[0].snapshot().buffers_out, 5);
+    }
+
+    #[test]
+    fn a_take_between_the_look_at_a_full_level_and_the_raise_still_sends_the_staged_batch() {
+        let mut r = rig(vec![Probe { pts_step: MS(10), ..source(100) }], &[], &[0]);
+        limit(&mut r, Limit::time(MS(25)));
+        assert_eq!(settle(&mut r), ring(0));
+        // a restart left a batch behind the full level, the ring itself has room
+        r.group.downstream[0].staged = Some(timed(&r.pool, 4, 1));
+        while r.down[0].0.try_pop().is_some() {}
+        let level = Arc::clone(&r.group.downstream[0].level);
+        let (fed, to) = (level.held().bytes, level.fed_to());
+        assert!(level.full());
+        // the consumer's take lands before the flag is up, so it signals nothing
+        let once = AtomicBool::new(false);
+        let take = move || {
+            if !once.swap(true, Ordering::Relaxed) {
+                level.take(fed, to);
+            }
+        };
+        assert!(r.group.downstream[0].room.before_raise.set(Box::new(take)).is_ok());
+        assert_eq!(r.group.pass().unwrap(), Outcome::Progressed, "the second look saw the room");
+        assert!(r.group.downstream[0].staged.is_none());
+        assert_eq!(r.down[0].0.try_pop().map(|b| b.len()), Some(1), "the staged batch went in");
     }
 
     /// A demuxer whose second pad alone is linked, its audio, hands that pad's buffers to the
@@ -5702,7 +5760,7 @@ mod tests {
 
     fn weave_link(d: &mut DownLink) {
         d.level.set_limit(Limit::time(WEAVE_LIMIT));
-        (d.limited, d.base) = (true, WEAVE_LIMIT);
+        d.base = WEAVE_LIMIT;
     }
 
     fn weave_rig(lay: fn(u64) -> (u32, Timestamp), rows: u32) -> Rig {
@@ -5874,7 +5932,6 @@ mod tests {
             room,
             staged: None,
             level,
-            limited: false,
             base: Timestamp::NONE,
             sparse: false,
             mark: None,

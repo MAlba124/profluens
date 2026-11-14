@@ -731,6 +731,69 @@ fn a_cap_on_the_pools_together_cuts_each_and_the_run_is_whole() {
     }
 }
 
+#[test]
+fn a_byte_bound_set_on_a_link_built_without_a_limit_rests_its_feeder() {
+    let mut r = Rig::new();
+    let (src, sink) = (r.add(&SRC, Role::Source), r.add(&SINK, Role::Sink));
+    r.link(src.src(OUT), sink.sink(IN));
+    r.p.set_queue_capacity(sink, 16);
+    let tap = r.p.tap_handle();
+    let mut run = r.step();
+    assert_eq!(tap.link_limit(sink, IN), Some(Limit::NONE));
+    assert_eq!(tap.set_link_bytes(sink, IN, 24), Some(()));
+    assert_eq!(tap.set_link_bytes(sink, SinkPad(7), 24), None, "no link into that pad");
+    assert_eq!(tap.set_link_bytes(ElementId(99), IN, 24), None, "no such element");
+    assert_eq!(tap.link_limit(sink, IN), Some(Limit::bytes(24)));
+    // the source's group alone runs, so the link only fills
+    for _ in 0..64 {
+        run.pass(0).expect("pass");
+    }
+    let held = tap.queued(sink, IN).expect("a link").bytes;
+    assert!((24..24 + 12).contains(&held), "two rows of 12 bytes and it rests, held {held}");
+    assert!(matches!(run.outcome(0), Some(Outcome::Blocked { .. })), "{:?}", run.outcome(0));
+    assert_eq!(tap.set_link_bytes(sink, IN, u64::MAX), Some(()));
+    run.pass(0).expect("pass");
+    assert!(tap.queued(sink, IN).expect("a link").bytes > held, "unbounded, it feeds again");
+}
+
+/// The link into `sink` stands at `bytes`, the live one's own bound, not a planned link's.
+fn bounded_at(tap: &profluens_core::counters::TapHandle, sink: ElementId, bytes: u64) -> bool {
+    tap.link_limit(sink, IN).is_some_and(|l| l.bytes == bytes)
+}
+
+#[test]
+fn a_relink_that_waits_or_is_taken_back_leaves_the_live_links_level_in_view() {
+    let mut r = Rig::new();
+    let (src, sink) = (r.add(&SRC, Role::Source), r.add(&SINK, Role::Sink));
+    let live = r.link(src.src(OUT), sink.sink(IN));
+    let tap = r.p.tap_handle();
+    let (mut run, mut rng) = (r.step(), Rng(7));
+    assert!(!r.run(&mut run, &mut rng, Some(40)));
+    assert_eq!(tap.set_link_bytes(sink, IN, 1 << 20), Some(()));
+    r.p.unlink(live).expect("unlink");
+    let mute = r.add(&SRC, Role::Mute);
+    r.link(mute.src(OUT), sink.sink(IN));
+    let change = r.p.commit().expect("commit");
+    assert!(!r.run(&mut run, &mut rng, Some(40)));
+    assert!(r.p.changing(), "the change waits for a batch that does not come");
+    assert!(bounded_at(&tap, sink, 1 << 20), "the live link until the splice");
+    assert_eq!(r.p.cancel(), Some(change));
+    assert!(bounded_at(&tap, sink, 1 << 20), "and once the change is taken back");
+    assert_eq!(tap.set_link_bytes(sink, IN, 1 << 21), Some(()));
+    assert!(bounded_at(&tap, sink, 1 << 21));
+    // a relink that lands moves the view to the new link, set as the new link is
+    let second = r.add(&SRC2, Role::Source);
+    r.p.remove(src, Leave::Cut).expect("remove");
+    r.link(second.src(OUT_B), sink.sink(IN));
+    r.p.commit().expect("commit");
+    while r.p.changing() {
+        assert!(!r.run(&mut run, &mut rng, Some(1)), "the run outlives the splice");
+    }
+    assert!(bounded_at(&tap, sink, u64::MAX), "the new link's bound");
+    assert!(r.run(&mut run, &mut rng, None), "the run ends");
+    run.finish().expect("finish");
+}
+
 static LATE: ElementDesc = ElementDesc {
     latency: LatencyDesc {
         min: Timestamp::from_millis(30),

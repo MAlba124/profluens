@@ -143,22 +143,35 @@ impl Waker {
     }
 }
 
-pub(crate) struct Room(AtomicBool);
+pub(crate) struct Room {
+    flag: AtomicBool,
+    /// Runs as a raise starts, so a test lands a take between a producer's look and its raise.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) before_raise: OnceLock<Box<dyn Fn() + Send + Sync>>,
+}
 
 impl Room {
     pub(crate) fn new() -> Room {
-        Room(AtomicBool::new(false))
+        Room {
+            flag: AtomicBool::new(false),
+            #[cfg(all(test, not(loom)))]
+            before_raise: OnceLock::new(),
+        }
     }
 
     pub(crate) fn raise(&self) {
+        #[cfg(all(test, not(loom)))]
+        if let Some(hook) = self.before_raise.get() {
+            hook();
+        }
         // Pairs with the fence in `try_pop`, the consumer sees the flag or the retry sees room.
-        self.0.store(true, Ordering::SeqCst);
+        self.flag.store(true, Ordering::SeqCst);
         fence(Ordering::SeqCst);
     }
 
     /// Consumer side after a successful `try_pop`, true when the producer must be signaled.
     pub(crate) fn take(&self) -> bool {
-        self.0.load(Ordering::Relaxed) && self.0.swap(false, Ordering::SeqCst)
+        self.flag.load(Ordering::Relaxed) && self.flag.swap(false, Ordering::SeqCst)
     }
 }
 

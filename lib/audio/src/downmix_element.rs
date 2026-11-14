@@ -1,7 +1,6 @@
 //! `audiodownmix`, folds multichannel `audio/raw` to stereo, or to mono when asked.
 
 use profluens_core::batch::Inputs;
-use profluens_core::bus::BusMessage;
 use profluens_core::couple::Coupling;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
@@ -116,21 +115,23 @@ static DESC_MONO: ElementDesc = ElementDesc {
     couplings: &[Coupling::same(0, 0, FIELD_RATE), Coupling::same(0, 0, FIELD_SAMPLE)],
 };
 
-/// Folds interleaved multichannel PCM to stereo, preserving rate and sample format.
+/// Folds interleaved multichannel PCM to stereo, preserving rate and sample format. The channels
+/// out are the ones the src link fixed, so a mono input to a link solved for two goes out on both
+/// sides. With no src link fixed a mono input passes as it is.
 #[derive(Default)]
 pub struct AudioDownmix {
     input: Option<(u32, u16, SampleFormat)>,
-    fed: bool,
     layout: Option<u64>,
     in_stride: usize,
     carry: Vec<u8>,
     scratch: Vec<u8>,
-    warned_relatch: Option<AudioFormat>,
     /// The fold scaled so a full scale input cannot clip, else clamped.
     normalized: bool,
     /// One channel out, the mean of the stereo fold.
     mono: bool,
     mono_buf: Vec<u8>,
+    /// Channels out, picked by `fix_out`.
+    out: u16,
 }
 
 impl AudioDownmix {
@@ -151,6 +152,24 @@ impl AudioDownmix {
     pub fn to_mono(mut self) -> Self {
         self.mono = true;
         self
+    }
+
+    fn out_channels(&self) -> u16 {
+        self.out
+    }
+
+    /// Channels out, the src link's when it is fixed, else the input's up to two.
+    fn fix_out(&mut self, ctx: &Ctx) {
+        let fixed = ctx
+            .negotiated_src(Self::OUT)
+            .zip(ctx.field_id(FIELD_CHANNELS))
+            .and_then(|(f, id)| f.get(id));
+        self.out = match (self.mono, fixed, self.input) {
+            (true, ..) => 1,
+            (false, Some(Value::Int(n @ 1..=2)), _) => n as u16,
+            (false, _, Some((_, 1, _))) => 1,
+            _ => 2,
+        };
     }
 
     fn set_input(&mut self, rate: u32, channels: u16, sample: SampleFormat) {
@@ -200,6 +219,7 @@ impl AudioDownmix {
         if let Some(fmt) = sample {
             self.set_input(rate as u32, channels as u16, fmt);
             self.layout = negotiated_layout(ctx, Self::IN);
+            self.fix_out(ctx);
             log!(
                 &*ctx,
                 Level::Info,
@@ -213,34 +233,35 @@ impl AudioDownmix {
         }
     }
 
-    fn warn_if_relatched(&mut self, ctx: &mut Ctx) {
-        let Some((rate, channels, sample)) = self.input else {
+    /// A format change between buffers. A new input format or layout drops the old one's partial
+    /// frame and is learned again, so the fold follows a 5.1 to 2.0 switch mid stream.
+    fn relearn(&mut self, ctx: &mut Ctx) {
+        let Some(now) = negotiated_audio_format(ctx, Self::IN) else {
             return;
         };
-        let latched = AudioFormat::new(rate, channels, sample);
-        let Some(offered) = negotiated_audio_format(ctx, Self::IN) else {
-            return;
-        };
-        if offered == latched || self.warned_relatch == Some(offered) {
+        let latched =
+            self.input.map(|(rate, channels, sample)| AudioFormat::new(rate, channels, sample));
+        let layout = negotiated_layout(ctx, Self::IN);
+        if latched == Some(now) && layout == self.layout {
             return;
         }
-        self.warned_relatch = Some(offered);
-        let element = ctx.element();
-        ctx.post(BusMessage::Warning {
-            element,
-            error: failed(ctx, DESC.name, K::FormatChangeIgnored { latched, offered }),
-        });
+        if !self.carry.is_empty() {
+            log!(&*ctx, Level::Warn, "format_change_partial_frame", bytes = self.carry.len());
+        }
+        self.carry.clear();
+        self.unlearn();
+        self.learn_from_sink(ctx);
     }
 
     fn announce_output(&self, ctx: &mut Ctx) {
         let Some((rate, channels, fmt)) = self.input else {
             return;
         };
-        let (out, layout) = match (self.mono, channels) {
-            (true, 1) | (false, 1) => (1, self.layout),
-            (true, _) => (1, Some(FC)),
-            (false, 2) => (2, self.layout),
-            (false, _) => (2, Some(STEREO)),
+        let out = self.out_channels();
+        let layout = match (out, channels) {
+            (1, 1) | (2, 2) => self.layout,
+            (1, _) => Some(FC),
+            _ => Some(STEREO),
         };
         announce_raw(ctx, Self::OUT, AudioFormat::new(rate, out, fmt), layout);
     }
@@ -250,13 +271,26 @@ impl AudioDownmix {
             return Err(failed(ctx, DESC.name, K::NoInputFormat));
         };
         let fold = channels > 2;
-        if !fold && (channels == 1 || !self.mono) {
+        if channels == self.out_channels() {
             return push_pcm(ctx, Self::OUT, bytes, (self.in_stride, rate), pts)
                 .map_err(|k| failed(ctx, DESC.name, k));
         }
         let bps = fmt.bytes();
         let frames = bytes.len() / self.in_stride;
         let mut stereo = std::mem::take(&mut self.scratch);
+        if channels == 1 {
+            // Stereo out of a mono input, each sample on both sides
+            stereo.clear();
+            for s in bytes.chunks_exact(bps) {
+                stereo.extend_from_slice(s);
+                stereo.extend_from_slice(s);
+            }
+            let r = push_pcm(ctx, Self::OUT, &stereo, (2 * bps, rate), pts)
+                .map_err(|k| failed(ctx, DESC.name, k));
+            self.scratch = stereo;
+            self.scratch.clear();
+            return r;
+        }
         if fold {
             stereo.clear();
             stereo.resize(frames * 2 * bps, 0);
@@ -274,7 +308,7 @@ impl AudioDownmix {
             }
         }
         let wide: &[u8] = if fold { &stereo } else { bytes };
-        let r = if self.mono {
+        let r = if self.out == 1 {
             let mut mono = std::mem::take(&mut self.mono_buf);
             mono.clear();
             mono.resize(frames * bps, 0);
@@ -301,8 +335,8 @@ impl Element for AudioDownmix {
     }
 
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        self.fix_out(ctx);
         self.announce_output(ctx);
-        self.fed = false;
         self.learn_from_sink(ctx);
         self.carry.clear();
         Ok(())
@@ -314,7 +348,6 @@ impl Element for AudioDownmix {
         }
 
         while let Some(buf) = crate::stamp::take_pcm(ctx, &mut inputs) {
-            self.fed = true;
             if self.input.is_none() {
                 return Err(failed(ctx, DESC.name, K::PcmBeforeFormat));
             }
@@ -322,9 +355,9 @@ impl Element for AudioDownmix {
                 return Err(failed(ctx, DESC.name, K::InputStrideUnknown));
             }
             let len = buf.memory.len();
-            // what passes as it is, a stereo input to a mono fold goes through `emit`
-            if let Some((rate, channels @ 1..=2, _)) = self.input
-                && (channels == 1 || !self.mono)
+            // what passes as it is, every other channel count goes through `emit`
+            if let Some((rate, channels, _)) = self.input
+                && channels == self.out_channels()
                 && self.carry.is_empty()
                 && len > 0
                 && len % self.in_stride == 0
@@ -356,14 +389,7 @@ impl Element for AudioDownmix {
                 log!(&*ctx, Level::Debug, "flush", carry = self.carry.len());
                 self.carry.clear();
             }
-            Event::FormatChange(_) => {
-                log!(&*ctx, Level::Debug, "format_change", fed = self.fed);
-                if !self.fed {
-                    self.unlearn();
-                }
-                self.learn_from_sink(ctx);
-                self.warn_if_relatched(ctx);
-            }
+            Event::FormatChange(_) => self.relearn(ctx),
             Event::Eos if !self.carry.is_empty() => {
                 log!(&*ctx, Level::Warn, "eos_partial_frame", bytes = self.carry.len());
             }
@@ -380,6 +406,7 @@ impl Element for AudioDownmix {
     fn stop(&mut self, _ctx: &mut Ctx) {
         self.carry.clear();
         self.scratch = Vec::new();
+        self.mono_buf = Vec::new();
     }
 }
 

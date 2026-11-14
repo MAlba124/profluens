@@ -75,6 +75,11 @@ impl PolyphaseFilter {
         PolyphaseFilter { l, m, taps_per_phase, stride, phases: Arc::from(phases) }
     }
 
+    /// Input samples one output reads, the branch length padded for the dot product.
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
     /// Total prototype length, `taps_per_phase * L`.
     pub fn prototype_len(&self) -> usize {
         self.taps_per_phase * self.l

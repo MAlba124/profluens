@@ -127,6 +127,8 @@ fn every_glue_element_says_its_output_once_for_an_input_fixed_on_the_link() {
     linked(AudioStretch::new(Rate::ONE), S16, S16, "audiostretch");
     linked(AudioDownmix::new(), (48_000, 6, "s16"), (48_000, 2, "s16"), "audiodownmix");
     linked(AudioDownmix::new(), (48_000, 1, "s16"), (48_000, 1, "s16"), "audiodownmix of mono");
+    let mono = AudioDownmix::new().to_mono();
+    linked(mono, (48_000, 1, "s16"), (48_000, 1, "s16"), "mono audiodownmix of mono");
     linked(AudioChop::new(), S16, S16, "audiochop");
     linked(AudioJoin::new(), S16, S16, "audiojoin");
 }

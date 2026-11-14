@@ -3,7 +3,9 @@
 
 use pf_harness::Harness;
 use profluens_audio::format::{FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE};
-use profluens_audio::{AudioConvert, AudioDownmix, AudioResample, SampleFormat, downmix_to_stereo};
+use profluens_audio::{
+    AudioConvert, AudioDownmix, AudioGain, AudioResample, SampleFormat, downmix_to_stereo,
+};
 use profluens_core::bus::BusMessage;
 use profluens_core::element::Element;
 use profluens_core::event::Event;
@@ -87,29 +89,43 @@ fn audioconvert_flush_drops_the_partial_frame_carry() {
     assert_eq!(got, want, "the carry survived the flush and shifted the interleave");
 }
 
+fn said_channels(h: &Harness) -> Option<Value> {
+    let field = h.vocabulary().field_id(FIELD_CHANNELS)?;
+    h.announced()?.get(field)
+}
+
 #[test]
-fn audioconvert_reports_an_ignored_format_change_once() {
+fn audioconvert_follows_a_format_change_mid_stream() {
     let mut h = rig(AudioConvert::new(SampleFormat::S32), 48_000, 2, "s16");
-    assert_eq!(warnings(&mut h), 0, "nothing to report before any change");
-    push_all(&mut h, &[0u8; 64]);
+    assert_eq!(push_all(&mut h, &[0u8; 64]).len(), 128, "s16 to s32 doubles");
 
     let ev = format_change(&mut h, 44_100, 2, "f32");
     h.push_event(ev).expect("format change");
-    assert_eq!(warnings(&mut h), 1, "a mid-stream format change must be reported");
-
-    let got = push_all(&mut h, &[0u8; 64]);
-    assert_eq!(got.len(), 128, "the element followed the new format instead of keeping the old");
-
-    let ev = format_change(&mut h, 44_100, 2, "f32");
-    h.push_event(ev).expect("format change");
-    for _ in 0..4 {
-        push_all(&mut h, &[0u8; 64]);
-    }
-    assert_eq!(warnings(&mut h), 0, "the warning repeated");
+    let got = push_all(&mut h, &f32_bytes(&[0.5, -0.5, 0.25, -0.25]));
+    let want: Vec<u8> = [0.5f64, -0.5, 0.25, -0.25]
+        .iter()
+        .flat_map(|v| ((v * 2_147_483_648.0) as i32).to_le_bytes())
+        .collect();
+    assert_eq!(got, want, "read as f32, not as the s16 it was");
 
     let ev = format_change(&mut h, 96_000, 6, "s16");
     h.push_event(ev).expect("format change");
-    assert_eq!(warnings(&mut h), 1, "a new distinct format must warn again");
+    assert_eq!(push_all(&mut h, &[0u8; 24]).len(), 48, "two 6 channel s16 frames");
+    assert_eq!(said_channels(&h), Some(Value::Int(6)), "the new channel count is said");
+    assert_eq!(warnings(&mut h), 0, "a followed change is no warning");
+}
+
+#[test]
+fn audiogain_follows_a_format_change_mid_stream() {
+    let mut h = rig(AudioGain::new(0.5), 48_000, 2, "s16");
+    push_all(&mut h, &[0u8; 64]);
+    let ev = format_change(&mut h, 44_100, 1, "f32");
+    h.push_event(ev).expect("format change");
+    let got = push_all(&mut h, &f32_bytes(&[1.0, -1.0, 0.5]));
+    let mut out = Vec::new();
+    take_f32(&mut out, &got);
+    assert_eq!(out, [0.5, -0.5, 0.25], "scaled as f32 mono, not as the s16 stereo it was");
+    assert_eq!(said_channels(&h), Some(Value::Int(1)));
 }
 
 #[test]
@@ -151,25 +167,23 @@ fn audioresample_flush_drops_the_partial_frame_carry() {
 }
 
 #[test]
-fn audioresample_reports_an_ignored_format_change_once() {
+fn audioresample_follows_a_format_change_mid_stream() {
     let mut h = rig(AudioResample::new(24_000), 48_000, 1, "f32");
-    assert_eq!(warnings(&mut h), 0, "nothing to report before any change");
-    push_all(&mut h, &f32_bytes(&vec![0.0f32; 256]));
+    push_all(&mut h, &f32_bytes(&vec![0.0f32; 4_800]));
 
-    let ev = format_change(&mut h, 44_100, 2, "s16");
+    let ev = format_change(&mut h, 24_000, 2, "s16");
     h.push_event(ev).expect("format change");
-    assert_eq!(warnings(&mut h), 1, "a mid-stream format change must be reported");
-
-    let ev = format_change(&mut h, 44_100, 2, "s16");
-    h.push_event(ev).expect("format change");
-    for _ in 0..4 {
-        push_all(&mut h, &f32_bytes(&vec![0.0f32; 256]));
+    let mut tail = Vec::new();
+    while let Some(b) = h.pull(OUT) {
+        tail.extend_from_slice(b.memory.data());
     }
-    assert_eq!(warnings(&mut h), 0, "the warning repeated");
-
-    let ev = format_change(&mut h, 96_000, 6, "s32");
-    h.push_event(ev).expect("format change");
-    assert_eq!(warnings(&mut h), 1, "a new distinct format must warn again");
+    assert!(!tail.is_empty() && tail.len() % 4 == 0, "the old filter's tail, f32 mono");
+    let pcm: Vec<u8> =
+        (0..480).flat_map(|_| [1_000i16, -1_000]).flat_map(i16::to_le_bytes).collect();
+    let got = push_all(&mut h, &pcm);
+    assert_eq!(said_channels(&h), Some(Value::Int(2)));
+    assert_eq!(got, pcm, "the new input at the target rate passes as it is");
+    assert_eq!(warnings(&mut h), 0, "a followed change is no warning");
 }
 
 fn surround_pcm(frames: usize) -> Vec<u8> {
@@ -201,28 +215,19 @@ fn audiodownmix_flush_drops_the_partial_frame_carry() {
 }
 
 #[test]
-fn audiodownmix_reports_an_ignored_format_change_once() {
+fn audiodownmix_follows_a_format_change_mid_stream() {
     let mut h = rig(AudioDownmix::new(), 48_000, 6, "s16");
-    assert_eq!(warnings(&mut h), 0, "nothing to report before any change");
-    push_all(&mut h, &surround_pcm(4));
+    assert_eq!(push_all(&mut h, &surround_pcm(4)).len(), 16, "four stereo frames");
 
     let ev = format_change(&mut h, 48_000, 8, "s16");
     h.push_event(ev).expect("format change");
-    assert_eq!(warnings(&mut h), 1, "a mid-stream channel-count change must be reported");
+    assert_eq!(push_all(&mut h, &[0u8; 48]).len(), 12, "three 8 channel frames folded");
 
-    let got = push_all(&mut h, &surround_pcm(1));
-    assert_eq!(got.len(), 4, "the element followed the new channel count instead of the old");
-
-    let ev = format_change(&mut h, 48_000, 8, "s16");
+    let ev = format_change(&mut h, 44_100, 2, "s16");
     h.push_event(ev).expect("format change");
-    for _ in 0..4 {
-        push_all(&mut h, &surround_pcm(4));
-    }
-    assert_eq!(warnings(&mut h), 0, "the warning repeated");
-
-    let ev = format_change(&mut h, 44_100, 2, "f32");
-    h.push_event(ev).expect("format change");
-    assert_eq!(warnings(&mut h), 1, "a new distinct format must warn again");
+    let stereo: Vec<u8> = (0..8i16).flat_map(i16::to_le_bytes).collect();
+    assert_eq!(push_all(&mut h, &stereo), stereo, "stereo passes as it is");
+    assert_eq!(warnings(&mut h), 0, "a followed change is no warning");
 }
 
 #[test]
@@ -272,6 +277,7 @@ fn a_flush_never_disturbs_the_learned_format() {
 
 #[test]
 fn audiodownmix_announces_the_channels_it_puts_out() {
+    // No src link fixed here, the linked mono case is in format_change.rs
     for (channels, out_channels) in [(1i64, 1i64), (2, 2), (6, 2)] {
         let mut h = rig(AudioDownmix::new(), 48_000, channels, "s16");
         let frames = 480usize;

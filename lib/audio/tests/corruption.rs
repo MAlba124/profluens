@@ -33,6 +33,9 @@ const MIB: usize = 1024 * KIB;
 
 const SLOT: usize = 1 << 16;
 
+/// Input frames the resample filter reads past an output, `HALF_TAPS` in the element.
+const RESAMPLE_HALF_TAPS: u64 = 32;
+
 const SAMPLES: [SampleFormat; 5] =
     [SampleFormat::U8, SampleFormat::S16, SampleFormat::S24, SampleFormat::S32, SampleFormat::F32];
 
@@ -525,7 +528,8 @@ fn resample_target(bytes: &[u8], chunking: Chunking) {
             let g = gcd(format.sample_rate, target);
             ((target / g) as u64, (format.sample_rate / g) as u64)
         };
-        let most = (frames * l).div_ceil(m) + 1;
+        // The filter's lead ahead of the first input, given back as its tail at the end
+        let most = ((frames + RESAMPLE_HALF_TAPS) * l).div_ceil(m) + 1;
         assert!(
             driven.out_bytes as u64 <= most * stride as u64,
             "{format} to {target} Hz gave {} bytes out of {}",

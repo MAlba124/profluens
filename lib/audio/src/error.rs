@@ -26,7 +26,6 @@ pub enum AudioErrorKind {
     NoEngine,
     NoRoom,
     UnsupportedRate { num: u16, den: u16 },
-    FormatChangeIgnored { latched: AudioFormat, offered: AudioFormat },
     WavHeaderBudget { buffered: usize, budget: usize },
     Wav(WavError),
 }
@@ -37,12 +36,7 @@ pub(crate) fn failed(ctx: &Ctx, element: &'static str, kind: AudioErrorKind) -> 
 
 impl fmt::Display for AudioError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.element, self.kind)?;
-        if matches!(self.kind, AudioErrorKind::FormatChangeIgnored { .. }) {
-            let element = self.element;
-            write!(f, " Rebuild the branch (or insert a fresh {element}) to follow the change.")?;
-        }
-        Ok(())
+        write!(f, "{}: {}", self.element, self.kind)
     }
 }
 
@@ -78,12 +72,6 @@ impl fmt::Display for AudioErrorKind {
             K::UnsupportedRate { num, den } => {
                 write!(f, "a rate of {num}/{den} is outside 1/4 to 4, the rate stays as it is")
             }
-            K::FormatChangeIgnored { latched, offered } => write!(
-                f,
-                "ignoring a mid-stream input format change ({latched} -> {offered}), the \
-                 input format is fixed at the first negotiation and every later buffer is \
-                 still processed as the latched one."
-            ),
             K::WavHeaderBudget { buffered, budget } => write!(
                 f,
                 "no WAV data chunk within header budget ({buffered} bytes buffered, budget \
@@ -130,27 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn a_relatch_warning_reads_as_caps_and_names_the_fix() {
-        let latched = AudioFormat::new(48_000, 2, SampleFormat::S16);
-        let offered = AudioFormat::new(44_100, 2, SampleFormat::S16);
-        let e = AudioError {
-            element: "audioresample",
-            kind: K::FormatChangeIgnored { latched, offered },
-        };
-        let s = format!("{e}");
-        let needles = [
-            "audioresample: ignoring",
-            "48000 Hz 2 ch s16 -> 44100 Hz 2 ch s16",
-            "fresh audioresample",
-        ];
-        for n in needles {
-            assert!(s.contains(n), "{s:?} should mention {n:?}");
-        }
-    }
-
-    #[test]
     fn every_message_is_one_plain_line() {
-        let f = AudioFormat::new(48_000, 2, SampleFormat::S16);
         let all = [
             K::PcmBeforeFormat,
             K::NoInputFormat,
@@ -162,7 +130,6 @@ mod tests {
             K::NoEngine,
             K::NoRoom,
             K::UnsupportedRate { num: 9, den: 2 },
-            K::FormatChangeIgnored { latched: f, offered: f },
             K::WavHeaderBudget { buffered: 2 << 20, budget: 1 << 20 },
             K::Wav(WavError::Unsupported { tag: 85, bits: 16 }),
         ];

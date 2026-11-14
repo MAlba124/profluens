@@ -1,7 +1,6 @@
 //! `audioresample`, the element over the [`crate::resample`] polyphase resampler.
 
 use profluens_core::batch::Inputs;
-use profluens_core::bus::BusMessage;
 use profluens_core::couple::Coupling;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
@@ -88,12 +87,26 @@ impl Engine {
         }
     }
 
+    /// The output grid sample of the next output, unstamped counted from the reset.
     fn output_start(&self, pts: Timestamp, in_rate: u32) -> Option<i128> {
+        match pts.nanos() {
+            Some(_) => self.next_output(position_at(pts, in_rate)),
+            None => self.next_output(self.channels.first()?.consumed()),
+        }
+    }
+
+    /// The output grid sample put out next when the next input sample is input grid sample `n`.
+    fn next_output(&self, n: u64) -> Option<i128> {
         let first = self.channels.first()?;
         let (l, m) = (first.filter().l as i128, first.filter().m as i128);
-        pts.nanos()?;
-        let n = i128::from(position_at(pts, in_rate));
-        Some((2 * n * l + i128::from(first.lead()) + m).div_euclid(2 * m))
+        Some((2 * i128::from(n) * l + i128::from(first.lead()) + m).div_euclid(2 * m))
+    }
+
+    /// The first output grid sample at or past input grid sample `n`.
+    fn output_at(&self, n: u64) -> Option<i128> {
+        let f = self.channels.first()?.filter();
+        let (l, m) = (f.l as i128, f.m as i128);
+        Some((i128::from(n) * l + m - 1).div_euclid(m))
     }
 }
 
@@ -101,14 +114,16 @@ impl Engine {
 pub struct AudioResample {
     target: Option<u32>,
     input: Option<AudioFormat>,
-    fed: bool,
     layout: Option<u64>,
     refused: Option<AudioFormat>,
     engine: Option<Engine>,
     in_stride: usize,
     carry: Vec<u8>,
     partial_in: Option<(u32, u16)>,
-    warned_relatch: Option<AudioFormat>,
+    /// Input grid sample just past the last input, `None` unstamped.
+    end_in: Option<u64>,
+    /// Output grid sample below which output is cut, the end of the format before a change.
+    floor: Option<i128>,
     preset: [(&'static str, ValueDesc); 1],
     presets: usize,
 }
@@ -141,8 +156,8 @@ impl AudioResample {
             in_stride: 0,
             carry: Vec::new(),
             partial_in: None,
-            warned_relatch: None,
-            fed: false,
+            end_in: None,
+            floor: None,
             preset: [("rate", ValueDesc::Int(0))],
             presets: 0,
         }
@@ -264,20 +279,68 @@ impl AudioResample {
         }
     }
 
-    fn warn_if_relatched(&mut self, ctx: &mut Ctx) {
-        let Some(latched) = self.input else { return };
-        let Some(offered) = negotiated_audio_format(ctx, Self::IN) else {
-            return;
+    /// A format change between buffers. A new input format or layout puts out what the filter
+    /// still holds of the old one, then rebuilds it, the new output starting where the old ended.
+    fn relearn(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        let Some(now) = negotiated_audio_format(ctx, Self::IN) else {
+            return Ok(());
         };
-        if offered == latched || self.warned_relatch == Some(offered) {
-            return;
+        let layout = negotiated_layout(ctx, Self::IN);
+        if self.input == Some(now) && layout == self.layout {
+            return Ok(());
         }
-        self.warned_relatch = Some(offered);
-        let element = ctx.element();
-        ctx.post(BusMessage::Warning {
-            element,
-            error: failed(ctx, DESC.name, K::FormatChangeIgnored { latched, offered }),
-        });
+        if !self.carry.is_empty() {
+            log!(&*ctx, Level::Warn, "format_change_partial_frame", bytes = self.carry.len());
+        }
+        self.carry.clear();
+        self.floor = self.drain(ctx)?;
+        self.unlearn();
+        self.learn_from_sink(ctx);
+        Ok(())
+    }
+
+    /// Puts out the filter's tail up to the end of the input fed, returns the output grid sample
+    /// past it, `None` unstamped. Leaves the engine reset.
+    fn drain(&mut self, ctx: &mut Ctx) -> Result<Option<i128>, Error> {
+        let stamped = self.end_in.take();
+        let Some(engine) = self.engine.as_mut() else {
+            return Ok(stamped.map(i128::from));
+        };
+        // Unstamped, the count since the reset places the tail as well.
+        let end_in = stamped.unwrap_or_else(|| engine.channels.first().map_or(0, |c| c.consumed()));
+        let (Some(next), Some(end)) = (engine.next_output(end_in), engine.output_at(end_in)) else {
+            return Ok(None);
+        };
+        let want = usize::try_from(end - next).unwrap_or(0);
+        if want == 0 {
+            engine.reset();
+            return Ok(stamped.map(|_| end));
+        }
+        let nch = engine.nch;
+        let pcm = {
+            let arena = ctx.scratch();
+            let zeros = engine.channels[0].filter().stride();
+            let mut silence: Vec<f32, &_> = Vec::with_capacity_in(zeros, arena);
+            silence.resize(zeros, 0.0);
+            let mut inter: Vec<u8, &_> = Vec::with_capacity_in(want * nch * 4, arena);
+            inter.resize(want * nch * 4, 0u8);
+            let mut lane: Vec<f32, &_> = Vec::with_capacity_in(want + zeros, arena);
+            for (ch, resampler) in engine.channels.iter_mut().enumerate() {
+                lane.clear();
+                resampler.process(&silence, &mut lane);
+                for (f, v) in lane.iter().take(want).enumerate() {
+                    let off = (f * nch + ch) * 4;
+                    inter[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                resampler.reset();
+            }
+            let to = engine.sample;
+            convert_interleaved_vec(SampleFormat::F32, to, nch, &inter)
+                .ok_or_else(|| failed(ctx, DESC.name, K::Convert { from: SampleFormat::F32, to }))?
+        };
+        log!(&*ctx, Level::Debug, "drained", frames = want);
+        self.push_from(ctx, &pcm, Some(next), stamped.is_some())?;
+        Ok(stamped.map(|_| end))
     }
 
     fn announce_output(&self, ctx: &mut Ctx) {
@@ -290,6 +353,8 @@ impl AudioResample {
             return Ok(());
         }
         let in_rate = self.input.map_or(0, |f| f.sample_rate);
+        let frames = (bytes.len() / self.in_stride.max(1)) as u64;
+        self.end_in = pts.nanos().map(|_| position_at(pts, in_rate) + frames);
         let Some(engine) = self.engine.as_mut() else {
             return self.push(ctx, bytes, in_rate, pts);
         };
@@ -343,17 +408,32 @@ impl AudioResample {
                 },
             )?
         };
-        self.push_from(ctx, &pcm, start)
+        self.push_from(ctx, &pcm, start, pts.is_some())
     }
 
-    fn push_from(&self, ctx: &mut Ctx, pcm: &[u8], start: Option<i128>) -> Result<(), Error> {
-        let before_zero = start.map_or(0, |at| usize::try_from(-at).unwrap_or(0));
-        let cut = before_zero.saturating_mul(self.in_stride).min(pcm.len());
+    /// Pushes `pcm`, its first frame output grid sample `start`, cut below zero and the floor.
+    fn push_from(
+        &mut self,
+        ctx: &mut Ctx,
+        pcm: &[u8],
+        start: Option<i128>,
+        stamped: bool,
+    ) -> Result<(), Error> {
+        let stride = self.in_stride.max(1);
+        let floor = self.floor.unwrap_or(0).max(0);
+        let before = start.map_or(0, |at| usize::try_from(floor - at).unwrap_or(0));
+        let cut = before.saturating_mul(stride).min(pcm.len());
         if cut > 0 {
-            log!(&*ctx, Level::Debug, "cut_before_zero", frames = before_zero);
+            log!(&*ctx, Level::Debug, "cut_before_floor", frames = before, floor = floor as i64);
         }
-        let on_grid = |at: i128| time_at(u64::try_from(at.max(0)).unwrap_or(u64::MAX), self.rate());
-        self.push(ctx, &pcm[cut..], self.rate(), start.map_or(Timestamp::NONE, on_grid))
+        if let Some(at) = start
+            && at + (pcm.len() / stride) as i128 > floor
+        {
+            self.floor = None;
+        }
+        let at = start.filter(|_| stamped).map(|at| at.max(floor));
+        let on_grid = |at: i128| time_at(u64::try_from(at).unwrap_or(u64::MAX), self.rate());
+        self.push(ctx, &pcm[cut..], self.rate(), at.map_or(Timestamp::NONE, on_grid))
     }
 
     fn push(&self, ctx: &mut Ctx, pcm: &[u8], rate: u32, pts: Timestamp) -> Result<(), Error> {
@@ -386,7 +466,6 @@ impl Element for AudioResample {
             }
         }
         self.announce_output(ctx);
-        self.fed = false;
         self.learn_from_sink(ctx);
         self.carry.clear();
         Ok(())
@@ -398,7 +477,6 @@ impl Element for AudioResample {
         }
 
         while let Some(buf) = crate::stamp::take_pcm(ctx, &mut inputs) {
-            self.fed = true;
             if self.input.is_none() {
                 let kind = match self.refused {
                     Some(format) => K::UnsupportedFormat { format },
@@ -430,6 +508,7 @@ impl Element for AudioResample {
             Event::FlushStart => {
                 log!(&*ctx, Level::Debug, "flush", carry = self.carry.len());
                 self.carry.clear();
+                (self.end_in, self.floor) = (None, None);
                 if let Some(engine) = self.engine.as_mut() {
                     engine.reset();
                 }
@@ -444,15 +523,10 @@ impl Element for AudioResample {
                     produced = first.map_or(0, |c| c.produced()),
                     carry = self.carry.len()
                 );
+                // The filter holds the last input frames until fed past them.
+                self.drain(ctx)?;
             }
-            Event::FormatChange(_) => {
-                log!(&*ctx, Level::Debug, "format_change", fed = self.fed);
-                if !self.fed {
-                    self.unlearn();
-                }
-                self.learn_from_sink(ctx);
-                self.warn_if_relatched(ctx);
-            }
+            Event::FormatChange(_) => self.relearn(ctx)?,
             _ => {}
         }
         if self.input.is_none() {

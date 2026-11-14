@@ -1,7 +1,6 @@
 //! `audioconvert`, the element over [`crate::convert`].
 
 use profluens_core::batch::Inputs;
-use profluens_core::bus::BusMessage;
 use profluens_core::couple::Coupling;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
@@ -74,13 +73,11 @@ pub static DESC: ElementDesc = ElementDesc {
 pub struct AudioConvert {
     target: Option<SampleFormat>,
     input: Option<AudioFormat>,
-    fed: bool,
     layout: Option<u64>,
     in_stride: usize,
     carry: Vec<u8>,
     scratch: Vec<u8>,
     partial_in: Option<(u32, u16)>,
-    warned_relatch: Option<AudioFormat>,
     preset: [(&'static str, ValueDesc); 1],
     presets: usize,
 }
@@ -112,8 +109,6 @@ impl AudioConvert {
             carry: Vec::new(),
             scratch: Vec::new(),
             partial_in: None,
-            warned_relatch: None,
-            fed: false,
             preset: [("format", ValueDesc::Id("f32"))],
             presets: 0,
         }
@@ -214,7 +209,6 @@ impl Element for AudioConvert {
             ctx.field_id(FIELD_SAMPLE).and_then(|id| ctx.negotiated_src(Self::OUT)?.get(id));
         self.target = named(ctx.prop("format")).or(self.target).or(named(solved));
         self.announce_output(ctx);
-        self.fed = false;
         self.learn_from_sink(ctx);
         self.carry.clear();
         Ok(())
@@ -226,7 +220,6 @@ impl Element for AudioConvert {
         }
 
         while let Some(buf) = crate::stamp::take_pcm(ctx, &mut inputs) {
-            self.fed = true;
             if self.input.is_none() {
                 return Err(failed(ctx, DESC.name, K::PcmBeforeFormat));
             }
@@ -267,14 +260,7 @@ impl Element for AudioConvert {
                 log!(&*ctx, Level::Debug, "flush", carry = self.carry.len());
                 self.carry.clear();
             }
-            Event::FormatChange(_) => {
-                log!(&*ctx, Level::Debug, "format_change", fed = self.fed);
-                if !self.fed {
-                    self.unlearn();
-                }
-                self.learn_from_sink(ctx);
-                self.warn_if_relatched(ctx);
-            }
+            Event::FormatChange(_) => self.relearn(ctx),
             Event::Eos if !self.carry.is_empty() => {
                 log!(&*ctx, Level::Warn, "eos_partial_frame", bytes = self.carry.len());
             }
@@ -353,19 +339,21 @@ impl AudioConvert {
         self.announce_output(ctx);
     }
 
-    fn warn_if_relatched(&mut self, ctx: &mut Ctx) {
-        let Some(latched) = self.input else { return };
-        let Some(offered) = negotiated_audio_format(ctx, Self::IN) else {
+    /// A format change between buffers. A new input format or layout drops the old one's partial
+    /// frame and is learned again.
+    fn relearn(&mut self, ctx: &mut Ctx) {
+        let Some(now) = negotiated_audio_format(ctx, Self::IN) else {
             return;
         };
-        if offered == latched || self.warned_relatch == Some(offered) {
+        let layout = negotiated_layout(ctx, Self::IN);
+        if self.input == Some(now) && layout == self.layout {
             return;
         }
-        self.warned_relatch = Some(offered);
-        let element = ctx.element();
-        ctx.post(BusMessage::Warning {
-            element,
-            error: failed(ctx, DESC.name, K::FormatChangeIgnored { latched, offered }),
-        });
+        if !self.carry.is_empty() {
+            log!(&*ctx, Level::Warn, "format_change_partial_frame", bytes = self.carry.len());
+        }
+        self.carry.clear();
+        self.unlearn();
+        self.learn_from_sink(ctx);
     }
 }

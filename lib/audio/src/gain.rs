@@ -1,7 +1,6 @@
 //! `audiogain`, linear volume with a declick ramp.
 
 use profluens_core::batch::Inputs;
-use profluens_core::bus::BusMessage;
 use profluens_core::couple::Coupling;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
@@ -135,11 +134,9 @@ pub struct AudioGain {
     ramp_remaining: usize,
     ramp_step: f32,
     input: Option<AudioFormat>,
-    fed: bool,
     layout: Option<u64>,
     in_stride: usize,
     carry: Vec<u8>,
-    warned_relatch: Option<AudioFormat>,
 }
 
 impl AudioGain {
@@ -161,8 +158,6 @@ impl AudioGain {
             layout: None,
             in_stride: 0,
             carry: Vec::new(),
-            warned_relatch: None,
-            fed: false,
         };
         el.set_gain(gain);
         el.snap();
@@ -320,20 +315,22 @@ impl AudioGain {
         announce_raw(ctx, Self::OUT, inp, self.layout);
     }
 
-    fn warn_if_relatched(&mut self, ctx: &mut Ctx) {
-        let Some(latched) = self.input else { return };
-        let Some(offered) = negotiated_audio_format(ctx, Self::IN) else {
+    /// A format change between buffers. A new input format or layout drops the old one's partial
+    /// frame and is learned again.
+    fn relearn(&mut self, ctx: &mut Ctx) {
+        let Some(now) = negotiated_audio_format(ctx, Self::IN) else {
             return;
         };
-        if offered == latched || self.warned_relatch == Some(offered) {
+        let layout = negotiated_layout(ctx, Self::IN);
+        if self.input == Some(now) && layout == self.layout {
             return;
         }
-        self.warned_relatch = Some(offered);
-        let element = ctx.element();
-        ctx.post(BusMessage::Warning {
-            element,
-            error: failed(ctx, DESC.name, K::FormatChangeIgnored { latched, offered }),
-        });
+        if !self.carry.is_empty() {
+            log!(&*ctx, Level::Warn, "format_change_partial_frame", bytes = self.carry.len());
+        }
+        self.carry.clear();
+        self.unlearn();
+        self.learn_from_sink(ctx);
     }
 
     fn apply(&mut self, pcm: &mut [u8]) {
@@ -404,7 +401,6 @@ impl Element for AudioGain {
             self.set_mute(m);
         }
         self.announce_output(ctx);
-        self.fed = false;
         self.learn_from_sink(ctx);
         self.carry.clear();
         self.snap();
@@ -417,7 +413,6 @@ impl Element for AudioGain {
         }
 
         while let Some(buf) = crate::stamp::take_pcm(ctx, &mut inputs) {
-            self.fed = true;
             if self.input.is_none() {
                 return Err(failed(ctx, DESC.name, K::PcmBeforeFormat));
             }
@@ -484,14 +479,7 @@ impl Element for AudioGain {
                 }
                 self.carry.clear();
             }
-            Event::FormatChange(_) => {
-                log!(&*ctx, Level::Debug, "format_change", fed = self.fed);
-                if !self.fed {
-                    self.unlearn();
-                }
-                self.learn_from_sink(ctx);
-                self.warn_if_relatched(ctx);
-            }
+            Event::FormatChange(_) => self.relearn(ctx),
             _ => {}
         }
         if self.input.is_none() {

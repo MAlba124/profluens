@@ -266,10 +266,19 @@ impl VobSubDec {
             log!(&*ctx, Level::Trace, "blank", pts = pts);
             return Ok(());
         }
+        // The area is coded in 12 bits, the picture is the part of it on the grid.
+        let (gw, gh) = self.grid_for(a);
+        if a.left >= gw || a.top >= gh {
+            self.blank += 1;
+            log!(&*ctx, Level::Debug, "blank", reason = "an area off the grid", pts = pts);
+            return Ok(());
+        }
         if self.clut.is_none() && self.decoded == 0 {
             log!(&*ctx, Level::Warn, "no_palette", fallback = "grey ramp");
         }
-        let (w, h) = ((a.right - a.left + 1) as usize, (a.bottom - a.top + 1) as usize);
+        let coded = (a.right - a.left + 1) as usize;
+        let (right, bottom) = (a.right.min(gw - 1), a.bottom.min(gh - 1));
+        let (w, h) = ((right - a.left + 1) as usize, (bottom - a.top + 1) as usize);
         let bytes = w * h * 4;
         if bytes > MAX_BITMAP_BYTES {
             return Err(VobSubError::Budget("a picture past the decoder's budget"));
@@ -280,7 +289,6 @@ impl VobSubDec {
             (None, Some(_)) => pts.saturating_add(duration).saturating_sub(start),
             (None, None) => Timestamp::NONE,
         };
-        let (gw, gh) = self.grid_for(a);
         let palette = self.palette(&plan.show);
         let (w32, h32) = (w as u32, h as u32);
         let n = payload_len(&[(w32, h32)])
@@ -291,7 +299,7 @@ impl VobSubDec {
         let slot = VobSubError::Budget("a picture past the slot");
         let mut b = BitmapBuilder::new(out, gw, gh, 1).map_err(|_| slot)?;
         let px = b.rect(a.left, a.top, w32, h32).map_err(|_| slot)?;
-        render(unit, plan.show.fields, &palette, px, w, h);
+        render(unit, plan.show.fields, &palette, px, coded, w, h);
         let n = b.finish().map_err(|_| slot)?;
         buf.memory.set_len(n);
         buf.pts = start;
@@ -472,11 +480,14 @@ fn commands(block: &[u8], d: &mut Display) -> Result<(bool, bool), VobSubError> 
     Ok((show, hide))
 }
 
+/// Lines `coded` pixels wide, the first `w` pixels of each and the first `h` lines kept.
+#[allow(clippy::too_many_arguments)]
 fn render(
     unit: &[u8],
     fields: [usize; 2],
     palette: &[Rgba; 4],
     out: &mut [u8],
+    coded: usize,
     w: usize,
     h: usize,
 ) {
@@ -486,14 +497,15 @@ fn render(
         // Every line starts byte aligned.
         *at = at.div_ceil(2) * 2;
         let mut x = 0usize;
-        while x < w {
+        while x < coded {
             let code = rle_code(unit, at);
             let run = match code >> 2 {
-                0 => w - x,
-                n => (n as usize).min(w - x),
+                0 => coded - x,
+                n => (n as usize).min(coded - x),
             };
             let c = palette[(code & 3) as usize];
-            for px in line[x * 4..(x + run) * 4].as_chunks_mut::<4>().0 {
+            let (from, to) = (x.min(w), (x + run).min(w));
+            for px in line[from * 4..to * 4].as_chunks_mut::<4>().0 {
                 px.copy_from_slice(&c);
             }
             x += run;
@@ -923,6 +935,33 @@ mod tests {
     }
 
     #[test]
+    fn an_area_past_the_grid_is_cut_to_it() {
+        // 32 bytes declaring 2048x2048, the default grid is 720x576.
+        let top = field(&[&[(1, 3), (2, 0)]]);
+        let chain = [Dcsq {
+            delay: 0,
+            commands: [setup(&top, [0, 15, 15, 15], (0, 0, 2047, 2047)), show()].concat(),
+        }];
+        let unit = unit_with(&top, &top, &chain, Last::Itself);
+        let mut r = Rig::new(None);
+        let ds = r.push(&unit, 0).remove(0).ds;
+        assert_eq!((ds.width, ds.height, ds.video_width, ds.video_height), (720, 576, 720, 576));
+        assert!(ds.rgba.len() <= 720 * 576 * 4, "{} bytes", ds.rgba.len());
+        assert_eq!(
+            (px(&ds, 2, 0), px(&ds, 3, 0), px(&ds, 719, 1)[0]),
+            ([255; 4], [127, 127, 127, 255], 127)
+        );
+
+        let mut r = Rig::new(Some(IDX));
+        let ds = r.push(&unit, 0).remove(0).ds;
+        assert_eq!((ds.width, ds.height), (720, 480), "the size line's grid");
+        let off = [setup(&top, [0, 15, 15, 15], (720, 0, 800, 3)), show()].concat();
+        let chain = [Dcsq { delay: 0, commands: off }];
+        assert!(r.push(&unit_with(&top, &top, &chain, Last::Itself), 0).is_empty());
+        assert_eq!((r.dec.blank, r.dec.dropped), (1, 0), "an area off the grid shows nothing");
+    }
+
+    #[test]
     fn hostile_units_are_counted_and_never_panic() {
         let cases: [(&str, Vec<u8>); 5] = [
             ("control past the end", vec![0, 8, 0xFF, 0xFF, 0, 0, 0, 0]),
@@ -941,14 +980,14 @@ mod tests {
             assert_eq!(r.push(&minimal(), 100).len(), 1, "{what}, the next unit decodes");
         }
 
-        let mut r = Rig::new(Some(IDX));
+        let mut r = Rig::new(Some(&b"size: 4096x4096\n"[..]));
         let top = field(&[&[(1, 4)]]);
         let chain = [Dcsq {
             delay: 0,
             commands: [setup(&top, [0, 15, 15, 15], (0, 0, 4095, 4095)), show()].concat(),
         }];
         assert!(r.push(&unit_with(&top, &[], &chain, Last::Itself), 0).is_empty());
-        assert_eq!((r.dec.dropped, r.dec.budget_faults), (1, 1));
+        assert_eq!((r.dec.dropped, r.dec.budget_faults), (1, 1), "a grid that big is past it");
 
         let mut r = Rig::new(Some(IDX));
         assert!(r.push(&[0, 0], 0).is_empty());

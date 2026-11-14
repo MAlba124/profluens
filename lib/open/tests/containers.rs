@@ -118,7 +118,7 @@ fn an_avi_reads_its_idx1_once() {
     assert_eq!(Some(vol), pf_avi::vol_prefix(first));
     assert!(vol.starts_with(&[0, 0, 1, 0xB0]), "{vol:x?}");
     let caps = Caps { window: 4096, ..Caps::default() };
-    let (o2, log) = open_with(&b, Want { index: false, meta: true }, caps);
+    let (o2, log) = open_with(&b, Want { index: false, meta: true, hdr10plus: false }, caps);
     assert_eq!(o2.unwrap().tracks, o.tracks, "the VOL read past the head too");
     let vol_read = log.iter().filter(|n| n.at == movi.movi_data_start).count();
     assert_eq!(vol_read, 1, "one read at movi for the VOL, {log:?}");

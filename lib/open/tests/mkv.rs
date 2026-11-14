@@ -101,7 +101,8 @@ fn the_cues_and_tags_at_the_end_are_one_read() {
     let Meta::Mkv(m) = &o.meta else { panic!() };
     assert!(!m.tags.is_empty());
     // without the meta the same, the Cues alone at the end
-    let (_, log) = open_with(&f.bytes, Want { index: true, meta: false }, Caps::default());
+    let (_, log) =
+        open_with(&f.bytes, Want { index: true, meta: false, hdr10plus: false }, Caps::default());
     assert_eq!(log, [Need { at: 0, len: Caps::default().window }, tail]);
     assert!(log.len() <= fhs_hls(&f.bytes).len());
     let (o, log) = open_with(&f.bytes, Want::TRACKS, Caps::default());
@@ -378,7 +379,9 @@ fn cues_in_the_head_are_not_read_again() {
     assert!(f.cues_at < f.clusters[0]);
     for window in [256 << 10, (f.cues_at + 20) as usize] {
         let caps = Caps { window, ..Caps::default() };
-        let (o, log) = open_with(&f.bytes, Want::ALL, caps);
+        // the first Cluster's read for HDR10+ is past the head
+        let want = Want { hdr10plus: false, ..Want::ALL };
+        let (o, log) = open_with(&f.bytes, want, caps);
         let o = o.unwrap();
         assert_eq!(cues(&o).1.len(), 40, "window {window}");
         assert_eq!(cues(&o).2, Some(f.cues_at));

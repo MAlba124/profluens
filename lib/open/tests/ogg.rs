@@ -109,7 +109,8 @@ fn a_comment_past_the_window_grows_the_head() {
     assert_eq!(grown[..3], [(0, window), (w, window), (2 * w, 2 * window)], "{grown:?}");
     assert_eq!(o.head.len(), 4 * window);
     assert_eq!(o.duration_ns, 6_000 * 20 * MS);
-    let (o, log) = open_with(&f, Want { index: true, meta: false }, Caps::default());
+    let (o, log) =
+        open_with(&f, Want { index: true, meta: false, hdr10plus: false }, Caps::default());
     let o = o.unwrap();
     assert_eq!(log.len(), 2, "the window and the tail, {log:?}");
     assert_eq!((&o.meta, o.title(&o.tracks[0])), (&Meta::None, ""));

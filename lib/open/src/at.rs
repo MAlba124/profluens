@@ -14,6 +14,7 @@ use pf_probe::head::{AviHeadAt, MkvHead, MkvHeadAt, Mp4HeadOwned};
 use pf_probe::{Kind, PREFIX_LEN, probe};
 use profluens_core::fetch::{Fetch, Need, Step};
 
+use crate::plus::{self, Key};
 use crate::{
     Caps, Desc, Index, Meta, OpenError, Opened, Span, Want, avi, bare, flv, mkv, mp4, ogg, ps, ts,
     wav,
@@ -41,6 +42,11 @@ enum Stage {
     AviHead(AviHeadAt),
     Idx1(Idx1At),
     Bare(Box<pf_bare::OpenAt>),
+    /// A first key unit past the `pre` bytes of it held, or the bytes a Matroska walk wants, for
+    /// [`crate::TrackDesc::hdr10plus`].
+    Key {
+        pre: usize,
+    },
     Done,
 }
 
@@ -90,6 +96,16 @@ pub struct OpenAt {
     movi: Option<pf_avi::MoviLocation>,
     /// A transport stream's packets as the window and the tail are read.
     ts: Option<Box<ts::Scan>>,
+    /// The first key units still to read, the last first.
+    keys: Vec<Key>,
+    /// The key unit read, from its first byte.
+    key: Vec<u8>,
+    /// A Matroska first Cluster walked for its video tracks' first blocks.
+    walk: Option<mkv::Walk>,
+    /// Where the walk's last read, held in `key`, starts.
+    key_at: u64,
+    /// The walk's last read came back short, nothing lies past it.
+    key_short: bool,
 }
 
 impl OpenAt {
@@ -115,6 +131,11 @@ impl OpenAt {
             ogg: None,
             movi: None,
             ts: None,
+            keys: Vec::new(),
+            key: Vec::new(),
+            walk: None,
+            key_at: 0,
+            key_short: false,
         }
     }
 
@@ -158,7 +179,14 @@ impl OpenAt {
                 },
                 Stage::Mp4Head(m) => match m.poll().map_err(OpenError::Mp4Head)? {
                     Step::Need(n) => return Ok(Some(n)),
-                    Step::Done(head) => self.mp4(Arc::from(head)),
+                    Step::Done(head) => {
+                        // the window back, still the file's first bytes, for the key samples
+                        if let Stage::Mp4Head(m) = std::mem::replace(&mut self.stage, Stage::Start)
+                        {
+                            self.window = m.into_window();
+                        }
+                        self.mp4(Arc::from(head))
+                    }
                 },
                 Stage::Mp4Tail(m) => match m.poll() {
                     Ok(Step::Need(n)) => return Ok(Some(n)),
@@ -169,7 +197,7 @@ impl OpenAt {
                     Ok(Step::Need(n)) => return Ok(Some(n)),
                     Ok(Step::Done(track)) => {
                         self.chapter_track = track;
-                        self.done()
+                        self.key_next()
                     }
                     Err(e) => match e {},
                 },
@@ -186,6 +214,12 @@ impl OpenAt {
                     Step::Need(n) => return Ok(Some(n)),
                     Step::Done((h, raw)) => self.bare(h, raw),
                 },
+                Stage::Key { pre } => {
+                    let pre = *pre;
+                    self.key_short = pre + self.got < self.key.len();
+                    self.key.truncate(pre + self.got);
+                    self.key_read()
+                }
                 Stage::Done => return Ok(None),
             }?;
             if next.is_some() {
@@ -231,7 +265,7 @@ impl OpenAt {
     /// The bytes held from `at` on, and whether they run to the end of the file. The window
     /// and the head both start the file, the longer of them is looked in.
     fn held_from(&self, at: u64) -> Option<(&[u8], bool)> {
-        let front = match self.window.len() >= self.head.len() {
+        let front = match self.window.len() >= self.head.len() || !self.head_prefix {
             true => &self.window[..],
             false => &self.head[..],
         };
@@ -425,8 +459,12 @@ impl OpenAt {
     }
 
     fn mkv_done(&mut self) -> Result<Option<Need>, OpenError> {
+        let first = self.mkv.parsed.first_cluster;
+        if self.want.hdr10plus && first > 0 && first < self.len {
+            self.walk = Some(mkv::Walk::new(first, self.len, &self.desc.tracks));
+        }
         self.index = Index::Mkv(Arc::new(take(&mut self.mkv.parsed)));
-        self.done()
+        self.walk_next()
     }
 
     fn mp4(&mut self, head: Arc<[u8]>) -> Result<Option<Need>, OpenError> {
@@ -445,7 +483,9 @@ impl OpenAt {
     fn mp4_described(&mut self, tail: &Tail) -> Result<Option<Need>, OpenError> {
         let head = Arc::clone(&self.head);
         (self.duration, self.index) =
-            mp4::describe(&head, self.len, self.want.index, tail, &mut self.desc)?;
+            mp4::describe(&head, self.len, self.want, tail, &mut self.desc, &mut self.keys)?;
+        // read in file order
+        self.keys.sort_unstable_by_key(|k| std::cmp::Reverse(k.at));
         if self.want.meta
             && let pf_mp4::MoovExtent::InPrefix { offset, len } =
                 pf_mp4::locate_moov(&head, head.len() as u64)
@@ -457,7 +497,7 @@ impl OpenAt {
                 return Ok(None);
             }
         }
-        self.done()
+        self.key_next()
     }
 
     fn avi(&mut self, head: Arc<[u8]>) -> Result<Option<Need>, OpenError> {
@@ -493,7 +533,8 @@ impl OpenAt {
     fn avi_tail(&mut self) -> Result<Option<Need>, OpenError> {
         match self.movi.filter(|_| self.want.index) {
             Some(movi) => {
-                self.stage = Stage::Idx1(Idx1At::new(movi.movi_end, self.len));
+                let at = Idx1At::new(movi.movi_end, self.len).with_odml(&self.head);
+                self.stage = Stage::Idx1(at);
                 Ok(None)
             }
             None => self.done(),
@@ -580,7 +621,7 @@ impl OpenAt {
         if !self.tail.is_empty() {
             scan.tail(self.tail_at, &self.tail);
         }
-        self.duration = scan.finish(&mut self.desc)?;
+        self.duration = scan.finish(&mut self.desc, self.want.hdr10plus)?;
         self.head = Arc::from(take(&mut self.window));
         self.done()
     }
@@ -645,6 +686,82 @@ impl OpenAt {
         self.done()
     }
 
+    /// The next first key unit scanned from the bytes held, else the read of what is not held,
+    /// then the open is done.
+    fn key_next(&mut self) -> Result<Option<Need>, OpenError> {
+        while let Some(&k) = self.keys.last() {
+            let (mut tracks, mut key) = (take(&mut self.desc.tracks), take(&mut self.key));
+            let (b, eof) = self.held_from(k.at).unwrap_or((&[], false));
+            let b = &b[..b.len().min(k.len)];
+            let whole = eof || b.len() == k.len;
+            let settled = scan_key(self.kind, k, b, whole, &mut tracks);
+            let pre = b.len();
+            if !settled {
+                key.clear();
+                key.extend_from_slice(b);
+                key.resize(k.len, 0);
+            }
+            (self.desc.tracks, self.key) = (tracks, key);
+            if settled {
+                self.keys.pop();
+                continue;
+            }
+            self.stage = Stage::Key { pre };
+            return Ok(Some(Need { at: k.at + pre as u64, len: k.len - pre }));
+        }
+        self.done()
+    }
+
+    /// Steps the Matroska walk over held bytes while they reach, else reads what it wants next.
+    fn walk_next(&mut self) -> Result<Option<Need>, OpenError> {
+        let Index::Mkv(p) = &self.index else { return self.key_next() };
+        let p = Arc::clone(p);
+        let mut tracks = take(&mut self.desc.tracks);
+        let mut need = None;
+        while let Some(mut w) = self.walk.take() {
+            let Some((at, len)) = w.want() else {
+                w.finish(&mut tracks);
+                break;
+            };
+            let held = self.held_from(at).unwrap_or((&[], false));
+            let read = at.checked_sub(self.key_at).and_then(|o| self.key.get(o as usize..));
+            let end = self.key_short || self.key_at + self.key.len() as u64 >= self.len;
+            let read = read.map(|b| (b, end));
+            let (b, eof) = read.filter(|r| r.0.len() > held.0.len()).unwrap_or(held);
+            if !w.enough(b, eof) {
+                w.read();
+                self.walk = Some(w);
+                need = Some(Need { at, len });
+                break;
+            }
+            w.step(&b[..b.len().min(len)], &p, &mut tracks);
+            self.walk = Some(w);
+        }
+        self.desc.tracks = tracks;
+        let Some(n) = need else {
+            (self.walk, self.key) = (None, Vec::new());
+            return self.key_next();
+        };
+        self.key.clear();
+        self.key.resize(n.len, 0);
+        (self.key_at, self.stage) = (n.at, Stage::Key { pre: 0 });
+        Ok(Some(n))
+    }
+
+    /// The key unit read, short at the end of the file or of what the reader gave.
+    fn key_read(&mut self) -> Result<Option<Need>, OpenError> {
+        if self.walk.is_some() {
+            return self.walk_next();
+        }
+        if let Some(k) = self.keys.pop() {
+            let mut tracks = take(&mut self.desc.tracks);
+            scan_key(self.kind, k, &self.key, true, &mut tracks);
+            self.desc.tracks = tracks;
+        }
+        self.key = Vec::new();
+        self.key_next()
+    }
+
     /// Answers `need` from the window, the head or the tail when they hold it, for the inner
     /// machines.
     fn serve(&mut self, need: Need) -> bool {
@@ -700,6 +817,18 @@ impl OpenAt {
     }
 }
 
+/// [`crate::TrackDesc::hdr10plus`] of the MP4 track `k` names from `b`, its bytes from its
+/// start. Whether it is settled, a unit cut short settles on its lead when `whole`.
+fn scan_key(kind: Kind, k: Key, b: &[u8], whole: bool, tracks: &mut [crate::TrackDesc]) -> bool {
+    if kind != Kind::Mp4 {
+        return true;
+    }
+    if whole && let Some(t) = tracks.get_mut(k.track) {
+        t.hdr10plus = plus::stream(t.family, t.nal_length, b);
+    }
+    whole
+}
+
 impl Fetch for OpenAt {
     type Out = Opened;
     type Err = OpenError;
@@ -735,6 +864,10 @@ impl Fetch for OpenAt {
             Stage::AviHead(m) => m.buf(),
             Stage::Idx1(m) => m.buf(),
             Stage::Bare(m) => m.buf(),
+            Stage::Key { pre } => {
+                let pre = *pre;
+                &mut self.key[pre..]
+            }
             Stage::Start | Stage::Done => &mut [],
         }
     }

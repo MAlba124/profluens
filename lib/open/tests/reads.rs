@@ -76,7 +76,7 @@ fn no_open_reads_more_than_today() {
             "avi, idx1 left to the demuxer",
             "avi",
             fixture("plugins/formats/avi/tests/fixtures/tiny.avi"),
-            Want { index: false, meta: true },
+            Want { index: false, meta: true, hdr10plus: false },
         ),
         ("ogg 700 KB", "ogg", opus_file(7, 6_000, 0, 0), Want::ALL),
         ("flac", "flac", fixture("plugins/formats/bare/tests/fixtures/tone.flac"), Want::ALL),

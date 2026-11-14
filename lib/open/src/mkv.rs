@@ -1,10 +1,11 @@
 // App-side setup, the Cues and the track list once per open.
 #![allow(clippy::disallowed_methods)]
 
-use pf_mkv::ebml::{id, read_element_header};
+use pf_mkv::ebml::{id, read_element_header, read_vint};
+use pf_mkv::reader::block_addition;
 use pf_mkv::{DemuxError, Parsed, Track, is_audio_family, is_video_family, track_family};
 
-use crate::{Desc, OpenError, SkipWhy, TrackDesc, TrackKind, id_of, ratio};
+use crate::{Desc, Hdr10Plus, OpenError, SkipWhy, TrackDesc, TrackKind, id_of, plus, ratio};
 
 /// Top level elements walked for the first Cluster, as `pf_probe::head::MkvHeadAt` walks them.
 const MAX_TOP: usize = 4096;
@@ -170,6 +171,171 @@ fn track(t: &Track, d: &mut Desc) {
     out.seek_preroll_ns = t.seek_pre_roll_ns;
     out.colour = pf_mkv::track_colour(t);
     d.push(out);
+}
+
+/// The walk of the first Cluster for [`TrackDesc::hdr10plus`], an element head at a time. A block
+/// is read for its frame's lead and its BlockAdditions alone, the frame's bulk is jumped over.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Walk {
+    /// The file offset of the next element head.
+    at: u64,
+    /// Where the Cluster ends, the file's end before its head is read or for an unknown size.
+    end: u64,
+    /// Whether the Cluster's head was read.
+    inside: bool,
+    /// The video tracks undecided, a bit by place among the first 64.
+    left: u64,
+    group: Option<Group>,
+    reads: u8,
+}
+
+/// A BlockGroup being walked, its track once its Block was read.
+#[derive(Clone, Copy, Debug)]
+struct Group {
+    end: u64,
+    track: Option<usize>,
+    stream: bool,
+    /// The tracks whose T.35 BlockAddID an addition ahead of the Block carries HDR10+ at.
+    added: u64,
+}
+
+/// Reads a walk makes at most, a first Cluster led by other tracks' blocks stops it.
+const WALK_READS: u8 = 8;
+
+impl Walk {
+    pub(crate) fn new(first: u64, len: u64, tracks: &[TrackDesc]) -> Walk {
+        let video = tracks.iter().take(64).enumerate().filter(|(_, t)| t.kind == TrackKind::Video);
+        let left = video.fold(0u64, |m, (i, _)| m | 1 << i);
+        Walk { at: first, end: len, inside: false, left, group: None, reads: 0 }
+    }
+
+    /// The bytes wanted from the next element head on, None when the walk is over.
+    pub(crate) fn want(&self) -> Option<(u64, usize)> {
+        (self.left != 0 && self.at < self.end && self.reads < WALK_READS)
+            .then(|| (self.at, (self.end - self.at).min(plus::KEY_READ as u64) as usize))
+    }
+
+    /// Whether `b`, the bytes from the next element head on, `eof` when they run to the file's
+    /// end, are enough for [`Walk::step`], the head, a block's lead or BlockAdditions whole.
+    pub(crate) fn enough(&self, b: &[u8], eof: bool) -> bool {
+        // a head that does not parse from a whole head's bytes never will
+        let Ok(h) = read_element_header(b, 0) else { return eof || b.len() >= EL_HEAD };
+        let Some(size) = h.size.filter(|_| self.inside) else { return true };
+        let total = (h.data_start as u64).saturating_add(size).min(self.end - self.at);
+        let need = match (h.id, self.group.is_some()) {
+            (i, false) if i == id::SIMPLE_BLOCK => total.min(plus::LEAD as u64),
+            (i, true) if i == id::BLOCK => total.min(plus::LEAD as u64),
+            // a longer one never comes whole and is passed over
+            (i, true) if i == id::BLOCK_ADDITIONS && total <= plus::KEY_READ as u64 => total,
+            _ => 0,
+        };
+        eof || b.len() as u64 >= need
+    }
+
+    /// Counts a read the walk asked for.
+    pub(crate) fn read(&mut self) {
+        self.reads += 1;
+    }
+
+    /// One element from `b`, its bytes from [`Walk::want`]'s offset, short only at the file's end.
+    pub(crate) fn step(&mut self, b: &[u8], p: &Parsed, tracks: &mut [TrackDesc]) {
+        let stop = self.end;
+        let Ok(h) = read_element_header(b, 0) else { return self.at = stop };
+        let size = h.size.map(|s| (h.data_start as u64).saturating_add(s));
+        let body = |n: u64| &b[h.data_start.min(b.len())..(n as usize).min(b.len())];
+        if !self.inside {
+            if h.id != id::CLUSTER {
+                return self.at = stop;
+            }
+            self.inside = true;
+            self.end = size.map_or(self.end, |n| self.at.saturating_add(n).min(self.end));
+            self.at += h.data_start as u64;
+            return;
+        }
+        // only a Cluster may be of unknown size, the next one ends this
+        let Some(n) = size.filter(|_| h.id != id::CLUSTER) else { return self.at = stop };
+        let next = self.at.saturating_add(n);
+        match (h.id, self.group.as_mut()) {
+            (i, None) if i == id::SIMPLE_BLOCK => {
+                if let Some((t, stream)) = block_lead(body(n), p, tracks, self.left) {
+                    tracks[t].hdr10plus = if stream { Hdr10Plus::Stream } else { Hdr10Plus::None };
+                    self.left &= !(1 << t);
+                }
+            }
+            (i, None) if i == id::BLOCK_GROUP => {
+                let g = Group { end: next, track: None, stream: false, added: 0 };
+                self.group = Some(g);
+                self.at += h.data_start as u64;
+                return;
+            }
+            (i, Some(g)) if i == id::BLOCK => match block_lead(body(n), p, tracks, self.left) {
+                Some((t, stream)) => (g.track, g.stream) = (Some(t), stream),
+                // another track's group, or one decided before
+                None => {
+                    self.at = g.end;
+                    return self.group = None;
+                }
+            },
+            (i, Some(g)) if i == id::BLOCK_ADDITIONS && n as usize <= b.len() => {
+                g.added |= added(body(n), p, tracks, self.left);
+            }
+            _ => {}
+        }
+        self.at = next;
+        if let Some(g) = self.group.filter(|g| self.at >= g.end) {
+            self.close(g, tracks);
+            self.at = g.end;
+        }
+    }
+
+    /// Decides a BlockGroup still open when the walk ends, cut by the file's end or the reads.
+    pub(crate) fn finish(&mut self, tracks: &mut [TrackDesc]) {
+        if let Some(g) = self.group {
+            self.close(g, tracks);
+        }
+    }
+
+    fn close(&mut self, g: Group, tracks: &mut [TrackDesc]) {
+        if let Some(t) = g.track {
+            tracks[t].hdr10plus = match (g.stream, g.added & 1 << t != 0) {
+                (true, _) => Hdr10Plus::Stream,
+                (false, true) => Hdr10Plus::Addition,
+                (false, false) => Hdr10Plus::None,
+            };
+            self.left &= !(1 << t);
+        }
+        self.group = None;
+    }
+}
+
+/// The place of the undecided video track `block` belongs to and whether its frame's lead, the
+/// bytes of it in `block`, carries HDR10+. A laced or coded frame is not read.
+fn block_lead(block: &[u8], p: &Parsed, tracks: &[TrackDesc], left: u64) -> Option<(usize, bool)> {
+    let (number, n, _) = read_vint(block, 0).ok()?;
+    let flags = *block.get(n + 2)?;
+    let i = tracks.iter().take(64).position(|t| u64::from(t.id) == number)?;
+    if left & 1 << i == 0 {
+        return None;
+    }
+    let mt = p.tracks.iter().find(|t| t.track_number == number);
+    let readable = flags & 0x06 == 0 && mt.is_some_and(|m| !m.coding.transforms());
+    let frame = block.get(n + 3..).filter(|_| readable).unwrap_or_default();
+    let t = &tracks[i];
+    Some((i, plus::in_unit(t.family, t.nal_length, frame)))
+}
+
+/// The undecided video tracks whose T.35 BlockAddID `additions` carries HDR10+ at, a bit by place.
+fn added(additions: &[u8], p: &Parsed, tracks: &[TrackDesc], left: u64) -> u64 {
+    let mut out = 0;
+    for (i, t) in tracks.iter().take(64).enumerate().filter(|&(i, _)| left & 1 << i != 0) {
+        let Some(mt) = p.tracks.iter().find(|m| m.track_number == u64::from(t.id)) else {
+            continue;
+        };
+        if block_addition(additions, mt.t35_add_id).is_some_and(|r| plus::is_plus(&additions[r])) {
+            out |= 1 << i;
+        }
+    }
+    out
 }
 
 /// The head parsed once for every run's demuxer.

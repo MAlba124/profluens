@@ -3,7 +3,8 @@ use std::sync::Arc;
 use pf_mp4::frag::{self, Tail};
 use pf_mp4::{Limits, Reframer, Tables, Track, TrackKind as Mp4Kind};
 
-use crate::{Brand, Desc, Index, OpenError, TrackDesc, TrackKind};
+use crate::plus::{KEY_READ, Key};
+use crate::{Brand, Desc, Index, OpenError, TrackDesc, TrackKind, Want};
 
 /// RFC 7845 section 4.6 asks Opus for 80 ms of decoding ahead of a seek target, the Opus in
 /// ISOBMFF mapping states the same roll.
@@ -17,28 +18,59 @@ fn ns(ticks: i64, timescale: u32) -> u64 {
         as u64
 }
 
-/// The tracks of the head through `moov`, the movie's duration, and with `index` the sample
-/// tables folded once for every run's demuxer, held to a file of `len` bytes. A fragmented
-/// movie's fragments and length come from its `sidx` and the `tail` too.
+/// The tracks of the head through `moov`, the movie's duration, and with [`Want::index`] the
+/// sample tables folded once for every run's demuxer, held to a file of `len` bytes. A
+/// fragmented movie's fragments and length come from its `sidx` and the `tail` too. With
+/// [`Want::hdr10plus`] the first sync sample of each video track goes to `keys`.
 pub(crate) fn describe(
     head: &[u8],
     len: u64,
-    index: bool,
+    want: Want,
     tail: &Tail,
     d: &mut Desc,
+    keys: &mut Vec<Key>,
 ) -> Result<(u64, Index), OpenError> {
-    // a fragmented moov holds few samples, folded for the length its fragments state
-    if !index && frag::length_stated(head).is_none() {
-        let tracks = Tables::tracks_of(head).map_err(OpenError::Mp4)?;
-        return Ok((tracks_into(&tracks, d)?, Index::None));
-    }
     // the file's length bounds the index a small hostile table can declare
     let limits = Limits { file_len: Some(len), ..Limits::default() };
+    // a fragmented moov holds few samples, folded for the length its fragments state
+    if !want.index && frag::length_stated(head).is_none() {
+        // folded for the key samples alone, a table the fold refuses leaves them unread
+        let tables = want.hdr10plus.then(|| Tables::resolve(head, &tail.mfra, limits).ok());
+        let Some(tables) = tables.flatten() else {
+            let tracks = Tables::tracks_of(head).map_err(OpenError::Mp4)?;
+            return Ok((tracks_into(&tracks, d)?, Index::None));
+        };
+        let first = d.tracks.len();
+        let duration = tracks_into(tables.tracks(), d)?;
+        first_keys(&tables, len, first, d, keys);
+        return Ok((duration, Index::None));
+    }
     let mut tables = Tables::resolve(head, &tail.mfra, limits).map_err(OpenError::Mp4)?;
     tables.last_fragment(&tail.moof);
     tables.sidx_chain(tail, len);
+    let first = d.tracks.len();
     let duration = tracks_into(tables.tracks(), d)?.max(tables.fragmented_duration_ns());
-    Ok((duration, if index { Index::Mp4(Arc::new(tables)) } else { Index::None }))
+    if want.hdr10plus {
+        first_keys(&tables, len, first, d, keys);
+    }
+    Ok((duration, if want.index { Index::Mp4(Arc::new(tables)) } else { Index::None }))
+}
+
+/// The first sync sample of each H.264, H.265 or AV1 track, the tracks described from `first` in
+/// the tables' order. A fragmented track's samples are not in the head and give none.
+fn first_keys(tables: &Tables, len: u64, first: usize, d: &Desc, keys: &mut Vec<Key>) {
+    for (i, t) in d.tracks.iter().enumerate().skip(first) {
+        if t.kind != TrackKind::Video || !matches!(t.family, "h264/annexb" | "h265/annexb" | "av1")
+        {
+            continue;
+        }
+        let Ok(ti) = u16::try_from(i - first) else { break };
+        let s = tables.samples().iter().find(|s| s.track_index == ti && s.sync);
+        if let Some(s) = s.filter(|s| s.size > 0 && s.offset < len) {
+            let n = u64::from(s.size).min(len - s.offset).min(KEY_READ as u64) as usize;
+            keys.push(Key { track: i, at: s.offset, len: n });
+        }
+    }
 }
 
 fn tracks_into(tracks: &[Track], d: &mut Desc) -> Result<u64, OpenError> {

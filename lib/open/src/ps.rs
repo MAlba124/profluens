@@ -1,7 +1,6 @@
 // App-side setup before any pipeline, the buffers of one open.
 #![allow(clippy::disallowed_methods)]
 
-use pf_ps::seek::Base;
 use pf_ps::streams::{self, Codec};
 use profluens_core::ctx::StreamKind;
 
@@ -9,11 +8,9 @@ use crate::{Desc, OpenError, SkipWhy, TrackDesc, TrackKind, es};
 
 /// The window is grown to this, a DVD's audio and video streams start within it.
 pub(crate) const HEAD: usize = 1 << 20;
-/// Slack below the earliest stamp for one read past it, as `psdemux` takes it.
-const ORIGIN_SLACK: i64 = 10 * 90_000;
 
 /// The streams `head` holds as `psdemux` finds them at preroll, by its order, and how long the
-/// file lasts by the last stamp in `tail`, 0 when no stamp tells.
+/// file lasts by the last stamp in `tail`, 0 when the stamps do not tell.
 pub(crate) fn describe(head: &[u8], tail: &[u8], d: &mut Desc) -> Result<u64, OpenError> {
     let h = pf_ps::scan_head(head);
     let mut seen: Vec<&pf_ps::Seen> = h.seen.iter().collect();
@@ -59,6 +56,7 @@ pub(crate) fn describe(head: &[u8], tail: &[u8], d: &mut Desc) -> Result<u64, Op
         return Err(OpenError::NoStreams);
     }
     let Some((_, least)) = h.opening else { return Ok(0) };
-    let last = pf_ps::last_ticks(tail, Base { origin: least, slack: ORIGIN_SLACK });
+    // summed across the clock breaks head and tail show, unknown when the tail reads as set back
+    let last = pf_ps::lasts((h.key, &h.line, h.rate), least, tail, None);
     Ok(last.map_or(0, |t| (i128::from(t.max(0)) * 100_000 / 9) as u64))
 }

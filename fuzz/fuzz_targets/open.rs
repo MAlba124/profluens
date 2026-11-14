@@ -12,11 +12,12 @@ const WINDOWS: [usize; 8] = [1, 12, 100, 1024, 4096, 65536, 256 << 10, 4 << 20];
 const MAX_NEED: usize = 128 << 20;
 
 // Input is a knob byte then the file. Bits 0-2 pick the window, bit 3 the index, bit 4 the
-// meta, bit 5 a tail cap of 0. Every span lies in the arena, the head is the file's start, the
-// meta's spans lie in what holds them and no read asks past the caps or for nothing.
+// meta, bit 5 a tail cap of 0, bit 6 the HDR10+ key read. Every span lies in the arena, the head
+// is the file's start, the meta's spans lie in what holds them and no read asks past the caps
+// or for nothing.
 fuzz_target!(|data: &[u8]| {
     let Some((&knob, file)) = data.split_first() else { return };
-    let want = Want { index: knob & 8 != 0, meta: knob & 16 != 0 };
+    let want = Want { index: knob & 8 != 0, meta: knob & 16 != 0, hdr10plus: knob & 64 != 0 };
     let caps = Caps {
         window: WINDOWS[usize::from(knob & 7)],
         max_tail: if knob & 32 != 0 { 0 } else { 4 << 20 },

@@ -9,6 +9,7 @@ mod mp4;
 mod ogg;
 #[cfg(feature = "pipeline")]
 pub mod pipeline;
+mod plus;
 mod ps;
 mod sps;
 mod ts;
@@ -31,11 +32,17 @@ pub struct Want {
     pub index: bool,
     /// The tags, pictures and chapters, for `pf_tags::of` and `pf_tags::item::chapters`.
     pub meta: bool,
+    /// The first key unit of each video track, for [`TrackDesc::hdr10plus`]. Its lead, at most
+    /// 64 KiB of each MP4 track's first sync sample, the MP4 sample tables folded for it. The
+    /// first Matroska Cluster walked by element heads, a block's lead and its BlockAdditions
+    /// read, in reads of at most 64 KiB where what is held runs out. A transport stream's first
+    /// payloads suffice.
+    pub hdr10plus: bool,
 }
 
 impl Want {
-    pub const ALL: Want = Want { index: true, meta: true };
-    pub const TRACKS: Want = Want { index: false, meta: false };
+    pub const ALL: Want = Want { index: true, meta: true, hdr10plus: true };
+    pub const TRACKS: Want = Want { index: false, meta: false, hdr10plus: false };
 }
 
 /// The most an open reads of each part.
@@ -167,6 +174,28 @@ pub struct TrackDesc {
     /// The NAL length prefix size of the stored units, 0 for Annex B or codecs without NALs.
     pub nal_length: u8,
     pub duration_ns: u64,
+    /// Where the track's first unit carries an HDR10+ T.35 message, an MP4's first sync sample,
+    /// a Matroska track's first block, HDR10+ riding every picture. None unless
+    /// [`Want::hdr10plus`] asks, and for AVI, FLV, Ogg, program streams, bare files and
+    /// fragmented MP4.
+    pub hdr10plus: Hdr10Plus,
+}
+
+/// Where a track's HDR10+ rides, the stream itself first when both carry it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Hdr10Plus {
+    #[default]
+    None,
+    /// In the coded units, an SEI or an AV1 metadata OBU, so a copy of the units keeps it.
+    Stream,
+    /// In a Matroska BlockAdditional alone, the demuxer hands it on as the unit's side data.
+    Addition,
+}
+
+impl Hdr10Plus {
+    pub fn present(self) -> bool {
+        self != Hdr10Plus::None
+    }
 }
 
 impl TrackDesc {
@@ -198,6 +227,7 @@ impl TrackDesc {
             layout: 0,
             nal_length: 0,
             duration_ns: 0,
+            hdr10plus: Hdr10Plus::None,
         }
     }
 }

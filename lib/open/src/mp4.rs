@@ -162,6 +162,16 @@ pub(crate) fn brand(head: &[u8]) -> Brand {
     major.or(compatible).unwrap_or(Brand::Mp4)
 }
 
+/// A larger `ftyp` box is not kept by [`ftyp_len`], a real one is a few dozen bytes.
+const MAX_FTYP: usize = 4 << 10;
+
+/// The length of the `ftyp` box `head` starts with, 0 without one or for one cut short.
+pub(crate) fn ftyp_len(head: &[u8]) -> usize {
+    let Some(hdr) = head.get(..8).filter(|h| &h[4..8] == b"ftyp") else { return 0 };
+    let size = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+    if (8..=MAX_FTYP.min(head.len())).contains(&size) { size } else { 0 }
+}
+
 /// Top level boxes walked for the `moov` and the `mdat`, as the head machine walks them.
 const MAX_BOXES: usize = 256;
 

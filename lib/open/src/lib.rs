@@ -309,6 +309,7 @@ pub struct Opened {
     pub duration_ns: u64,
     /// The bytes the demuxer starts from, empty for a bare file. A Matroska demuxer starts from
     /// the head parsed in [`Index::Mkv`], the head ending before any Attachments behind Tracks.
+    /// An MP4 demuxer starts from the tables in [`Index::Mp4`], see [`Opened::shed_head`].
     pub head: Arc<[u8]>,
     pub tracks: Vec<TrackDesc>,
     /// The codec heads, languages and titles the spans of the tracks name.
@@ -325,6 +326,25 @@ impl Opened {
     /// [`Brand::of`] its head.
     pub fn brand(&self) -> Brand {
         Brand::of(self.kind, &self.head)
+    }
+
+    /// Lets go of the head bytes no run reads again and says how many. Those are an MP4's
+    /// behind its `ftyp` once [`Index::Mp4`] holds its tables, every run starts from the
+    /// tables. The tags and chapters are read from the `moov`, so call it after them. The
+    /// meta that names the `moov` goes with it.
+    pub fn shed_head(&mut self) -> usize {
+        if self.kind != Kind::Mp4 || !matches!(self.index, Index::Mp4(_)) {
+            return 0;
+        }
+        let keep = mp4::ftyp_len(&self.head);
+        let shed = self.head.len() - keep;
+        if shed > 0 {
+            self.head = Arc::from(&self.head[..keep]);
+        }
+        if matches!(self.meta, Meta::Moov(_)) {
+            self.meta = Meta::None;
+        }
+        shed
     }
 
     pub fn bytes(&self, s: Span) -> &[u8] {

@@ -90,15 +90,21 @@ fn plays_at(path: &Path, kind: Kind) {
     let rel = path.display();
     let o = opened_at(path);
     assert_eq!(o.kind, kind, "{rel}");
+    for (id, n) in counted(path, &o) {
+        assert!(n > 0, "{rel} track {id} sent nothing");
+    }
+}
+
+/// The buffers each audio and video track of the open `o` of `path` sends, played to its end.
+fn counted(path: &Path, o: &Opened) -> Vec<(u32, u64)> {
+    let rel = path.display();
     let mut p = pf_reactor::pipeline();
     p.set_select_all(false);
-    let path = path.to_path_buf();
-    let demux = demuxer(&mut p, File::open(&path).unwrap(), &path, &o, false).unwrap();
+    let demux = demuxer(&mut p, File::open(path).unwrap(), path, o, false).unwrap();
     p.preroll().unwrap();
     let mut counts = Vec::new();
     for t in o.tracks.iter().filter(|t| matches!(t.kind, TrackKind::Audio | TrackKind::Video)) {
-        let out =
-            route(&p, demux, &o, t).unwrap_or_else(|| panic!("{rel} track {} unrouted", t.id));
+        let out = route(&p, demux, o, t).unwrap_or_else(|| panic!("{rel} track {} unrouted", t.id));
         let pad = out.pad(&mut p, demux).unwrap();
         let n = Arc::new(AtomicU64::new(0));
         let sink = p.add(Count(Arc::clone(&n)));
@@ -107,9 +113,7 @@ fn plays_at(path: &Path, kind: Kind) {
     }
     assert!(!counts.is_empty(), "{rel}");
     p.run().unwrap();
-    for (id, n) in counts {
-        assert!(n.load(Ordering::Relaxed) > 0, "{rel} track {id} sent nothing");
-    }
+    counts.into_iter().map(|(id, n)| (id, n.load(Ordering::Relaxed))).collect()
 }
 
 #[test]
@@ -287,6 +291,87 @@ fn an_mp4_run_takes_the_tables_of_the_open() {
         drop(runs);
         assert_eq!(Arc::strong_count(tables), 1, "{rel}");
     }
+}
+
+/// An MP4 open lets go of its `moov` once the tables are folded, the `ftyp` stays for the
+/// brand, and its runs send what they sent with the head held.
+fn sheds(path: &Path) {
+    let rel = path.display();
+    let mut o = opened_at(path);
+    let whole = counted(path, &o);
+    assert!(whole.iter().all(|c| c.1 > 0), "{rel} {whole:?}");
+    let (len, brand) = (o.head.len(), o.brand());
+    let shed = o.shed_head();
+    assert!(shed > 0 && o.head.len() == len - shed, "{rel} shed {shed} of {len}");
+    assert!(o.head.len() <= 64, "{rel} keeps {}", o.head.len());
+    assert_eq!((o.brand(), &o.meta), (brand, &pf_open::Meta::None), "{rel}");
+    assert_eq!(o.shed_head(), 0, "{rel} once");
+    for run in 1..=2 {
+        assert_eq!(counted(path, &o), whole, "{rel} run {run}");
+    }
+}
+
+#[test]
+fn an_mp4_sheds_its_head_and_plays_from_its_tables() {
+    for rel in [
+        "plugins/formats/mp4/tests/fixtures/tiny_av.mp4",
+        "plugins/formats/mp4/tests/fixtures/moov_last.mp4",
+        "plugins/formats/mp4/tests/fixtures/bframes_h264.mp4",
+    ] {
+        sheds(&path_of(rel));
+    }
+    // a fragmented movie reads its moofs from the stream, by the tables' defaults
+    let args = [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=96x64:rate=25:d=6",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000:d=6",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-g",
+        "25",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof",
+    ];
+    if let Some(bytes) = common::ffmpeg("shed_frag.mp4", &args) {
+        let path =
+            std::env::temp_dir().join(format!("pf_open_{}_shed_frag.mp4", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        sheds(&path);
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
+/// Only an MP4 with its tables folded sheds. Another container's runs read its head, and so
+/// does the run of an MP4 opened without its index.
+#[test]
+fn a_head_a_run_reads_is_not_shed() {
+    for rel in [
+        "plugins/formats/mp4/tests/fixtures/cues_last.mkv",
+        "plugins/formats/avi/tests/fixtures/tiny.avi",
+    ] {
+        let mut o = opened(rel);
+        let (head, meta) = (Arc::clone(&o.head), o.meta.clone());
+        assert_eq!((o.shed_head(), &o.head, &o.meta), (0, &head, &meta), "{rel}");
+    }
+    let path = path_of("plugins/formats/mp4/tests/fixtures/tiny_av.mp4");
+    let f = File::open(&path).unwrap();
+    let len = f.metadata().unwrap().len();
+    let mut log = Vec::new();
+    let mut o =
+        drive_file_log(&mut OpenAt::new(len, Want::TRACKS, Caps::default()), &f, &mut log).unwrap();
+    assert!(matches!(o.index, pf_open::Index::None), "{:?}", o.index);
+    let head = o.head.len();
+    assert_eq!((o.shed_head(), o.head.len()), (0, head));
+    assert!(counted(&path, &o).iter().all(|c| c.1 > 0), "the run folds from the head");
 }
 
 /// A Matroska run's demuxer holds the head the open parsed and its Cues, and neither the head's

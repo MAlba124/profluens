@@ -1,6 +1,7 @@
 //! VobSub sub-picture units through the `vobsubdec` element. Input is `knob` then `u16` LE
 //! length prefixed records, 3 s apart. `knob & 1` makes the first record the `.idx` head,
-//! `knob & 2` gives every Block a 2 s duration.
+//! `knob & 2` gives every Block a 2 s duration. Every picture lies on its grid, so a few bytes
+//! never stand for more than the grid's pixels.
 
 #![no_main]
 // Fuzz target, not an element.
@@ -105,8 +106,8 @@ fn bitmap(o: &Out, px: &[[u8; 4]], tinted: bool) {
     let [w, h, x, y, gw, gh] = o.head;
     assert!(w >= 1 && h >= 1, "an empty picture put out");
     assert!(px.len() * 4 <= MAX_BITMAP_BYTES, "a picture past the budget");
-    assert!(x + w <= 4096 && y + h <= 4096, "an area past 12 bits");
     assert!((1..=4096).contains(&gw) && (1..=4096).contains(&gh), "a grid out of range");
+    assert!(x + w <= gw && y + h <= gh, "a picture past its grid");
     if !tinted {
         assert_eq!((gw, gh), (720, if y + h > 480 { 576 } else { 480 }), "not the default grid");
     }

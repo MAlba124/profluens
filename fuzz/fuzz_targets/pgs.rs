@@ -1,5 +1,7 @@
 //! PGS Display Sets through `pgs::parse_display_set` and the `pgsdec` element. Input is `knob`
 //! then the stream. `knob & 1` 0 for `u16` LE length prefixed Blocks, 1 for a `.sup` file.
+//! Blocks are cut anywhere, an END header at a cut included. Each drawn object is no larger than
+//! the coded bytes seen can fill.
 
 #![no_main]
 // Fuzz target, not an element.
@@ -13,7 +15,10 @@ use std::sync::Arc;
 use libfuzzer_sys::fuzz_target;
 use pf_sim::prng::Prng;
 use pf_text::bitmap::{BITMAP_HEADER_LEN, BITMAP_RECT_LEN, BitmapRef};
-use pf_text::pgs::{decode_bitmap, encode_bitmap, parse_display_set, split_sup, strip_sup_header};
+use pf_text::pgs::{
+    PgsState, decode_bitmap, decode_rects, encode_bitmap, parse_display_set, parse_display_set_in,
+    split_sup, strip_sup_header,
+};
 use pf_text::{BITMAP_FAMILY, PGS_FAMILY, PgsDec};
 use profluens_core::batch::Batch;
 use profluens_core::buffer::{Buffer, BufferFlags};
@@ -142,22 +147,32 @@ fn display_set(set: &[u8]) {
     }
 }
 
-fn ends_with_end(b: &[u8]) -> bool {
-    b.len() >= 3 && b[b.len() - 3..] == [SEG_END, 0, 0]
-}
-
 fn element(blocks: &[Block], knob: u8) {
     let whole = run(blocks, None);
     let split = run(blocks, Some(knob));
     assert!(whole == split, "a Block in pieces decoded other than whole");
-    if blocks.iter().all(|b| ends_with_end(&b.0)) {
+    // Blocks of one set each, closed by their END, decode as the sets do one after another.
+    if blocks.iter().all(|b| walk(&b.0).0 == Some(b.0.len())) {
+        let mut state = PgsState::new();
         let want: Vec<Out> = blocks
             .iter()
             .filter_map(|&(ref b, pts, duration)| {
-                parse_display_set(b).ok().map(|ds| Out::of(pts, duration, &encode_bitmap(&ds)))
+                let pic = parse_display_set_in(b, &mut state).ok()?;
+                let mut p = vec![0u8; pic.payload_len()?];
+                let n = pic.write_bitmap(&mut p).ok()?;
+                Some(Out::of(pts, duration, &p[..n]))
             })
             .collect();
         assert!(whole == want, "the element put out other than the sets that decode");
+    }
+    // Objects persist over sets, so each is bounded by every coded byte seen.
+    let coded: usize = blocks.iter().map(|b| b.0.len()).sum();
+    for o in &whole {
+        for &[w, h, _, _] in &o.rects {
+            let px = w as usize * h as usize;
+            assert!(w <= 3840 && h <= 2160, "an object past UHD");
+            assert!(px <= MAX_RUN * coded.div_ceil(3), "an object past its coded data");
+        }
     }
     if say() {
         let ok = blocks.iter().filter(|b| parse_display_set(&b.0).is_ok()).count();
@@ -173,16 +188,12 @@ fn run(blocks: &[Block], cut: Option<u8>) -> Vec<Out> {
     for &(ref b, pts, duration) in blocks {
         let mut at = 0;
         loop {
-            let mut end = match cut {
+            let end = match cut {
                 None => b.len(),
                 Some(_) => {
                     (at + rng.range(1, ceiling.min(b.len()) as u64 + 1) as usize).min(b.len())
                 }
             };
-            // A piece ending in an END header closes the set early, so no cut lands there.
-            while end < b.len() && (end < 3 || ends_with_end(&b[..end])) {
-                end += 1;
-            }
             rig.push(&b[at..end], pts, duration);
             at = end;
             if at >= b.len() {
@@ -203,28 +214,28 @@ fn say() -> bool {
 struct Out {
     pts: Timestamp,
     duration: Timestamp,
-    head: [u32; 6],
+    /// Width, height, x and y of each rect, one per drawn object, at most two.
+    rects: Vec<[u32; 4]>,
+    video: [u32; 2],
     hash: u64,
 }
 
 impl Out {
     fn of(pts: Timestamp, duration: Timestamp, p: &[u8]) -> Out {
         let image = BitmapRef::parse(p).expect("a bitmap payload the view refuses");
-        let (w, h, x, y) = match image.rects() {
-            [] => (0, 0, 0, 0),
-            [r] => (r.width, r.height, r.x, r.y),
-            _ => panic!("a decoder put out more than one rect"),
-        };
-        let head = [w, h, x, y, image.video_width(), image.video_height()];
-        let px = w as usize * h as usize;
-        let table = BITMAP_HEADER_LEN + image.rects().len() * BITMAP_RECT_LEN;
+        let rects: Vec<[u32; 4]> =
+            image.rects().iter().map(|r| [r.width, r.height, r.x, r.y]).collect();
+        assert!(rects.len() <= 2, "more rects than the two windows");
+        let px: usize = rects.iter().map(|r| r[0] as usize * r[1] as usize).sum();
+        let table = BITMAP_HEADER_LEN + rects.len() * BITMAP_RECT_LEN;
         assert_eq!(p.len() - table, px * 4, "RGBA other than width * height");
         if p.len() <= 1 << 16 {
-            assert!(decode_bitmap(p).is_some(), "a well formed bitmap payload refused");
+            assert!(decode_rects(p).is_some_and(|r| r.len() == rects.len()), "a payload refused");
         }
         let mut h = DefaultHasher::new();
         h.write(p);
-        Out { pts, duration, head, hash: h.finish() }
+        let video = [image.video_width(), image.video_height()];
+        Out { pts, duration, rects, video, hash: h.finish() }
     }
 }
 

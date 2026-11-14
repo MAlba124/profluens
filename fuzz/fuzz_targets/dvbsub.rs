@@ -1,6 +1,10 @@
 //! DVB subtitle Blocks through the `dvbsubdec` element. Input is `knob` then records of a
 //! `u16` LE length, a PTS step in 100 ms (0 continues the set) and the Block. `knob & 1` makes
-//! a five byte first record the CodecPrivate, `knob & 2` a 10 s duration, `knob >> 2` the cuts.
+//! a five byte first record the CodecPrivate, failing that `knob & 0x20` a CodecPrivate of
+//! composition page 1 and ancillary page `1 + (knob >> 6)`, so the page filter drops some
+//! segments of a corpus written on page 1. `knob & 2` gives a
+//! 10 s duration, `knob >> 2` the cuts. Every set's work stays in its budget and every bitmap's
+//! pixels in the region budget.
 
 #![no_main]
 // Fuzz target, not an element.
@@ -14,8 +18,8 @@ use std::sync::Arc;
 use libfuzzer_sys::fuzz_target;
 use pf_sim::prng::Prng;
 use pf_text::bitmap::{BITMAP_HEADER_LEN, BITMAP_RECT_LEN, BitmapRef};
-use pf_text::dvbsubdec::PIXEL_BUDGET;
-use pf_text::pgs::decode_bitmap;
+use pf_text::dvbsubdec::{PIXEL_BUDGET, WORK_BUDGET};
+use pf_text::pgs::decode_rects;
 use pf_text::{BITMAP_FAMILY, DVB_FAMILY, DvbSubDec};
 use profluens_core::batch::Batch;
 use profluens_core::buffer::{Buffer, BufferFlags};
@@ -40,8 +44,11 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let mut blocks: Vec<Block<'_>> = records(rest).collect();
-    let head = (knob & 1 != 0 && blocks.first().is_some_and(|b| b.0.len() == 5))
-        .then(|| blocks.remove(0).0);
+    let pages = [0, 1, 0, 1 + (knob >> 6), 0];
+    let head = match knob & 1 != 0 && blocks.first().is_some_and(|b| b.0.len() == 5) {
+        true => Some(blocks.remove(0).0),
+        false => (knob & 0x20 != 0).then_some(&pages[..]),
+    };
     let duration = if knob & 2 != 0 { DURATION } else { Timestamp::NONE };
     let check = |o: &Out, _: &[[u8; 4]]| bitmap(o, &blocks, duration);
 
@@ -62,7 +69,7 @@ fuzz_target!(|data: &[u8]| {
     assert!(flushed.out == once, "a flush did not start the stream over");
 
     if say() {
-        let shows = once.iter().filter(|o| o.head[0] > 0).count();
+        let shows = once.iter().filter(|o| !o.rects.is_empty()).count();
         eprintln!(
             "dvbsub blocks {} put out {} shows {shows} dropped {}",
             blocks.len(),
@@ -100,8 +107,12 @@ fn play<F: FnMut(&Out, &[[u8; 4]])>(
                 }
             }
         }
+        // A Block may close the set before it, on that set's budget, then spend its own.
+        let before = rig.el.work_done();
         rig.push(&b[at..], pts, d);
         assert!(rig.el.held_pixels() <= PIXEL_BUDGET, "the region arena past its budget");
+        assert!(rig.el.work_spent() <= WORK_BUDGET, "a set past its work budget");
+        assert!(rig.el.work_done() - before <= 2 * WORK_BUDGET, "a Block past two budgets");
     }
 }
 
@@ -118,13 +129,15 @@ fn boundaries(b: &[u8]) -> impl Iterator<Item = usize> + '_ {
 }
 
 fn bitmap(o: &Out, blocks: &[Block<'_>], duration: Timestamp) {
-    let [w, h, x, y, gw, gh] = o.head;
+    let [gw, gh] = o.grid;
     assert!((1..=4096).contains(&gw) && (1..=4096).contains(&gh), "a grid out of range");
-    if w == 0 || h == 0 {
-        assert_eq!([w, h, x, y], [0; 4], "a clear with a size or a place");
-    } else {
+    let mut pixels = 0usize;
+    for &[w, h, x, y] in &o.rects {
+        assert!(w > 0 && h > 0, "an empty rect");
         assert!(x + w <= gw && y + h <= gh, "a show past its grid");
+        pixels += w as usize * h as usize;
     }
+    assert!(pixels <= PIXEL_BUDGET, "a bitmap of more pixels than the regions hold");
     assert!(blocks.iter().any(|b| b.1 == o.pts), "a bitmap at a PTS no Block had");
     let most = if duration.is_some() { duration } else { TIME_OUT };
     assert!(o.duration.is_none() || o.duration <= most, "held past its duration");
@@ -155,28 +168,27 @@ fn say() -> bool {
 struct Out {
     pts: Timestamp,
     duration: Timestamp,
-    head: [u32; 6],
+    /// Width, height, x and y of each rect, one per region.
+    rects: Vec<[u32; 4]>,
+    grid: [u32; 2],
     hash: u64,
 }
 
 impl Out {
     fn of(pts: Timestamp, duration: Timestamp, p: &[u8]) -> Out {
         let image = BitmapRef::parse(p).expect("a bitmap payload the view refuses");
-        let (w, h, x, y) = match image.rects() {
-            [] => (0, 0, 0, 0),
-            [r] => (r.width, r.height, r.x, r.y),
-            _ => panic!("a decoder put out more than one rect"),
-        };
-        let head = [w, h, x, y, image.video_width(), image.video_height()];
-        let px = w as usize * h as usize;
-        let table = BITMAP_HEADER_LEN + image.rects().len() * BITMAP_RECT_LEN;
+        let rects: Vec<[u32; 4]> =
+            image.rects().iter().map(|r| [r.width, r.height, r.x, r.y]).collect();
+        let px: usize = rects.iter().map(|r| r[0] as usize * r[1] as usize).sum();
+        let table = BITMAP_HEADER_LEN + rects.len() * BITMAP_RECT_LEN;
         assert_eq!(p.len() - table, px * 4, "RGBA other than width * height");
         if p.len() <= 1 << 16 {
-            assert!(decode_bitmap(p).is_some(), "a well formed bitmap payload refused");
+            assert!(decode_rects(p).is_some_and(|r| r.len() == rects.len()), "a payload refused");
         }
         let mut h = DefaultHasher::new();
         h.write(p);
-        Out { pts, duration, head, hash: h.finish() }
+        let grid = [image.video_width(), image.video_height()];
+        Out { pts, duration, rects, grid, hash: h.finish() }
     }
 }
 

@@ -284,10 +284,11 @@ impl Harness {
         self.run_process()
     }
 
+    /// The next buffer out on `pad`, in-band events ahead of it stepped over.
     pub fn pull(&mut self, pad: SrcPad) -> Option<Buffer> {
         let mut batch = self.ctx.take_output(pad);
-        let head = batch.pop_front();
-        if !batch.is_empty() {
+        let head = next_buffer(&mut batch);
+        if !batch.is_inert() {
             self.ctx.output_on(pad).append(&mut batch);
         }
         head
@@ -344,6 +345,15 @@ impl Harness {
     /// End the stream as the scheduler does and return every buffer put out, FIFO.
     pub fn eos(&mut self) -> Result<Vec<Buffer>, Error> {
         let mut out = self.drain_outputs();
+        // the scheduler ends an element only once its input is drained
+        let mut idle = 0;
+        while self.ctx.input_len() > 0 && idle < 4 {
+            let left = self.ctx.input_len();
+            self.run_process()?;
+            let produced = self.drain_outputs();
+            idle = if self.ctx.input_len() < left || !produced.is_empty() { 0 } else { idle + 1 };
+            self.copy_off_pool(produced, &mut out);
+        }
         self.run_held(&mut out)?;
         self.push_event(Event::Eos)?;
         self.drain_announcement();
@@ -366,17 +376,22 @@ impl Harness {
                 (true, true) => idle,
                 (true, false) => idle + 1,
             };
-            for buf in produced {
-                let Some(mut copy) = self.off_pool.acquire_exact(buf.memory.len()) else {
-                    continue;
-                };
-                let n = buf.memory.len();
-                copy.as_mut_full()[..n].copy_from_slice(buf.memory.data());
-                copy.set_len(n);
-                out.push(Buffer { memory: copy, ..buf });
-            }
+            self.copy_off_pool(produced, out);
         }
         Ok(())
+    }
+
+    /// Copies `produced` into `out` off the element's pool, so its slots return.
+    fn copy_off_pool(&mut self, produced: Vec<Buffer>, out: &mut Vec<Buffer>) {
+        for buf in produced {
+            let Some(mut copy) = self.off_pool.acquire_exact(buf.memory.len()) else {
+                continue;
+            };
+            let n = buf.memory.len();
+            copy.as_mut_full()[..n].copy_from_slice(buf.memory.data());
+            copy.set_len(n);
+            out.push(Buffer { memory: copy, ..buf });
+        }
     }
 
     /// Sleeps out a `wake_within` the element asked for, `false` without one.
@@ -410,7 +425,7 @@ impl Harness {
     pub fn drain_outputs(&mut self) -> Vec<Buffer> {
         let mut batch = self.ctx.take_output(SrcPad(0));
         let mut out = Vec::new();
-        while let Some(b) = batch.pop_front() {
+        while let Some(b) = next_buffer(&mut batch) {
             out.push(b);
         }
         out
@@ -434,6 +449,16 @@ impl Harness {
             *announced = Some(f);
             *changes += 1;
         });
+    }
+}
+
+/// The oldest buffer of `batch`, the events due ahead of it dropped. A test reads buffers.
+fn next_buffer(batch: &mut Batch) -> Option<Buffer> {
+    loop {
+        if let Some(b) = batch.pop_front() {
+            return Some(b);
+        }
+        batch.due_event()?;
     }
 }
 
@@ -516,6 +541,8 @@ mod tests {
     #[derive(Default)]
     struct Doubler {
         bogus: bool,
+        /// An in-band event after every buffer out.
+        tags: bool,
     }
 
     impl Doubler {
@@ -553,6 +580,9 @@ mod tests {
                 out.memory.set_len(n);
                 out.pts = ctx.now();
                 ctx.out(Self::OUT).push(out);
+                if self.tags {
+                    ctx.push_event(Self::OUT, Event::Tags(profluens_core::event::TagList::new()));
+                }
             }
             Ok(Flow::Ok)
         }
@@ -689,6 +719,27 @@ mod tests {
     }
 
     #[test]
+    fn buffers_behind_an_in_band_event_still_come_out() {
+        let batch = |h: &mut Harness| {
+            let mut b = Batch::new(BYTES);
+            for n in 1..=3u8 {
+                b.push(h.alloc(&[n]));
+            }
+            b
+        };
+        let mut h = Harness::new(Doubler { tags: true, ..Doubler::default() });
+        let b = batch(&mut h);
+        h.push_batch(b).unwrap();
+        let got: Vec<u8> = h.drain_outputs().iter().map(|b| b.memory.data()[0]).collect();
+        assert_eq!(got, [2, 4, 6], "drain_outputs");
+        let b = batch(&mut h);
+        h.push_batch(b).unwrap();
+        let got: Vec<u8> =
+            std::iter::from_fn(|| h.pull(Doubler::OUT)).map(|b| b.memory.data()[0]).collect();
+        assert_eq!(got, [2, 4, 6], "pull");
+    }
+
+    #[test]
     fn crank_runs_process_without_input() {
         let mut h = Harness::new(Doubler::default());
         let flow = h.crank().unwrap();
@@ -699,7 +750,7 @@ mod tests {
 
     #[test]
     fn unresolvable_announcement_warns_once_and_caches_nothing() {
-        let mut h = Harness::new(Doubler { bogus: true });
+        let mut h = Harness::new(Doubler { bogus: true, ..Doubler::default() });
         h.crank().unwrap();
         assert!(h.announced().is_none(), "an unresolvable name reaches no sink");
         let warnings = h

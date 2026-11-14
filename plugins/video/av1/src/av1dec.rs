@@ -14,14 +14,18 @@ use profluens_video::FAMILY;
 use profluens_video::decoder::{self, Codec, Held, Out, PlaneRef, Scan, Sent, VideoDec};
 use profluens_video::gpuframe::{DmabufFormat, GpuFrameChannel};
 
-use crate::dav1d::{self, Dav1dError, Decoder, OpenError, Picture, PictureSupply, Settings};
+use crate::dav1d::{
+    self, Dav1dError, Decoder, OpenError, Picture, PictureSupply, Settings, Stamps,
+};
+use crate::tu::{self, Last, Seq};
 
-static PIXFMTS: [ValueDesc; 5] = [
+static PIXFMTS: [ValueDesc; 6] = [
     ValueDesc::Id("i420"),
     ValueDesc::Id("gray8"),
     ValueDesc::Id("p010"),
     ValueDesc::Id("i422"),
     ValueDesc::Id("i422_10"),
+    ValueDesc::Id("gray10"),
 ];
 static SRC_FIELDS: [FieldDesc; 13] = decoder::src_fields_stating_color(&PIXFMTS);
 static SRC_OFFERS: [OfferDesc; 1] = [OfferDesc { family: FAMILY, fields: &SRC_FIELDS }];
@@ -49,7 +53,7 @@ pub const DEFAULT_FRAME_DELAY: u32 = 0;
 /// The most pixels a frame may have, 35,651,584 (8192x4352).
 pub const FRAME_SIZE_LIMIT: u32 = 8192 * 4352;
 
-/// Decodes AV1 temporal units to packed 8-bit `i420` or `gray8`, or 10-bit `p010`.
+/// Decodes AV1 temporal units to packed 8-bit `i420` or `gray8`, or 10-bit `p010` or `gray10`.
 pub type Av1Dec = VideoDec<Av1>;
 
 /// dav1d in dmabuf mode if `desc` is its element, see [`VideoDec::with_dmabuf`].
@@ -78,11 +82,9 @@ impl fmt::Display for Av1DecError {
         match self {
             Av1DecError::Open(e) => write!(f, "av1 decoder not opened, {e}"),
             Av1DecError::Unit(e) => write!(f, "av1 temporal unit dropped, {e}"),
-            Av1DecError::Shape { width, height, bit_depth, layout } => write!(
-                f,
-                "av1 {width}x{height} {bit_depth}-bit {layout} is not decoded here, only 8-bit \
-                 4:2:0 and monochrome and 10-bit 4:2:0 are"
-            ),
+            Av1DecError::Shape { width, height, bit_depth, layout } => {
+                write!(f, "av1 {width}x{height} {bit_depth}-bit {layout} is not decoded here")
+            }
             Av1DecError::HeldFull { slots } => {
                 write!(f, "av1 frame dropped, all {slots} held picture slots are taken")
             }
@@ -94,10 +96,15 @@ impl std::error::Error for Av1DecError {}
 
 pub struct Av1 {
     held: Vec<Option<Picture>>,
+    /// Declared before the decoder, whose pictures it may hold.
+    last: Last<Picture>,
     decoder: Option<Decoder>,
     supply: PictureSupply,
     settings: Settings,
     open_failed: bool,
+    seq: Seq,
+    /// Of the next unit sent, to tell its pictures from another's.
+    serial: i64,
 }
 
 impl Av1 {
@@ -207,6 +214,43 @@ impl Av1 {
     }
 }
 
+/// A unit as the shell hands it over.
+#[derive(Clone, Copy)]
+enum Unit<'a> {
+    Bytes(&'a [u8]),
+    Memory(&'a Memory),
+}
+
+impl Av1 {
+    fn send(&mut self, unit: Unit<'_>, pts: Timestamp, duration: Timestamp, out: &mut Out<'_>) {
+        if !self.ensure_open(out) || !self.top_up(out) {
+            return;
+        }
+        let Av1 { held, last, decoder: Some(decoder), supply, seq, serial, .. } = self else {
+            return;
+        };
+        let bytes = match unit {
+            Unit::Bytes(b) => b,
+            Unit::Memory(m) => m.data(),
+        };
+        let stamps = Stamps {
+            timestamp: to_dav1d(pts, i64::MIN),
+            duration: to_dav1d(duration, -1),
+            serial: *serial,
+        };
+        last.note(*serial, tu::shown(bytes, seq));
+        *serial += 1;
+        let mut emit = |p: Picture| last.take(p.serial(), p, |p| Self::place(held, supply, p, out));
+        let sent = match unit {
+            Unit::Bytes(b) => decoder.decode(b, stamps, &mut emit),
+            Unit::Memory(m) => decoder.decode_memory(m, stamps, &mut emit),
+        };
+        if let Err(e) = sent {
+            out.warn(Av1DecError::Unit(e));
+        }
+    }
+}
+
 fn to_dav1d(t: Timestamp, none: i64) -> i64 {
     t.nanos().map_or(none, |n| n as i64)
 }
@@ -231,6 +275,9 @@ impl Codec for Av1 {
                 frame_size_limit: FRAME_SIZE_LIMIT,
             },
             open_failed: false,
+            last: Last::default(),
+            seq: Seq::default(),
+            serial: 0,
         }
     }
 
@@ -253,7 +300,9 @@ impl Codec for Av1 {
                 frame_delay = settings.frame_delay
             );
             self.held.iter_mut().for_each(|h| *h = None);
+            self.last.clear();
             self.decoder = None;
+            self.seq = Seq::default();
         }
         self.settings = settings;
         self.open_failed = false;
@@ -265,6 +314,7 @@ impl Codec for Av1 {
 
     fn reset(&mut self) {
         self.held.iter_mut().for_each(|h| *h = None);
+        self.last.clear();
         if let Some(d) = &mut self.decoder {
             d.flush();
         }
@@ -272,18 +322,7 @@ impl Codec for Av1 {
     }
 
     fn decode(&mut self, unit: &[u8], pts: Timestamp, duration: Timestamp, out: &mut Out<'_>) {
-        if !self.ensure_open(out) || !self.top_up(out) {
-            return;
-        }
-        let Av1 { held, decoder: Some(decoder), supply, .. } = self else {
-            return;
-        };
-        let (timestamp, duration) = (to_dav1d(pts, i64::MIN), to_dav1d(duration, -1));
-        if let Err(e) =
-            decoder.decode(unit, timestamp, duration, |p| Self::place(held, supply, p, out))
-        {
-            out.warn(Av1DecError::Unit(e));
-        }
+        self.send(Unit::Bytes(unit), pts, duration, out);
     }
 
     fn decode_memory(
@@ -293,25 +332,17 @@ impl Codec for Av1 {
         duration: Timestamp,
         out: &mut Out<'_>,
     ) {
-        if !self.ensure_open(out) || !self.top_up(out) {
-            return;
-        }
-        let Av1 { held, decoder: Some(decoder), supply, .. } = self else {
-            return;
-        };
-        let (timestamp, duration) = (to_dav1d(pts, i64::MIN), to_dav1d(duration, -1));
-        if let Err(e) =
-            decoder.decode_memory(unit, timestamp, duration, |p| Self::place(held, supply, p, out))
-        {
-            out.warn(Av1DecError::Unit(e));
-        }
+        self.send(Unit::Memory(unit), pts, duration, out);
     }
 
     fn finish(&mut self, out: &mut Out<'_>) {
-        let Av1 { held, decoder: Some(decoder), supply, .. } = self else {
+        let Av1 { held, last, decoder: Some(decoder), supply, .. } = self else {
             return;
         };
-        if let Err(e) = decoder.drain(|p| Self::place(held, supply, p, out)) {
+        let drained =
+            decoder.drain(|p| last.take(p.serial(), p, |p| Self::place(held, supply, p, out)));
+        last.flush(|p| Self::place(held, supply, p, out));
+        if let Err(e) = drained {
             out.warn(Av1DecError::Unit(e));
         }
     }

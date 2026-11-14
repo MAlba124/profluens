@@ -27,7 +27,7 @@ const FRAME_NS: u64 = 40_000_000;
 
 const SLOT: usize = 64 * 1024;
 
-const EXACT: [&str; 7] = [
+const EXACT: [&str; 8] = [
     "inter_64x48",
     "altref_64x48",
     "odd_61x37",
@@ -35,6 +35,7 @@ const EXACT: [&str; 7] = [
     "tiles_256x128",
     "grain_64x48",
     "resize_64x48_96x64",
+    "mono10_64x48",
 ];
 
 struct Expected {
@@ -333,6 +334,109 @@ fn what_the_link_does_not_take_goes_out_as_the_i420_it_does() {
             .map(|w| ((u32::from(u16::from_le_bytes(*w) >> 6) + 2) >> 2).min(255) as u8)
             .collect();
         assert_eq!(b.bytes[..luma], want[..], "frame {n}: luma rounded to 8 bits");
+    }
+}
+
+#[test]
+fn ten_bit_monochrome_comes_out_as_gray10_or_as_the_420_the_link_takes() {
+    let f = fixture("mono10_64x48");
+    let mut h = harness();
+    let gray = decode_all(&mut h, &f.units);
+    check(&f, &gray, 0);
+    assert_eq!(announced_id(&h, "pixfmt").as_deref(), Some("gray10"));
+    assert_eq!(gray[0].bytes.len(), 2 * 64 * 48, "Y only in 16-bit words");
+    let luma = 64 * 48;
+    for (takes, pixfmt) in [(&["i420", "p010"][..], "p010"), (&["i420"][..], "i420")] {
+        let mut h = harness();
+        h.fix_src_takes(
+            Av1Dec::OUT,
+            "pixfmt",
+            &takes.iter().map(|t| ValueDesc::Id(t)).collect::<Vec<_>>(),
+        );
+        let out = decode_all(&mut h, &f.units);
+        assert_eq!(announced_id(&h, "pixfmt").as_deref(), Some(pixfmt));
+        assert_eq!(out.len(), f.expected.len(), "{pixfmt}: every frame");
+        for (n, (b, g)) in out.iter().zip(&gray).enumerate() {
+            let words = g.bytes.as_chunks::<2>().0.iter().map(|w| u16::from_le_bytes(*w));
+            if pixfmt == "p010" {
+                assert_eq!(b.bytes.len(), 2 * luma * 3 / 2, "frame {n}: tight p010");
+                let want: Vec<u8> = words.flat_map(|v| (v << 6).to_le_bytes()).collect();
+                assert_eq!(b.bytes[..2 * luma], want[..], "frame {n}: luma high aligned");
+                let c = &b.bytes[2 * luma..];
+                assert!(c.as_chunks::<2>().0.iter().all(|w| *w == [0, 0x80]), "frame {n}: grey");
+            } else {
+                assert_eq!(b.bytes.len(), luma * 3 / 2, "frame {n}: tight i420");
+                let want: Vec<u8> =
+                    words.map(|v| ((u32::from(v) + 2) >> 2).min(255) as u8).collect();
+                assert_eq!(b.bytes[..luma], want[..], "frame {n}: luma rounded to 8 bits");
+                assert!(b.bytes[luma..].iter().all(|c| *c == 128), "frame {n}: neutral chroma");
+            }
+        }
+        assert!(warnings(&mut h).is_empty(), "{pixfmt}: no warning on a clean stream");
+    }
+}
+
+/// The units with the sequence header's `operating_point_idc[0]` set to `idc`. The fixtures
+/// carry no timing info and one operating point, so the field is payload bits 12 to 23.
+fn with_idc(units: &[Vec<u8>], idc: u16) -> Vec<Vec<u8>> {
+    let mut units = units.to_vec();
+    let mut found = 0;
+    for unit in &mut units {
+        let mut at = 0;
+        while at < unit.len() {
+            let h = unit[at];
+            let head = at + 1 + usize::from(h & 0x04 != 0);
+            let (mut size, mut n) = (0, 0);
+            while unit[head + n] & 0x80 != 0 {
+                size |= usize::from(unit[head + n] & 0x7F) << (7 * n);
+                n += 1;
+            }
+            size |= usize::from(unit[head + n]) << (7 * n);
+            let payload = head + n + 1;
+            if (h >> 3) & 0xF == 1 {
+                let mut bits = u32::from_be_bytes(unit[payload..payload + 4].try_into().unwrap());
+                assert_eq!(bits >> 20 & 0xDF, 0, "no reduced header, no timing, one point");
+                bits = bits & !(0xFFF << 8) | u32::from(idc) << 8;
+                unit[payload..payload + 4].copy_from_slice(&bits.to_be_bytes());
+                found += 1;
+            }
+            at = payload + size;
+        }
+    }
+    assert!(found > 0, "a sequence header");
+    units
+}
+
+#[test]
+fn an_operating_point_naming_layers_its_frames_lack_loses_no_picture() {
+    // Spatial layers 0 and 1 named, the frames carry no extension, so all are layer 0. Units
+    // that lead with a hidden altref used to lose the picture before them.
+    let f = fixture("altref_64x48");
+    let units = with_idc(&f.units, 0x301);
+    let mut h = harness();
+    let out = decode_all(&mut h, &units);
+    check(&f, &out, 0);
+    assert!(warnings(&mut h).is_empty(), "no warning on a clean stream");
+}
+
+#[test]
+fn a_unit_showing_several_frames_puts_out_its_last_alone() {
+    // Units 2 and 3 as one, so it shows two frames, unit 3's goes out at unit 2's time.
+    let f = fixture("inter_64x48");
+    let mut units = f.units.clone();
+    let third = units.remove(3);
+    assert_eq!(third[..2], [0x12, 0x00], "a unit leads with its temporal delimiter");
+    units[2].extend_from_slice(&third[2..]);
+    for threads in [1, 4] {
+        let mut h = Harness::with_slot_size(Av1Dec::new(), SLOT);
+        assert!(h.set_prop("threads", Value::Int(threads)));
+        let out = decode_all(&mut h, &units);
+        assert_eq!(out.len(), f.expected.len() - 1, "threads {threads}: one picture a unit");
+        for (k, b) in out.iter().enumerate() {
+            let n = if k < 2 { k } else { k + 1 };
+            assert_eq!(b.pts, at(k), "threads {threads}: picture {k} pts");
+            assert_eq!(md5::md5_hex(&b.bytes), f.expected[n].md5, "threads {threads}: picture {k}");
+        }
     }
 }
 

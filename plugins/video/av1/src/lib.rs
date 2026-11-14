@@ -2,6 +2,7 @@
 
 pub mod av1dec;
 pub mod dav1d;
+pub mod tu;
 
 pub use av1dec::{Av1Dec, Av1DecError};
 

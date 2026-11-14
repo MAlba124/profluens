@@ -4,9 +4,11 @@
 use std::time::Instant;
 
 use pf_av1::av1dec::FRAME_SIZE_LIMIT;
-use pf_av1::dav1d::{Decoder, PictureSupply, Settings};
+use pf_av1::dav1d::{Decoder, PictureSupply, Settings, Stamps};
 use profluens_video::PixelFormats;
-use profluens_video::decoder::{HeldLayout, pack_gray, pack_p010, pack_planes, pack_reduced};
+use profluens_video::decoder::{
+    HeldLayout, pack_gray, pack_gray_wide, pack_p010, pack_planes, pack_reduced,
+};
 use profluens_video::geometry::frame_size;
 
 fn ivf_units(bytes: &[u8]) -> Vec<&[u8]> {
@@ -59,6 +61,9 @@ fn main() {
                 pack_reduced(&mut dst, w, h, chroma_shift, bits, pixfmt, &planes).expect("pack")
             }
             HeldLayout::Gray => pack_gray(&mut dst, w, h, &planes).expect("pack"),
+            HeldLayout::GrayWide { bits } => {
+                pack_gray_wide(&mut dst, (w, h), bits, pixfmt, &planes).expect("pack")
+            }
         };
         copy_ms.push(t.elapsed().as_secs_f64() * 1e3);
         frames += 1;
@@ -67,7 +72,8 @@ fn main() {
     let start = Instant::now();
     for (i, u) in units.iter().enumerate() {
         let t = Instant::now();
-        if dec.decode(u, i as i64, 0, |pic| pack(pic, &mut copy_ms)).is_err() {
+        let stamps = Stamps { timestamp: i as i64, duration: 0, serial: i as i64 };
+        if dec.decode(u, stamps, |pic| pack(pic, &mut copy_ms)).is_err() {
             failed += 1;
         }
         unit_ms.push(t.elapsed().as_secs_f64() * 1e3);

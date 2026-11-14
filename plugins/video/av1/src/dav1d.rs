@@ -11,7 +11,7 @@ use profluens_core::memory::Memory;
 use profluens_video::color::{
     ChromaSite, ContentLight, HdrStatic, Mastering, Matrix, Primaries, Range, TransferFn,
 };
-use profluens_video::decoder::{Color, HeldLayout, Planar, PlaneRef, place};
+use profluens_video::decoder::{Color, HeldLayout, Planar, PlaneRef, place, place_gray};
 use profluens_video::{PixelFormat, PixelFormats};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -340,7 +340,8 @@ impl Decoder {
             s.n_threads = settings.threads.min(MAX_THREADS) as c_int;
             s.max_frame_delay = settings.frame_delay.min(MAX_FRAME_DELAY) as c_int;
             s.apply_grain = 1;
-            s.all_layers = 0;
+            // Every shown frame comes out, crate::tu::Last keeps the last of each unit.
+            s.all_layers = 1;
             s.frame_size_limit = settings.frame_size_limit;
             s.logger.callback = None;
             s.allocator = ffi::Dav1dPicAllocator {
@@ -365,15 +366,15 @@ impl Decoder {
         self.frame_delay
     }
 
-    /// Feed one temporal unit and hand `emit` the picture that came out, if any.
+    /// Feed one temporal unit and hand `emit` the pictures that came out. `serial` comes back
+    /// on each picture of the unit, see [`Picture::serial`].
     pub fn decode(
         &mut self,
         unit: &[u8],
-        timestamp: i64,
-        duration: i64,
+        stamps: Stamps,
         emit: impl FnMut(Picture),
     ) -> Result<(), Dav1dError> {
-        let data = Data::create(unit, timestamp, duration)?;
+        let data = Data::create(unit, stamps)?;
         self.send(data, emit)
     }
 
@@ -381,11 +382,10 @@ impl Decoder {
     pub fn decode_memory(
         &mut self,
         unit: &Memory,
-        timestamp: i64,
-        duration: i64,
+        stamps: Stamps,
         emit: impl FnMut(Picture),
     ) -> Result<(), Dav1dError> {
-        let data = Data::wrap(unit, &self.supply, timestamp, duration)?;
+        let data = Data::wrap(unit, &self.supply, stamps)?;
         self.send(data, emit)
     }
 
@@ -459,12 +459,21 @@ impl Drop for Decoder {
     }
 }
 
+/// What a unit's pictures carry back, dav1d's `Dav1dDataProps`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamps {
+    pub timestamp: i64,
+    pub duration: i64,
+    /// Rides in `offset`, which dav1d copies to the pictures and never reads.
+    pub serial: i64,
+}
+
 struct Data {
     raw: ffi::Dav1dData,
 }
 
 impl Data {
-    fn create(unit: &[u8], timestamp: i64, duration: i64) -> Result<Data, Dav1dError> {
+    fn create(unit: &[u8], stamps: Stamps) -> Result<Data, Dav1dError> {
         if unit.is_empty() {
             return Err(Dav1dError::Invalid);
         }
@@ -476,18 +485,12 @@ impl Data {
                 return Err(Dav1dError::OutOfMemory);
             }
             ptr::copy_nonoverlapping(unit.as_ptr(), dst, unit.len());
-            raw.m.timestamp = timestamp;
-            raw.m.duration = duration;
+            stamp(&mut raw, stamps);
             Ok(Data { raw })
         }
     }
 
-    fn wrap(
-        unit: &Memory,
-        supply: &PictureSupply,
-        timestamp: i64,
-        duration: i64,
-    ) -> Result<Data, Dav1dError> {
+    fn wrap(unit: &Memory, supply: &PictureSupply, stamps: Stamps) -> Result<Data, Dav1dError> {
         let bytes = unit.data();
         if bytes.is_empty() {
             return Err(Dav1dError::Invalid);
@@ -504,11 +507,16 @@ impl Data {
                 lock(&supply.shared.units)[index] = None;
                 return Err(Dav1dError::from_code(code));
             }
-            raw.m.timestamp = timestamp;
-            raw.m.duration = duration;
+            stamp(&mut raw, stamps);
             Ok(Data { raw })
         }
     }
+}
+
+fn stamp(raw: &mut ffi::Dav1dData, s: Stamps) {
+    raw.m.timestamp = s.timestamp;
+    raw.m.duration = s.duration;
+    raw.m.offset = s.serial;
 }
 
 impl Drop for Data {
@@ -543,13 +551,7 @@ impl Picture {
     pub fn pixfmt(&self, takes: PixelFormats) -> Option<(PixelFormat, HeldLayout)> {
         let bits = u8::try_from(self.raw.p.bpc).ok()?;
         let chroma_shift = match self.raw.p.layout {
-            ffi::DAV1D_PIXEL_LAYOUT_I400 if bits != 8 => return None,
-            ffi::DAV1D_PIXEL_LAYOUT_I400
-                if !takes.has(PixelFormat::Gray8) && takes.has(PixelFormat::I420) =>
-            {
-                return Some((PixelFormat::I420, HeldLayout::Gray));
-            }
-            ffi::DAV1D_PIXEL_LAYOUT_I400 => return Some((PixelFormat::Gray8, HeldLayout::Native)),
+            ffi::DAV1D_PIXEL_LAYOUT_I400 => return place_gray(bits, takes),
             ffi::DAV1D_PIXEL_LAYOUT_I420 => (1, 1),
             ffi::DAV1D_PIXEL_LAYOUT_I422 => (1, 0),
             ffi::DAV1D_PIXEL_LAYOUT_I444 => (0, 0),
@@ -574,6 +576,11 @@ impl Picture {
 
     pub fn duration(&self) -> i64 {
         self.raw.m.duration
+    }
+
+    /// The serial of the unit the picture came of, see [`Stamps`].
+    pub fn serial(&self) -> i64 {
+        self.raw.m.offset
     }
 
     pub fn bytes(&self) -> Option<usize> {
@@ -760,6 +767,13 @@ mod tests {
         unsafe { release_picture(&mut pic, supply.cookie()) };
     }
 
+    /// Drops a hand made picture's supply and skips its unref, no dav1d reference is behind it.
+    fn unmade(picture: Picture) {
+        let picture = std::mem::ManuallyDrop::new(picture);
+        // SAFETY: read once, the picture itself is never dropped.
+        drop(unsafe { std::ptr::read(&picture.supply) });
+    }
+
     #[test]
     fn pictures_take_fed_slots_and_release_into_the_registry() {
         let supply = PictureSupply::new();
@@ -780,7 +794,7 @@ mod tests {
         let mut n = 0;
         supply.for_each_held(&mut |_| n += 1);
         assert_eq!(n, 0, "nothing of a pool is held");
-        std::mem::forget(private); // no dav1d reference behind a hand made picture
+        unmade(private);
         release(&supply, 1);
         assert_eq!(supply.live(), (0, 0));
         supply.want(geo.bytes);
@@ -801,7 +815,7 @@ mod tests {
         let mut n = 0;
         supply.for_each_held(&mut |m| n += usize::from(m.slot_id() == id));
         assert_eq!(n, 1, "counted among what the decoder holds");
-        std::mem::forget(placed);
+        unmade(placed);
         release(&supply, index);
         assert_eq!(supply.live(), (0, 0));
         drop(memory);
@@ -815,8 +829,10 @@ mod tests {
         let mut unit = pool.acquire();
         unit.as_mut_full()[..4].copy_from_slice(&[1, 2, 3, 4]);
         unit.set_len(4);
-        let data = Data::wrap(&unit, &supply, 7, 1).expect("wrapped");
-        assert_eq!((data.raw.sz, data.raw.m.timestamp, data.raw.m.duration), (4, 7, 1));
+        let stamps = Stamps { timestamp: 7, duration: 1, serial: 9 };
+        let data = Data::wrap(&unit, &supply, stamps).expect("wrapped");
+        let m = data.raw.m;
+        assert_eq!((data.raw.sz, m.timestamp, m.duration, m.offset), (4, 7, 1, 9));
         assert_eq!(data.raw.data, unit.data().as_ptr(), "read in place");
         assert_eq!(supply.live(), (0, 1));
         drop(unit);
@@ -825,6 +841,6 @@ mod tests {
         assert_eq!(supply.live(), (0, 0), "the last reference released the view");
         assert_eq!(pool.stats().outstanding, 0);
         let empty = Pool::new(256).acquire();
-        assert_eq!(Data::wrap(&empty, &supply, 0, 0).err(), Some(Dav1dError::Invalid));
+        assert_eq!(Data::wrap(&empty, &supply, stamps).err(), Some(Dav1dError::Invalid));
     }
 }

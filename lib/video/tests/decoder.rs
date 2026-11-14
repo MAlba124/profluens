@@ -1470,6 +1470,60 @@ fn pack_gray_fills_neutral_chroma() {
 }
 
 #[test]
+fn pack_gray_wide_moves_luma_to_p010_or_rounds_it_to_i420_with_neutral_chroma() {
+    let words: [u16; 6] = [0, 1, 0xEEE, 0x3FF, 2, 0xEEE];
+    let luma: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let planes = [PlaneRef { data: &luma, stride: 6 }, PlaneRef::EMPTY, PlaneRef::EMPTY];
+    let mut dst = [0u8; 2 * (4 + 2 * 2)];
+    let packed = decoder::pack_gray_wide(&mut dst, (2, 2), 10, PixelFormat::P010, &planes);
+    assert_eq!(packed, Ok(12));
+    let out: Vec<u16> = dst.as_chunks::<2>().0.iter().map(|w| u16::from_le_bytes(*w)).collect();
+    assert_eq!(out[..4], [0, 1 << 6, 0x3FF << 6, 2 << 6], "the row padding is skipped");
+    assert_eq!(out[4..], [0x8000, 0x8000, 0, 0], "neutral chroma");
+    let packed = decoder::pack_gray_wide(&mut dst, (2, 2), 10, PixelFormat::I420, &planes);
+    assert_eq!(packed, Ok(6));
+    assert_eq!(dst[..6], [0, 0, 255, 1, 128, 128]);
+    let err = decoder::pack_gray_wide(&mut dst, (2, 2), 10, PixelFormat::Gray10, &planes);
+    assert!(matches!(err, Err(VideoDecError::HeldLayout { .. })));
+    let short = [PlaneRef { data: &luma[..8], stride: 6 }, PlaneRef::EMPTY, PlaneRef::EMPTY];
+    let err = decoder::pack_gray_wide(&mut dst, (2, 2), 10, PixelFormat::P010, &short);
+    assert_eq!(err, Err(VideoDecError::PlaneShort { plane: 0, need: 10, have: 8 }));
+    // the dmabuf path goes by 8-bit I420, an odd size repeats its last row and column
+    let mut nv12 = [0u8; 4 + 2];
+    let mut scratch = Vec::new();
+    let one = [PlaneRef { data: &luma[..2], stride: 2 }, PlaneRef::EMPTY, PlaneRef::EMPTY];
+    let layout = HeldLayout::GrayWide { bits: 10 };
+    let packed =
+        decoder::pack_nv12(&mut nv12, Some(&mut scratch), layout, PixelFormat::I420, 1, 1, &one);
+    assert_eq!(packed, Ok(6));
+    assert_eq!(nv12, [0, 0, 0, 0, 128, 128]);
+}
+
+#[test]
+fn monochrome_goes_out_as_gray_else_as_the_420_the_link_takes() {
+    use profluens_video::PixelFormats;
+    let takes = |names: &[&str]| PixelFormats::of_names(names.iter().copied());
+    let wide = |bits| HeldLayout::GrayWide { bits };
+    let native = |f| Some((f, HeldLayout::Native));
+    assert_eq!(decoder::place_gray(8, PixelFormats::NONE), native(PixelFormat::Gray8));
+    assert_eq!(
+        decoder::place_gray(8, takes(&["i420"])),
+        Some((PixelFormat::I420, HeldLayout::Gray))
+    );
+    assert_eq!(decoder::place_gray(8, takes(&["gray8", "i420"])), native(PixelFormat::Gray8));
+    assert_eq!(decoder::place_gray(10, PixelFormats::NONE), native(PixelFormat::Gray10));
+    assert_eq!(decoder::place_gray(10, takes(&["gray10"])), native(PixelFormat::Gray10));
+    assert_eq!(
+        decoder::place_gray(10, takes(&["i420", "p010"])),
+        Some((PixelFormat::P010, wide(10)))
+    );
+    assert_eq!(decoder::place_gray(10, takes(&["i420"])), Some((PixelFormat::I420, wide(10))));
+    assert_eq!(decoder::place_gray(12, PixelFormats::NONE), Some((PixelFormat::P010, wide(12))));
+    assert_eq!(decoder::place_gray(12, takes(&["i420"])), Some((PixelFormat::I420, wide(12))));
+    assert_eq!(decoder::place_gray(7, PixelFormats::NONE), None);
+}
+
+#[test]
 fn pack_reduced_moves_twelve_bits_up_by_four() {
     let lent = planar([(2, 2); 3], 2, |p, _, _| if p == 0 { 0xFFF } else { 0x800 });
     let mut dst = vec![0; 8 + 4];

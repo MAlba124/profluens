@@ -27,6 +27,8 @@ pub enum PixelFormat {
     I422P10,
     Rgb24,
     Gray8,
+    /// Luma alone in 16-bit LE words, significant bits low. ffmpeg's `gray10le`.
+    Gray10,
 }
 
 impl PixelFormat {
@@ -40,6 +42,7 @@ impl PixelFormat {
             PixelFormat::I422P10 => "i422_10",
             PixelFormat::Rgb24 => "rgb24",
             PixelFormat::Gray8 => "gray8",
+            PixelFormat::Gray10 => "gray10",
         }
     }
 
@@ -52,6 +55,7 @@ impl PixelFormat {
             "i422_10" => PixelFormat::I422P10,
             "rgb24" => PixelFormat::Rgb24,
             "gray8" => PixelFormat::Gray8,
+            "gray10" => PixelFormat::Gray10,
             _ => return None,
         })
     }
@@ -64,6 +68,7 @@ impl PixelFormat {
             PixelFormat::I422 | PixelFormat::I422P10 => 3,
             PixelFormat::Rgb24 => 1, // packed RGB
             PixelFormat::Gray8 => 1, // packed luma
+            PixelFormat::Gray10 => 1,
         }
     }
 
@@ -88,7 +93,7 @@ impl PixelFormat {
     /// 2 for the 16-bit word formats, else 1.
     pub const fn bytes_per_sample(self) -> usize {
         match self {
-            PixelFormat::P010 | PixelFormat::I422P10 => 2,
+            PixelFormat::P010 | PixelFormat::I422P10 | PixelFormat::Gray10 => 2,
             PixelFormat::I420
             | PixelFormat::Nv12
             | PixelFormat::I422
@@ -139,7 +144,7 @@ impl VideoFormat {
 // A parser with a data-dependent format offers RAW_ANY_OFFER and announces the exact one at
 // runtime.
 
-static PIXFMT_VALUES: [ValueDesc; 7] = [
+static PIXFMT_VALUES: [ValueDesc; 8] = [
     ValueDesc::Id("i420"),
     ValueDesc::Id("nv12"),
     ValueDesc::Id("p010"),
@@ -147,6 +152,7 @@ static PIXFMT_VALUES: [ValueDesc; 7] = [
     ValueDesc::Id("i422_10"),
     ValueDesc::Id("rgb24"),
     ValueDesc::Id("gray8"),
+    ValueDesc::Id("gray10"),
 ];
 
 pub static MATRIX_VALUES: [ValueDesc; crate::color::Matrix::ALL.len()] =
@@ -245,6 +251,7 @@ mod tests {
             PixelFormat::I422P10,
             PixelFormat::Rgb24,
             PixelFormat::Gray8,
+            PixelFormat::Gray10,
         ] {
             assert_eq!(PixelFormat::from_caps_name(f.caps_name()), Some(f));
             assert!(
@@ -264,6 +271,7 @@ mod tests {
         assert_eq!(PixelFormat::I422P10.plane_count(), 3);
         assert_eq!(PixelFormat::Rgb24.plane_count(), 1);
         assert_eq!(PixelFormat::Gray8.plane_count(), 1);
+        assert_eq!(PixelFormat::Gray10.plane_count(), 1);
     }
 
     #[test]
@@ -275,6 +283,7 @@ mod tests {
         assert!(!PixelFormat::I422P10.is_subsampled_420());
         assert!(!PixelFormat::Rgb24.is_subsampled_420());
         assert!(!PixelFormat::Gray8.is_subsampled_420());
+        assert!(!PixelFormat::Gray10.is_subsampled_420());
     }
 
     #[test]
@@ -312,9 +321,10 @@ mod tests {
     }
 
     #[test]
-    fn p010_and_i422p10_are_the_wide_sample_formats() {
+    fn p010_i422p10_and_gray10_are_the_wide_sample_formats() {
         assert_eq!(PixelFormat::P010.bytes_per_sample(), 2);
         assert_eq!(PixelFormat::I422P10.bytes_per_sample(), 2);
+        assert_eq!(PixelFormat::Gray10.bytes_per_sample(), 2);
         for f in [
             PixelFormat::I420,
             PixelFormat::Nv12,

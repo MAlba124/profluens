@@ -47,6 +47,7 @@ pub fn plane_geometry(
         (PixelFormat::I422P10, 1) | (PixelFormat::I422P10, 2) => g(2 * cw, h),
         (PixelFormat::Rgb24, 0) => g(3 * w, h),
         (PixelFormat::Gray8, 0) => g(w, h),
+        (PixelFormat::Gray10, 0) => g(2 * w, h),
         _ => return None,
     })
 }
@@ -114,6 +115,7 @@ mod tests {
         },
         Case { pixfmt: PixelFormat::Rgb24, w: 4, h: 4, planes: &[(12, 4)] },
         Case { pixfmt: PixelFormat::Gray8, w: 4, h: 4, planes: &[(4, 4)] },
+        Case { pixfmt: PixelFormat::Gray10, w: 3, h: 5, planes: &[(6, 5)] },
         // Odd dimensions, chroma rounds up.
         Case { pixfmt: PixelFormat::I420, w: 3, h: 3, planes: &[(3, 3), (2, 2), (2, 2)] },
         Case { pixfmt: PixelFormat::I420, w: 5, h: 3, planes: &[(5, 3), (3, 2), (3, 2)] },
@@ -182,6 +184,7 @@ mod tests {
         assert_eq!(frame_size(PixelFormat::I422P10, 4, 4), 2 * (16 + 8 + 8));
         assert_eq!(frame_size(PixelFormat::Rgb24, 4, 4), 48);
         assert_eq!(frame_size(PixelFormat::Gray8, 4, 4), 16);
+        assert_eq!(frame_size(PixelFormat::Gray10, 4, 4), 32);
         assert_eq!(frame_size(PixelFormat::I420, 16, 16), 256 + 64 + 64);
     }
 }

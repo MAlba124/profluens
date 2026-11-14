@@ -167,6 +167,30 @@ pub fn place(p: Planar, takes: PixelFormats) -> Option<(PixelFormat, HeldLayout)
     Some(order.iter().copied().find(|(f, _)| takes.has(*f)).unwrap_or(order[0]))
 }
 
+/// The pixel format and pack layout of a `bits` deep monochrome picture on a link taking `takes`.
+/// Gray where the link takes it, else 4:2:0 with neutral chroma, else gray. `None` for a depth
+/// outside 8 to 16.
+pub fn place_gray(bits: u8, takes: PixelFormats) -> Option<(PixelFormat, HeldLayout)> {
+    if !(8..=16).contains(&bits) {
+        return None;
+    }
+    let gray = match bits {
+        8 => Some(PixelFormat::Gray8),
+        10 => Some(PixelFormat::Gray10),
+        _ => None,
+    };
+    if let Some(f) = gray.filter(|f| takes.has(*f)) {
+        return Some((f, HeldLayout::Native));
+    }
+    let wide = HeldLayout::GrayWide { bits };
+    let order = match bits {
+        8 => [(PixelFormat::I420, HeldLayout::Gray); 2],
+        _ => [(PixelFormat::P010, wide), (PixelFormat::I420, wide)],
+    };
+    let fallback = gray.map_or(order[0], |f| (f, HeldLayout::Native));
+    Some(order.into_iter().find(|(f, _)| takes.has(*f)).unwrap_or(fallback))
+}
+
 const PICKS: &[Coupling] = &[Coupling::takes(0, FIELD_PIXFMT)];
 
 pub const fn picking(mut desc: ElementDesc) -> ElementDesc {
@@ -246,7 +270,13 @@ pub enum HeldLayout {
         chroma_shift: (u8, u8),
         bits: u8,
     },
+    /// 8-bit luma alone, packed to I420 with neutral chroma.
     Gray,
+    /// Luma alone in LE 16-bit words of `bits` low bits, packed to P010 or I420 with neutral
+    /// chroma.
+    GrayWide {
+        bits: u8,
+    },
 }
 
 /// A picture the codec keeps until a pool slot is free.
@@ -935,6 +965,52 @@ pub fn pack_gray(
     Ok(luma + chroma)
 }
 
+/// Pack a [`HeldLayout::GrayWide`] picture into tight P010 or I420, chroma neutral. Bytes
+/// written.
+pub fn pack_gray_wide(
+    dst: &mut [u8],
+    (width, height): (u32, u32),
+    bits: u8,
+    to: PixelFormat,
+    planes: &[PlaneRef<'_>; 3],
+) -> Result<usize, VideoDecError> {
+    let lanes = Lanes::detect();
+    let (w, h) = (width as usize, height as usize);
+    if !reduces_to(bits, to) {
+        let layout = HeldLayout::GrayWide { bits };
+        return Err(VideoDecError::HeldLayout { layout, pixfmt: to.caps_name() });
+    }
+    check_planes(&planes[..1], &[(2 * w, h)])?;
+    let size = to.bytes_per_sample();
+    let (luma, chroma) = (size * w * h, 2 * size * w.div_ceil(2) * h.div_ceil(2));
+    let (y_dst, c_dst) = dst[..luma + chroma].split_at_mut(luma);
+    let rows = y_dst.chunks_exact_mut((size * w).max(1)).take(h);
+    if size == 2 {
+        let up = 16 - u32::from(bits.min(16));
+        for (row, d) in rows.enumerate() {
+            let from = row * planes[0].stride;
+            let src = &planes[0].data[from..from + 2 * w];
+            let done = 2 * simd::shift(lanes, d, src, up);
+            deep_luma_row(&mut d[done..], &src[done..], up);
+        }
+        for c in c_dst.as_chunks_mut::<2>().0 {
+            *c = 0x8000u16.to_le_bytes();
+        }
+        return Ok(luma + chroma);
+    }
+    let down = u32::from(bits) - 8;
+    for (row, d) in rows.enumerate() {
+        let from = row * planes[0].stride;
+        let src = &planes[0].data[from..from + 2 * w];
+        let done = simd::narrow(lanes, d, src, down);
+        for (d, s) in d[done..].iter_mut().zip(src[2 * done..].as_chunks::<2>().0) {
+            *d = narrow(u16::from_le_bytes(*s), down);
+        }
+    }
+    c_dst.fill(128);
+    Ok(luma + chroma)
+}
+
 #[inline]
 fn deep_luma_row(dst: &mut [u8], src: &[u8], up: u32) {
     for (d, s) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src.as_chunks::<2>().0) {
@@ -1118,6 +1194,12 @@ pub(crate) fn pack_nv12_on(
                 (HeldLayout::Native, PixelFormat::Gray8) | (HeldLayout::Gray, _) => {
                     pack_gray(s, width, height, planes)?
                 }
+                (HeldLayout::Native, PixelFormat::Gray10) => {
+                    pack_gray_wide(s, (width, height), 10, PixelFormat::I420, planes)?
+                }
+                (HeldLayout::GrayWide { bits }, _) => {
+                    pack_gray_wide(s, (width, height), bits, PixelFormat::I420, planes)?
+                }
                 (HeldLayout::Reduce { chroma_shift, bits }, _) => {
                     let to = PixelFormat::I420;
                     pack_reduced_on(lanes, s, (width, height), chroma_shift, bits, to, planes)?
@@ -1219,6 +1301,8 @@ pub struct VideoDec<C: Codec> {
 impl<C: Codec> VideoDec<C> {
     pub const IN: SinkPad = SINK_PAD;
     pub const OUT: SrcPad = SRC_PAD;
+    /// The codec's descriptor with its src pad probed, dmabuf mode's. A constant, built once.
+    const PROBED_DESC: &'static ElementDesc = &ElementDesc { srcs: &PROBED_SRC, ..*C::DESC };
 
     // Once per element, at construction.
     #[allow(clippy::disallowed_methods)]
@@ -1243,7 +1327,7 @@ impl<C: Codec> VideoDec<C> {
     // Once per element.
     #[allow(clippy::disallowed_methods)]
     pub fn with_dmabuf(mut self, channel: Arc<GpuFrameChannel>, formats: &[DmabufFormat]) -> Self {
-        let desc = Box::leak(Box::new(ElementDesc { srcs: &PROBED_SRC, ..*C::DESC }));
+        let desc = Self::PROBED_DESC;
         let formats = written_formats(C::DESC, formats);
         self.dmabuf = Some(DmabufOut {
             channel,
@@ -1434,6 +1518,9 @@ impl<C: Codec> VideoDec<C> {
                         (HeldLayout::Gray, PixelFormat::I420) => {
                             pack_gray(dst, h.width, h.height, &planes)
                         }
+                        (HeldLayout::GrayWide { bits }, f) => {
+                            pack_gray_wide(dst, (h.width, h.height), bits, f, &planes)
+                        }
                         (layout, _) => Err(VideoDecError::HeldLayout { layout, pixfmt }),
                     };
                     let (pts, duration, handle) = (h.pts, h.duration, h.handle);
@@ -1464,6 +1551,9 @@ impl<C: Codec> VideoDec<C> {
                         }
                         (HeldLayout::Gray, PixelFormat::I420) => {
                             pack_gray(dst, s.width, s.height, &planes)
+                        }
+                        (HeldLayout::GrayWide { bits }, f) => {
+                            pack_gray_wide(dst, (s.width, s.height), bits, f, &planes)
                         }
                         (layout, _) => Err(VideoDecError::HeldLayout { layout, pixfmt }),
                     };

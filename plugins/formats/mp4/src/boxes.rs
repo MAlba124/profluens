@@ -347,7 +347,8 @@ pub fn parse_stts(body: &[u8]) -> Result<Vec<SttsEntry>, BoxError> {
     Ok(out)
 }
 
-/// One `ctts` run (8.6.1.3). Version 1 offsets are signed, so both versions are kept as i64.
+/// One `ctts` run (8.6.1.3). Offsets are read signed in both versions, muxers write negative
+/// ones in version 0 too, as FFmpeg reads them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CttsEntry {
     pub count: u32,
@@ -362,8 +363,7 @@ pub fn parse_ctts(body: &[u8]) -> Result<Vec<CttsEntry>, BoxError> {
     for _ in 0..count {
         let c = r.u32("ctts sample_count")?;
         let offset = match head.version {
-            0 => r.u32("ctts v0 sample_offset")? as i64,
-            1 => r.i32("ctts v1 sample_offset")? as i64,
+            0 | 1 => i64::from(r.i32("ctts sample_offset")?),
             _ => return Err(BoxError::Malformed("unsupported ctts version")),
         };
         out.push(CttsEntry { count: c, offset });
@@ -488,6 +488,10 @@ pub fn parse_stss(body: &[u8]) -> Result<Vec<u32>, BoxError> {
     let mut out = Vec::with_capacity(r.rows(count, 4));
     for _ in 0..count {
         out.push(r.u32("stss sample_number")?);
+    }
+    // Searched by halves, so a table out of order is put in order.
+    if !out.is_sorted() {
+        out.sort_unstable();
     }
     Ok(out)
 }
@@ -684,6 +688,15 @@ mod tests {
         ctts.extend_from_slice(&(-40i32).to_be_bytes());
         let c = parse_ctts(&ctts).unwrap();
         assert_eq!(c, vec![CttsEntry { count: 2, offset: -40 }]);
+        ctts[0] = 0;
+        let c = parse_ctts(&ctts).unwrap();
+        assert_eq!(c, vec![CttsEntry { count: 2, offset: -40 }], "version 0 is read signed too");
+
+        let mut stss = vec![0u8; 4];
+        for n in [3u32, 4, 9, 1] {
+            stss.extend_from_slice(&n.to_be_bytes());
+        }
+        assert_eq!(parse_stss(&stss).unwrap(), [1, 4, 9], "out of order, searched in order");
 
         let mut stsz = vec![0u8; 4];
         stsz.extend_from_slice(&7u32.to_be_bytes()); // sample_size

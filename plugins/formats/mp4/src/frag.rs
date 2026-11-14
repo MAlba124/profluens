@@ -96,7 +96,6 @@ pub fn parse_tfdt(body: &[u8]) -> Result<u64, BoxError> {
 
 pub struct Trun<'a> {
     rows: Cursor<'a>,
-    version: u8,
     flags: u32,
     pub count: u32,
     pub data_offset: Option<i32>,
@@ -123,7 +122,7 @@ pub fn parse_trun(body: &[u8]) -> Result<Trun<'_>, BoxError> {
         true => Some(r.u32("trun first_sample_flags")?),
         false => None,
     };
-    Ok(Trun { rows: r, version: head.version, flags: head.flags, count, data_offset, first_flags })
+    Ok(Trun { rows: r, flags: head.flags, count, data_offset, first_flags })
 }
 
 impl Trun<'_> {
@@ -139,11 +138,9 @@ impl Trun<'_> {
             row.flags = Some(self.rows.u32("trun sample_flags")?);
         }
         if self.flags & 0x800 != 0 {
-            // Unsigned in version 0 and signed from version 1 on.
-            row.offset = match self.version {
-                0 => i64::from(self.rows.u32("trun sample_composition_time_offset")?),
-                _ => i64::from(self.rows.i32("trun sample_composition_time_offset")?),
-            };
+            // Unsigned in version 0 by the spec, read signed in both as FFmpeg does, muxers
+            // write negative ones in version 0 too.
+            row.offset = i64::from(self.rows.i32("trun sample_composition_time_offset")?);
         }
         Ok(row)
     }
@@ -293,7 +290,8 @@ pub fn expand(
     // A sample holds an octet at least, and they are disjoint.
     let room = place.mdat.1.saturating_sub(place.mdat.0).min(MAX_FRAGMENT_SAMPLES as u64) as usize;
     let mut first: Option<u64> = None;
-    let mut data_end = place.moof;
+    // None behind a traf of a track not read whose data could not be measured.
+    let mut data_end = Some(place.moof);
     let (mut at, mut trafs) = (0usize, 0usize);
     // One budget for the whole moof, a run of 16 octet truns is as cheap as one.
     let mut empty = 0u32;
@@ -309,16 +307,19 @@ pub fn expand(
         };
         let tfhd = parse_tfhd(tfhd.body(traf))?;
         trafs += 1;
-        let Some(index) = movie.tracks.iter().position(|t| t.track_id == tfhd.track_id) else {
-            continue;
-        };
-        let (track, trex) =
-            (&movie.tracks[index], movie.trex.get(index).copied().unwrap_or_default());
         let base = match (tfhd.base_data_offset, tfhd.base_is_moof, trafs) {
-            (Some(base), _, _) => base,
-            (None, true, _) | (None, false, 1) => place.moof,
+            (Some(base), _, _) => Some(base),
+            (None, true, _) | (None, false, 1) => Some(place.moof),
             (None, false, _) => data_end,
         };
+        let Some(index) = movie.tracks.iter().position(|t| t.track_id == tfhd.track_id) else {
+            // The next traf may start where this one's data ends (8.8.7.1).
+            data_end = base.and_then(|base| traf_end(traf, &tfhd, base));
+            continue;
+        };
+        let base = base.ok_or(Mp4Error::Inconsistent("a traf after one of unknown length"))?;
+        let (track, trex) =
+            (&movie.tracks[index], movie.trex.get(index).copied().unwrap_or_default());
         let mut dts = match boxes::find_child(traf, boxtype::TFDT)? {
             Some(tfdt) => parse_tfdt(tfdt.body(traf))?,
             None => next_dts.get(index).copied().unwrap_or(0),
@@ -383,12 +384,41 @@ pub fn expand(
                 offset = end;
             }
         }
-        data_end = offset;
+        data_end = Some(offset);
         if let Some(next) = next_dts.get_mut(index) {
             *next = dts;
         }
     }
     Ok(first)
+}
+
+/// Where the data of a traf of a track not read ends, None when a size is the track's default
+/// from a `trex` the reader does not hold, or a box does not parse.
+fn traf_end(traf: &[u8], tfhd: &Tfhd, base: u64) -> Option<u64> {
+    let mut offset = base;
+    let mut child = 0usize;
+    while child + 8 <= traf.len() && !tfhd.empty {
+        let h = boxes::read_box_header(traf, child).ok()?;
+        child = h.end;
+        if h.kind != boxtype::TRUN {
+            continue;
+        }
+        let mut run = parse_trun(h.body(traf)).ok()?;
+        if let Some(by) = run.data_offset {
+            offset = base.checked_add_signed(i64::from(by))?;
+        }
+        if run.flags & 0x200 == 0 {
+            // Every row the same size, none read.
+            let size = u64::from(tfhd.size?).checked_mul(u64::from(run.count))?;
+            offset = offset.checked_add(size)?;
+            continue;
+        }
+        // Each row holds its size, so the rows are bounded by the box.
+        for _ in 0..run.count {
+            offset = offset.checked_add(u64::from(run.row().ok()?.size?))?;
+        }
+    }
+    Some(offset)
 }
 
 /// None for a head through `moov` that is not a fragmented movie, else whether its `mehd`
@@ -812,6 +842,14 @@ mod tests {
             Ok(TrunRow { duration: None, size: Some(20), flags: None, offset: 5 })
         );
         assert!(run.row().is_err(), "a third row is past the box");
+    }
+
+    #[test]
+    fn a_version_0_composition_offset_is_read_signed() {
+        let mut body = be32(&[0x0000_0800, 1]);
+        body.extend((-1000i32).to_be_bytes());
+        let mut run = parse_trun(&body).expect("a whole trun");
+        assert_eq!(run.row().map(|r| r.offset), Ok(-1000));
     }
 
     #[test]

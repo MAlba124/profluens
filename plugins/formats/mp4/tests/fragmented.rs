@@ -412,6 +412,38 @@ fn a_run_that_claims_more_than_its_mdat_holds_is_cut_and_said() {
     assert!(reader.take_error().is_some());
 }
 
+/// A traf of track 99, which the init segment lacks, holding 8 octets of 0x11 when `sized`,
+/// then one of track 1 that starts where it ends, 8 octets of 0x22.
+fn behind_an_unknown_traf(sized: bool) -> Vec<u8> {
+    let moof = |offset: u32| {
+        let tfhd = match sized {
+            true => boxed(b"tfhd", &be32(&[0x0000_0010, 99, 4])),
+            false => boxed(b"tfhd", &be32(&[0, 99])),
+        };
+        let unknown = boxed(b"traf", &[tfhd, boxed(b"trun", &be32(&[1, 2, offset]))].concat());
+        let tfhd = boxed(b"tfhd", &be32(&[0, 1]));
+        let known = boxed(b"traf", &[tfhd, boxed(b"trun", &be32(&[0x200, 1, 8]))].concat());
+        boxed(b"moof", &[unknown, known].concat())
+    };
+    let moof = moof(moof(0).len() as u32 + 8);
+    let payload = [[0x11u8; 8], [0x22; 8]].concat();
+    [moof, boxed(b"mdat", &payload)].concat()
+}
+
+#[test]
+fn a_traf_placed_after_one_of_a_track_not_read_starts_where_its_data_ends() {
+    let init = fixture("dash_init-stream0.m4s");
+    let (mut reader, out) = read_segments(&init, &[(FIRST, behind_an_unknown_traf(true))], 4096);
+    assert_eq!(reader.take_error(), None);
+    let got: Vec<(usize, u64)> = out.iter().map(|s| (s.size, s.sum)).collect();
+    assert_eq!(got, [(8, 0x22 * 36)], "the known track's octets, not the moof's");
+
+    let (mut reader, out) = read_segments(&init, &[(FIRST, behind_an_unknown_traf(false))], 4096);
+    assert!(out.is_empty());
+    let unknown = Mp4Error::Inconsistent("a traf after one of unknown length");
+    assert_eq!(reader.take_error(), Some(unknown), "sizes from a trex the reader lacks");
+}
+
 #[test]
 fn a_segment_cut_short_is_said_and_the_next_one_plays() {
     let init = fixture("dash_init-stream0.m4s");

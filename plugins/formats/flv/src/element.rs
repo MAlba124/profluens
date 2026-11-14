@@ -196,7 +196,10 @@ struct Live {
     origin_ms: u32,
     file_len: Option<u64>,
     duration: Timestamp,
+    /// The `keyframes` of `onMetaData`, entries read past its end added where it does not reach
+    /// the end of the file, and how many of them went out.
     keyframes: Option<Index>,
+    listed_out: usize,
     grown: Grown,
     key: Option<usize>,
     reframed: Vec<u8>,
@@ -236,6 +239,7 @@ impl FlvDemux {
                 file_len: None,
                 duration: Timestamp::NONE,
                 keyframes: None,
+                listed_out: 0,
                 grown: Grown::new(),
                 key: None,
                 reframed: Vec::new(),
@@ -476,7 +480,10 @@ impl Live {
         let stream = self.key.map(|k| self.tracks[k].stream);
         let grouped = self.tracks.iter().any(|t| t.kind == StreamKind::Video);
         let index = match &self.keyframes {
-            Some(index) => index.clone(),
+            Some(index) => {
+                self.listed_out = index.entries.len();
+                index.clone()
+            }
             None => {
                 self.grown.published = self.grown.entries.len();
                 let entries = self.grown.entries.clone();
@@ -487,12 +494,34 @@ impl Live {
         ctx.publish_index(index);
     }
 
-    /// The key track's units grow the index and measure the rate.
-    fn keyed(&mut self, ctx: &mut Ctx, n: usize, key: bool, pts: u64, pos: u64) {
+    /// Entries grown or added past the keyframes listed that have not gone out.
+    fn unpublished(&self) -> bool {
+        match &self.keyframes {
+            Some(index) => index.entries.len() != self.listed_out,
+            None => self.grown.unpublished(),
+        }
+    }
+
+    /// The key track's units grow the index and measure the rate. A list's entries are at decode
+    /// times, as muxers write `keyframes`.
+    fn keyed(&mut self, ctx: &mut Ctx, n: usize, key: bool, (pts, dts): (u64, u64), pos: u64) {
         if self.key != Some(n) {
             return;
         }
-        if key && self.keyframes.is_none() && self.grown.keyframe(pts, pos) {
+        let video = self.tracks[n].kind == StreamKind::Video;
+        let due = match self.keyframes.as_mut() {
+            None => key && self.grown.keyframe(pts, pos),
+            // past the end of a list that stops short
+            Some(index) if key && video && !index.complete => {
+                let past = index.entries.last().is_none_or(|l| l.time_ns < dts && l.byte < pos);
+                if past && index.entries.len() < index::MAX_KEYS {
+                    index.entries.push(IndexEntry::key(dts, pos));
+                }
+                index.entries.len() >= self.listed_out + index::GROWN_EVERY
+            }
+            Some(_) => false,
+        };
+        if due {
             self.publish(ctx);
         }
         self.measured.note(pos, Timestamp(pts));
@@ -571,7 +600,8 @@ impl Live {
         }
         t.need_key = false;
         let pts = stamp(self.origin_ms, tag.header.ts_ms, v.cts, v.nanos);
-        self.keyed(ctx, n, key, pts, tag.pos);
+        let dts = stamp(self.origin_ms, tag.header.ts_ms, 0, v.nanos);
+        self.keyed(ctx, n, key, (pts, dts), tag.pos);
         self.start_track(ctx, n, pad, pts);
         let Live { tracks, park, exact, reframed, dropped, .. } = self;
         let (bytes, conv) = match tracks[n].nal {
@@ -640,7 +670,7 @@ impl Live {
             (t.form, t.started) = (form, false);
         }
         let pts = stamp(self.origin_ms, tag.header.ts_ms, 0, 0);
-        self.keyed(ctx, n, true, pts, tag.pos);
+        self.keyed(ctx, n, true, (pts, pts), tag.pos);
         self.start_track(ctx, n, pad, pts);
         let flags = BufferFlags::KEYFRAME;
         Self::put(ctx, &mut self.park, self.exact, pad, Some(pts), flags, payload, Conv::Copy);
@@ -663,6 +693,19 @@ impl Live {
             self.grown.audio = key.is_some_and(|k| self.tracks[k].kind == StreamKind::Audio);
         }
     }
+}
+
+/// Past this the keyframe ahead of the end, a long GOP, is past the stated duration.
+const LIST_GAP_NS: u64 = 20_000_000_000;
+
+/// Whether keyframes `listed` reach the end of a file of `duration` and `file_len`, the last
+/// within a long GOP of the end and the bytes behind it three mean GOPs at most.
+fn reaches_end(listed: &[IndexEntry], duration: Timestamp, file_len: Option<u64>) -> bool {
+    let Some(last) = listed.last() else { return false };
+    let timed = duration.nanos().is_none_or(|d| last.time_ns.saturating_add(LIST_GAP_NS) >= d);
+    let gop = last.byte / listed.len() as u64;
+    let sized = file_len.is_none_or(|len| last.byte.saturating_add(3 * gop) >= len);
+    timed && sized
 }
 
 impl FlvDemux {
@@ -861,11 +904,17 @@ impl Element for FlvDemux {
             let stream = live.key.map(|k| live.tracks[k].stream);
             let grouped = live.tracks.iter().any(|t| t.kind == StreamKind::Video);
             let (file_len, duration) = (live.file_len, live.duration);
+            let complete = reaches_end(&entries, duration, file_len);
+            if !complete {
+                let (last, n) = (entries.last().map_or(0, |e| e.byte), entries.len());
+                log!(&*ctx, Level::Warn, "keyframes_partial", entries = n, last = last);
+            }
+            live.listed_out = 0;
             live.keyframes = Some(Index {
                 entries,
                 file_len,
                 duration,
-                complete: true,
+                complete,
                 stream,
                 grouped,
                 ..Index::default()
@@ -995,7 +1044,7 @@ impl FlvDemux {
                 }
                 self.feed(ctx, &[], true);
                 self.live.unpark(ctx);
-                if self.live.keyframes.is_none() && self.live.grown.unpublished() {
+                if self.live.unpublished() {
                     self.live.publish(ctx);
                 }
                 let s = self.reader.stats;
@@ -1018,7 +1067,7 @@ impl FlvDemux {
                 let live = &mut self.live;
                 live.measured.clear();
                 live.teller.restart();
-                if live.keyframes.is_none() && live.grown.unpublished() {
+                if live.unpublished() {
                     live.publish(ctx);
                 }
                 let target = ctx.seek_target();

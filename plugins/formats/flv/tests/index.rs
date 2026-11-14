@@ -30,6 +30,39 @@ fn keyframes_metadata_is_the_index() {
     assert_eq!(got, keys, "the keyframes ffprobe lists, at their decode times");
 }
 
+/// `data` with its audio and video tags again behind it, `ms` later, so its `keyframes` list
+/// and duration cover the first half only.
+fn twice(data: &[u8], ms: u32) -> Vec<u8> {
+    let mut out = data.to_vec();
+    for (at, kind) in common::tags(data) {
+        if kind == 18 {
+            continue;
+        }
+        let size = data[at + 1..at + 4].iter().fold(0usize, |n, b| n << 8 | usize::from(*b));
+        let mut tag = data[at..at + 15 + size].to_vec();
+        let ts = u32::from_be_bytes([tag[7], tag[4], tag[5], tag[6]]) + ms;
+        let b = ts.to_be_bytes();
+        (tag[4], tag[5], tag[6], tag[7]) = (b[1], b[2], b[3], b[0]);
+        out.extend_from_slice(&tag);
+    }
+    out
+}
+
+/// A `keyframes` list that stops well short of the end of the file is no complete index, and
+/// the keyframes read past its end are added to it.
+#[test]
+fn keyframes_metadata_short_of_the_end_grows_on() {
+    let data = twice(&fixture("h264_aac"), 4133);
+    let out = run(&data, &data, 4096);
+    let index = out.index.expect("published");
+    assert!(!index.complete, "the list stops at half the file");
+    let keys: Vec<u64> = index.entries.iter().map(|e| e.time_ns).collect();
+    let want: Vec<u64> = [0, 1000, 2000, 3000].iter().map(|ms| ms * MS).collect();
+    let more: Vec<u64> = want.iter().map(|t| t + 4133 * MS).collect();
+    assert_eq!(keys, [want, more].concat(), "the listed four, then the four read, decode times");
+    assert!(index.entries.windows(2).all(|w| w[0].byte < w[1].byte));
+}
+
 #[test]
 fn without_keyframes_the_index_grows_from_what_is_read() {
     let data = fixture("h264_mp3");

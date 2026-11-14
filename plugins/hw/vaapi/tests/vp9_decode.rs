@@ -4,6 +4,8 @@
 //! - `resilient_176x144.ivf`: 12 frames, `-error-resilient 1 -aq-mode 3 -deadline realtime`
 //! - `lossless_96x64.ivf`: 6 frames, `-lossless 1`
 //! - `p2_160x96.ivf`: 16 frames, `-pix_fmt yuv420p10le -profile:v 2 -crf 30 -g 8`
+//! - `svc_1280x720.ivf`: the first 3 superframes of libvpx's vp90-2-22-svc_1280x720_3.ivf, spatial
+//!   layers of 320x180, 640x360 and 1280x720 each
 
 // Test code.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -25,6 +27,7 @@ const RESILIENT: &[u8] = include_bytes!("fixtures/resilient_176x144.ivf");
 const LOSSLESS: &[u8] = include_bytes!("fixtures/lossless_96x64.ivf");
 const PROFILE2: &[u8] = include_bytes!("fixtures/p2_160x96.ivf");
 const HIDDEN: &[u8] = include_bytes!("fixtures/alloc_352x288.ivf");
+const SVC: &[u8] = include_bytes!("fixtures/svc_1280x720.ivf");
 
 const MIN_PSNR_DB: f64 = 50.0;
 const FRAME_NS: u64 = 16_666_667;
@@ -301,6 +304,38 @@ fn key_frames_that_change_size_and_depth_rebuild_the_session() {
     want.extend([i420(96, 64); 6]);
     assert_eq!(sizes, want);
     compare("size and depth switch", &packets, 0, false, 1 << 20);
+}
+
+/// FNV-1a 64 of a frame.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+}
+
+#[test]
+fn inter_frames_outgrowing_the_key_frame_decode_and_a_superframe_shows_its_top_layer() {
+    let _turn = hw_turn();
+    if !vp9_device() {
+        return;
+    }
+    let mut h = Harness::with_slot_size(VaapiVp9Dec::new(), 1 << 22);
+    h.start().expect("start");
+    let mut got = Decoded { frames: VecDeque::new(), warnings: Vec::new() };
+    for (i, p) in demux_ivf(SVC).iter().enumerate() {
+        let mut b = h.alloc(p);
+        b.pts = Timestamp::from_nanos(i as u64 * FRAME_NS);
+        h.push(b).expect("push");
+        take(&mut h, VaapiVp9Dec::OUT, &mut got);
+    }
+    finish(&mut h, &mut got);
+    assert!(got.warnings.is_empty(), "{:?}", got.warnings);
+    assert_eq!(announced_width(&h), Some(1280));
+    let pts: Vec<u64> = got.frames.iter().map(|(t, _)| t.0).collect();
+    assert_eq!(pts, [0, FRAME_NS, 2 * FRAME_NS], "one frame per superframe");
+    // libvpx's frames, iHD decodes VP9 bit exact
+    let sums: Vec<u64> = got.frames.iter().map(|(_, f)| fnv(f)).collect();
+    assert_eq!(sums, [0x179d_90ee_cb56_2302, 0x15d7_cae8_7036_0e13, 0x3335_03d2_898f_d9b2]);
 }
 
 struct Importer {

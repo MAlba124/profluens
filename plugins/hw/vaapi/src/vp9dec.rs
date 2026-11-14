@@ -313,6 +313,19 @@ struct VaState {
     readback: Option<ReadbackImage>,
     /// The scaled twins of the surfaces when the decoder shrinks, and the frame size planned.
     twins: Option<(Twins, (u32, u32))>,
+    /// Surface sets an inter frame outgrew with their coded size, kept while a slot, the output
+    /// queue or the presentation holds one of them
+    retired: Vec<(Surfaces, u32, u32)>,
+}
+
+impl VaState {
+    /// The coded size of surface `id`, of a retired set or the current one.
+    fn coded_of(&self, id: ffi::VASurfaceID) -> (u32, u32) {
+        self.retired
+            .iter()
+            .find(|(s, _, _)| s.ids().contains(&id))
+            .map_or((self.coded_w, self.coded_h), |&(_, w, h)| (w, h))
+    }
 }
 
 pub struct VaapiVp9Dec {
@@ -500,6 +513,12 @@ impl VaapiVp9Dec {
                 return true;
             }
             if h.frame_type != FrameType::KeyFrame {
+                // reference scaling lets an inter frame outgrow the key frame, its references
+                // stay in the surfaces they were decoded to
+                if va.format == format && va.twins.is_none() && shrink.is_none() {
+                    let coded = (coded_w.max(va.coded_w), coded_h.max(va.coded_h));
+                    return self.grow(ctx, h, coded);
+                }
                 self.warn(ctx, K::Vp9Resize { width: w, height: hgt });
                 return false;
             }
@@ -590,8 +609,65 @@ impl VaapiVp9Dec {
             coded_h,
             readback,
             twins,
+            retired: Vec::new(),
         });
         true
+    }
+
+    /// Surfaces of `coded` size for an inter frame larger than the surfaces, in the same
+    /// context. The slots keep theirs, retired until none is held, and the driver scales them
+    /// as references from the sizes it decoded them at, which a new context would not know.
+    // Cold: once per growth.
+    #[allow(clippy::disallowed_methods)]
+    fn grow(&mut self, ctx: &mut Ctx, h: &Vp9FrameHeader, coded: (u32, u32)) -> bool {
+        let (Some(display), Some(va)) = (&self.display, &self.va) else {
+            return false;
+        };
+        let (format, count) = (va.format, va.surfaces.ids().len() as u32);
+        let built = Surfaces::new(display, format, coded.0, coded.1, count).and_then(|s| {
+            let image =
+                |(w, h)| ReadbackImage::new(display, format.fourcc, format.bits_per_pixel, w, h);
+            let readback = self.zerocopy.is_none().then(|| image(coded)).transpose()?;
+            Ok((s, readback))
+        });
+        let (surfaces, readback) = match built {
+            Ok(b) => b,
+            Err(e) => {
+                self.fail(ctx, K::SessionSetup(e));
+                return false;
+            }
+        };
+        let (w, hgt) = (h.frame_width, h.frame_height);
+        log!(&*ctx, Level::Debug, "grow", width = w, height = hgt, coded_w = coded.0);
+        self.stats.made(count, 0);
+        if readback.is_some() {
+            self.row = vec![0u8; coded.0 as usize * 2];
+        }
+        let Some(va) = &mut self.va else {
+            return false;
+        };
+        let old = std::mem::replace(&mut va.surfaces, surfaces);
+        va.retired.push((old, va.coded_w, va.coded_h));
+        va.free = va.surfaces.ids().iter().copied().collect();
+        (va.coded_w, va.coded_h) = coded;
+        va.readback = readback;
+        self.prune_retired();
+        true
+    }
+
+    /// Destroys the retired surface sets no slot, queued output or presentation holds.
+    fn prune_retired(&mut self) {
+        let Some(n) = self.va.as_ref().map(|va| va.retired.len()) else {
+            return;
+        };
+        for i in (0..n).rev() {
+            let held = self.va.as_ref().is_some_and(|va| {
+                va.retired[i].0.ids().iter().any(|&id| self.surface_referenced(id))
+            });
+            if !held && let Some(va) = &mut self.va {
+                va.retired.swap_remove(i);
+            }
+        }
     }
 
     fn teardown_session(&mut self, ctx: &Ctx) {
@@ -628,10 +704,12 @@ impl VaapiVp9Dec {
         if self.surface_referenced(id) {
             return;
         }
-        if let Some(va) = &mut self.va
-            && va.surfaces.ids().contains(&id)
-            && !va.free.contains(&id)
-        {
+        let Some(va) = &mut self.va else {
+            return;
+        };
+        if !va.surfaces.ids().contains(&id) {
+            self.prune_retired();
+        } else if !va.free.contains(&id) {
             va.free.push_back(id);
         }
     }
@@ -639,16 +717,26 @@ impl VaapiVp9Dec {
     fn decode_packet(&mut self, ctx: &mut Ctx, unit: &[u8], pts: Timestamp, duration: Timestamp) {
         let mut ranges = std::mem::take(&mut self.ranges);
         crate::vp9::superframe::split_superframe_into(unit, &mut ranges);
+        // a superframe puts out its last shown frame as libvpx does, the top spatial layer
         let last = ranges.len().saturating_sub(1);
+        let shown = ranges.iter().rposition(|&(s, e)| bs::peek_shown(&unit[s..e])).unwrap_or(last);
         for (i, &(start, end)) in ranges.iter().enumerate() {
             let (p, d) =
-                if i == last { (pts, duration) } else { (Timestamp::ZERO, Timestamp::ZERO) };
-            self.decode_frame(ctx, &unit[start..end], p, d);
+                if i == shown { (pts, duration) } else { (Timestamp::ZERO, Timestamp::ZERO) };
+            self.decode_frame(ctx, &unit[start..end], p, d, i == shown);
         }
         self.ranges = ranges;
     }
 
-    fn decode_frame(&mut self, ctx: &mut Ctx, frame: &[u8], pts: Timestamp, duration: Timestamp) {
+    /// One frame of a superframe, put out only when `out` and shown.
+    fn decode_frame(
+        &mut self,
+        ctx: &mut Ctx,
+        frame: &[u8],
+        pts: Timestamp,
+        duration: Timestamp,
+        out: bool,
+    ) {
         let h = match self.dpb.parse(frame) {
             Ok(h) => h,
             Err(_) => {
@@ -659,14 +747,15 @@ impl VaapiVp9Dec {
                 return;
             }
         };
-        if self.dpb.awaits_key() && h.frame_type != FrameType::KeyFrame {
+        if self.dpb.skips(&h) {
             log!(&*ctx, Level::Trace, "await_key", pts = pts);
             return;
         }
         let mut ev = Events::new();
         if h.show_existing_frame {
             match self.dpb.begin(&h, &mut ev) {
-                Ok(_) => self.apply(ctx, &ev, None, pts, duration),
+                Ok(_) if out => self.apply(ctx, &ev, None, pts, duration),
+                Ok(_) => {}
                 Err(_) => {
                     let slot = h.frame_to_show_map_idx.unwrap_or(0);
                     self.warn(ctx, K::EmptyRefSlot { slot });
@@ -714,6 +803,8 @@ impl VaapiVp9Dec {
                 return;
             }
         };
+        // the slots an intra-only start lets go
+        self.apply(ctx, &ev, None, pts, duration);
         if !self.ensure_va(ctx, &h) {
             self.abandon(ctx, &h, pts, duration);
             return;
@@ -731,7 +822,9 @@ impl VaapiVp9Dec {
         }
         let slot = self.slot_of(target);
         self.held[usize::from(slot.0)] = true;
-        self.dpb.end(&h, fate, slot, &mut ev);
+        // decoded as coded, the DPB puts it out only when asked
+        let ended = Vp9FrameHeader { show_frame: h.show_frame && out, ..h };
+        self.dpb.end(&ended, fate, slot, &mut ev);
         let cur = (slot, h.frame_width, h.frame_height);
         self.apply(ctx, &ev, Some(cur), pts, duration);
     }
@@ -861,7 +954,10 @@ impl VaapiVp9Dec {
                 let twin = t.of(&va.surfaces, surface).unwrap_or(surface);
                 (twin, t.plan.width, t.plan.height, t.coded.0, t.coded.1)
             }
-            None => (surface, width, height, va.coded_w, va.coded_h),
+            None => {
+                let (coded_w, coded_h) = va.coded_of(surface);
+                (surface, width, height, coded_w, coded_h)
+            }
         };
         self.output_queue.push_back(PendingOut {
             surface,

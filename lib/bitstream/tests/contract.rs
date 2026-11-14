@@ -32,6 +32,7 @@ fn runs(drive: fn(&mut Bytes) -> Tally, seeds: u64) -> Tally {
         all.abandoned += t.abandoned;
         all.errors += t.errors;
         all.discards += t.discards;
+        all.ordered += t.ordered;
     }
     all
 }
@@ -47,5 +48,31 @@ fn h264_slots_go_out_once_and_are_released_once_on_random_streams() {
 fn h265_slots_go_out_once_and_are_released_once_on_random_streams() {
     let t = runs(drive::h265, 10_000);
     assert!(t.pictures > 250_000, "{t:?}");
+    assert!(t.skipped > 0 && t.abandoned > 0 && t.errors > 0 && t.discards > 0, "{t:?}");
+}
+
+#[test]
+fn h264_pictures_go_out_in_order_on_streams_within_the_reorder_depth() {
+    let t = runs(drive::h264_conform, 10_000);
+    assert!(t.ordered > 40_000, "{t:?}");
+}
+
+#[test]
+fn h265_pictures_go_out_in_order_on_streams_within_the_reorder_depth() {
+    let t = runs(drive::h265_conform, 10_000);
+    assert!(t.ordered > 25_000, "{t:?}");
+}
+
+#[test]
+fn vp9_slots_go_out_in_decode_order_and_are_released_once_on_random_streams() {
+    let t = runs(drive::vp9, 10_000);
+    assert!(t.ordered > 40_000, "{t:?}");
+    assert!(t.skipped > 0 && t.abandoned > 0 && t.errors > 0 && t.discards > 0, "{t:?}");
+}
+
+#[test]
+fn av1_slots_agree_with_the_parser_and_are_released_once_on_random_streams() {
+    let t = runs(drive::av1, 10_000);
+    assert!(t.ordered > 40_000, "{t:?}");
     assert!(t.skipped > 0 && t.abandoned > 0 && t.errors > 0 && t.discards > 0, "{t:?}");
 }

@@ -38,6 +38,10 @@ pub struct Dpb {
     stream: Stream,
     /// the frame `next_frame` gave last, the parser's slots take it before the next one
     parsed: Option<Frame>,
+    /// `parsed` is in the slots, by `end`, `abandon` or a key frame shown again
+    taken: bool,
+    /// slots whose header the parser has from a frame never decoded, `begin` empties them
+    stale: u8,
     slots: [Option<Ref>; NUM_SLOTS],
     /// no key frame yet, or a discard, a parse error or a new sequence came
     awaiting_key: bool,
@@ -45,16 +49,29 @@ pub struct Dpb {
 
 impl Dpb {
     pub fn new() -> Self {
-        Dpb { stream: Stream::new(), parsed: None, slots: [None; NUM_SLOTS], awaiting_key: true }
+        Dpb {
+            stream: Stream::new(),
+            parsed: None,
+            taken: false,
+            stale: 0,
+            slots: [None; NUM_SLOTS],
+            awaiting_key: true,
+        }
     }
 
     /// The next frame of temporal unit `tu` from byte `at` on, None once none is left. The
-    /// parser's slots take the frame before it first, decoded or not. A parse error resets
-    /// the parser and waits for a key frame, so does a new sequence until its key frame.
+    /// parser's slots take the frame before it first, decoded or not, and the slots of one
+    /// never decoded are emptied at the next `begin`. A parse error resets the parser, empties
+    /// every slot at the next `begin` and waits for a key frame, a new sequence waits for its
+    /// key frame.
     pub fn next_frame(&mut self, tu: &[u8], at: &mut usize) -> Result<Option<Frame>, Av1Error> {
         if let Some(f) = self.parsed.take() {
+            if !self.taken {
+                self.stale |= f.header.refresh_frame_flags;
+            }
             self.stream.finish(&f);
         }
+        self.taken = false;
         match self.stream.next_frame(tu, at) {
             Ok(Some(f)) => {
                 if std::mem::take(&mut self.stream.seq_changed)
@@ -68,6 +85,7 @@ impl Dpb {
             Ok(None) => Ok(None),
             Err(e) => {
                 self.stream.reset();
+                self.stale = u8::MAX;
                 self.awaiting_key = true;
                 Err(e)
             }
@@ -79,13 +97,17 @@ impl Dpb {
         &self.stream
     }
 
-    /// Starts a frame `next_frame` gave. Frames before the first key frame are `Fate::Skip`,
-    /// so is a frame shown again, with its `Output` in `ev`. A key frame shown again also takes
-    /// every slot (7.21), not showable any more, and decoding starts at it. A slot the frame
-    /// names empty is `MissingReference`, a frame shown again that is not showable
-    /// `NotShowable`, nothing changes then. Otherwise `Shown` or `Hidden` by show_frame.
+    /// Starts a frame `next_frame` gave. First empties the slots the parser took from frames
+    /// never decoded, so `ev` may hold releases whatever the outcome. Frames before the first
+    /// key frame are `Fate::Skip`, so is a frame shown again, with its `Output` in `ev`. A key
+    /// frame shown again also takes every slot (7.21), not showable any more, and decoding
+    /// starts at it. A slot the frame names empty is `MissingReference`, a frame shown again
+    /// that is not showable `NotShowable`, nothing else changes then. Otherwise `Shown` or
+    /// `Hidden` by show_frame.
     pub fn begin(&mut self, h: &FrameHeader, ev: &mut Events) -> Result<Fate, DpbError> {
         ev.clear();
+        let stale = std::mem::take(&mut self.stale);
+        self.empty(stale, ev);
         let key = h.frame_type == FrameType::Key;
         if self.awaiting_key && !key {
             return Ok(Fate::Skip);
@@ -100,6 +122,7 @@ impl Dpb {
             if key {
                 let shown = Ref { showable: false, ..r };
                 self.refresh(h.refresh_frame_flags, shown, ev);
+                self.taken = true;
                 self.awaiting_key = false;
             }
             return Ok(Fate::Skip);
@@ -137,6 +160,7 @@ impl Dpb {
         if fate == Fate::Skip {
             return;
         }
+        self.taken = true;
         if h.show_frame {
             ev.push(Event::Output(slot));
         }
@@ -154,13 +178,8 @@ impl Dpb {
     /// stream counts on.
     pub fn abandon(&mut self, h: &FrameHeader, ev: &mut Events) {
         ev.clear();
-        let mut old = [None; NUM_SLOTS];
-        for (i, s) in self.slots.iter_mut().enumerate() {
-            if h.refresh_frame_flags >> i & 1 == 1 {
-                old[i] = s.take();
-            }
-        }
-        self.release_unheld(&old, ev);
+        self.empty(h.refresh_frame_flags, ev);
+        self.taken = true;
     }
 
     /// A seek or a stream error. Empties the slots and the parser's, decoding resumes at the
@@ -171,7 +190,19 @@ impl Dpb {
         self.release_unheld(&old, ev);
         self.stream.reset();
         self.parsed = None;
+        self.stale = 0;
         self.awaiting_key = true;
+    }
+
+    /// Empties the slots `flags` names, releasing what no slot holds any more.
+    fn empty(&mut self, flags: u8, ev: &mut Events) {
+        let mut old = [None; NUM_SLOTS];
+        for (i, s) in self.slots.iter_mut().enumerate() {
+            if flags >> i & 1 == 1 {
+                old[i] = s.take();
+            }
+        }
+        self.release_unheld(&old, ev);
     }
 
     fn refresh(&mut self, flags: u8, new: Ref, ev: &mut Events) {
@@ -185,7 +216,9 @@ impl Dpb {
     }
 
     /// A frame that failed. Frames up to the next key frame are `Fate::Skip`, the slots and the
-    /// parser stay so the frames between still parse.
+    /// parser stay so the frames between still parse. The slots the failed and the skipped
+    /// frames refresh are emptied as the parser takes them, so a hidden key frame ending the
+    /// wait leaves a frame naming one of them `MissingReference`.
     pub fn await_key(&mut self) {
         self.awaiting_key = true;
     }

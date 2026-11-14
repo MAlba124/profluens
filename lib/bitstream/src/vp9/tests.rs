@@ -385,6 +385,55 @@ fn frames_before_the_first_key_frame_are_skipped() {
 }
 
 #[test]
+fn an_intra_only_frame_ends_the_wait_for_a_key() {
+    // as vp90-2-16-intra-only, hidden intra-only frames first, then inter frames on them
+    let mut d = Dpb::new();
+    let io = d.parse(&intra_only_frame(&Tail::default())).unwrap();
+    assert!(!d.skips(&io));
+    assert_eq!(run(&mut d, &io, 1), (Fate::Hidden, vec![]));
+    assert!(!d.awaits_key());
+    assert_eq!(held(&d), [Some(1), None, None, None, None, None, None, Some(1)]);
+    let (_, key) = feature_key_frame();
+    let mut inter = key.parse(&inter_frame(false, &Tail::default())).unwrap();
+    inter.ref_frame_idx = Some([0, 7, 0]);
+    assert_eq!(run(&mut d, &inter, 2), (Fate::Shown, vec![Output(Slot(2))]));
+    // a slot it did not refresh stays empty
+    inter.ref_frame_idx = Some([0, 7, 3]);
+    let mut ev = Events::new();
+    assert_eq!(d.begin(&inter, &mut ev), Err(DpbError::MissingReference));
+}
+
+#[test]
+fn an_intra_only_frame_after_a_failure_lets_the_slots_it_keeps_go() {
+    let (_, mut d) = feature_key_frame();
+    let io = d.parse(&intra_only_frame(&Tail::default())).unwrap();
+    d.await_key();
+    let mut ev = Events::new();
+    assert_eq!(d.begin(&io, &mut ev), Ok(Fate::Hidden));
+    // the key frame stays in slots 0 and 7 until the intra-only frame replaces it
+    assert_eq!(ev.as_slice(), []);
+    assert_eq!(held(&d), [Some(1), None, None, None, None, None, None, Some(1)]);
+    d.end(&io, Fate::Hidden, Slot(2), &mut ev);
+    assert_eq!(ev.as_slice(), [Release(Slot(1))]);
+    assert!(!d.awaits_key());
+    assert_eq!(held(&d), [Some(2), None, None, None, None, None, None, Some(2)]);
+}
+
+#[test]
+fn shown_frames_peek_from_the_first_bits() {
+    let t = Tail::default();
+    assert!(peek_shown(&key_frame(0, 64, 64, &t)));
+    // profile 3 has a reserved bit before show_existing_frame
+    assert!(peek_shown(&[0b1011_0001]));
+    assert!(peek_shown(&[0b1011_0100]));
+    assert!(!peek_shown(&[0b1011_0000]));
+    assert!(peek_shown(&inter_frame(false, &t)));
+    assert!(peek_shown(&show_existing(2)));
+    assert!(!peek_shown(&intra_only_frame(&t)));
+    assert!(!peek_shown(&[]));
+}
+
+#[test]
 fn refresh_replaces_named_slots_and_releases_what_no_slot_holds() {
     let (_, mut d) = feature_key_frame();
     let mut h = d.parse(&inter_frame(false, &Tail::default())).unwrap();

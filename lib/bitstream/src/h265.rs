@@ -93,23 +93,27 @@ fn push_set(list: &mut [u8; MAX_DPB], n: &mut u8, v: usize) {
     }
 }
 
-/// What the DPB takes from the active SPS.
+/// What the DPB takes from the active SPS, the values of its highest sub-layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Seq {
     /// MaxPicOrderCntLsb
     pub max_poc_lsb: i32,
-    /// pictures waiting for output before the oldest goes, at least one
+    /// sps_max_num_reorder_pics, pictures waiting for output before the smallest goes
     pub reorder: u8,
-    /// sps_max_num_reorder_pics is 0, a key at the start goes out as soon as it is decoded
-    pub no_reorder: bool,
+    /// SpsMaxLatencyPictures, None for no bound
+    pub max_latency: Option<u32>,
+    /// sps_max_dec_pic_buffering_minus1 + 1, the pictures stored before the current one goes in
+    pub dpb_size: u8,
 }
 
 impl Seq {
     pub fn of(sps: &Sps) -> Seq {
+        let size = sps.sps_max_dec_pic_buffering_minus1.saturating_add(1);
         Seq {
             max_poc_lsb: sps.max_poc_lsb(),
-            reorder: sps.reorder_frames() as u8,
-            no_reorder: sps.sps_max_num_reorder_pics == 0,
+            reorder: sps.sps_max_num_reorder_pics.min(MAX_DPB as u32) as u8,
+            max_latency: sps.max_latency_pictures(),
+            dpb_size: size.min(MAX_DPB as u32) as u8,
         }
     }
 }
@@ -241,6 +245,8 @@ struct Waiting {
     slot: Slot,
     gop: u32,
     poc: i32,
+    /// PicLatencyCount (C.5.2.3)
+    latency: u32,
 }
 
 /// Short-term RPS entries of a header in spec order: delta, used and the subset when used.
@@ -294,6 +300,8 @@ pub struct Dpb {
     after_eos: bool,
     skip_rasl: bool,
     reorder: u8,
+    max_latency: Option<u32>,
+    dpb_size: u8,
 }
 
 impl Dpb {
@@ -303,7 +311,7 @@ impl Dpb {
         Dpb {
             refs: [Ref { slot: Slot(0), poc: 0, long_term: false, set: RpsSet::None }; MAX_DPB],
             n_refs: 0,
-            waiting: [Waiting { slot: Slot(0), gop: 0, poc: 0 }; MAX_WAITING],
+            waiting: [Waiting { slot: Slot(0), gop: 0, poc: 0, latency: 0 }; MAX_WAITING],
             n_waiting: 0,
             poc: PocState::ZERO,
             gop: 0,
@@ -311,14 +319,17 @@ impl Dpb {
             lead: Lead::Off,
             after_eos: false,
             skip_rasl: false,
-            reorder: 1,
+            reorder: 0,
+            max_latency: None,
+            dpb_size: MAX_DPB as u8,
         }
     }
 
     /// Starts a picture from its first slice segment header, `inter` when any of its segments
-    /// is P or B. Derives POC (8.3.1), marks the RPS (8.3.2) releasing what left it, and puts
-    /// out or drops what an IRAP ends (C.5.2.2). Pictures before the first IRAP and RASL ones
-    /// of an IRAP decoding started at are `Fate::Skip`, with nothing changed. A used reference
+    /// is P or B. Derives POC (8.3.1), marks the RPS (8.3.2) releasing what left it, puts out
+    /// or drops what an IRAP ends and bumps for room otherwise (C.5.2.2). Pictures before the
+    /// first IRAP and RASL ones of an IRAP decoding started at are `Fate::Skip`, with nothing
+    /// changed. A used reference
     /// missing is `MissingReference`, the one error that changes state: the marking, the order
     /// count and the sequence count stay as the stream has them and `ev` holds what the
     /// marking let go. A picture taken here is ended with `end` or `abandon`.
@@ -337,10 +348,10 @@ impl Dpb {
             return Ok(Picture::SKIP);
         }
         let no_rasl = hp::is_idr(t) || hp::is_bla(t) || self.awaiting_irap || self.after_eos;
-        // a key with no leading pictures, or a stream that never reorders, goes out at once
-        let key_now = self.awaiting_irap
-            && (matches!(t, hp::NAL_IDR_N_LP | hp::NAL_BLA_N_LP) || seq.no_reorder);
-        self.reorder = seq.reorder.max(1);
+        // a key with no leading pictures goes out at once
+        let key_now = self.awaiting_irap && matches!(t, hp::NAL_IDR_N_LP | hp::NAL_BLA_N_LP);
+        (self.reorder, self.max_latency, self.dpb_size) =
+            (seq.reorder, seq.max_latency, seq.dpb_size);
         if irap {
             self.skip_rasl = no_rasl;
         }
@@ -369,6 +380,12 @@ impl Dpb {
         // undecodable up to the next IRAP
         if !complete && inter {
             return Err(DpbError::MissingReference);
+        }
+        if !(irap && no_rasl) {
+            // C.5.2.2, the DPB makes room for the current picture
+            while self.n_waiting > 0 && (self.over() || self.fullness() >= self.dpb_size as usize) {
+                self.put_out_smallest(ev);
+            }
         }
         let shown = sh.pic_output_flag && !self.lead.leads(self.gop, poc);
         Ok(Picture {
@@ -420,8 +437,8 @@ impl Dpb {
     /// Ends a decoded picture in `slot`. Stores it, queues it for output when it is
     /// `Fate::Shown` and bumps (C.5.2.3). A `Fate::Skip` picture changes nothing. `Full` when
     /// every frame store holds a reference or 17 pictures wait for output, nothing changes then
-    /// and the picture is lost unless the caller calls `abandon`. The DPB does not track the
-    /// stream's dpb size, C.5.2.2's "no empty frame buffer" is the caller's, with `bump_one`.
+    /// and the picture is lost unless the caller calls `abandon`. `begin` bumps to the stream's
+    /// dpb size (C.5.2.2), a caller out of surfaces before that uses `bump_one`.
     pub fn end(&mut self, pic: &Picture, slot: Slot, ev: &mut Events) -> Result<(), DpbError> {
         ev.clear();
         if pic.fate == Fate::Skip {
@@ -436,7 +453,14 @@ impl Dpb {
             Ref { slot, poc: pic.poc, long_term: false, set: RpsSet::Foll };
         self.n_refs += 1;
         if shown {
-            self.waiting[self.n_waiting as usize] = Waiting { slot, gop: pic.gop, poc: pic.poc };
+            // C.5.2.3, the waiting pictures the current one goes out before are a picture later
+            for w in &mut self.waiting[..self.n_waiting as usize] {
+                if (w.gop, w.poc) > (pic.gop, pic.poc) {
+                    w.latency = w.latency.saturating_add(1);
+                }
+            }
+            self.waiting[self.n_waiting as usize] =
+                Waiting { slot, gop: pic.gop, poc: pic.poc, latency: 0 };
             self.n_waiting += 1;
         }
         // the key a discard restarts at goes out now, so its readers are queued before the
@@ -598,9 +622,22 @@ impl Dpb {
         }
     }
 
-    /// Puts out the smallest (gop, POC) while more than the reorder depth wait, or all.
+    /// More than the reorder depth wait, or one waited the most pictures it may (C.5.2.3).
+    fn over(&self) -> bool {
+        let waiting = &self.waiting[..self.n_waiting as usize];
+        self.n_waiting > self.reorder
+            || self.max_latency.is_some_and(|m| waiting.iter().any(|w| w.latency >= m))
+    }
+
+    /// Pictures stored, references and those waiting for output alone.
+    fn fullness(&self) -> usize {
+        let waiting = &self.waiting[..self.n_waiting as usize];
+        self.n_refs as usize + waiting.iter().filter(|w| !self.is_ref(w.slot)).count()
+    }
+
+    /// Puts out the smallest (gop, POC) while `over`, or all.
     fn bump(&mut self, all: bool, ev: &mut Events) {
-        while self.n_waiting > 0 && (all || self.n_waiting > self.reorder) {
+        while self.n_waiting > 0 && (all || self.over()) {
             self.put_out_smallest(ev);
         }
     }

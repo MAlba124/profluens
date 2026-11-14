@@ -126,12 +126,12 @@ fn frames_before_the_first_key_frame_are_skipped() {
     assert_eq!(run(&mut d, &h[1], 0), (Fate::Skip, vec![]));
     assert_eq!(run(&mut d, &h[0], 1), (Fate::Shown, vec![Output(Slot(1))]));
     assert_eq!(run(&mut d, &h[1], 2), (Fate::Shown, vec![Output(Slot(2))]));
-    // a parse error waits for the next key frame
+    // a parse error waits for the next key frame, the parser forgot every slot so they go
     let mut at = 0;
     assert!(d.next_frame(&[0xff; 4], &mut at).is_err());
-    assert_eq!(run(&mut d, &h[1], 3), (Fate::Skip, vec![]));
+    assert_eq!(run(&mut d, &h[1], 3), (Fate::Skip, vec![Release(Slot(2)), Release(Slot(1))]));
     let r = feed(&mut d, &tu(&[key(), inter(1, 0x01, [0; 7])]), 4);
-    assert_eq!(r[0], (Fate::Shown, vec![Output(Slot(4)), Release(Slot(2)), Release(Slot(1))]));
+    assert_eq!(r[0], (Fate::Shown, vec![Output(Slot(4))]));
     assert_eq!(r[1], (Fate::Shown, vec![Output(Slot(5))]));
 }
 
@@ -329,4 +329,85 @@ fn an_abandoned_frame_empties_its_slots() {
     d.abandon(&all, &mut ev);
     assert_eq!(ev.as_slice(), [Release(Slot(0))]);
     assert_eq!(held(&d), [None; NUM_SLOTS]);
+}
+
+/// A key frame into slot 0 alone, not shown, as one after a loss.
+fn hidden_key(h: &FrameHeader) -> FrameHeader {
+    let mut k = *h;
+    (k.show_frame, k.showable_frame, k.refresh_frame_flags) = (false, true, 0x01);
+    k
+}
+
+#[test]
+fn a_hidden_key_after_a_loss_leaves_the_skipped_frames_slots_empty() {
+    let mut d = Dpb::new();
+    feed(&mut d, &tu(&[key()]), 0);
+    d.await_key();
+    // skipped while the parser's slot 1 takes it
+    assert_eq!(feed(&mut d, &tu(&[inter(1, 0x02, [0; 7])]), 1), [(Fate::Skip, vec![])]);
+    let unit = tu(&[key(), inter(2, 0, [1; 7]), inter(3, 0, [0; 7])]);
+    let mut at = 0;
+    let k = d.next_frame(&unit, &mut at).unwrap().unwrap();
+    let k = hidden_key(&k.header);
+    assert_eq!(run(&mut d, &k, 2), (Fate::Hidden, vec![]));
+    assert!(!d.awaiting_key());
+    assert_eq!(held(&d), [Some(2), None, Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)]);
+    // slot 1 holds no frame of the header the parser has for it
+    let f = d.next_frame(&unit, &mut at).unwrap().unwrap();
+    let mut ev = Events::new();
+    assert_eq!(d.begin(&f.header, &mut ev), Err(DpbError::MissingReference));
+    let f = d.next_frame(&unit, &mut at).unwrap().unwrap();
+    assert_eq!(run(&mut d, &f.header, 3), (Fate::Shown, vec![Output(Slot(3)), Release(Slot(3))]));
+}
+
+#[test]
+fn a_refused_frame_leaves_its_slots_empty_once_parsed_past() {
+    let mut d = Dpb::new();
+    feed(&mut d, &tu(&[key()]), 0);
+    let unit = tu(&[inter(1, 0x06, [0, 0, 0, 3, 0, 0, 0]), key(), inter(2, 0, [2; 7])]);
+    let mut at = 0;
+    let f = d.next_frame(&unit, &mut at).unwrap().unwrap();
+    d.slots[3] = None;
+    let mut ev = Events::new();
+    assert_eq!(d.begin(&f.header, &mut ev), Err(DpbError::MissingReference));
+    assert!(ev.as_slice().is_empty());
+    d.await_key();
+    let k = d.next_frame(&unit, &mut at).unwrap().unwrap();
+    assert_eq!(run(&mut d, &hidden_key(&k.header), 1), (Fate::Hidden, vec![]));
+    assert_eq!(held(&d)[1..4], [None, None, None]);
+    let f = d.next_frame(&unit, &mut at).unwrap().unwrap();
+    assert_eq!(d.begin(&f.header, &mut ev), Err(DpbError::MissingReference));
+}
+
+#[test]
+fn a_hidden_key_after_a_parse_error_holds_its_slot_alone() {
+    let mut d = Dpb::new();
+    feed(&mut d, &tu(&[key()]), 0);
+    let mut at = 0;
+    assert!(d.next_frame(&[0xff; 4], &mut at).is_err());
+    let unit = tu(&[key(), inter(1, 0, [1; 7])]);
+    let mut at = 0;
+    let k = d.next_frame(&unit, &mut at).unwrap().unwrap();
+    assert_eq!(run(&mut d, &hidden_key(&k.header), 1), (Fate::Hidden, vec![Release(Slot(0))]));
+    assert_eq!(held(&d), [Some(1), None, None, None, None, None, None, None]);
+    let f = d.next_frame(&unit, &mut at).unwrap().unwrap();
+    let mut ev = Events::new();
+    assert_eq!(d.begin(&f.header, &mut ev), Err(DpbError::MissingReference));
+}
+
+#[test]
+fn an_abandoned_or_decoded_frame_is_not_emptied_again() {
+    let mut d = Dpb::new();
+    feed(&mut d, &tu(&[key()]), 0);
+    let unit = tu(&[inter(1, 0x02, [0; 7]), inter(2, 0x04, [0; 7]), inter(3, 0, [1; 7])]);
+    let mut at = 0;
+    let f = d.next_frame(&unit, &mut at).unwrap().unwrap();
+    let mut ev = Events::new();
+    assert_eq!(d.begin(&f.header, &mut ev), Ok(Fate::Shown));
+    d.abandon(&f.header, &mut ev);
+    let f = d.next_frame(&unit, &mut at).unwrap().unwrap();
+    assert_eq!(run(&mut d, &f.header, 1), (Fate::Shown, vec![Output(Slot(1))]));
+    let f = d.next_frame(&unit, &mut at).unwrap().unwrap();
+    assert_eq!(d.begin(&f.header, &mut ev), Err(DpbError::MissingReference));
+    assert_eq!(held(&d)[..3], [Some(0), None, Some(1)]);
 }

@@ -179,6 +179,29 @@ fn pictures_go_out_in_order_and_leave_through_the_sliding_window() {
 }
 
 #[test]
+fn without_a_vui_reorder_depth_p_pictures_reorder_as_deep_as_the_dpb() {
+    // as MR4_TANDBERG_C, P references in falling order count past max_num_ref_frames + 1
+    let mut s = sps(0, 2, 0);
+    s.max_num_reorder_frames = None;
+    s.max_dec_frame_buffering = Some(8);
+    let mut d = Dpb::new();
+    let mut out = Vec::new();
+    let mut keep = |ev: Vec<Event>| {
+        out.extend(ev.into_iter().filter_map(|e| match e {
+            Output(s) => Some(s.0),
+            _ => None,
+        }))
+    };
+    keep(picture(&mut d, &s, true, &idr(0), 0).1);
+    for (k, lsb) in [14, 12, 10, 8, 6, 4, 2].into_iter().enumerate() {
+        let n = k as u16 + 1;
+        keep(picture(&mut d, &s, true, &header(SliceType::P, u32::from(n), lsb), n).1);
+    }
+    keep(flush(&mut d));
+    assert_eq!(out, [0, 7, 6, 5, 4, 3, 2, 1]);
+}
+
+#[test]
 fn p_lists_descend_by_frame_num_wrap_and_modify() {
     let d = with_refs(&[(10, 0, 0, None), (11, 2, 4, None), (12, 1, 2, None)], 3);
     let mut sh = header(SliceType::P, 3, 6);
@@ -405,7 +428,7 @@ fn run(st: &mut Start, pics: &[(bool, bool, bool, i32, bool)]) -> Vec<Fate> {
     pics.iter()
         .map(
             |&(idr, intra, reset, poc, r)| {
-                if st.wants(idr, intra) { st.fate(reset, poc, r) } else { Fate::Skip }
+                if st.wants(idr, intra, r) { st.fate(reset, poc, r) } else { Fate::Skip }
             },
         )
         .collect()
@@ -457,6 +480,22 @@ fn idr_and_mmco5_keys_have_no_leading_run() {
     // an all intra picture mid stream after the start changes nothing
     let f = run(&mut st, &[(false, true, false, 40, true), (false, false, false, 36, false)]);
     assert_eq!(f, [Fate::Shown; 2]);
+}
+
+#[test]
+fn a_non_reference_intra_picture_is_no_key() {
+    let mut st = Start::AwaitKey;
+    let f = run(&mut st, &[(false, true, false, 8, false), (false, true, false, 16, true)]);
+    assert_eq!(f, [Fate::Skip, Fate::Shown]);
+    assert_eq!(st, Start::Leading { poc: 16 });
+    // nor through begin, the P after it would build empty lists
+    let s = sps(0, 4, 2);
+    let mut d = Dpb::new();
+    let mut ev = Events::new();
+    let p = d.begin(&s, &nal(false, false), &header(SliceType::I, 1, 8), true, &mut ev).unwrap();
+    assert_eq!(p.fate, Fate::Skip);
+    let p = d.begin(&s, &nal(false, false), &header(SliceType::P, 1, 10), false, &mut ev).unwrap();
+    assert_eq!(p.fate, Fate::Skip);
 }
 
 #[test]

@@ -199,13 +199,32 @@ impl Default for StreamState {
     }
 }
 
+/// Whether a frame is shown, a shown frame or one shown again, read from its first bits
+/// without the header parse. False for a frame too short.
+pub fn peek_shown(frame: &[u8]) -> bool {
+    let Some(&b) = frame.first() else {
+        return false;
+    };
+    // frame_marker, profile_low_bit, profile_high_bit, reserved_zero for profile 3
+    let at = if b >> 4 & 3 == 3 { 5 } else { 4 };
+    let bit = |i: usize| frame.get(i / 8).is_some_and(|&x| x >> (7 - i % 8) & 1 == 1);
+    // show_existing_frame, or frame_type then show_frame
+    bit(at) || bit(at + 2)
+}
+
+/// A frame decoding may start at, a key frame or an intra-only frame (libvpx and libav start
+/// at either).
+fn starts(h: &Vp9FrameHeader) -> bool {
+    h.frame_type == FrameType::KeyFrame || h.intra_only
+}
+
 /// Reference slots and the state carried across frames of a VP9 stream. Frames go out in
 /// decode order, a slot shown again goes out again. No allocation, no hardware, the caller
 /// decodes.
 pub struct Dpb {
     slots: [Option<Ref>; NUM_SLOTS],
     state: StreamState,
-    /// no key frame yet, or a discard came
+    /// no key or intra-only frame yet, or a discard came
     awaiting_key: bool,
 }
 
@@ -227,13 +246,15 @@ impl Dpb {
         parse::parse_uncompressed_header_with_refs(frame, Some(refs))
     }
 
-    /// Starts a frame. Frames before the first key frame are `Fate::Skip`, so is a shown
-    /// existing frame, with its `Output` in `ev`. A slot the frame names empty is
-    /// `MissingReference` and nothing changes. Otherwise the held state takes the header,
-    /// `Shown` or `Hidden` by show_frame.
+    /// Starts a frame. Frames before the first key or intra-only frame are `Fate::Skip`, so
+    /// is a shown existing frame, with its `Output` in `ev`. An intra-only frame ending the
+    /// wait empties the slots it does not refresh, with their releases in `ev`, so a frame
+    /// naming one is refused instead of predicting from before the wait. A slot the frame
+    /// names empty is `MissingReference` and nothing changes. Otherwise the held state takes
+    /// the header, `Shown` or `Hidden` by show_frame.
     pub fn begin(&mut self, h: &Vp9FrameHeader, ev: &mut Events) -> Result<Fate, DpbError> {
         ev.clear();
-        if self.awaiting_key && h.frame_type != FrameType::KeyFrame {
+        if self.skips(h) {
             return Ok(Fate::Skip);
         }
         if h.show_existing_frame {
@@ -246,6 +267,15 @@ impl Dpb {
             return Err(DpbError::MissingReference);
         }
         self.state.fold(h);
+        if self.awaiting_key && h.intra_only {
+            let mut old = [None; NUM_SLOTS];
+            for (i, s) in self.slots.iter_mut().enumerate() {
+                if h.refresh_frame_flags >> i & 1 == 0 {
+                    old[i] = s.take();
+                }
+            }
+            self.release_unheld(&old, ev);
+        }
         self.awaiting_key = false;
         Ok(if h.show_frame { Fate::Shown } else { Fate::Hidden })
     }
@@ -296,10 +326,10 @@ impl Dpb {
 
     /// A frame `begin` took that was never decoded, in place of `end`. The caller keeps its
     /// slot. The slots refresh_frame_flags names are emptied, a frame no slot holds any more
-    /// released, and frames up to the next key frame are `Fate::Skip`, as the probability
-    /// context the lost frame would have refreshed (refresh_frame_context) lives in the decoder,
-    /// not in a slot, and the frames after it count on it. The held state keeps what `begin`
-    /// folded, the frames between still parse.
+    /// released, and frames up to the next key or intra-only frame are `Fate::Skip`, as the
+    /// probability context the lost frame would have refreshed (refresh_frame_context) lives in
+    /// the decoder, not in a slot, and the frames after it count on it. The held state keeps
+    /// what `begin` folded, the frames between still parse.
     pub fn abandon(&mut self, h: &Vp9FrameHeader, ev: &mut Events) {
         ev.clear();
         let mut old = [None; NUM_SLOTS];
@@ -313,7 +343,7 @@ impl Dpb {
     }
 
     /// A seek or a stream error. Empties the slots and the held state, decoding resumes at
-    /// the next key frame.
+    /// the next key or intra-only frame.
     pub fn discard(&mut self, ev: &mut Events) {
         ev.clear();
         let old = std::mem::replace(&mut self.slots, [None; NUM_SLOTS]);
@@ -322,13 +352,19 @@ impl Dpb {
         self.awaiting_key = true;
     }
 
-    /// Whether frames wait for a key frame, after a discard, a failed frame or at the start.
+    /// Whether frames wait for a key or intra-only frame, after a discard, a failed frame or at
+    /// the start.
     pub fn awaits_key(&self) -> bool {
         self.awaiting_key
     }
 
-    /// A frame that failed. Frames up to the next key frame are `Fate::Skip`, the slots and the
-    /// held state stay so the frames between still parse.
+    /// Whether `begin` skips the frame as one before a key or intra-only frame.
+    pub fn skips(&self, h: &Vp9FrameHeader) -> bool {
+        self.awaiting_key && !starts(h)
+    }
+
+    /// A frame that failed. Frames up to the next key or intra-only frame are `Fate::Skip`, the
+    /// slots and the held state stay so the frames between still parse.
     pub fn await_key(&mut self) {
         self.awaiting_key = true;
     }

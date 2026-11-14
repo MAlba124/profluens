@@ -7,7 +7,7 @@ use profluens_video::h265parse::{self as hp, Nal, SliceHeader, SliceType};
 use super::*;
 use crate::Event::{Output, Release};
 
-const SEQ: Seq = Seq { max_poc_lsb: 16, reorder: 1, no_reorder: false };
+const SEQ: Seq = Seq { max_poc_lsb: 16, reorder: 1, max_latency: None, dpb_size: MAX_DPB as u8 };
 
 fn nal(t: u8) -> Nal {
     Nal { nal_type: t, temporal_id: 0, start: 0, end: 0 }
@@ -313,7 +313,7 @@ fn a_key_with_nothing_to_reorder_goes_out_at_once() {
     let (_, ev) = picture(&mut d, &SEQ, hp::NAL_IDR_N_LP, &intra(0), 0);
     assert_eq!(ev, [Output(Slot(0))]);
     let mut d = Dpb::new();
-    let seq = Seq { no_reorder: true, ..SEQ };
+    let seq = Seq { reorder: 0, ..SEQ };
     let (_, ev) = picture(&mut d, &seq, hp::NAL_CRA_NUT, &intra(0), 0);
     assert_eq!(ev, [Output(Slot(0))]);
 }
@@ -572,4 +572,89 @@ fn an_abandoned_picture_is_missing_and_an_abandoned_key_waits_for_an_irap() {
     assert!(d.skips(hp::NAL_TRAIL_R) && !d.skips(hp::NAL_IDR_N_LP));
     let (p, ev) = picture(&mut d, &SEQ, hp::NAL_IDR_N_LP, &intra(0), 3);
     assert_eq!((p.fate, ev), (Fate::Shown, vec![Output(Slot(3))]));
+}
+
+/// BUMPING_A_ericsson, C.5.2.2 bumps before a picture when the DPB holds its dpb size.
+#[test]
+fn a_dpb_at_its_size_lets_the_smallest_out_before_the_next_picture() {
+    let seq = Seq { reorder: 4, dpb_size: 3, ..SEQ };
+    let mut d = Dpb::new();
+    picture(&mut d, &seq, hp::NAL_IDR_W_RADL, &intra(0), 0);
+    let p8 = header(8, SliceType::P, &[(-8, true)], &[], &[]);
+    picture(&mut d, &seq, hp::NAL_TRAIL_R, &p8, 1);
+    let b4 = header(4, SliceType::B, &[(-4, true)], &[(4, true)], &[]);
+    let (_, ev) = picture(&mut d, &seq, hp::NAL_TRAIL_N, &b4, 2);
+    assert_eq!(ev, [], "three wait, within the reorder depth");
+    // 8 stays a reference, 0 and 4 wait alone, three stored is the dpb size
+    let p16 = header(16, SliceType::P, &[(-8, true)], &[], &[]);
+    let mut ev = Events::new();
+    let p = d.begin(&seq, &nal(hp::NAL_TRAIL_R), &p16, true, &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), [Output(Slot(0)), Release(Slot(0))]);
+    d.end(&p, Slot(3), &mut ev).unwrap();
+    assert_eq!(ev.as_slice(), []);
+    // the same stream with room to spare keeps all four waiting
+    let seq = Seq { reorder: 4, ..SEQ };
+    let mut d = Dpb::new();
+    for (t, sh, slot) in [
+        (hp::NAL_IDR_W_RADL, intra(0), 0),
+        (hp::NAL_TRAIL_R, p8, 1),
+        (hp::NAL_TRAIL_N, b4, 2),
+        (hp::NAL_TRAIL_R, p16, 3),
+    ] {
+        assert_eq!(picture(&mut d, &seq, t, &sh, slot).1, []);
+    }
+}
+
+/// C.5.2.3, a picture waiting while SpsMaxLatencyPictures pictures ahead of it in output order
+/// were decoded goes out, with every smaller one before it.
+#[test]
+fn a_picture_past_its_latency_goes_out_ahead_of_the_reorder_depth() {
+    let seq = Seq { reorder: 4, max_latency: Some(2), ..SEQ };
+    let mut d = Dpb::new();
+    picture(&mut d, &seq, hp::NAL_IDR_W_RADL, &intra(0), 0);
+    let p8 = header(8, SliceType::P, &[(-8, true)], &[], &[]);
+    let (_, ev) = picture(&mut d, &seq, hp::NAL_TRAIL_R, &p8, 1);
+    assert_eq!(ev, [], "8 follows nothing decoded after it");
+    let b4 = header(4, SliceType::B, &[(-4, true)], &[(4, true)], &[]);
+    let (_, ev) = picture(&mut d, &seq, hp::NAL_TRAIL_R, &b4, 2);
+    assert_eq!(ev, [], "8 waited one picture");
+    let b2 = header(2, SliceType::B, &[(-2, true)], &[(2, true), (6, true)], &[]);
+    let (_, ev) = picture(&mut d, &seq, hp::NAL_TRAIL_N, &b2, 3);
+    // 8 waited two, 4 one, out go 0, 2, 4 and 8 in order
+    assert_eq!(ev, [Output(Slot(0)), Output(Slot(3)), Output(Slot(2)), Output(Slot(1))]);
+    // a picture later in output order adds nothing to those before it
+    let mut d = Dpb::new();
+    picture(&mut d, &seq, hp::NAL_IDR_W_RADL, &intra(0), 0);
+    for (i, lsb) in [2u32, 4, 6].into_iter().enumerate() {
+        let p = header(lsb, SliceType::P, &[(-2, true)], &[], &[]);
+        let (_, ev) = picture(&mut d, &seq, hp::NAL_TRAIL_R, &p, i as u16 + 1);
+        assert_eq!(ev, [], "{lsb}");
+    }
+}
+
+/// NoOutPrior_A_Qualcomm and RAP_B_Bossen, an end of sequence puts nothing out itself, the CRA
+/// after it drops what still waits and an IDR keeps its flag's choice.
+#[test]
+fn after_an_end_of_sequence_the_next_irap_decides_the_waiting_pictures() {
+    let seq = Seq { reorder: 2, ..SEQ };
+    for (t, no_output, out) in [
+        (hp::NAL_CRA_NUT, false, false),
+        (hp::NAL_IDR_W_RADL, false, true),
+        (hp::NAL_IDR_N_LP, true, false),
+    ] {
+        let mut d = Dpb::new();
+        picture(&mut d, &seq, hp::NAL_IDR_W_RADL, &intra(0), 0);
+        let p8 = header(8, SliceType::P, &[(-8, true)], &[], &[]);
+        picture(&mut d, &seq, hp::NAL_TRAIL_R, &p8, 1);
+        d.end_of_sequence();
+        let mut key = intra(0);
+        key.no_output_of_prior_pics_flag = no_output;
+        let (p, ev) = picture(&mut d, &seq, t, &key, 2);
+        assert!(p.no_rasl_output, "type {t}");
+        let prior = match out {
+            true => vec![Output(Slot(0)), Output(Slot(1)), Release(Slot(0)), Release(Slot(1))],
+            false => vec![Release(Slot(0)), Release(Slot(1))],
+        };
+        assert_eq!(ev[..prior.len()], prior[..], "type {t}");
+    }
 }

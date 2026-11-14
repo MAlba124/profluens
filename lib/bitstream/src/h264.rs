@@ -89,8 +89,8 @@ impl Ref {
 }
 
 /// Where decoding stands after `new` or `discard`. Pictures wait for an IDR or an all intra
-/// picture, and a non-IDR key's leading pictures, those before it in output order, may
-/// reference pictures never decoded.
+/// reference picture, and a non-IDR key's leading pictures, those before it in output order,
+/// may reference pictures never decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Start {
     AwaitKey,
@@ -102,9 +102,10 @@ enum Start {
 }
 
 impl Start {
-    /// Whether a picture is decoded at all, before its order count is known.
-    fn wants(self, idr: bool, intra: bool) -> bool {
-        self != Start::AwaitKey || idr || intra
+    /// Whether a picture is decoded at all, before its order count is known. A non-reference
+    /// intra picture is no key, nothing after it could predict from it.
+    fn wants(self, idr: bool, intra: bool, reference: bool) -> bool {
+        self != Start::AwaitKey || idr || (intra && reference)
     }
 
     /// The fate of a picture `wants` took. `reset` is an IDR or MMCO 5 picture. A non-reference
@@ -303,8 +304,8 @@ pub struct Dpb {
 }
 
 impl Dpb {
-    /// Waits for a key. Unlike after `discard`, a non-IDR key's leading pictures go out before
-    /// it as the stream orders them, so the first picture is out later than after a seek.
+    /// Waits for a key as after `discard`. A non-IDR key goes out as soon as it is decoded, its
+    /// leading pictures are `Hidden` or `Skip`.
     pub fn new() -> Self {
         Dpb {
             refs: [Ref::EMPTY; MAX_REFS],
@@ -342,10 +343,10 @@ impl Dpb {
             return Err(DpbError::Fields);
         }
         let idr = nal.unit_type == hp::NAL_SLICE_IDR;
-        if !self.start.wants(idr, intra) {
+        let reference = nal.ref_idc != 0;
+        if !self.start.wants(idr, intra, reference) {
             return Ok(Picture::SKIP);
         }
-        let reference = nal.ref_idc != 0;
         self.max_refs = sps.max_num_ref_frames.clamp(1, MAX_REFS as u32) as u8;
         self.max_frame_num = sps.max_frame_num() as i32;
         self.reorder = sps.reorder_frames().clamp(1, MAX_REFS as u32) as u8;

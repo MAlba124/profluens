@@ -67,7 +67,8 @@ impl Track {
         }
         let mut settings = self.string();
         cue_settings(ir.layout(), &mut settings);
-        let end = start + dur.filter(|&d| d > 0).unwrap_or(OPEN_CUE);
+        // Saturates, a cue near the end of time would overflow.
+        let end = start.saturating_add(dur.filter(|&d| d > 0).unwrap_or(OPEN_CUE));
         let at = self.cues.partition_point(|c| c.start <= start);
         self.cues.insert(at, Cue { start, end, settings, text });
     }
@@ -125,7 +126,7 @@ fn segment<'a>(out: &mut Vec<u8>, cues: impl Iterator<Item = &'a Cue>) {
 
 /// `hh:mm:ss.ttt`, to the nearest millisecond.
 fn stamp(out: &mut Vec<u8>, ns: i64) {
-    let ms = (ns.max(0) + 500_000) / 1_000_000;
+    let ms = ns.max(0).saturating_add(500_000) / 1_000_000;
     let _ = write!(
         out,
         "{:02}:{:02}:{:02}.{:03}",
@@ -337,6 +338,19 @@ mod tests {
         s.clear();
         stamp(&mut s, -5);
         assert_eq!(s, b"00:00:00.000");
+    }
+
+    #[test]
+    fn a_cue_at_the_end_of_time_saturates() {
+        let mut t = Track::default();
+        t.reset(0);
+        t.cue(i64::MAX - 1, None, &view(&plain("open")));
+        t.cue(i64::MAX - 1, Some(i64::MAX), &view(&plain("long")));
+        let mut out = Vec::new();
+        assert_eq!(t.ready(&[0], i64::MAX, true, &mut out), Some(0));
+        let s = body(&out);
+        assert!(s.contains("\nopen\n") && s.contains("\nlong\n"), "{s}");
+        assert!(s.contains("2562047:47:16.854 --> 2562047:47:16.854"), "{s}");
     }
 
     fn body(out: &[u8]) -> String {

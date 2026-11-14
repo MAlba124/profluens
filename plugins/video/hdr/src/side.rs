@@ -72,22 +72,20 @@ impl<'a> Writer<'a> {
         true
     }
 
-    fn has_hdr10plus(&self) -> bool {
-        records(&self.buf[..self.len])
-            .any(|(k, b)| k == Kind::T35 as u8 && matches!(classify(b), T35Kind::Hdr10Plus { .. }))
-    }
-
-    /// Append container records under the bitstream's. A bitstream HDR10+ message wins.
+    /// Append container records under the bitstream's. A bitstream HDR10+ message or Dolby
+    /// Vision RPU, in either form, wins over the container's.
     pub fn merge_under(&mut self, container: &[u8]) {
-        let bitstream_hdr10plus = self.has_hdr10plus();
+        let (mut plus, mut rpu) = (false, false);
+        for (k, b) in records(&self.buf[..self.len]) {
+            plus |= is_hdr10plus(k, b);
+            rpu |= is_rpu(k, b);
+        }
         for (kind, bytes) in records(container) {
             let Some(kind) = Kind::from_u8(kind) else {
                 continue;
             };
-            if kind == Kind::T35
-                && bitstream_hdr10plus
-                && matches!(classify(bytes), T35Kind::Hdr10Plus { .. })
-            {
+            let k = kind as u8;
+            if (plus && is_hdr10plus(k, bytes)) || (rpu && is_rpu(k, bytes)) {
                 continue;
             }
             self.push(kind, bytes);
@@ -105,6 +103,15 @@ impl<'a> Writer<'a> {
     pub fn bytes(&self) -> &[u8] {
         &self.buf[..self.len]
     }
+}
+
+fn is_hdr10plus(kind: u8, b: &[u8]) -> bool {
+    kind == Kind::T35 as u8 && matches!(classify(b), T35Kind::Hdr10Plus { .. })
+}
+
+fn is_rpu(kind: u8, b: &[u8]) -> bool {
+    kind == Kind::DoviRpu as u8
+        || (kind == Kind::T35 as u8 && matches!(classify(b), T35Kind::DoviRpu { .. }))
 }
 
 /// Walk the records of `side`, stopping at the first that runs past the end.
@@ -265,5 +272,36 @@ mod tests {
         let m = FrameMeta::read(&buf[..n]).unwrap();
         assert_eq!(m.dovi_rpu(), Some((RpuForm::Av1Emdf, &[0xAA][..])));
         assert_eq!(m.hdr10plus(), None);
+    }
+
+    #[test]
+    fn the_bitstream_rpu_wins_over_the_containers_in_either_form() {
+        let t35_rpu = [0xB5, 0x00, 0x3B, 0x00, 0x00, 0x08, 0x00, 0xAA];
+        let container = {
+            let mut buf = [0u8; 128];
+            let mut w = Writer::new(&mut buf);
+            assert!(w.push(Kind::T35, &t35_rpu));
+            assert!(w.push(Kind::DoviRpu, &[0x7C, 0x01, 0x19]));
+            assert!(w.push(Kind::T35, &hdr10plus_t35(10_000)));
+            let n = w.len();
+            buf[..n].to_vec()
+        };
+        let rpus = |side: &[u8]| {
+            FrameMeta::read(side).unwrap().records().filter(|&(k, b)| is_rpu(k as u8, b)).count()
+        };
+        let mut buf = [0u8; 512];
+        let mut w = Writer::new(&mut buf);
+        assert!(w.push(Kind::DoviRpu, &[0x7C, 0x01, 0x42]));
+        w.merge_under(&container);
+        let n = w.len();
+        let m = FrameMeta::read(&buf[..n]).unwrap();
+        assert_eq!(rpus(&buf[..n]), 1, "one RPU an access unit");
+        assert_eq!(m.dovi_rpu(), Some((RpuForm::Nal, &[0x7C, 0x01, 0x42][..])));
+        assert_eq!(m.hdr10plus().unwrap().unwrap().windows[0].maxscl[0], 10_000, "HDR10+ kept");
+        let mut buf = [0u8; 512];
+        let mut w = Writer::new(&mut buf);
+        w.merge_under(&container);
+        let n = w.len();
+        assert_eq!(rpus(&buf[..n]), 2, "no bitstream RPU, the container's as they were");
     }
 }

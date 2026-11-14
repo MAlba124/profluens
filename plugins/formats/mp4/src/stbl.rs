@@ -169,11 +169,16 @@ pub(crate) struct TrackTable {
     offsets: Box<[OffsetRun]>,
     /// The sync samples numbered from 1, None when every one is.
     sync: Option<Box<[u32]>>,
-    /// The chunks the file's end cuts with the samples of each inside it, by chunk.
+    /// The chunks before `live` the file's end cuts, with the samples of each inside it,
+    /// by chunk.
     cuts: Box<[(u32, u32)]>,
+    /// Past the last chunk with a sample inside the file.
+    live: u32,
     edits: Edits,
-    /// The samples the tables state, those past the file's end among them.
+    /// The samples inside the file when they are the numbers below it, `prefix`. The end
+    /// of a cut file takes the last of them, so they mostly are. Else the samples stated.
     total: u32,
+    prefix: bool,
 }
 
 impl Default for TrackTable {
@@ -189,8 +194,10 @@ impl Default for TrackTable {
             offsets: Box::default(),
             sync: None,
             cuts: Box::default(),
+            live: 0,
             edits: Edits::None,
             total: 0,
+            prefix: true,
         }
     }
 }
@@ -260,6 +267,8 @@ struct ChunkAt {
     /// Its samples inside the file.
     count: u32,
     offset: u64,
+    /// The next chunk of the track that may hold a sample.
+    next: u32,
 }
 
 /// A place in one track's samples in the order the file stores them.
@@ -368,6 +377,8 @@ impl TrackTable {
         // Each sample is charged to the room as the walk in the track's order reaches it. A
         // sample past the end cuts its chunk there, offsets rise through a chunk.
         let mut cuts: Vec<(u32, u32)> = Vec::new();
+        // past the last chunk with a sample in the file, and past that sample's number
+        let (mut live, mut inside) = (0u32, 0u64);
         for (r, run) in runs.iter().enumerate() {
             let end = runs.get(r + 1).map_or(chunk_count as u32, |next| next.first_chunk);
             for chunk in run.first_chunk..end {
@@ -376,6 +387,14 @@ impl TrackTable {
                     + u64::from(chunk - run.first_chunk) * u64::from(run.per_chunk);
                 let samples =
                     if group == 0 { run.per_chunk } else { run.per_chunk.div_ceil(PCM_GROUP) };
+                let first = match group {
+                    0 => entry,
+                    _ => {
+                        u64::from(groups[r])
+                            + u64::from(chunk - run.first_chunk) * u64::from(samples)
+                    }
+                };
+                let mut kept = samples;
                 for k in 0..samples {
                     let (size, at) = match group {
                         0 => (sizes.get(entry as usize + k as usize), entry + u64::from(k)),
@@ -391,6 +410,7 @@ impl TrackTable {
                         size.ok_or(Mp4Error::Inconsistent("sample index past size table"))?;
                     if !room.admits(offset, size)? {
                         cuts.push((chunk, k));
+                        kept = k;
                         break;
                     }
                     if at >= stated {
@@ -401,11 +421,20 @@ impl TrackTable {
                         .checked_add(u64::from(size))
                         .ok_or(Mp4Error::Inconsistent("chunk offset overflow"))?;
                 }
+                if kept > 0 {
+                    (live, inside) = (chunk + 1, first + u64::from(kept));
+                }
             }
         }
         if stated < entries as u64 {
             return Err(short);
         }
+        // The chunks past the last one inside the file are left out as one. With no other
+        // cut than of that last chunk, the samples inside are the numbers below `inside`.
+        cuts.retain(|cut| cut.0 < live);
+        let prefix = cuts.iter().all(|cut| cut.0 + 1 == live);
+        let stated_samples = if group == 0 { entries as u64 } else { grouped };
+        let total = if prefix { inside } else { stated_samples }.min(u64::from(u32::MAX)) as u32;
         let mut times: Vec<TimeRun> = Vec::new();
         let (mut first, mut dts) = (0u64, 0u64);
         for run in stts.iter().filter(|run| run.count != 0) {
@@ -444,12 +473,10 @@ impl TrackTable {
             offsets: offsets.into_boxed_slice(),
             sync: stss.map(Vec::into_boxed_slice),
             cuts: cuts.into_boxed_slice(),
+            live,
             edits: Edits::None,
-            total: if group == 0 {
-                entries as u32
-            } else {
-                grouped.min(u64::from(u32::MAX)) as u32
-            },
+            total,
+            prefix,
         };
         // The edits go by the track's order, read before the chunks are put in the file's.
         let presented = match &s.edits {
@@ -457,9 +484,12 @@ impl TrackTable {
             _ => true,
         };
         let chunks = &table.chunks;
-        let ascends = (1..chunks.len() as u32).all(|c| chunks.get(c - 1) <= chunks.get(c));
+        let ascends = (1..live).all(|c| chunks.get(c - 1) <= chunks.get(c));
         if !ascends {
-            let mut by: Vec<u32> = (0..chunks.len() as u32).collect();
+            // only the chunks with a sample inside the file
+            let mut hint = 0;
+            let holds = |c: &u32| table.chunk(*c, &mut hint).is_some_and(|at| at.count > 0);
+            let mut by: Vec<u32> = (0..live).filter(holds).collect();
             by.sort_by_key(|&c| chunks.get(c));
             table.by_offset = Some(by.into_boxed_slice());
         }
@@ -488,7 +518,7 @@ impl TrackTable {
             }
         };
         // With every sample in the file and one an entry, the times are read off the runs.
-        let direct = self.group == 0 && self.cuts.is_empty();
+        let direct = self.group == 0 && self.prefix;
         match direct {
             true => {
                 let (mut time, mut cts) = (0, 0);
@@ -590,7 +620,7 @@ impl TrackTable {
 
     /// Chunk `chunk` of the track.
     fn chunk(&self, chunk: u32, hint: &mut u32) -> Option<ChunkAt> {
-        if chunk as usize >= self.chunks.len() {
+        if chunk >= self.live {
             return None;
         }
         let r = upto(self.runs.len(), |i| self.runs[i].first_chunk, chunk, hint).checked_sub(1)?;
@@ -607,6 +637,11 @@ impl TrackTable {
         };
         let cut = self.cuts.binary_search_by_key(&chunk, |c| c.0).ok().map(|at| self.cuts[at].1);
         let count = cut.unwrap_or(stated);
+        // a run of chunks without a sample is stepped over as one
+        let next = match (run.per_chunk, self.runs.get(r + 1)) {
+            (0, Some(next)) => next.first_chunk,
+            _ => chunk + 1,
+        };
         Some(ChunkAt {
             chunk,
             first,
@@ -614,7 +649,13 @@ impl TrackTable {
             per: run.per_chunk,
             count,
             offset: self.chunks.get(chunk),
+            next,
         })
+    }
+
+    /// The chunks by offset a walk passes.
+    fn ords(&self) -> usize {
+        self.by_offset.as_ref().map_or(self.live as usize, |by| by.len())
     }
 
     /// The chunk the track stores `ord`th by offset.
@@ -629,13 +670,15 @@ impl TrackTable {
     fn enter(&self, h: &mut Head, mut ord: u32) {
         loop {
             match self.chunk(self.chunk_of(ord), &mut h.run) {
+                // a track in the file's order numbers its chunks as it stores them
+                Some(at) if at.count == 0 && self.by_offset.is_none() => ord = at.next.max(ord + 1),
                 Some(at) if at.count == 0 => ord += 1,
                 Some(at) => {
                     (h.ord, h.k, h.at, h.offset, h.done) = (ord, 0, at, at.offset, false);
                     return;
                 }
                 None => {
-                    (h.ord, h.k, h.done) = (self.chunks.len() as u32, 0, true);
+                    (h.ord, h.k, h.done) = (self.ords() as u32, 0, true);
                     return;
                 }
             }
@@ -696,8 +739,7 @@ impl TrackTable {
     /// `h` at the track's first sample at or past `byte`. A place in the chunk `h` is in is
     /// walked to from where it is.
     pub(crate) fn to_byte(&self, h: &mut Head, byte: u64) {
-        let chunks = self.chunks.len();
-        let before = bisect(chunks, |ord| self.chunks.get(self.chunk_of(ord as u32)) < byte);
+        let before = bisect(self.ords(), |ord| self.chunks.get(self.chunk_of(ord as u32)) < byte);
         let Some(ord) = before.checked_sub(1).map(|ord| ord as u32) else {
             return self.enter(h, 0);
         };
@@ -746,12 +788,14 @@ impl TrackTable {
         if h.done || h.at.chunk != chunk {
             let ord = match &self.by_offset {
                 None => chunk,
-                Some(by) => {
-                    let at = self.chunks.get(chunk.min(self.chunks.len() as u32 - 1));
+                // a chunk past the file's end or without a sample is not among them
+                Some(by) if (chunk as usize) < self.chunks.len() => {
+                    let at = self.chunks.get(chunk);
                     let from = bisect(by.len(), |ord| self.chunks.get(by[ord]) < at);
-                    let same = by[from..].iter().position(|&c| c == chunk);
-                    same.map_or(u32::MAX, |i| (from + i) as u32)
+                    let same = by[from..].iter().take_while(|&&c| self.chunks.get(c) == at);
+                    same.clone().position(|&c| c == chunk).map_or(from, |i| from + i) as u32
                 }
+                Some(by) => by.len() as u32,
             };
             self.enter(h, ord);
             if h.done || h.at.chunk != chunk {
@@ -825,7 +869,7 @@ impl TrackTable {
             Edits::None | Edits::Shift(_) => Some((0, self.total)),
             Edits::Followed { kept, .. } => *kept,
         };
-        kept.filter(|_| self.by_offset.is_none() && self.cuts.is_empty())
+        kept.filter(|_| self.by_offset.is_none() && self.prefix)
     }
 
     /// The [`TrackTable::span`] of a track whose samples are presented in the order of their
@@ -1031,6 +1075,10 @@ impl Iterator for Keys<'_> {
             *at += 1;
             // numbered from 1, one past the end or left out by an edit is no sample
             let Some(n) = key.checked_sub(1) else { continue };
+            if table.prefix && n >= table.total {
+                *at = sync.len();
+                break;
+            }
             table.to_sample(&mut self.head, n);
             if self.head.done || self.head.at.first + self.head.k != n {
                 continue;

@@ -101,7 +101,7 @@ fn edited(name: &str, entries: &[(u32, i32)]) -> Vec<u8> {
 
 fn samples(file: &[u8]) -> Vec<(f64, bool)> {
     let reader = Mp4Reader::new(file).expect("the movie resolves");
-    reader.samples().iter().map(|s| (s.pts as f64 / PICTURE as f64, s.hidden)).collect()
+    reader.samples().iter().map(|s| (s.pts() as f64 / PICTURE as f64, s.hidden())).collect()
 }
 
 fn shown(from: f64, n: usize) -> Vec<(f64, bool)> {
@@ -237,7 +237,7 @@ fn a_leading_media_time_hides_what_comes_before_it() {
 fn a_seek_into_a_later_edit_restarts_at_its_sync_sample() {
     let reader = Mp4Reader::new(&with_edits(&[(200, 0), (400, 9 * PICTURE as i32)])).unwrap();
     let tables = reader.tables();
-    let first = reader.samples()[0].offset;
+    let first = reader.samples()[0].offset();
     let r = tables.restart(stamp(5), stamp(5), &|_| true);
     assert_eq!((r.to_byte, r.at_ns), (first, 0));
     let index = tables.seek_index(&|_| true);
@@ -255,12 +255,12 @@ fn with_b_frames_the_decoder_shows_what_the_edits_present() {
     ] {
         let file = edited("bframes_h264.mp4", &entries);
         let reader = Mp4Reader::new(&file).expect("the movie resolves");
-        assert!(reader.samples().iter().any(|s| s.hidden) || entries[0].1 == -1, "{entries:?}");
+        assert!(reader.samples().iter().any(|s| s.hidden()) || entries[0].1 == -1, "{entries:?}");
         let mut want: Vec<u64> = reader
             .samples()
             .iter()
-            .filter(|s| !s.hidden)
-            .map(|s| reader.ticks_to_ns(0, s.pts))
+            .filter(|s| !s.hidden())
+            .map(|s| reader.ticks_to_ns(0, s.pts()))
             .collect();
         want.sort_unstable();
         assert_eq!(decoded(file), want, "{entries:?}");
@@ -274,7 +274,7 @@ fn the_edits_set_the_duration_and_what_is_not_followed_is_said() {
     assert_eq!(reader.tracks()[0].edit_refused, None);
     let back = Mp4Reader::new(&with_edits(&[(200, 9 * PICTURE as i32), (200, 0)])).unwrap();
     assert_eq!(back.tracks()[0].edit_refused, Some(pf_mp4::edit::EditRefusal::Backwards));
-    assert_eq!(back.samples().iter().filter(|s| !s.hidden).count(), 3, "the first edit plays");
+    assert_eq!(back.samples().iter().filter(|s| !s.hidden()).count(), 3, "the first edit plays");
     let past = Mp4Reader::new(&with_edits(&[(200, 100 * PICTURE as i32)])).unwrap();
     assert_eq!(past.tracks()[0].edit_refused, Some(pf_mp4::edit::EditRefusal::NothingPresented));
     assert_eq!(past.samples().len(), 15, "nothing is dropped");

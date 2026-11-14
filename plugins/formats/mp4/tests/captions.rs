@@ -369,7 +369,7 @@ fn run(file: &[u8], pushed: bool, text_ms: Option<u64>, seek_ms: Option<u64>) ->
 fn sample_at(file: &[u8], track: usize, n: usize) -> (u64, u32) {
     let tables = Mp4Reader::new(file).expect("resolves").tables();
     let s = tables.samples().iter().filter(|s| s.track() == track).nth(n).expect("the sample");
-    (s.offset, s.size)
+    (s.offset(), s.size())
 }
 
 const S: u64 = 1_000 * MS;

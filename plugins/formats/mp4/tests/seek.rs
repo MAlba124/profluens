@@ -349,15 +349,20 @@ fn the_movie_resolves_as_laid_out() {
     assert_eq!(reader.tracks()[1].family(), "aac");
     assert_eq!(reader.samples().len(), (PICTURES + PACKETS) as usize);
     for s in reader.samples() {
-        let at = s.offset as usize;
+        let at = s.offset() as usize;
         let n = u32::from_be_bytes(file[at + 1..at + 5].try_into().unwrap());
-        let (letter, want) = if s.track_index == 0 {
+        let (letter, want) = if s.track_index() == 0 {
             (b'V', picture_at(&head, n))
         } else {
             (b'A', packet_at(&head, n))
         };
-        assert_eq!((file[at], s.offset), (letter, want), "sample {n} of track {}", s.track_index);
-        assert_eq!(s.sync, s.track_index == 1 || n % GOP == 0);
+        assert_eq!(
+            (file[at], s.offset()),
+            (letter, want),
+            "sample {n} of track {}",
+            s.track_index()
+        );
+        assert_eq!(s.sync(), s.track_index() == 1 || n % GOP == 0);
     }
 }
 

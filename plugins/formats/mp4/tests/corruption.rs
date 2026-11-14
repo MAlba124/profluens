@@ -298,11 +298,11 @@ fn pristine<'a>(bases: &'a [Base], name: &str) -> &'a [u8] {
     bases.iter().find(|b| b.name == name).map_or(&bases[0].data, |b| &b.data)
 }
 
-/// Densest table is `stz2` at two samples an octet, 32 octets each in the index plus merge and
+/// Densest table is `stz2` at two samples an octet, 24 octets each in the index plus merge and
 /// sort.
 const RESOLVE_HEAP_PER_BYTE: usize = 256;
-/// A run-length table costs the file an octet a sample, 32 index octets each.
-const RESOLVE_INDEX_PER_FILE_OCTET: usize = 32;
+/// A run-length table costs the file an octet a sample, 24 index octets each.
+const RESOLVE_INDEX_PER_FILE_OCTET: usize = 24;
 const RESOLVE_HEAP_PER_SAMPLE: usize = 128;
 const RESOLVE_HEAP_SLACK: usize = 16 << 10;
 
@@ -839,7 +839,7 @@ fn run_length_tables_describing_four_billion_samples_are_refused() {
     assert!(heap_growth(mark) < 4096);
 }
 
-/// 76 octets of run-length tables declare `MAX_SAMPLES` one octet samples, a 512 MiB index
+/// 76 octets of run-length tables declare `MAX_SAMPLES` one octet samples, a 384 MiB index
 /// once folded. Held to the file length, the index takes only the samples the file holds.
 #[test]
 fn a_tiny_table_declaring_max_samples_commits_only_what_the_file_holds() {
@@ -861,7 +861,7 @@ fn a_tiny_table_declaring_max_samples_commits_only_what_the_file_holds() {
     let start = std::time::Instant::now();
     let reader = Mp4Reader::bounded(&head, &[], known).expect("the samples in the file resolve");
     assert_eq!(reader.samples().len(), FILE, "the samples past the end are left out");
-    assert_eq!(reader.tables().index_bytes(), 32 * FILE);
+    assert_eq!(reader.tables().index_bytes(), size_of::<pf_mp4::Sample>() * FILE);
     assert!(heap_growth(mark) < 4096, "{} heap octets", heap_growth(mark));
     // The tail past the end is stepped over a run at a time, not a sample at a time.
     assert!(start.elapsed() < std::time::Duration::from_secs(1), "{:?}", start.elapsed());

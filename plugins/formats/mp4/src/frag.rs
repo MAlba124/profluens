@@ -372,15 +372,9 @@ pub fn expand(
                 if out.len() >= room {
                     return Err(Mp4Error::TooManySamples { limit: room });
                 }
-                out.push(Sample {
-                    track_index: index as u16,
-                    offset,
-                    size,
-                    dts: stamp(raw),
-                    pts: stamp(raw + i128::from(row.offset)),
-                    sync: flags & NON_SYNC == 0,
-                    hidden: false,
-                });
+                let pts = stamp(raw + i128::from(row.offset));
+                let sync = flags & NON_SYNC == 0;
+                out.push(Sample::new(index as u16, offset, size, stamp(raw), pts, sync)?);
                 offset = end;
             }
         }

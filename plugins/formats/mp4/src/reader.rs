@@ -37,8 +37,8 @@ pub enum Mp4Error {
 }
 
 /// The most samples one file may describe, about 24 h of 60 fps video and two AAC tracks.
-/// Run-length tables let a tiny head declare billions. At this limit the 32 octet per-sample
-/// index is 512 MiB, so an embedder that knows the file length passes it in [`Limits`].
+/// Run-length tables let a tiny head declare billions. At this limit the 24 octet per-sample
+/// index is 384 MiB, so an embedder that knows the file length passes it in [`Limits`].
 pub const MAX_SAMPLES: usize = 1 << 24;
 
 /// What one reader may commit to its sample index, across all its tracks.
@@ -111,28 +111,114 @@ impl From<BoxError> for Mp4Error {
     }
 }
 
-/// 32 octets, the index costs that per sample.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// 24 octets, the index costs that per sample.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Sample {
-    /// Below [`MAX_TRACKS`].
-    pub track_index: u16,
-    pub offset: u64,
-    pub size: u32,
-    /// Decode time in media ticks, moved by the edit list. Signed, an edit that trims the
-    /// composition lead makes the first DTS negative (the ffmpeg convention).
-    pub dts: i64,
-    /// Presentation time in media ticks on the edit list's timeline. Signed.
-    pub pts: i64,
-    pub sync: bool,
-    /// Needed by referring samples but left out by the edit list. Leaves as `DECODE_ONLY`.
-    pub hidden: bool,
+    /// The file offset above the track index in the low octet, a track index is below
+    /// [`MAX_TRACKS`]. Ascending is file order, then track.
+    place: u64,
+    dts: i64,
+    /// `pts - dts`, the composition offset.
+    cts: i32,
+    /// The size in the low 30 bits, sync and hidden above.
+    size_flags: u32,
 }
 
-const _: () = assert!(size_of::<Sample>() == 32);
+const _: () = assert!(size_of::<Sample>() == 24);
+const _: () = assert!(MAX_TRACKS <= 1 << Sample::TRACK_BITS);
 
 impl Sample {
+    const TRACK_BITS: u32 = 8;
+    /// The sizes held, as FFmpeg's index entry holds them.
+    pub const MAX_SIZE: u32 = (1 << 30) - 1;
+    /// The offsets held.
+    pub const MAX_OFFSET: u64 = (1 << (64 - Self::TRACK_BITS)) - 1;
+    const SYNC: u32 = 1 << 30;
+    const HIDDEN: u32 = 1 << 31;
+
+    /// A sample of track `track_index`, below [`MAX_TRACKS`], its times in media ticks.
+    /// Refused past [`Sample::MAX_SIZE`] or [`Sample::MAX_OFFSET`], and with times further
+    /// apart than a composition offset states.
+    pub fn new(
+        track_index: u16,
+        offset: u64,
+        size: u32,
+        dts: i64,
+        pts: i64,
+        sync: bool,
+    ) -> Result<Sample, Mp4Error> {
+        if size > Self::MAX_SIZE {
+            return Err(Mp4Error::Inconsistent("a sample of 1 GiB or more"));
+        }
+        if offset > Self::MAX_OFFSET {
+            return Err(Mp4Error::Inconsistent("a sample offset past 2^56"));
+        }
+        if usize::from(track_index) >= MAX_TRACKS {
+            return Err(Mp4Error::Inconsistent("a sample of a track past the most resolved"));
+        }
+        let cts = pts.checked_sub(dts).and_then(|by| i32::try_from(by).ok());
+        let cts = cts.ok_or(Mp4Error::Inconsistent("a composition offset past 32 bits"))?;
+        let place = offset << Self::TRACK_BITS | u64::from(track_index);
+        Ok(Sample { place, dts, cts, size_flags: size | if sync { Self::SYNC } else { 0 } })
+    }
+
     pub fn track(&self) -> usize {
-        usize::from(self.track_index)
+        (self.place & ((1 << Self::TRACK_BITS) - 1)) as usize
+    }
+
+    pub fn track_index(&self) -> u16 {
+        self.track() as u16
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.place >> Self::TRACK_BITS
+    }
+
+    pub fn size(&self) -> u32 {
+        self.size_flags & Self::MAX_SIZE
+    }
+
+    /// Decode time in media ticks, moved by the edit list. Signed, an edit that trims the
+    /// composition lead makes the first DTS negative (the ffmpeg convention).
+    pub fn dts(&self) -> i64 {
+        self.dts
+    }
+
+    /// Presentation time in media ticks on the edit list's timeline. Signed.
+    pub fn pts(&self) -> i64 {
+        self.dts.saturating_add(i64::from(self.cts))
+    }
+
+    pub fn sync(&self) -> bool {
+        self.size_flags & Self::SYNC != 0
+    }
+
+    /// Needed by referring samples but left out by the edit list. Leaves as `DECODE_ONLY`.
+    pub fn hidden(&self) -> bool {
+        self.size_flags & Self::HIDDEN != 0
+    }
+
+    pub(crate) fn hide(&mut self) {
+        self.size_flags |= Self::HIDDEN;
+    }
+
+    /// Presents at `pts`, the decode time moved as far.
+    pub(crate) fn present_at(&mut self, pts: i64) {
+        self.dts = self.dts.saturating_add(pts.saturating_sub(self.pts()));
+    }
+}
+
+impl std::fmt::Debug for Sample {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sample")
+            .field("track_index", &self.track_index())
+            .field("offset", &self.offset())
+            .field("size", &self.size())
+            .field("dts", &self.dts())
+            .field("pts", &self.pts())
+            .field("sync", &self.sync())
+            .field("hidden", &self.hidden())
+            .finish()
     }
 }
 
@@ -462,7 +548,7 @@ impl Tables {
         let mut ring = vec![0u64; k];
         let (mut at, mut sum, mut peak, mut largest) = (0usize, 0u64, 0u64, 0u64);
         for s in self.samples.iter().filter(|s| s.track() == track) {
-            let size = u64::from(s.size);
+            let size = u64::from(s.size());
             sum = sum - ring[at] + size;
             ring[at] = size;
             at = (at + 1) % k;
@@ -482,7 +568,8 @@ impl Tables {
     }
 
     pub fn most_within(&self, track: usize, bytes: u64) -> u32 {
-        let mut of = self.samples.iter().filter(|s| s.track() == track).map(|s| u64::from(s.size));
+        let mut of =
+            self.samples.iter().filter(|s| s.track() == track).map(|s| u64::from(s.size()));
         let mut behind = of.clone();
         let (mut sum, mut n, mut most) = (0u64, 0u32, 0u32);
         for size in of.by_ref() {
@@ -526,10 +613,10 @@ impl Tables {
         let bound = ticks_at_or_before(point, rule.timescale);
         let mut up = None;
         for s in self.samples.iter().filter(|s| s.track() == track) {
-            if s.pts.saturating_add(rule.delay_ticks).max(0) > bound {
-                return up.or(Some(s.offset));
+            if s.pts().saturating_add(rule.delay_ticks).max(0) > bound {
+                return up.or(Some(s.offset()));
             }
-            up = self.caption_up(track, point, s.pts).then_some(s.offset);
+            up = self.caption_up(track, point, s.pts()).then_some(s.offset());
         }
         up
     }
@@ -663,19 +750,20 @@ impl Tables {
                 ..Index::default()
             };
         }
-        let keys =
-            |(i, s): &(usize, &Sample)| s.track() == track && s.sync && !false_key(false_keys, *i);
+        let keys = |(i, s): &(usize, &Sample)| {
+            s.track() == track && s.sync() && !false_key(false_keys, *i)
+        };
         let stride =
             self.samples.iter().enumerate().filter(keys).count().div_ceil(MAX_INDEX_ENTRIES).max(1);
         let cursors = vec![Swept::default(); self.tracks.len()];
         let mut sweep = Sweep { tables: self, cursors, false_keys };
         for (_, s) in self.samples.iter().enumerate().filter(keys).step_by(stride) {
-            let time_ns = self.tracks[track].stamp_ns(s.pts);
-            if ascends(&entries, time_ns, s.offset) {
+            let time_ns = self.tracks[track].stamp_ns(s.pts());
+            if ascends(&entries, time_ns, s.offset()) {
                 let r = sweep.restart(time_ns, on);
                 entries.push(IndexEntry {
                     time_ns,
-                    byte: s.offset,
+                    byte: s.offset(),
                     restart: r.to_byte,
                     restart_ns: r.at_ns,
                 });
@@ -706,12 +794,12 @@ impl Tables {
             let own = self.samples.iter().filter(|s| s.track() == i);
             let first = captions.len();
             for s in own {
-                let time_ns = t.stamp_ns(s.pts);
+                let time_ns = t.stamp_ns(s.pts());
                 let end_ns = time_ns.saturating_add(CAPTION_REACH_NS);
                 if let Some(last) = captions.get_mut(first..).and_then(<[Caption]>::last_mut) {
                     last.end_ns = time_ns.max(last.time_ns);
                 }
-                captions.push(Caption { stream: i as u32, time_ns, end_ns, byte: s.offset });
+                captions.push(Caption { stream: i as u32, time_ns, end_ns, byte: s.offset() });
             }
         }
         captions.sort_unstable_by_key(|c| c.time_ns);
@@ -725,9 +813,9 @@ impl Tables {
         let mut gates = [0u64; MAX_TRACKS];
         self.gates(Some(point), point, 0, on, &[], &mut gates);
         let to_byte = gates.get(track).copied().unwrap_or(0);
-        let at = self.samples.partition_point(|s| s.offset < to_byte);
+        let at = self.samples.partition_point(|s| s.offset() < to_byte);
         let sample = self.samples[at..].iter().find(|s| s.track() == track);
-        let stamp = sample.zip(self.tracks.get(track)).map(|(s, t)| t.stamp_ns(s.pts));
+        let stamp = sample.zip(self.tracks.get(track)).map(|(s, t)| t.stamp_ns(s.pts()));
         Restart { to_byte, at_ns: stamp.unwrap_or(point) }
     }
 
@@ -757,22 +845,22 @@ impl Tables {
             (pick.bound, pick.done) = (ticks_at_or_before(bound_ns, rule.timescale), false);
             open += 1;
         }
-        let from = self.samples.partition_point(|s| s.offset < floor);
+        let from = self.samples.partition_point(|s| s.offset() < floor);
         for (i, s) in self.samples[from..].iter().enumerate() {
             if open == 0 {
                 break;
             }
             let (pick, rule) = (&mut picks[s.track()], &self.rules[s.track()]);
-            let key = s.sync && !false_key(false_keys, from + i);
+            let key = s.sync() && !false_key(false_keys, from + i);
             if pick.done || (rule.kind == TrackKind::Video && !key) {
                 continue;
             }
             if pick.first == NONE {
-                pick.first = (s.offset, s.pts);
+                pick.first = (s.offset(), s.pts());
             }
             // A stamp before zero is stamped zero.
-            if s.pts.saturating_add(rule.delay_ticks).max(0) <= pick.bound {
-                pick.best = (s.offset, s.pts);
+            if s.pts().saturating_add(rule.delay_ticks).max(0) <= pick.bound {
+                pick.best = (s.offset(), s.pts());
             } else {
                 pick.done = true;
                 open -= 1;
@@ -834,17 +922,17 @@ impl Sweep<'_> {
             };
             let bound = ticks_at_or_before(bound_ns, rule.timescale);
             while let Some(s) = tables.samples.get(cursor.at) {
-                let key = s.sync && !false_key(self.false_keys, cursor.at);
+                let key = s.sync() && !false_key(self.false_keys, cursor.at);
                 if s.track() != i || (rule.kind == TrackKind::Video && !key) {
                     cursor.at += 1;
                     continue;
                 }
-                cursor.first.get_or_insert((s.offset, s.pts));
+                cursor.first.get_or_insert((s.offset(), s.pts()));
                 // A stamp before zero is stamped zero.
-                if s.pts.saturating_add(rule.delay_ticks).max(0) > bound {
+                if s.pts().saturating_add(rule.delay_ticks).max(0) > bound {
                     break;
                 }
-                cursor.best = Some((s.offset, s.pts));
+                cursor.best = Some((s.offset(), s.pts()));
                 cursor.at += 1;
             }
             // A caption is up from its sample on, a later one is not
@@ -1073,11 +1161,11 @@ impl Mp4Reader {
         let video = self.tables.rules.get(track).is_some_and(|rule| rule.kind == TrackKind::Video);
         let (at, keys) = (self.next, &self.false_keys);
         let next = |(i, s): &(usize, &Sample)| {
-            s.track() == track && ((s.sync && !false_key(keys, at + i)) || !video)
+            s.track() == track && ((s.sync() && !false_key(keys, at + i)) || !video)
         };
         let rest = self.tables.samples.get(at..).unwrap_or_default();
         let from = rest.iter().enumerate().find(next).map(|(_, s)| s);
-        self.gates[track] = if on { from.map_or(SHUT, |s| s.offset) } else { SHUT };
+        self.gates[track] = if on { from.map_or(SHUT, |s| s.offset()) } else { SHUT };
     }
 
     /// `track`'s next sample out is read for a random access point, where its samples can say.
@@ -1124,7 +1212,7 @@ impl Mp4Reader {
             (self.buffered, self.stream_base) = (0, to_byte);
             return;
         }
-        let resume = self.tables.samples.get(self.next).map_or(SHUT, |s| s.offset);
+        let resume = self.tables.samples.get(self.next).map_or(SHUT, |s| s.offset());
         self.gates.iter_mut().for_each(|gate| *gate = (*gate).max(resume));
         let mut fresh = [0u64; MAX_TRACKS];
         let off = self.off;
@@ -1135,7 +1223,7 @@ impl Mp4Reader {
         self.chunks.clear();
         self.buffered = 0;
         self.stream_base = to_byte;
-        self.next = self.tables.samples.partition_point(|s| s.offset < to_byte);
+        self.next = self.tables.samples.partition_point(|s| s.offset() < to_byte);
     }
 
     /// Caption track `track`, rejoined, reads from its sample up at `point` where that lies
@@ -1148,7 +1236,7 @@ impl Mp4Reader {
         let Some(from) = self.tables.caption_from(track, point) else { return };
         if from < self.gates[track] {
             self.gates[track] = from;
-            self.next = self.next.min(self.tables.samples.partition_point(|s| s.offset < from));
+            self.next = self.next.min(self.tables.samples.partition_point(|s| s.offset() < from));
         }
     }
 
@@ -1185,7 +1273,7 @@ impl Mp4Reader {
         for (gate, off) in self.gates.iter_mut().zip(self.off) {
             *gate = if off { SHUT } else { *gate };
         }
-        self.next = self.tables.samples.partition_point(|s| s.offset < restart.to_byte);
+        self.next = self.tables.samples.partition_point(|s| s.offset() < restart.to_byte);
         restart
     }
 
@@ -1273,7 +1361,7 @@ impl Mp4Reader {
             return self.next_fragment_sample();
         }
         let samples = &self.tables.samples;
-        while samples.get(self.next).is_some_and(|s| s.offset < self.gates[s.track()]) {
+        while samples.get(self.next).is_some_and(|s| s.offset() < self.gates[s.track()]) {
             self.next += 1;
         }
         let Some(s) = samples.get(self.next).copied() else {
@@ -1350,13 +1438,13 @@ impl Mp4Reader {
         };
         let keys = &self.false_keys;
         let earlier = samples.get(..from).unwrap_or_default().iter().enumerate().rev();
-        let mut keyed = earlier.filter(|(_, s)| s.track() == track && s.sync);
+        let mut keyed = earlier.filter(|(_, s)| s.track() == track && s.sync());
         let Some((at, s)) = keyed.find(|(i, _)| !false_key(keys, *i)) else {
             return false;
         };
-        let past = cur.offset.saturating_add(1);
+        let past = cur.offset().saturating_add(1);
         self.gates.iter_mut().for_each(|gate| *gate = (*gate).max(past));
-        (self.gates[track], self.next) = (s.offset, at);
+        (self.gates[track], self.next) = (s.offset(), at);
         true
     }
 
@@ -1375,7 +1463,7 @@ impl Mp4Reader {
             return None;
         }
         let samples = &self.tables.samples;
-        while samples.get(self.next).is_some_and(|s| s.offset < self.gates[s.track()]) {
+        while samples.get(self.next).is_some_and(|s| s.offset() < self.gates[s.track()]) {
             self.next += 1;
         }
         let s = *samples.get(self.next)?;
@@ -1446,23 +1534,23 @@ impl Mp4Reader {
     }
 
     fn slice(&mut self, s: Sample) -> Option<ResolvedSample> {
-        let start = s.offset;
-        let end = s.offset.checked_add(s.size as u64)?;
+        let start = s.offset();
+        let end = s.offset().checked_add(s.size() as u64)?;
         self.drop_before(start);
 
         if start < self.stream_base || end > self.stream_base + self.buffered {
             self.gather_from(start);
             return None;
         }
-        if s.size == 0 {
+        if s.size() == 0 {
             // Zero-length sample. `Vec::new()` does not allocate.
             #[allow(clippy::disallowed_methods)]
             return Some(ResolvedSample {
                 track_index: s.track(),
-                pts: s.pts,
+                pts: s.pts(),
                 dts: s.dts,
-                sync: s.sync,
-                hidden: s.hidden,
+                sync: s.sync(),
+                hidden: s.hidden(),
                 span: None,
                 payload: SamplePayload::Copied(Vec::new()),
             });
@@ -1480,7 +1568,7 @@ impl Mp4Reader {
         }
         let rel = (start - base) as usize;
         let sliced = match &self.chunks[idx] {
-            Chunk::Retained(m) => m.slice(rel, s.size as usize),
+            Chunk::Retained(m) => m.slice(rel, s.size() as usize),
             Chunk::Owned(_) => None,
         };
         let payload = match sliced {
@@ -1488,7 +1576,7 @@ impl Mp4Reader {
             None => {
                 // Cold path, only for a sample crossing retained chunk bounds.
                 #[allow(clippy::disallowed_methods)]
-                let mut v = Vec::with_capacity(s.size as usize);
+                let mut v = Vec::with_capacity(s.size() as usize);
                 let (mut at, mut cbase, mut i) = (start, base, idx);
                 while at < end {
                     let c = &self.chunks[i];
@@ -1504,10 +1592,10 @@ impl Mp4Reader {
         };
         Some(ResolvedSample {
             track_index: s.track(),
-            pts: s.pts,
+            pts: s.pts(),
             dts: s.dts,
-            sync: s.sync,
-            hidden: s.hidden,
+            sync: s.sync(),
+            hidden: s.hidden(),
             span: None,
             payload,
         })
@@ -1535,7 +1623,7 @@ impl Mp4Reader {
                                     .get(s.track())
                                     .map(|n| (*n).min(i64::MAX as u64) as i64 - media_time);
                                 sample.span =
-                                    span_in(&walk.run, walk.next).or(end.map(|e| e - s.pts));
+                                    span_in(&walk.run, walk.next).or(end.map(|e| e - s.pts()));
                             }
                             walk.next += 1;
                             return Some(sample);
@@ -1651,19 +1739,20 @@ impl Mp4Reader {
             }
             walk.gate(&tables.rules);
         } else {
-            walk.run
-                .retain(|s| s.offset >= body && s.offset.saturating_add(u64::from(s.size)) <= end);
+            walk.run.retain(|s| {
+                s.offset() >= body && s.offset().saturating_add(u64::from(s.size())) <= end
+            });
         }
         // Disjoint offsets, so an unstable sort loses nothing and allocates nothing.
-        walk.run.sort_unstable_by_key(|s| s.offset);
+        walk.run.sort_unstable_by_key(|s| s.offset());
         let mut covered = body;
         for s in &walk.run {
-            if s.offset < covered {
+            if s.offset() < covered {
                 walk.error.get_or_insert(Mp4Error::Inconsistent("samples overlap in the fragment"));
                 walk.run.clear();
                 break;
             }
-            covered = s.offset + u64::from(s.size);
+            covered = s.offset() + u64::from(s.size());
         }
     }
 
@@ -1759,8 +1848,8 @@ pub(crate) fn ticks_to_ns(ticks: i64, timescale: u32) -> u64 {
 
 fn span_in(samples: &[Sample], at: usize) -> Option<i64> {
     let s = samples.get(at)?;
-    let next = samples.get(at + 1..)?.iter().find(|n| n.track_index == s.track_index)?;
-    Some(next.pts.saturating_sub(s.pts))
+    let next = samples.get(at + 1..)?.iter().find(|n| n.track_index() == s.track_index())?;
+    Some(next.pts().saturating_sub(s.pts()))
 }
 
 fn find_moov(head: &[u8]) -> Result<Option<BoxHeader>, BoxError> {
@@ -1863,11 +1952,11 @@ fn resolve_moov(moov_body: &[u8], limits: Option<Limits>) -> Result<Movie, Mp4Er
     // Samples must be disjoint byte ranges. Overlapping ones would emit the same bytes per
     // sample, an output unbounded by the input. Empty samples are exempt.
     let mut covered = 0u64;
-    for s in samples.iter().filter(|s| s.size != 0) {
-        if s.offset < covered {
+    for s in samples.iter().filter(|s| s.size() != 0) {
+        if s.offset() < covered {
             return Err(Mp4Error::Inconsistent("samples overlap in the file"));
         }
-        covered = s.offset.saturating_add(s.size as u64);
+        covered = s.offset().saturating_add(s.size() as u64);
     }
 
     let Some(mvex) = mvex else {
@@ -1902,17 +1991,17 @@ fn resolve_moov(moov_body: &[u8], limits: Option<Limits>) -> Result<Movie, Mp4Er
 /// Past this many runs the index is sorted whole, the merge scans every run's head per stretch.
 const MERGE_RUNS: usize = 16;
 
-fn order_key(s: &Sample) -> (u64, u16, i64) {
-    (s.offset, s.track_index, s.dts)
+fn order_key(s: &Sample) -> (u64, i64) {
+    (s.place, s.dts)
 }
 
 /// [`order_key`] of the `n`th sample of a sorted run in one integer, the place in the run for
 /// the DTS, so the merge picks a head without a branch.
 fn packed_key(s: &Sample, n: usize) -> u128 {
-    u128::from(s.offset) << 64 | u128::from(s.track_index) << 48 | n as u128
+    u128::from(s.place) << 64 | n as u128
 }
 
-/// Above every [`packed_key`], a track index is below [`MAX_TRACKS`].
+/// Above every [`packed_key`], a run holds at most [`MAX_SAMPLES`].
 const DONE: u128 = u128::MAX;
 
 /// `samples` into file order from `runs`, the contiguous per track ranges that cover it in
@@ -2107,7 +2196,7 @@ impl Walk {
     /// The first byte of what the walk has not let out, the run is in file order.
     fn resume(&self) -> u64 {
         match self.step {
-            Step::Mdat { end } => self.run.get(self.next).map_or(end, |s| s.offset),
+            Step::Mdat { end } => self.run.get(self.next).map_or(end, |s| s.offset()),
             Step::Gather { start, .. } => start,
             Step::Box | Step::Lost => self.at,
         }
@@ -2132,7 +2221,7 @@ impl Walk {
             cut[track] = match *gate {
                 Gate::Open => 0,
                 Gate::Shut => usize::MAX,
-                Gate::NextSync => match of.clone().position(|s| s.sync || !video) {
+                Gate::NextSync => match of.clone().position(|s| s.sync() || !video) {
                     Some(n) => {
                         *gate = Gate::Open;
                         n
@@ -2144,9 +2233,9 @@ impl Walk {
                     let end =
                         self.next_dts.get(track).copied().unwrap_or(0).min(i64::MAX as u64) as i64;
                     let mut past = stamp(end.saturating_sub(rule.media_time)) > bound_ns;
-                    for (n, s) in of.enumerate().filter(|(_, s)| s.sync || !video) {
+                    for (n, s) in of.enumerate().filter(|(_, s)| s.sync() || !video) {
                         first.get_or_insert(n);
-                        match stamp(s.pts) <= bound_ns {
+                        match stamp(s.pts()) <= bound_ns {
                             true => best = Some(n),
                             false => past = true,
                         }
@@ -2161,7 +2250,7 @@ impl Walk {
                     }
                     from.unwrap_or(usize::MAX)
                 }
-                Gate::Past { byte } => match of.clone().position(|s| s.offset >= byte) {
+                Gate::Past { byte } => match of.clone().position(|s| s.offset() >= byte) {
                     Some(n) => {
                         *gate = Gate::Open;
                         n
@@ -2550,8 +2639,8 @@ fn fold_track(track_index: u16, s: &Stbl<'_>, out: &mut SampleIndex) -> Result<b
         None => {
             let shift = list.first_media();
             for sample in &mut out[from..] {
-                (sample.dts, sample.pts) =
-                    (sample.dts.saturating_sub(shift), sample.pts.saturating_sub(shift));
+                // the composition offset stays, so the presentation moves as far
+                sample.dts = sample.dts.saturating_sub(shift);
             }
             Ok(false)
         }
@@ -2664,15 +2753,7 @@ fn build_samples(
                     .ok_or(Mp4Error::Inconsistent("stts describes fewer samples than stsz"))?;
                 let dts = (dts_raw as i128 - media_time_shift as i128)
                     .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-                out.push(Sample {
-                    track_index,
-                    offset,
-                    size,
-                    dts,
-                    pts: dts,
-                    sync: true,
-                    hidden: false,
-                })?;
+                out.push(Sample::new(track_index, offset, size, dts, dts, true)?)?;
                 dts_raw = dts_raw
                     .checked_add(span)
                     .ok_or(Mp4Error::Inconsistent("cumulative dts overflow"))?;
@@ -2710,7 +2791,7 @@ fn build_samples(
 
             let sync = sync_lookup.is_sync(sample_no);
 
-            out.push(Sample { track_index, offset, size, dts, pts, sync, hidden: false })?;
+            out.push(Sample::new(track_index, offset, size, dts, pts, sync)?)?;
 
             dts_raw = dts_raw
                 .checked_add(delta as u64)
@@ -2981,11 +3062,14 @@ mod tests {
         build_samples(0, 4, &sizes, &stts, &ctts, &stsc, &chunk_offsets, None, 0, 0, &mut out)
             .unwrap();
         assert_eq!(out.len(), 4);
-        assert_eq!((out[0].offset, out[0].size, out[0].dts, out[0].pts), (1000, 10, 0, 0));
-        assert_eq!((out[1].offset, out[1].size, out[1].dts, out[1].pts), (1010, 20, 512, 512));
-        assert_eq!((out[2].offset, out[2].size, out[2].dts), (5000, 30, 1024));
-        assert_eq!((out[3].offset, out[3].size, out[3].dts), (5030, 40, 1536));
-        assert!(out.iter().all(|s| s.sync));
+        assert_eq!((out[0].offset(), out[0].size(), out[0].dts, out[0].pts()), (1000, 10, 0, 0));
+        assert_eq!(
+            (out[1].offset(), out[1].size(), out[1].dts, out[1].pts()),
+            (1010, 20, 512, 512)
+        );
+        assert_eq!((out[2].offset(), out[2].size(), out[2].dts), (5000, 30, 1024));
+        assert_eq!((out[3].offset(), out[3].size(), out[3].dts), (5030, 40, 1536));
+        assert!(out.iter().all(|s| s.sync()));
     }
 
     #[test]
@@ -3000,9 +3084,9 @@ mod tests {
         build_samples(0, 3, &sizes, &stts, &ctts, &stsc, &chunk_offsets, None, 200, 0, &mut out)
             .unwrap();
         // dts_raw 0, dts -200, pts 0+200-200 = 0.
-        assert_eq!((out[0].dts, out[0].pts), (-200, 0));
-        assert_eq!((out[1].dts, out[1].pts), (-100, -100));
-        assert_eq!((out[2].dts, out[2].pts), (0, 0));
+        assert_eq!((out[0].dts, out[0].pts()), (-200, 0));
+        assert_eq!((out[1].dts, out[1].pts()), (-100, -100));
+        assert_eq!((out[2].dts, out[2].pts()), (0, 0));
     }
 
     #[test]
@@ -3067,8 +3151,8 @@ mod tests {
         let mut out = SampleIndex::reserve(4).unwrap();
         build_samples(0, 2, &a, &stts, &[], &stsc, &[100], None, 0, 0, &mut out).unwrap();
         build_samples(1, 2, &b, &stts, &[], &stsc, &[0], None, 0, 0, &mut out).unwrap();
-        out.sort_by_key(|s| s.offset);
-        let order: Vec<_> = out.iter().map(|s| (s.track_index, s.offset)).collect();
+        out.sort_by_key(|s| s.offset());
+        let order: Vec<_> = out.iter().map(|s| (s.track_index(), s.offset())).collect();
         assert_eq!(order, [(1, 0), (1, 8), (0, 100), (0, 104)]);
         let mut none = SampleIndex::reserve(0).unwrap();
         assert!(none.is_empty());
@@ -3122,7 +3206,7 @@ mod tests {
             .unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(8), "walked per frame");
         assert_eq!(out.len(), groups);
-        assert_eq!((out[0].offset, out[0].size, out[0].dts), (64, 2048, 0));
+        assert_eq!((out[0].offset(), out[0].size(), out[0].dts), (64, 2048, 0));
         assert_eq!(out[1].dts, 1024);
         let last = out[groups - 1];
         assert_eq!(last.dts, i64::from(FRAMES / 2) + i64::from(FRAMES / 2 - 1024) * 3);
@@ -3157,7 +3241,7 @@ mod tests {
         out.room = Room::of(Some(50));
         build_samples(0, 12, &sizes, &stts, &ctts, &stsc, &[0, 49, 10], None, 0, 0, &mut out)
             .unwrap();
-        let got: Vec<_> = out.iter().map(|s| (s.offset, s.dts, s.pts)).collect();
+        let got: Vec<_> = out.iter().map(|s| (s.offset(), s.dts, s.pts())).collect();
         let want = [(0, 0, 0), (2, 1, 1), (4, 2, 2), (6, 3, 3)];
         let tail = [(10, 8, 17), (12, 9, 18), (14, 10, 19), (16, 11, 20)];
         assert_eq!(got, [&want[..], &tail[..]].concat());
@@ -3189,16 +3273,9 @@ mod tests {
             let mut chunk = Vec::new();
             for _ in 0..1 + next(20) {
                 let size = next(4) as u32 * next(3000) as u32;
-                let s = Sample {
-                    track_index: t as u16,
-                    offset,
-                    size,
-                    dts: dts[t],
-                    pts: dts[t] + 2,
-                    sync: next(10) == 0,
-                    hidden: false,
-                };
-                chunk.push(s);
+                let sync = next(10) == 0;
+                let s = Sample::new(t as u16, offset, size, dts[t], dts[t] + 2, sync);
+                chunk.push(s.expect("a sample"));
                 (offset, dts[t]) = (offset + u64::from(size), dts[t] + 1 + next(3) as i64);
             }
             per[t].push(chunk);
@@ -3219,7 +3296,7 @@ mod tests {
         let mut runs: Vec<Range<usize>> = Vec::new();
         for (i, s) in samples.iter().enumerate() {
             match runs.last_mut() {
-                Some(r) if samples[r.start].track_index == s.track_index => r.end = i + 1,
+                Some(r) if samples[r.start].track_index() == s.track_index() => r.end = i + 1,
                 _ => runs.push(i..i + 1),
             }
         }
@@ -3242,7 +3319,7 @@ mod tests {
             for seed in [1, 7, 0x9E37_79B9] {
                 let mut got = interleaved(tracks, chunks, seed, shuffled);
                 let mut want = got.clone();
-                want.sort_unstable_by_key(|s| (s.offset, s.track_index, s.dts));
+                want.sort_unstable_by_key(|s| (s.offset(), s.track_index(), s.dts));
                 let runs = runs_of(&got);
                 merge_runs(&mut got, &runs);
                 assert!(got == want, "{tracks} tracks, {chunks} chunks, seed {seed}");
@@ -3250,5 +3327,95 @@ mod tests {
         }
         let mut empty: [Sample; 0] = [];
         merge_runs(&mut empty, &[]);
+    }
+
+    /// Every field a packed sample is made of reads back, at the ends of what it holds too.
+    #[test]
+    fn a_packed_sample_reads_back_what_it_was_made_of() {
+        let tracks = [0u16, 1, 7, (MAX_TRACKS - 1) as u16];
+        let offsets = [0u64, 1, 4096, u64::from(u32::MAX) + 9, Sample::MAX_OFFSET];
+        let sizes = [0u32, 1, 1500, Sample::MAX_SIZE];
+        let times = [i64::MIN + (1 << 32), -3, 0, 90_000, i64::MAX - (1 << 32)];
+        let offs = [i64::from(i32::MIN), -1001, 0, 2, i64::from(i32::MAX)];
+        let mut n = 0u32;
+        for (&track, &offset) in tracks.iter().flat_map(|t| offsets.iter().map(move |o| (t, o))) {
+            for (&size, &dts) in sizes.iter().flat_map(|s| times.iter().map(move |t| (s, t))) {
+                for &cts in &offs {
+                    n += 1;
+                    let (pts, sync) = (dts + cts, n.is_multiple_of(3));
+                    let mut s = Sample::new(track, offset, size, dts, pts, sync).expect("held");
+                    let read = |s: &Sample| {
+                        (s.track_index(), s.track(), s.offset(), s.size(), s.dts(), s.pts())
+                    };
+                    assert_eq!(read(&s), (track, usize::from(track), offset, size, dts, pts));
+                    assert_eq!((s.sync(), s.hidden()), (sync, false));
+                    s.hide();
+                    assert_eq!((read(&s), s.sync(), s.hidden()), (read(&s), sync, true));
+                    s.present_at(pts - 40);
+                    assert_eq!((s.dts(), s.pts(), s.size()), (dts - 40, pts - 40, size));
+                    assert!(s.hidden() && s.sync() == sync && s.offset() == offset);
+                }
+            }
+        }
+    }
+
+    /// File order is the offset, then the track, then the decode time, as the fields compared.
+    #[test]
+    fn packed_samples_order_as_their_fields() {
+        let of = |offset: u64, track: u16, dts: i64| {
+            Sample::new(track, offset, 0, dts, dts, true).expect("held")
+        };
+        let rows = [(0, 255, 9), (1, 0, -5), (1, 0, 3), (1, 1, -9), (2, 0, 0), (1 << 40, 3, 1)];
+        let mut samples: Vec<Sample> = rows.iter().rev().map(|&(o, t, d)| of(o, t, d)).collect();
+        samples.sort_unstable_by_key(order_key);
+        let got: Vec<_> = samples.iter().map(|s| (s.offset(), s.track_index(), s.dts())).collect();
+        assert_eq!(got, rows);
+        assert!(packed_key(&of(1, 0, 0), usize::MAX >> 1) < packed_key(&of(1, 1, 0), 0));
+        assert!(packed_key(&of(Sample::MAX_OFFSET, 255, 0), MAX_SAMPLES) < DONE);
+    }
+
+    #[test]
+    fn a_sample_past_what_the_index_holds_is_refused() {
+        let refused = |s: Result<Sample, Mp4Error>| matches!(s, Err(Mp4Error::Inconsistent(_)));
+        assert!(refused(Sample::new(0, 0, 1 << 30, 0, 0, true)), "1 GiB");
+        assert!(refused(Sample::new(0, 0, u32::MAX, 0, 0, true)));
+        assert!(refused(Sample::new(0, 1 << 56, 1, 0, 0, true)), "an offset past 2^56");
+        assert!(refused(Sample::new(MAX_TRACKS as u16, 0, 1, 0, 0, true)));
+        assert!(refused(Sample::new(0, 0, 1, 0, i64::from(i32::MAX) + 1, true)), "past i32");
+        assert!(refused(Sample::new(0, 0, 1, 0, i64::from(i32::MIN) - 1, true)));
+        assert!(refused(Sample::new(0, 0, 1, i64::MIN, i64::MAX, true)), "the offset overflows");
+        // the fold refuses the movie
+        let sizes = SampleSizes::Table(vec![4, 1 << 30]);
+        let stts = [SttsEntry { count: 2, delta: 1 }];
+        let stsc =
+            [StscEntry { first_chunk: 1, samples_per_chunk: 2, sample_description_index: 1 }];
+        let mut out = SampleIndex::reserve(2).unwrap();
+        let got = build_samples(0, 2, &sizes, &stts, &[], &stsc, &[64], None, 0, 0, &mut out);
+        assert!(matches!(got, Err(Mp4Error::Inconsistent(_))), "{got:?}");
+        let sizes = SampleSizes::Table(vec![4, 4]);
+        let mut out = SampleIndex::reserve(2).unwrap();
+        let far = [(1 << 56) - 4];
+        let got = build_samples(0, 2, &sizes, &stts, &[], &stsc, &far, None, 0, 0, &mut out);
+        assert!(matches!(got, Err(Mp4Error::Inconsistent(_))), "{got:?}");
+        assert_eq!(out.len(), 1, "the one below 2^56 was held");
+    }
+
+    /// A composition offset is 32 bits in either version of the box, so every one is held.
+    #[test]
+    fn the_widest_composition_offsets_are_held() {
+        let sizes = SampleSizes::Constant { sample_size: 2, sample_count: 3 };
+        let stts = [SttsEntry { count: 3, delta: 10 }];
+        let ctts = [
+            CttsEntry { count: 1, offset: i64::from(i32::MAX) },
+            CttsEntry { count: 1, offset: i64::from(i32::MIN) },
+            CttsEntry { count: 1, offset: 7 },
+        ];
+        let stsc =
+            [StscEntry { first_chunk: 1, samples_per_chunk: 3, sample_description_index: 1 }];
+        let mut out = SampleIndex::reserve(3).unwrap();
+        build_samples(0, 3, &sizes, &stts, &ctts, &stsc, &[0], None, 5, 0, &mut out).unwrap();
+        let got: Vec<_> = out.iter().map(|s| (s.dts(), s.pts())).collect();
+        let want = [(-5, i64::from(i32::MAX) - 5), (5, i64::from(i32::MIN) + 5), (15, 22)];
+        assert_eq!(got, want);
     }
 }

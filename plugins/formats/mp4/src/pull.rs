@@ -48,7 +48,7 @@ impl Plan {
     }
 
     pub(crate) fn push(&mut self, index: usize, sample: Sample, at: u32) {
-        let state = if sample.size == 0 { State::Empty } else { State::Waiting };
+        let state = if sample.size() == 0 { State::Empty } else { State::Waiting };
         self.items.push_back(Planned { index, sample, tag: self.next_tag, at, last_of: 0, state });
     }
 
@@ -82,15 +82,15 @@ impl Plan {
         let Some(last) = count.checked_sub(1).map(|k| &self.items[from + k]) else {
             return Ok(());
         };
-        let (want, got) = (last.at + last.sample.size, buf.len() as u32);
-        let offset = self.items[from].sample.offset;
+        let (want, got) = (last.at + last.sample.size(), buf.len() as u32);
+        let offset = self.items[from].sample.offset();
         if count == 1 && got == want {
             self.items[from].state = State::Ready(buf, true);
             return Ok(());
         }
-        for p in self.items.range_mut(from..from + count).filter(|p| p.sample.size > 0) {
-            let end = p.at as usize + p.sample.size as usize;
-            p.state = match buf.slice(p.at as usize, p.sample.size as usize) {
+        for p in self.items.range_mut(from..from + count).filter(|p| p.sample.size() > 0) {
+            let end = p.at as usize + p.sample.size() as usize;
+            p.state = match buf.slice(p.at as usize, p.sample.size() as usize) {
                 Some(view) if end <= got as usize => State::Ready(view, false),
                 _ => State::Dropped,
             };
@@ -121,7 +121,7 @@ mod tests {
     use profluens_core::memory::Pool;
 
     fn sample(offset: u64, size: u32) -> Sample {
-        Sample { track_index: 0, offset, size, dts: 0, pts: 0, sync: true, hidden: false }
+        Sample::new(0, offset, size, 0, 0, true).expect("a sample")
     }
 
     fn filled(pool: &Pool, bytes: &[u8]) -> Memory {

@@ -264,11 +264,11 @@ impl Video {
     }
 
     fn ns(&self, s: &Sample) -> u64 {
-        self.tables.tracks()[s.track()].stamp_ns(s.pts)
+        self.tables.tracks()[s.track()].stamp_ns(s.pts())
     }
 
     fn rap(&self, file: &[u8], s: &Sample) -> Option<bool> {
-        let data = &file[s.offset as usize..s.offset as usize + s.size as usize];
+        let data = &file[s.offset() as usize..s.offset() as usize + s.size() as usize];
         random_access(NalSyntax::Hevc, 4, data)
     }
 }
@@ -340,7 +340,7 @@ fn times(index: &Index) -> Vec<u64> {
 fn hevc_keys_come_from_the_nal_types_and_a_landing_on_a_false_one_steps_back() {
     let Some(clean) = hevc_open_gops() else { return };
     let v = Video::of(&clean);
-    let syncs: Vec<usize> = (0..v.samples.len()).filter(|&k| v.samples[k].1.sync).collect();
+    let syncs: Vec<usize> = (0..v.samples.len()).filter(|&k| v.samples[k].1.sync()).collect();
     assert!(syncs.len() >= 3, "{syncs:?}");
     for &k in &syncs {
         assert_eq!(v.rap(&clean, &v.samples[k].1), Some(true), "sample {} is an IRAP", k + 1);
@@ -351,7 +351,7 @@ fn hevc_keys_come_from_the_nal_types_and_a_landing_on_a_false_one_steps_back() {
     let file = with_sync(&clean, false_at as u32 + 1);
     let v = Video::of(&file);
     let (cra, fake) = (v.samples[syncs[1]].1, v.samples[false_at].1);
-    assert!(fake.sync, "the stss names it");
+    assert!(fake.sync(), "the stss names it");
     let (cra_ns, fake_ns) = (v.ns(&cra), v.ns(&fake));
     let iraps: Vec<u64> = syncs.iter().map(|&k| v.ns(&v.samples[k].1)).collect();
     assert!(times(&v.tables.seek_index(&|_| false)).contains(&fake_ns), "the index offers it");
@@ -364,7 +364,7 @@ fn hevc_keys_come_from_the_nal_types_and_a_landing_on_a_false_one_steps_back() {
     }
     assert_eq!(times(&played.index), iraps, "the false key left the index once read");
 
-    let sought = run(&file, fake.offset, Some(fake_ns + 1));
+    let sought = run(&file, fake.offset(), Some(fake_ns + 1));
     let planned = sought.planned.as_deref().unwrap();
     assert!(times(planned).contains(&fake_ns), "the seek was planned on the false key");
     let after = bufs(behind_flush(&sought.video));
@@ -384,7 +384,7 @@ fn hevc_keys_come_from_the_nal_types_and_a_landing_on_a_false_one_steps_back() {
 fn h264_idr_keys_and_the_index_stand() {
     let Some(file) = movie("h264.mp4", &["-c:v", "libx264", "-g", "24"]) else { return };
     let v = Video::of(&file);
-    let keys: Vec<u64> = v.samples.iter().filter(|s| s.1.sync).map(|s| v.ns(&s.1)).collect();
+    let keys: Vec<u64> = v.samples.iter().filter(|s| s.1.sync()).map(|s| v.ns(&s.1)).collect();
     assert!(keys.len() >= 4, "{keys:?}");
     let played = run(&file, u64::MAX, None);
     let pictures = bufs(&played.video);
@@ -394,8 +394,8 @@ fn h264_idr_keys_and_the_index_stand() {
     }
     let tables = v.tables.seek_index(&|_| false);
     assert_eq!((&played.index.entries, played.index.duration), (&tables.entries, tables.duration));
-    let third = v.samples.iter().filter(|s| s.1.sync).nth(2).unwrap().1;
-    let sought = run(&file, third.offset, Some(v.ns(&third) + 1));
+    let third = v.samples.iter().filter(|s| s.1.sync()).nth(2).unwrap().1;
+    let sought = run(&file, third.offset(), Some(v.ns(&third) + 1));
     let after = bufs(behind_flush(&sought.video));
     assert_eq!(after.first(), Some(&(v.ns(&third), true)), "decoding starts at the IDR");
 }
@@ -406,7 +406,7 @@ fn h264_idr_keys_and_the_index_stand() {
 fn a_pushed_restart_on_a_false_key_waits_for_the_next_random_access_point() {
     let Some(clean) = hevc_open_gops() else { return };
     let v = Video::of(&clean);
-    let syncs: Vec<usize> = (0..v.samples.len()).filter(|&k| v.samples[k].1.sync).collect();
+    let syncs: Vec<usize> = (0..v.samples.len()).filter(|&k| v.samples[k].1.sync()).collect();
     let false_at =
         (syncs[1] + 8..syncs[2]).find(|&k| v.rap(&clean, &v.samples[k].1) == Some(false)).unwrap();
     let file = with_sync(&clean, false_at as u32 + 1);
@@ -414,7 +414,7 @@ fn a_pushed_restart_on_a_false_key_waits_for_the_next_random_access_point() {
     let (fake, next) = (v.samples[false_at].1, v.samples[syncs[2]].1);
     let mut reader = Mp4Reader::new(&head_of(&file)).unwrap();
     let track = fake.track();
-    let r = reader.seek_stream(fake.offset, Some(v.ns(&fake)), v.ns(&fake));
+    let r = reader.seek_stream(fake.offset(), Some(v.ns(&fake)), v.ns(&fake));
     reader.push_bytes(&file[r.to_byte as usize..]);
     let mut out = Vec::new();
     while let Some(s) = reader.next_sample() {
@@ -422,8 +422,8 @@ fn a_pushed_restart_on_a_false_key_waits_for_the_next_random_access_point() {
             out.push((s.pts, reader.keyed(track, None, s.sync, s.payload.data(), false)));
         }
     }
-    assert_eq!(out[0], (fake.pts, Keyed::Skip), "the false key is held back");
+    assert_eq!(out[0], (fake.pts(), Keyed::Skip), "the false key is held back");
     let first = out.iter().position(|o| o.1 != Keyed::Skip).unwrap();
-    assert_eq!(out[first], (next.pts, Keyed::Put { key: true }), "the next CRA");
+    assert_eq!(out[first], (next.pts(), Keyed::Put { key: true }), "the next CRA");
     assert!(out[first + 1..].iter().all(|o| matches!(o.1, Keyed::Put { .. })));
 }

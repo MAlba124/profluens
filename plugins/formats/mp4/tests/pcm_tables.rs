@@ -73,7 +73,7 @@ fn a_billion_pcm_frames_resolve_as_their_groups_in_bounded_time() {
         let n = tables.samples().len();
         let first = tables.samples()[0];
         assert_eq!(tables.tracks()[0].bitrate, 64_000, "a constant size times its count");
-        let _ = tx.send((n, first.offset, first.size));
+        let _ = tx.send((n, first.offset(), first.size()));
     });
     match rx.recv_timeout(Duration::from_secs(8)) {
         Ok((n, offset, size)) => {
@@ -89,7 +89,7 @@ fn a_pcm_track_with_a_per_sample_size_table_resolves() {
     let head = movie(&be32(&[0, 4, 2, 2, 2, 2]), &be32(&[1, 4, 2]), &be32(&[1, 1, 4, 1]), 4, 4096);
     let reader = Mp4Reader::new(&head).expect("a per-sample table folds one sample an entry");
     let tables = reader.tables();
-    let sizes: Vec<_> = tables.samples().iter().map(|s| (s.offset, s.size)).collect();
+    let sizes: Vec<_> = tables.samples().iter().map(|s| (s.offset(), s.size())).collect();
     assert_eq!(sizes, [(4096, 2), (4098, 2), (4100, 2), (4102, 2)]);
     assert_eq!(tables.tracks()[0].entry.pcm.map(|p| p.frame), Some(1));
     let t = &tables.tracks()[0];

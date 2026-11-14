@@ -611,7 +611,7 @@ impl Mp4Demux {
                     State::Dropped | State::Waiting => continue,
                 };
                 let (track_index, pts, dts, sync, hidden) =
-                    (s.track(), s.pts, s.dts, s.sync, s.hidden);
+                    (s.track(), s.pts(), s.dts(), s.sync(), s.hidden());
                 let span = self.reader.as_ref().and_then(|r| r.span_at(p.index));
                 break Some((
                     ResolvedSample { track_index, pts, dts, sync, hidden, span, payload },
@@ -887,7 +887,7 @@ impl Mp4Demux {
             let passthrough = pad_tracks
                 .get(s.track())
                 .is_some_and(|pt| matches!(pt.reframer, Reframer::Passthrough));
-            s.size <= most && passthrough
+            s.size() <= most && passthrough
         };
         while ctx.asks_left(Self::IN) > 0 && self.plan.held < bytes && self.plan.ranges < ranges {
             let Some((index, first)) = reader.next_wanted() else {
@@ -901,18 +901,18 @@ impl Mp4Demux {
                 return;
             };
             self.plan.push(index, first, 0);
-            let mut len = first.size;
+            let mut len = first.size();
             let run = RUN.min(within(bytes - self.plan.held));
             while small(&first) {
                 let Some((i, s)) = reader.next_wanted() else {
                     break;
                 };
-                if s.offset != first.offset + len as u64 || !small(&s) || len + s.size > run {
+                if s.offset() != first.offset() + len as u64 || !small(&s) || len + s.size() > run {
                     reader.rewind_to(i);
                     break;
                 }
                 self.plan.push(i, s, len);
-                len += s.size;
+                len += s.size();
             }
             if len == 0 {
                 self.plan.asked(0);
@@ -927,9 +927,9 @@ impl Mp4Demux {
             match ctx.try_alloc_sized(len as usize) {
                 Ok(Some(buf)) => {
                     let charge = buf.memory.capacity().min(u32::MAX as usize) as u32;
-                    let ask = Ask { offset: first.offset, len, tag: self.plan.next_tag, buf };
+                    let ask = Ask { offset: first.offset(), len, tag: self.plan.next_tag, buf };
                     if ctx.ask(Self::IN, ask).is_err() {
-                        log!(&*ctx, Level::Debug, "ask_refused", at = first.offset, bytes = len);
+                        log!(&*ctx, Level::Debug, "ask_refused", at = first.offset(), bytes = len);
                         self.plan.unplan().inspect(|at| reader.rewind_to(*at));
                         return;
                     }

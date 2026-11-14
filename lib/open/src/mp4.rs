@@ -65,10 +65,10 @@ fn first_keys(tables: &Tables, len: u64, first: usize, d: &Desc, keys: &mut Vec<
             continue;
         }
         let Ok(ti) = u16::try_from(i - first) else { break };
-        let s = tables.samples().iter().find(|s| s.track_index == ti && s.sync);
-        if let Some(s) = s.filter(|s| s.size > 0 && s.offset < len) {
-            let n = u64::from(s.size).min(len - s.offset).min(KEY_READ as u64) as usize;
-            keys.push(Key { track: i, at: s.offset, len: n });
+        let s = tables.samples().iter().find(|s| s.track_index() == ti && s.sync());
+        if let Some(s) = s.filter(|s| s.size() > 0 && s.offset() < len) {
+            let n = u64::from(s.size()).min(len - s.offset()).min(KEY_READ as u64) as usize;
+            keys.push(Key { track: i, at: s.offset(), len: n });
         }
     }
 }

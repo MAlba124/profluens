@@ -48,7 +48,7 @@ fn demux(file: &[u8]) -> (Vec<u8>, &'static str, usize) {
     assert_eq!(track.family(), "audio/raw");
     let (mut pcm_out, mut scratch) = (Vec::new(), Vec::new());
     for s in tables.samples() {
-        let block = &file[s.offset as usize..][..s.size as usize];
+        let block = &file[s.offset() as usize..][..s.size() as usize];
         pcm_out
             .extend_from_slice(track.reframer().reframe_into(block, &mut scratch).expect("whole"));
     }

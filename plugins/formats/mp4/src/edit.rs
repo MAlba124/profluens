@@ -141,7 +141,7 @@ pub fn apply(samples: &mut [Sample], kind: TrackKind, list: &EditList) -> Option
     let mut shown = vec![(usize::MAX, 0usize); edits.len()];
     let mut any = false;
     for (i, s) in samples.iter().enumerate() {
-        if let Some(k) = edit_of(edits, s.pts) {
+        if let Some(k) = edit_of(edits, s.pts()) {
             let (first, last) = &mut shown[k];
             (*first, *last, any) = ((*first).min(i), (*last).max(i), true);
         }
@@ -159,7 +159,7 @@ pub fn apply(samples: &mut [Sample], kind: TrackKind, list: &EditList) -> Option
             if at == firsts.len() {
                 break;
             }
-            if s.sync {
+            if s.sync() {
                 key = i;
             }
             while firsts.get(at).is_some_and(|f| f.0 == i) {
@@ -181,14 +181,14 @@ pub fn apply(samples: &mut [Sample], kind: TrackKind, list: &EditList) -> Option
     let (mut kept, mut range) = (0usize, 0usize);
     for i in 0..samples.len() {
         let mut s = samples[i];
-        let m = s.pts;
+        let m = s.pts();
         while needed.get(range).is_some_and(|r| r.1 < i) {
             range += 1;
         }
         let pts = match edit_of(edits, m) {
             Some(k) => Some(edits[k].start.saturating_add(m - edits[k].media)),
             None if needed.get(range).is_some_and(|r| r.0 <= i) => {
-                s.hidden = true;
+                s.hide();
                 Some(hidden_stamp(edits, m))
             }
             None if kind == TrackKind::Audio && m < first.media => {
@@ -197,8 +197,7 @@ pub fn apply(samples: &mut [Sample], kind: TrackKind, list: &EditList) -> Option
             None => None,
         };
         let Some(pts) = pts else { continue };
-        s.dts = s.dts.saturating_add(pts.saturating_sub(m));
-        s.pts = pts;
+        s.present_at(pts);
         samples[kept] = s;
         kept += 1;
     }
@@ -216,20 +215,13 @@ mod tests {
     fn track(rows: &[(i64, bool)]) -> Vec<Sample> {
         rows.iter()
             .enumerate()
-            .map(|(i, &(pts, sync))| Sample {
-                track_index: 0,
-                offset: i as u64 * 10,
-                size: 10,
-                dts: i as i64,
-                pts,
-                sync,
-                hidden: false,
-            })
-            .collect()
+            .map(|(i, &(pts, sync))| Sample::new(0, i as u64 * 10, 10, i as i64, pts, sync))
+            .collect::<Result<_, _>>()
+            .expect("samples")
     }
 
     fn times(samples: &[Sample]) -> Vec<(i64, bool)> {
-        samples.iter().map(|s| (s.pts, s.hidden)).collect()
+        samples.iter().map(|s| (s.pts(), s.hidden())).collect()
     }
 
     #[test]
@@ -279,7 +271,7 @@ mod tests {
             (40, false),
         ];
         assert_eq!(times(&v[..kept]), want);
-        assert_eq!(v[2].offset, 50, "the sync sample the second edit decodes from");
+        assert_eq!(v[2].offset(), 50, "the sync sample the second edit decodes from");
     }
 
     #[test]

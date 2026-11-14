@@ -12,6 +12,8 @@ use profluens_core::time::Timestamp;
 
 const SLOT: usize = 64 * 1024;
 const RATE: i64 = 48_000;
+/// The encoder's priming, the shift of every stamp.
+const PRIMING: i64 = 1024;
 
 fn ns(sample: i64) -> u64 {
     (sample * 1_000_000_000 / RATE) as u64
@@ -68,8 +70,75 @@ fn feed_with(
     }
 }
 
+fn ns_i(sample: i64) -> i64 {
+    sample * 1_000_000_000 / RATE
+}
+
 fn stamps(out: &[Buffer]) -> Vec<u64> {
     out.iter().map(|b| b.pts.0).collect()
+}
+
+/// `out` through `libavaacdec` told the priming, the left channel.
+fn decode_left(out: &[Buffer]) -> Vec<f32> {
+    let mut d = Harness::with_slot_size(LibavAudioDec::aac(), SLOT);
+    d.fix_sink_format(
+        LibavAudioDec::IN,
+        "aac",
+        &[
+            ("rate", ValueDesc::Int(RATE)),
+            ("channels", ValueDesc::Int(2)),
+            ("delay", ValueDesc::Int(ns_i(PRIMING))),
+        ],
+    );
+    let mut pcm = Vec::new();
+    for b in out {
+        let mut i = d.alloc(b.memory.data());
+        i.pts = b.pts;
+        d.push(i).expect("push");
+        for o in d.drain_outputs() {
+            pcm.extend_from_slice(o.memory.data());
+        }
+    }
+    for o in d.eos().expect("eos") {
+        pcm.extend_from_slice(o.memory.data());
+    }
+    pcm.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0)
+        .collect()
+}
+
+/// The tone [`tone`] makes, the left channel as f32.
+fn tone_left(from: i64, samples: usize) -> Vec<f32> {
+    tone(from, samples)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0)
+        .collect()
+}
+
+fn rms_error(a: &[f32], b: &[f32]) -> f32 {
+    let sum: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+    (sum / a.len().min(b.len()) as f32).sqrt()
+}
+
+/// The priming packet goes out at zero with the delay declared, so the decoder has the overlap
+/// and the first frame decodes as well as the rest.
+#[test]
+fn the_first_frame_from_zero_decodes_whole() {
+    let mut h = encoder(LibavAacEnc::new());
+    let mut out = Vec::new();
+    feed(&mut h, 0, RATE as usize / 2, 1000, &mut out);
+    out.extend(h.eos().expect("eos"));
+    let left = decode_left(&out);
+    let want = tone_left(0, RATE as usize / 2);
+    assert!(left.len() >= want.len(), "{} samples back", left.len());
+    let first = rms_error(&left[..1024], &want[..1024]);
+    let mid = rms_error(&left[4096..8192], &want[4096..8192]);
+    // about 1.6 times the middle's, 35 times without the priming packet
+    assert!(first < 4.0 * mid.max(0.002), "first frame off by {first}, the middle by {mid}");
 }
 
 #[test]
@@ -90,34 +159,20 @@ fn tone_round_trip(e: LibavAacEnc) {
     let f = h.announced().expect("announced");
     assert_eq!(f.get(h.vocabulary().field_id("channels").expect("field")), Some(Value::Int(2)));
 
+    assert_eq!(
+        f.get(h.vocabulary().field_id("delay").expect("field")),
+        Some(Value::Int(ns_i(PRIMING)))
+    );
     let asc = LibavAacEnc::config_for(48_000, 2).expect("config");
     assert_eq!(out[0].memory.data(), asc.as_slice(), "the config first");
     let packets = &out[1..];
-    // the priming packet would present before zero and is left out
+    // the priming packet first, at zero, the stamps a frame ahead of what they present
     let want: Vec<u64> = (0..packets.len() as i64).map(|k| ns(k * 1024)).collect();
     assert_eq!(stamps(packets), want);
     assert_eq!(out[0].pts.0, 0);
-    assert_eq!(packets.len(), 94);
+    assert_eq!(packets.len(), 95);
 
-    let mut d = Harness::with_slot_size(LibavAudioDec::aac(), SLOT);
-    let mut pcm = Vec::new();
-    for b in &out {
-        let mut i = d.alloc(b.memory.data());
-        i.pts = b.pts;
-        d.push(i).expect("push");
-        for o in d.drain_outputs() {
-            pcm.extend_from_slice(o.memory.data());
-        }
-    }
-    for o in d.eos().expect("eos") {
-        pcm.extend_from_slice(o.memory.data());
-    }
-    let left: Vec<f32> = pcm
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0)
-        .collect();
+    let left = decode_left(&out);
     assert!(left.len() >= 2 * RATE as usize, "{} samples back", left.len());
     let mid = &left[2048..2 * RATE as usize - 2048];
     let rms = (mid.iter().map(|v| v * v).sum::<f32>() / mid.len() as f32).sqrt();
@@ -138,8 +193,9 @@ fn aligned_runs_from_different_starts_share_their_stamps() {
     };
     let all = run(0);
     let late = run(48_336);
-    assert_eq!(late[0], ns(48_128), "the priming packet a frame ahead of the grid point");
-    assert_eq!(late[1], ns(49_152));
+    // the priming packet presents a frame ahead of the grid point, stamped on it
+    assert_eq!(late[0], ns(49_152));
+    assert_eq!(late[1], ns(49_152 + PRIMING));
     let shared = late.iter().filter(|s| all.contains(s)).count();
     // the short last frame and the tail land off the grid
     assert!(shared >= late.len() - 2, "{shared} of {} stamps shared", late.len());
@@ -174,8 +230,8 @@ fn a_flush_starts_over_with_the_config() {
     after.extend(h.eos().expect("eos"));
     let asc = LibavAacEnc::config_for(48_000, 2).expect("config");
     assert_eq!(after[0].memory.data(), asc.as_slice());
-    assert_eq!(after[1].pts.0, ns(10 * RATE - 1024));
-    assert_eq!(after[2].pts.0, ns(10 * RATE));
+    assert_eq!(after[1].pts.0, ns(10 * RATE));
+    assert_eq!(after[2].pts.0, ns(10 * RATE + PRIMING));
 }
 
 #[test]
@@ -188,13 +244,14 @@ fn unstamped_pcm_comes_out_whole_stamped_from_zero() {
     let asc = LibavAacEnc::config_for(48_000, 2).expect("config");
     assert_eq!(out[0].memory.data(), asc.as_slice(), "the config first");
     let packets = &out[1..];
-    // one packet per started 1024 sample frame, priming and padding in, the priming one left out
-    assert_eq!(packets.len(), (total + 1024).div_ceil(1024) - 1);
+    // one packet per started 1024 sample frame, priming and padding in
+    assert_eq!(packets.len(), (total + 1024).div_ceil(1024));
     let want: Vec<u64> = (0..packets.len() as i64).map(|k| ns(k * 1024)).collect();
     assert_eq!(stamps(packets), want, "contiguous from zero");
     // no PCM lost, the packets cover every input sample and at most one frame of padding
     let last = packets.last().expect("packets");
-    let end = (last.pts.0 + last.duration.0) as i64 * RATE / 1_000_000_000;
+    let end = ((last.pts.0 + last.duration.0) as i64 * RATE + 500_000_000) / 1_000_000_000;
+    let end = end - PRIMING;
     assert!(end >= total as i64 && end < total as i64 + 1024, "covers {end} of {total}");
 }
 
@@ -208,6 +265,7 @@ fn unstamped_and_stamped_from_zero_put_out_the_same_stream() {
         out.iter().map(|b| (b.pts.0, b.duration.0, b.memory.data().to_vec())).collect::<Vec<_>>()
     };
     let stamped = run(true);
-    assert_eq!(stamped.len(), (3 * RATE as usize + 1024).div_ceil(1024));
+    // the config, the priming packet and one per started frame
+    assert_eq!(stamped.len(), 1 + (3 * RATE as usize + 1024).div_ceil(1024));
     assert_eq!(run(false), stamped);
 }

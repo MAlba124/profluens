@@ -1,9 +1,12 @@
 //! `libavaacenc`, libavcodec's native AAC-LC encoder. Interleaved PCM in, the
 //! AudioSpecificConfig then one raw access unit per buffer out, stamped by sample count.
 //! Unstamped input counts on from the end of the last packet put out, zero at the start.
+//! Stamps run the encoder's priming ahead, declared as `delay` (as Matroska's `CodecDelay`), so
+//! the priming packet goes out even at zero and a decoder cuts what falls before it.
 
 use std::fmt;
 
+use profluens_audio::FIELD_DELAY;
 use profluens_core::batch::Inputs;
 use profluens_core::buffer::BufferFlags;
 use profluens_core::ctx::Ctx;
@@ -63,9 +66,10 @@ static SINK_FIELDS: [FieldDesc; 3] = [
     },
 ];
 static SINK_OFFERS: [OfferDesc; 1] = [OfferDesc { family: "audio/raw", fields: &SINK_FIELDS }];
-static SRC_FIELDS: [FieldDesc; 2] = [
+static SRC_FIELDS: [FieldDesc; 3] = [
     FieldDesc { field: F_RATE, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: F_CHANNELS, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: FIELD_DELAY, allowed: ConstraintDesc::Any, preferred: None },
 ];
 static SRC_OFFERS: [OfferDesc; 1] = [OfferDesc { family: "aac", fields: &SRC_FIELDS }];
 static SINKS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &SINK_OFFERS }];
@@ -129,7 +133,9 @@ pub struct LibavAacEnc {
     acc: Vec<f32>,
     origin: Option<i64>,
     sent: i64,
-    floor: i64,
+    /// The end of the last packet put out, in samples before the priming shift. `None` since
+    /// start or flush.
+    floor: Option<i64>,
     head_due: bool,
     /// Packets put out and PCM samples the encoder refused, for the end of stream summary.
     packets: u64,
@@ -166,7 +172,7 @@ impl LibavAacEnc {
             acc: Vec::new(),
             origin: None,
             sent: 0,
-            floor: 0,
+            floor: None,
             head_due: true,
             packets: 0,
             lost: 0,
@@ -238,9 +244,11 @@ impl LibavAacEnc {
             float = input.float,
             bitrate = self.bitrate,
         );
+        let delay = self.enc.as_ref().map_or(0, |e| e.delay() as i64);
         let fields = [
             (F_RATE, ValueDesc::Int(i64::from(input.rate))),
             (F_CHANNELS, ValueDesc::Int(i64::from(input.channels))),
+            (FIELD_DELAY, ValueDesc::Int(ns_of(delay, input.rate))),
         ];
         ctx.announce_format(Self::OUT, "aac", &fields);
         Ok(())
@@ -329,20 +337,23 @@ impl LibavAacEnc {
             return Ok(());
         };
         // place() sets it before any PCM goes in, the fallback never stamps a packet.
-        let origin = self.origin.unwrap_or(self.floor);
+        let origin = self.origin.unwrap_or(self.floor.unwrap_or(0));
+        let delay = enc.delay() as i64;
         loop {
             let (data, pts, duration) = match enc.receive() {
                 Ok(Encoded::Packet { data, pts, duration }) => (data, pts, duration),
                 Ok(Encoded::Again | Encoded::Ended) => return Ok(()),
                 Err(e) => return Err(Error::element_failed(ctx.element(), LavAacError::Encode(e))),
             };
+            // The priming packet presents `delay` ahead of the origin. After a restart it
+            // overlaps what went out and no consumer takes overlapping audio.
             let at = origin + pts;
-            if at < self.floor {
-                log!(&*ctx, Level::Debug, "overlap_drop", at = at, floor = self.floor);
+            if let Some(floor) = self.floor.filter(|f| at < *f) {
+                log!(&*ctx, Level::Debug, "overlap_drop", at = at, floor = floor);
                 continue;
             }
             let end = at + duration.max(1);
-            let stamp = Timestamp(ns_of(at, i.rate) as u64);
+            let stamp = Timestamp(ns_of(at + delay, i.rate) as u64);
             if self.head_due {
                 self.head_due = false;
                 let cfg = &self.config;
@@ -363,12 +374,13 @@ impl LibavAacEnc {
             buf.memory.set_len(data.len());
             buf.pts = stamp;
             buf.dts = stamp;
-            buf.duration = Timestamp((ns_of(end, i.rate) - ns_of(at, i.rate)) as u64);
+            buf.duration =
+                Timestamp((ns_of(end + delay, i.rate) - ns_of(at + delay, i.rate)) as u64);
             buf.flags = BufferFlags::KEYFRAME;
             log!(&*ctx, Level::Trace, "packet", pts = stamp, bytes = data.len());
             ctx.out(Self::OUT).push(buf);
             self.packets += 1;
-            self.floor = end;
+            self.floor = Some(end);
         }
     }
 
@@ -399,8 +411,9 @@ impl LibavAacEnc {
             return Ok(Some(0));
         }
         let Some(p) = pts else {
-            log!(&*ctx, Level::Debug, "origin", sample = self.floor, skip = 0, stamped = false);
-            self.origin = Some(self.floor);
+            let at = self.floor.unwrap_or(0);
+            log!(&*ctx, Level::Debug, "origin", sample = at, skip = 0, stamped = false);
+            self.origin = Some(at);
             return Ok(Some(0));
         };
         let s = sample_of(p, i.rate);
@@ -465,7 +478,7 @@ impl LibavAacEnc {
 
     fn reset(&mut self, ctx: &Ctx) -> Result<(), Error> {
         log!(ctx, Level::Debug, "flush", tail = self.acc.len(), lost = self.lost);
-        self.floor = 0;
+        self.floor = None;
         self.head_due = true;
         if self.input.is_some() {
             self.open(ctx)?;

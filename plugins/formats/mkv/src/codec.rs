@@ -147,7 +147,10 @@ pub fn track_offers(track: &Track) -> &'static [OfferDesc] {
     static FLV1: [OfferDesc; 3] = video("flv1");
     static H264: [OfferDesc; 5] = nal("h264/annexb", "h264/avcc");
     static H265: [OfferDesc; 5] = nal("h265/annexb", "h265/hvcc");
-    let stores = |hevc| nal_head_from_config(&track.codec_private, hevc).is_ok();
+    // A record of no parameter sets leaves no head to lead stored units, as the element finds.
+    let stores = |hevc| {
+        nal_head_from_config(&track.codec_private, hevc).is_ok_and(|(head, _)| !head.is_empty())
+    };
     match track_family(track) {
         "encrypted" => &ENCRYPTED,
         "compressed" => &COMPRESSED,
@@ -1055,6 +1058,29 @@ mod tests {
         ));
         assert!(matches!(Reframer::for_codec("V_VP8"), Reframer::Passthrough));
         assert!(matches!(Reframer::for_codec("A_FLAC"), Reframer::Passthrough));
+    }
+
+    #[test]
+    fn a_record_of_no_parameter_sets_offers_no_stored_family() {
+        let nal = |codec_id: &str, private: &[u8]| {
+            let mut t = track("A_AAC", 48_000.0, 0, &[]);
+            (t.codec_id, t.codec_private) = (codec_id.into(), private.to_vec());
+            track_offers(&t)
+                .iter()
+                .any(|o| o.family.ends_with("/avcc") || o.family.ends_with("/hvcc"))
+        };
+        let empty_avcc = [1, 0x42, 0, 0x0A, 0xFF, 0xE0, 0];
+        let one_sps = [1, 0x42, 0, 0x0A, 0xFF, 0xE1, 0, 1, 0x67, 0];
+        assert!(!nal("V_MPEG4/ISO/AVC", &empty_avcc), "the element announces Annex B");
+        assert!(nal("V_MPEG4/ISO/AVC", &one_sps));
+        let mut empty_hvcc = vec![1];
+        empty_hvcc.extend([0; 21]);
+        empty_hvcc[21] = 0x03;
+        empty_hvcc.push(0);
+        assert!(!nal("V_MPEGH/ISO/HEVC", &empty_hvcc));
+        empty_hvcc.pop();
+        empty_hvcc.extend([1, 0x20, 0, 1, 0, 1, 0x40]);
+        assert!(nal("V_MPEGH/ISO/HEVC", &empty_hvcc));
     }
 
     #[test]

@@ -259,10 +259,8 @@ struct Session {
     read: Option<ReadbackImage>,
     /// The driver has the HDR10 to SDR filter.
     can_tone: bool,
-    /// The filter and the metadata it was made from.
+    /// The filter and the metadata it was made from, kept once the driver ran it.
     tone: Option<(ToneMap, HdrStatic)>,
-    /// The driver refused a tone mapped picture of this session.
-    tone_refused: bool,
 }
 
 struct GpuIn {
@@ -329,11 +327,16 @@ pub struct VaapiPostProc {
     disabled: bool,
     in_fmt: Option<InFormat>,
     color: StreamColor,
-    announced: Option<(u32, u32, PixelFormat)>,
+    /// The source transfer the driver refused to tone map, not tried again on a new session.
+    tone_refused: Option<TransferFn>,
+    announced: Option<(u32, u32, PixelFormat, StreamColor)>,
     stats: Arc<Stats>,
     last_pts: Option<u64>,
     period_ns: u64,
     warned: Warned,
+    /// Every tone mapped run counts as refused.
+    #[cfg(test)]
+    refuse_tone: bool,
 }
 
 impl VaapiPostProc {
@@ -355,11 +358,14 @@ impl VaapiPostProc {
             disabled: false,
             in_fmt: None,
             color: StreamColor::default(),
+            tone_refused: None,
             announced: None,
             stats: Arc::default(),
             last_pts: None,
             period_ns: 0,
             warned: Warned::default(),
+            #[cfg(test)]
+            refuse_tone: false,
         }
     }
 
@@ -508,11 +514,12 @@ impl VaapiPostProc {
     }
 
     /// Whether pictures to `out` are tone mapped, a PQ or HLG input to nv12 on a driver with
-    /// the filter.
+    /// the filter that has not refused the input's transfer.
     fn maps_tones(&self, out: Kind) -> bool {
         out == NV12
             && is_hdr(&self.color)
-            && self.session.as_ref().is_some_and(|s| s.can_tone && !s.tone_refused)
+            && self.tone_refused != self.color.transfer
+            && self.session.as_ref().is_some_and(|s| s.can_tone)
     }
 
     /// The colour the output states, BT.709 when tone mapped, else the input's.
@@ -607,6 +614,7 @@ impl VaapiPostProc {
             g.out.clear();
         }
         let can_tone = proc.tone_maps();
+        self.stats.made(count + u32::from(src.is_some()), 0);
         self.session = Some(Session {
             key: f,
             proc,
@@ -618,7 +626,6 @@ impl VaapiPostProc {
             read,
             can_tone,
             tone: None,
-            tone_refused: false,
         });
         log!(
             ctx,
@@ -650,10 +657,13 @@ impl VaapiPostProc {
         height: u32,
         pixfmt: PixelFormat,
     ) {
-        if self.announced == Some((width, height, pixfmt)) {
+        let kind = if pixfmt == PixelFormat::P010 { P010 } else { NV12 };
+        // the colour too, a fixed size output still tells the encoder of new HDR metadata
+        let color = self.out_color(kind);
+        if self.announced == Some((width, height, pixfmt, color)) {
             return;
         }
-        self.announced = Some((width, height, pixfmt));
+        self.announced = Some((width, height, pixfmt, color));
         let mut out = [(FIELD_WIDTH, ValueDesc::Int(0)); 14];
         out[0] = (FIELD_WIDTH, ValueDesc::Int(i64::from(width)));
         out[1] = (FIELD_HEIGHT, ValueDesc::Int(i64::from(height)));
@@ -676,8 +686,7 @@ impl VaapiPostProc {
             }
         };
         let fixed = if self.gpu_out.is_none() && f.fps.is_none() { 3 } else { 4 };
-        let kind = if pixfmt == PixelFormat::P010 { P010 } else { NV12 };
-        let n = fixed + self.out_color(kind).write_fields(&mut out[fixed..]);
+        let n = fixed + color.write_fields(&mut out[fixed..]);
         ctx.announce_format(OUT_PAD, family, &out[..n]);
     }
 
@@ -694,8 +703,9 @@ impl VaapiPostProc {
             self.disabled = true;
             return Err(Self::fail(ctx, e));
         }
-        if p.out == NV12 && is_hdr(&self.color) && !self.maps_tones(p.out) {
-            // the samples pass as they are, the picture looks washed out
+        let refused = self.tone_refused == self.color.transfer;
+        if p.out == NV12 && is_hdr(&self.color) && !refused && !self.maps_tones(p.out) {
+            // the samples pass as they are, the picture looks washed out. A refusal warned once.
             self.warn(ctx, K::DriverLacks("HDR10 to SDR tone mapping"));
         }
         let len = match self.gpu_out {
@@ -810,7 +820,8 @@ impl VaapiPostProc {
     }
 
     /// `src` into `dst` by plan `p`, tone mapped when [`Self::maps_tones`]. A tone map the
-    /// driver refuses is warned once and the session converts without it from then on.
+    /// driver refuses is warned once and the element converts that transfer without it from
+    /// then on, the session kept unless it mapped before.
     fn convert(
         &mut self,
         ctx: &mut Ctx,
@@ -831,20 +842,28 @@ impl VaapiPostProc {
         };
         let size = (f.width, f.height);
         if maps {
-            if s.tone.as_ref().is_none_or(|(_, h)| *h != self.color.hdr) {
-                let tm = s.proc.tone_map(&hdr10_of(&self.color.hdr)).map_err(K::SessionSetup)?;
-                s.tone = Some((tm, self.color.hdr));
-            }
+            let hdr = self.color.hdr;
+            let fresh = match &s.tone {
+                Some((_, h)) if *h == hdr => None,
+                _ => Some(s.proc.tone_map(&hdr10_of(&hdr)).map_err(K::SessionSetup)?),
+            };
             let color = explicit_of(&self.color);
-            let tone = s.tone.as_ref().map(|(t, _)| t);
-            if s.proc
+            let tone = fresh.as_ref().or(s.tone.as_ref().map(|(t, _)| t));
+            let ran = s
+                .proc
                 .run(Src { surface: src, at: src_at, size, color }, place(Color::SDR), tone)
-                .is_ok()
-            {
+                .is_ok();
+            #[cfg(test)]
+            let ran = ran && !self.refuse_tone;
+            if ran {
+                if let Some(tm) = fresh {
+                    s.tone = Some((tm, hdr));
+                }
                 return Ok(());
             }
-            // iHD 26.1 on Gen9 refuses an HLG source this way
-            s.tone_refused = true;
+            // iHD 26.1 on Gen9 refuses an HLG source this way. A session that never mapped
+            // holds no tone state and is kept, one that did is made anew by the next picture.
+            self.tone_refused = self.color.transfer;
             self.warn(ctx, K::DriverLacks("HDR to SDR tone mapping of this source"));
         }
         let s = self.session.as_mut().ok_or(K::NoDevice)?;
@@ -1387,6 +1406,7 @@ impl Element for VaapiPostProc {
                     known = self.in_fmt.is_some()
                 );
                 self.color = StreamColor::read(ctx, f);
+                // a fixed size output announces again only on a new colour, see `announce`
                 if !self.fixed {
                     self.announced = None;
                 }
@@ -1433,9 +1453,110 @@ impl Element for VaapiPostProc {
 }
 
 #[cfg(test)]
+// Test fixtures.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use pf_harness::Harness;
     use profluens_core::memory::Pool;
+
+    /// Whether the device has the processor, and the HDR10 to SDR filter.
+    fn proc_device(test: &str) -> Option<bool> {
+        let Some(caps) = probe::probe() else {
+            eprintln!("skip {test}: no VA-API device");
+            return None;
+        };
+        if !caps.video_proc {
+            eprintln!("skip {test}: no VAEntrypointVideoProc");
+            return None;
+        }
+        let d = Display::open(&caps.device).expect("the probed device opens");
+        Some(Proc::new(&d).expect("a processing context").tone_maps())
+    }
+
+    fn hdr10(max_cll: u16) -> StreamColor {
+        StreamColor {
+            matrix: Some(Matrix::Bt2020),
+            range: Some(Range::Limited),
+            transfer: Some(TransferFn::Pq),
+            primaries: Some(Primaries::Bt2020),
+            hdr: HdrStatic {
+                light: ContentLight { max_cll, max_fall: 400 },
+                ..HdrStatic::default()
+            },
+            ..StreamColor::default()
+        }
+    }
+
+    const W: u32 = 128;
+    const H: u32 = 64;
+
+    fn fix(hn: &mut Harness, c: &StreamColor, change: bool) {
+        let mut f = [(FIELD_WIDTH, ValueDesc::Int(i64::from(W))); 16];
+        f[1] = (FIELD_HEIGHT, ValueDesc::Int(i64::from(H)));
+        f[2] = (FIELD_PIXFMT, ValueDesc::Id("p010"));
+        let n = 3 + c.write_fields(&mut f[3..]);
+        match change {
+            true => hn.change_sink_format(IN_PAD, FAMILY, &f[..n]).expect("the change"),
+            false => hn.fix_sink_format(IN_PAD, FAMILY, &f[..n]),
+        }
+    }
+
+    /// A mid grey P010 picture through, its output pulled.
+    fn one(hn: &mut Harness) {
+        let grey = (512u16 << 6).to_le_bytes();
+        let frame: Vec<u8> = grey.iter().copied().cycle().take((W * H * 3) as usize).collect();
+        let b = hn.alloc(&frame);
+        hn.push(b).expect("pushed");
+        assert!(hn.pull(OUT_PAD).is_some(), "a picture out");
+    }
+
+    fn announced(hn: &Harness) -> StreamColor {
+        StreamColor::read_vocabulary(hn.vocabulary(), &hn.announced().expect("a format"))
+    }
+
+    #[test]
+    fn a_refused_tone_map_is_not_tried_on_a_new_session_each_picture() {
+        let test = "a_refused_tone_map_is_not_tried_on_a_new_session_each_picture";
+        match proc_device(test) {
+            None => return,
+            Some(false) => return eprintln!("skip {test}: no HDR10 to SDR tone mapping"),
+            Some(true) => {}
+        }
+        let target = Target { max_width: W / 2, max_height: H / 2, depth: 8 };
+        let vpp = VaapiPostProc { refuse_tone: true, ..VaapiPostProc::new(target) };
+        let stats = vpp.stats();
+        let mut hn = Harness::with_pool(vpp, 1 << 20, 8);
+        fix(&mut hn, &hdr10(1000), false);
+        one(&mut hn);
+        let made = stats.snapshot().surfaces;
+        assert!(made > 0, "{test} a session");
+        for _ in 0..3 {
+            one(&mut hn);
+        }
+        assert_eq!(stats.snapshot().surfaces, made, "{test} the session kept");
+        let c = announced(&hn);
+        assert_eq!(c, hdr10(1000), "{test} the colour it still has");
+    }
+
+    #[test]
+    fn a_fixed_size_output_announces_new_hdr_metadata() {
+        let test = "a_fixed_size_output_announces_new_hdr_metadata";
+        if proc_device(test).is_none() {
+            return;
+        }
+        let target = Target { max_width: W / 2, max_height: H / 2, depth: 10 };
+        let mut hn = Harness::with_pool(VaapiPostProc::new(target).with_fixed_size(), 1 << 20, 8);
+        fix(&mut hn, &hdr10(1000), false);
+        one(&mut hn);
+        assert_eq!((hn.format_changes(), announced(&hn)), (1, hdr10(1000)), "{test}");
+        fix(&mut hn, &hdr10(600), true);
+        one(&mut hn);
+        assert_eq!((hn.format_changes(), announced(&hn)), (2, hdr10(600)), "{test} the new light");
+        fix(&mut hn, &hdr10(600), true);
+        one(&mut hn);
+        assert_eq!(hn.format_changes(), 2, "{test} the same colour, the same format");
+    }
 
     #[test]
     fn a_scaled_picture_carries_the_side_records_of_its_input() {

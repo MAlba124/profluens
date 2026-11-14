@@ -3,7 +3,7 @@
 use crate::ident::{
     TheoraIdent, parse_speex_head, parse_theora_ident, theora_frames, theora_keyframe,
 };
-use crate::page::{CAPTURE_PATTERN, GRANULE_NONE, PageHeader};
+use crate::page::{CAPTURE_PATTERN, GRANULE_NONE, PageError, PageHeader};
 
 /// Opus granule positions count 48 kHz samples whatever the input rate (RFC 7845 section 4).
 pub const OPUS_GRANULE_RATE: u32 = 48_000;
@@ -18,18 +18,31 @@ pub const OGG_TAIL_FIRST: usize = 16 * 1024;
 
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 
+/// The bytes of candidate pages failing their CRC a tail scan takes before it gives up, capture
+/// patterns every few bytes would cost a CRC of up to 64 KiB each.
+pub(crate) const TAIL_CRC_MAX: usize = 4 << 20;
+
 /// Scan `tail` backwards for the last valid Ogg page and return its granule position (RFC 3533
 /// section 6, field 4).
 pub fn last_granule(tail: &[u8], serial: Option<u32>) -> Option<u64> {
     if tail.len() < CAPTURE_PATTERN.len() {
         return None;
     }
+    let mut spent = 0usize;
     for start in (0..=tail.len() - CAPTURE_PATTERN.len()).rev() {
         if tail[start] != CAPTURE_PATTERN[0] || tail[start..start + 4] != CAPTURE_PATTERN {
             continue;
         }
-        let Ok(page) = PageHeader::parse(&tail[start..]) else {
-            continue;
+        let page = match PageHeader::parse(&tail[start..]) {
+            Ok(page) => page,
+            Err(PageError::BadCrc { len, .. }) => {
+                spent += len;
+                if spent > TAIL_CRC_MAX {
+                    return None;
+                }
+                continue;
+            }
+            Err(_) => continue,
         };
         if page.n_segments() == 0 {
             continue;
@@ -192,6 +205,17 @@ mod tests {
         let mut tail = Vec::new();
         write_page(&mut tail, 0, 4_242, 7, 0, &[body.len() as u8], &body);
         assert_eq!(last_granule(&tail, None), Some(4_242));
+    }
+
+    /// Capture patterns every 8 bytes each name a page of about 14 KiB failing its CRC, the scan
+    /// gives up rather than check each.
+    #[test]
+    fn a_tail_of_capture_patterns_is_given_up_on() {
+        let mut tail = Vec::new();
+        write_page(&mut tail, 0, 5_000, 1, 0, &[4], b"real");
+        tail.extend(b"OggS\x00\xFF\xFF\xFF".iter().cycle().take(64 << 10));
+        assert_eq!(last_granule(&tail, None), None);
+        assert_eq!(crate::chain::last_page_serial(&tail), None);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod chain;
 pub mod comment;
 pub mod crc;
 pub mod duration;
@@ -14,6 +15,7 @@ pub mod seek;
 pub mod streams;
 pub mod writer;
 
+pub use chain::{ChainScan, Link, Links};
 pub use comment::{
     PictureBlocks, parse_comment_body, parse_comment_body_lossy, parse_opus_tags,
     parse_vorbis_comments, picture_blocks,

@@ -19,6 +19,7 @@ use profluens_core::pull::{Fed, Feed, RangeError};
 use profluens_core::rate;
 use profluens_core::time::Timestamp;
 
+use crate::chain::{self, ChainScan, Links};
 use crate::duration::{
     GranuleClock, OGG_TAIL_FIRST, OGG_TAIL_LEN, OPUS_GRANULE_RATE, granule_clock, last_granule,
 };
@@ -28,7 +29,7 @@ use crate::ident::{
 use crate::page::GRANULE_NONE;
 use crate::reader::{OggReader, Packet};
 use crate::seek::{Bisect, Landing, Step};
-use crate::streams::scan_head;
+use crate::streams::{channels_of, scan_head};
 use crate::writer::OggWriter;
 
 /// Ogg has no concept of time (RFC 3533 section 4), so the muxer stamps granule 0.
@@ -91,6 +92,8 @@ fn paced_window(bits_per_second: u64) -> u32 {
 
 const TAIL_TAG: u32 = 1;
 const PROBE_TAG: u32 = 2;
+/// A read of the link scan, its count in the bits above the two of the tag.
+const CHAIN_TAG: u32 = 3;
 /// How far ahead of a target Opus starts decoding to converge (RFC 7845 section 4.6).
 const OPUS_PREROLL_NS: u64 = 80_000_000;
 
@@ -136,6 +139,50 @@ struct Track {
     kept_over: bool,
     /// A link made mid-run is owed `kept` ahead of the track's next packet.
     greet: bool,
+    /// The serial of the file's first link, the one a start reads first.
+    first: Option<u32>,
+    /// What a chained link must match to go on in this track.
+    config: Option<Config>,
+    clock: Option<GranuleClock>,
+    /// The stream time of the chained links before the one it is in, ns, added to what its
+    /// granules give.
+    offset: u64,
+    /// Its link is the one being read, a bos page behind data clears it until the next takes it.
+    renewed: bool,
+}
+
+/// What a chained link keeps of the one before for its packets to go on in the same track, the
+/// decoder set up for that one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Config {
+    mapping: Mapping,
+    channels: u16,
+    clock: Option<GranuleClock>,
+}
+
+impl Config {
+    fn of(ident: &[u8]) -> Config {
+        let mapping = Mapping::identify(ident);
+        let clock = granule_clock(ident).map(|c| match c {
+            GranuleClock::Opus { .. } => GranuleClock::Opus { pre_skip: 0 },
+            c => c,
+        });
+        Config { mapping, channels: channels_of(mapping, ident), clock }
+    }
+}
+
+/// The link scan in flight, `asked` while a read is out under the tag of `seq`.
+struct Scan {
+    m: ChainScan,
+    asked: bool,
+    seq: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Chained {
+    Unknown,
+    Scanning,
+    Known,
 }
 
 impl Track {
@@ -154,7 +201,17 @@ impl Track {
             kept_ends: Vec::new(),
             kept_over: false,
             greet: false,
+            first: serial,
+            config: None,
+            clock: None,
+            offset: 0,
+            renewed: true,
         }
+    }
+
+    /// Back on the file's first link.
+    fn rewind(&mut self) {
+        (self.serial, self.offset, self.renewed) = (self.first, 0, true);
     }
 
     fn keep_head(&mut self, head: bool, data: &[u8]) {
@@ -294,9 +351,9 @@ impl Run {
     }
 
     /// Anchors the clock at the sample of `granule`, its container stamp, ahead of the stream
-    /// time by an Opus pre-skip as a demuxer stamps.
-    fn anchor_at(&mut self, granule: u64) {
-        self.anchor = Timestamp(self.ns(granule));
+    /// time by an Opus pre-skip as a demuxer stamps, `offset` the links before it.
+    fn anchor_at(&mut self, granule: u64, offset: u64) {
+        self.anchor = Timestamp(offset.saturating_add(self.ns(granule)));
         (self.samples, self.base) = (0, Some(granule));
     }
 
@@ -327,6 +384,17 @@ impl Run {
         }
         pts
     }
+}
+
+/// Where a seek pulled goes.
+enum Plan {
+    Bisect(Bisect),
+    /// The start of the chained link of this number.
+    Link(usize),
+    /// The file's start, its first link, a chain of links not known having been followed.
+    Head,
+    /// Where the source restarts, stamped with the target.
+    Stamp,
 }
 
 /// What a head that names no stream fails with.
@@ -379,6 +447,25 @@ pub struct OggDemux {
     lead: Option<Vec<u8>>,
     /// The reader's resync and drop counts last logged.
     seen: (u64, u64),
+    /// The serials of the first link's bos pages.
+    group0: Vec<u32>,
+    /// A packet off a bos page came since the last bos, a bos page now starts a chained link.
+    data_seen: bool,
+    /// The bos pages of a chained link are being read.
+    switching: bool,
+    /// The stream time of the links before the one being read, and where that one ends so far.
+    chain_offset: u64,
+    group_end: u64,
+    /// The streams of the link being read no track takes, timed for where the link ends.
+    strays: Vec<(u32, GranuleClock)>,
+    chained: Chained,
+    scan: Option<Scan>,
+    /// The links of a chained file, two or more.
+    links: Option<Links>,
+    /// The stream time and first byte of the link a seek bisects in.
+    seek_base: (u64, u64),
+    /// The key stream and clock of the first link.
+    learnt_first: Option<(u32, GranuleClock)>,
 }
 
 impl Default for OggDemux {
@@ -417,6 +504,17 @@ impl Default for OggDemux {
             primes: false,
             lead: None,
             seen: (0, 0),
+            group0: Vec::new(),
+            data_seen: false,
+            switching: false,
+            chain_offset: 0,
+            group_end: 0,
+            strays: Vec::new(),
+            chained: Chained::Unknown,
+            scan: None,
+            links: None,
+            seek_base: (0, 0),
+            learnt_first: None,
         }
     }
 }
@@ -450,6 +548,16 @@ impl OggDemux {
         self
     }
 
+    /// The links of a chained file a scan found, so the duration spans them all and a seek lands
+    /// in the link of its time. One link changes nothing.
+    pub fn with_links(mut self, links: Links) -> Self {
+        if links.links.len() > 1 {
+            (self.known, self.tail_at) = (Some(links.total_ns()), Tail::In);
+            (self.links, self.chained) = (Some(links), Chained::Known);
+        }
+        self
+    }
+
     /// The demuxer of the file whose first bytes are `head`, enough of them to hold every bos page
     /// (RFC 3533 section 4 puts them first).
     pub fn with_head(mut self, head: Vec<u8>) -> Self {
@@ -466,7 +574,7 @@ impl OggDemux {
 
     fn unlock(&mut self) {
         if !self.streams {
-            self.tracks[0].serial = None;
+            (self.tracks[0].serial, self.tracks[0].first) = (None, None);
             self.key = None;
         }
     }
@@ -477,22 +585,72 @@ impl OggDemux {
         }
     }
 
-    fn route(&mut self, serial: u32) -> Option<usize> {
+    fn route(&mut self, ctx: &Ctx, serial: u32, bos: bool, data: &[u8]) -> Option<usize> {
         if let Some(at) = self.tracks.iter().position(|t| t.serial == Some(serial)) {
+            self.tracks[at].renewed |= bos;
             return Some(at);
         }
-        let first = self.tracks.first_mut().filter(|t| !self.streams && t.serial.is_none())?;
-        first.serial = Some(serial);
-        self.key = Some(serial);
-        Some(0)
+        if let Some(first) = self.tracks.first_mut().filter(|t| !self.streams && t.serial.is_none())
+        {
+            (first.serial, first.first) = (Some(serial), Some(serial));
+            self.key = Some(serial);
+            return Some(0);
+        }
+        if !bos || Mapping::identify(data) == Mapping::Skeleton {
+            return None;
+        }
+        self.link_to(ctx, serial, data)
+    }
+
+    /// A bos page of a serial no track has, behind data, starts the next link of a chained file
+    /// (RFC 3533 section 4). Its stream goes on in the track of the same configuration, stamped
+    /// on from where the link before ended. One of another is dropped and the track ends.
+    fn link_to(&mut self, ctx: &Ctx, serial: u32, ident: &[u8]) -> Option<usize> {
+        if std::mem::take(&mut self.data_seen) {
+            self.switching = true;
+            self.tracks.iter_mut().for_each(|t| t.renewed = false);
+            self.strays.clear();
+            self.chain_offset = self.group_end;
+        }
+        if !self.switching {
+            log!(ctx, Level::Debug, "stream_skipped", serial = serial);
+            return None;
+        }
+        if let Some(links) = &self.links
+            && let Some(i) = links.of_serial(serial)
+        {
+            self.chain_offset = links.links[i].start_ns;
+        }
+        self.group_end = self.group_end.max(self.chain_offset);
+        let config = Config::of(ident);
+        let Some(at) = self.tracks.iter().position(|t| !t.renewed && t.config == Some(config))
+        else {
+            let family = config.mapping.family();
+            log!(ctx, Level::Warn, "link_changed", serial = serial, family = family);
+            if let Some(clock) = granule_clock(ident).filter(|_| self.strays.len() < 64) {
+                self.strays.push((serial, clock));
+            }
+            return None;
+        };
+        let t = &mut self.tracks[at];
+        let old = t.serial.replace(serial);
+        (t.offset, t.renewed) = (self.chain_offset, true);
+        let offset = Timestamp(t.offset);
+        if old.is_some() && self.learnt.map(|(key, _)| key) == old {
+            self.learnt = granule_clock(ident).map(|clock| (serial, clock)).or(self.learnt);
+        }
+        log!(ctx, Level::Info, "link", serial = serial, at = self.taken, offset = offset);
+        Some(at)
     }
 
     // Cold, once per open, a name and a description per stream.
     #[allow(clippy::disallowed_methods)]
     fn describe(&mut self, ctx: &mut Ctx, head: &[u8]) -> Result<(), Error> {
         self.tracks.clear();
+        self.group0.clear();
         for s in scan_head(head) {
             let (serial, family) = (s.serial, s.mapping.family());
+            self.group0.push(serial);
             let kind = match s.mapping {
                 Mapping::Skeleton => {
                     log!(&*ctx, Level::Debug, "skeleton_skipped", serial = serial);
@@ -560,10 +718,17 @@ impl OggDemux {
     // Cold, once per stream, and the tail is let go.
     #[allow(clippy::disallowed_methods)]
     fn publish(&mut self, ctx: &mut Ctx, bos: &[u8], serial: u32) {
-        if std::mem::replace(&mut self.published, true) {
+        if self.published {
             return;
         }
-        let duration = self.known.or_else(|| crate::stream_duration_ns(bos, &self.tail, serial));
+        if self.scans(ctx, serial) {
+            self.ident = Some(bos.to_vec());
+            return;
+        }
+        self.published = true;
+        let total = self.links.as_ref().map(Links::total_ns);
+        let duration =
+            total.or(self.known).or_else(|| crate::stream_duration_ns(bos, &self.tail, serial));
         self.ends = duration;
         let tail = self.tail.len();
         self.tail = Vec::new();
@@ -582,6 +747,80 @@ impl OggDemux {
         let index = Index { file_len: self.len, duration, ..Index::default() };
         self.average = rate::average(&index);
         ctx.publish_index(index);
+    }
+
+    /// Starts the link scan of a file whose tail ends on a page of a serial its first link does
+    /// not have, a chained one. True while it runs, one running at the end is let go.
+    fn scans(&mut self, ctx: &mut Ctx, serial: u32) -> bool {
+        match self.chained {
+            Chained::Known => return false,
+            Chained::Scanning => {
+                self.scan = None;
+                self.chained = Chained::Known;
+                log!(&*ctx, Level::Debug, "chain_scan_dropped");
+                return false;
+            }
+            Chained::Unknown => {}
+        }
+        self.chained = Chained::Known;
+        let Some(len) = self.len.filter(|_| self.known.is_none() && ctx.pulls(Self::IN)) else {
+            return false;
+        };
+        let last = chain::last_page_serial(&self.tail);
+        let first = |s: u32| s == serial || self.group0.contains(&s);
+        if last.is_none_or(first) {
+            return false;
+        }
+        log!(&*ctx, Level::Debug, "chain_scan", last = last.unwrap_or(0));
+        let m = ChainScan::with_tail(len, &self.tail);
+        (self.scan, self.chained) = (Some(Scan { m, asked: false, seq: 0 }), Chained::Scanning);
+        true
+    }
+
+    fn ask_chain(&mut self, ctx: &mut Ctx) {
+        let Some(scan) = &mut self.scan else {
+            return;
+        };
+        if scan.asked {
+            return;
+        }
+        match scan.m.step() {
+            chain::Step::Read { len, .. } if u64::from(len) > ctx.pool_stats().bytes_budget => {
+                log!(&*ctx, Level::Warn, "chain_scan_unread", bytes = len);
+                self.end_scan(ctx, None);
+            }
+            chain::Step::Read { at, len } => {
+                let tag = CHAIN_TAG | scan.seq << 2;
+                match self.feed.aside(ctx, Self::IN, at, len, tag) {
+                    true => scan.asked = true,
+                    false => ctx.wake_within(std::time::Duration::from_millis(1)),
+                }
+            }
+            chain::Step::Done => {
+                let links = scan.m.links();
+                self.end_scan(ctx, Some(links));
+            }
+        }
+    }
+
+    fn chain_in(&mut self, ctx: &mut Ctx, tag: u32, data: &[u8]) {
+        let Some(scan) = self.scan.as_mut().filter(|s| s.asked && tag >> 2 == s.seq) else {
+            return;
+        };
+        scan.m.served(data);
+        (scan.asked, scan.seq) = (false, (scan.seq + 1) & (u32::MAX >> 2));
+        self.ask_chain(ctx);
+    }
+
+    // Cold, once per file.
+    #[allow(clippy::disallowed_methods)]
+    fn end_scan(&mut self, ctx: &mut Ctx, found: Option<Option<Links>>) {
+        self.scan = None;
+        let links = found.flatten();
+        let n = links.as_ref().map_or(0, |l| l.links.len());
+        log!(&*ctx, Level::Info, "chain_links", links = n);
+        self.links = links.filter(|l| l.links.len() > 1);
+        self.publish_kept(ctx);
     }
 
     fn emit_packet(ctx: &mut Ctx, pad: SrcPad, data: &[u8], pts: Timestamp, head: bool) -> bool {
@@ -628,7 +867,13 @@ impl OggDemux {
             && !t.run.anchored()
             && let Some(g) = t.run.start(packet, self.reader.queued())
         {
-            t.run.anchor_at(g);
+            t.run.anchor_at(g, t.offset);
+        }
+        if packet.last
+            && packet.granule != GRANULE_NONE
+            && let Some(ns) = t.clock.and_then(|c| c.ns(packet.granule))
+        {
+            self.group_end = self.group_end.max(t.offset.saturating_add(ns));
         }
         t.run.stamp(stamp, &packet.data, packet.granule, packet.last)
     }
@@ -640,6 +885,7 @@ impl OggDemux {
             track.heads = mapping.header_packets(data);
             track.flac = mapping == Mapping::Flac;
             track.run.identify(data);
+            (track.config, track.clock) = (Some(Config::of(data)), granule_clock(data));
             // the stream sends its headers again itself
             track.greet = false;
             track.kept.clear();
@@ -654,10 +900,18 @@ impl OggDemux {
         head
     }
 
-    fn place(&mut self, ctx: &mut Ctx, serial: u32, bos: bool, data: &[u8]) -> Option<usize> {
-        let at = self.route(serial);
-        if at.is_none() && bos && Mapping::identify(data) != Mapping::Skeleton {
-            log!(&*ctx, Level::Warn, "link_dropped", serial = serial, at = self.taken);
+    fn place(&mut self, ctx: &mut Ctx, packet: &Packet) -> Option<usize> {
+        let (serial, bos, data) = (packet.serial, packet.bos, packet.data.as_slice());
+        let at = self.route(ctx, serial, bos, data);
+        if !bos {
+            (self.data_seen, self.switching) = (true, false);
+        }
+        if at.is_none()
+            && packet.granule != GRANULE_NONE
+            && let Some((_, clock)) = self.strays.iter().find(|s| s.0 == serial)
+            && let Some(ns) = clock.ns(packet.granule)
+        {
+            self.group_end = self.group_end.max(self.chain_offset.saturating_add(ns));
         }
         if !self.published && self.ident.is_none() && self.key == Some(serial) {
             self.ident(ctx, data, serial);
@@ -669,6 +923,7 @@ impl OggDemux {
                     self.primes = Mapping::identify(data) == Mapping::Vorbis;
                 }
                 self.learnt.get_or_insert((serial, clock));
+                self.learnt_first.get_or_insert((serial, clock));
             }
         }
         at
@@ -775,7 +1030,7 @@ impl OggDemux {
         }
         let mut budget = EMIT_BUDGET;
         while let Some(packet) = self.reader.next_packet() {
-            let placed = self.place(ctx, packet.serial, packet.bos, &packet.data);
+            let placed = self.place(ctx, &packet);
             self.note(packet.serial, packet.granule, packet.data.len());
             self.tell_rate(ctx);
             let skipped = self.skips(packet.serial, packet.granule);
@@ -844,7 +1099,7 @@ impl OggDemux {
             self.reader.recycle(c.data);
         }
         while let Some(packet) = self.reader.next_packet() {
-            let placed = self.place(ctx, packet.serial, packet.bos, &packet.data);
+            let placed = self.place(ctx, &packet);
             let skipped = self.skips(packet.serial, packet.granule);
             let Some(at) = placed.filter(|_| !skipped) else {
                 self.keep(skipped, packet.data);
@@ -913,20 +1168,53 @@ impl OggDemux {
         }
         self.stamp_all(Timestamp::NONE);
         self.tracks.iter_mut().for_each(|t| t.run.stop());
+        (self.data_seen, self.switching) = (false, false);
         self.unland();
         (self.at, self.measured) = (Timestamp::NONE, rate::ByteRate::default());
         self.teller.restart();
     }
 
-    fn bisector(&self, ctx: &Ctx, from: SeekTarget) -> Option<Bisect> {
-        let len = self.len.filter(|len| *len > 0 && ctx.pulls(Self::IN))?;
-        let (key, clock) = self.learnt?;
-        let target = ctx.presentation_point().unwrap_or(from.at).nanos()?;
-        let preroll = match clock {
+    /// Where a seek pulled to `from` goes. In a chained file a seek in the link being read
+    /// bisects its bytes, one in another reads that link from its bos pages, its headers going
+    /// out again.
+    fn plan(&mut self, ctx: &Ctx, from: SeekTarget) -> Plan {
+        self.seek_base = (0, 0);
+        let len = self.len.filter(|len| *len > 0 && ctx.pulls(Self::IN));
+        let target = ctx.presentation_point().unwrap_or(from.at).nanos();
+        let (Some(len), Some((key, clock)), Some(target)) = (len, self.learnt, target) else {
+            return Plan::Stamp;
+        };
+        let target = target.saturating_sub(match clock {
             GranuleClock::Opus { .. } => OPUS_PREROLL_NS,
             GranuleClock::Rate(_) | GranuleClock::Theora(_) => 0,
+        });
+        let Some(links) = &self.links else {
+            // a chain of links not known, the first is read again from the start
+            if self.tracks.iter().any(|t| t.serial != t.first) {
+                return Plan::Head;
+            }
+            return Plan::Bisect(Bisect::new(key, clock, target, len).ending(self.ends));
         };
-        Some(Bisect::new(key, clock, target.saturating_sub(preroll), len).ending(self.ends))
+        let k = links.at_time(target);
+        if links.of_serial(key) != Some(k) {
+            return Plan::Link(k);
+        }
+        let link = &links.links[k];
+        self.seek_base = (link.start_ns, link.at);
+        let b = Bisect::new(key, clock, target.saturating_sub(link.start_ns), len);
+        Plan::Bisect(b.within(link.at, links.end(k)).ending(Some(link.ns)))
+    }
+
+    /// Reads from `at`, the first byte of a link starting at `start_ns`, each track stamped from
+    /// its first packet on.
+    fn land_at_link(&mut self, at: u64, start_ns: u64) {
+        self.feed.restart(at);
+        for t in &mut self.tracks {
+            t.stamp = match t.run.rate {
+                0 => Timestamp(start_ns),
+                _ => Timestamp::NONE,
+            };
+        }
     }
 
     fn ask_probe(&mut self, ctx: &mut Ctx) {
@@ -970,11 +1258,16 @@ impl OggDemux {
             self.stamp_all(from.at);
             return;
         };
-        self.feed.restart(l.at);
+        let (offset, link_at) = self.seek_base;
         let head = l == Landing::HEAD;
+        if head && link_at > 0 {
+            return self.land_at_link(link_at, offset);
+        }
+        self.feed.restart(l.at);
         self.skip = (!head).then_some(l.granule);
         let (key, clock) = self.learnt.unzip();
-        let stamp = Timestamp(clock.and_then(|c| c.stamp(l.granule)).unwrap_or(l.ns));
+        let ns = clock.and_then(|c| c.stamp(l.granule)).unwrap_or(l.ns);
+        let stamp = Timestamp(offset.saturating_add(ns));
         // The landing page's time is the key stream's alone. A track whose packet lengths are
         // read anchors on its own page granule, the others take the landing's, 0 at the head.
         for t in &mut self.tracks {
@@ -990,10 +1283,14 @@ impl OggDemux {
     fn restart_pull(&mut self, ctx: &mut Ctx, from: SeekTarget) {
         self.feed.restart(from.to_byte);
         self.drop_read();
+        // a scan read out before the restart is asked again, a late one is told by its tag
+        if let Some(scan) = self.scan.as_mut().filter(|s| s.asked) {
+            (scan.asked, scan.seq) = (false, (scan.seq + 1) & (u32::MAX >> 2));
+        }
         // A source stamps nothing on its first byte read unasked.
         if std::mem::replace(&mut self.paired, true) {
-            let bisect = self.bisector(ctx, from);
-            let planned = bisect.is_some();
+            let plan = self.plan(ctx, from);
+            let planned = matches!(plan, Plan::Bisect(_));
             log!(
                 &*ctx,
                 Level::Debug,
@@ -1002,9 +1299,24 @@ impl OggDemux {
                 at = from.to_byte,
                 bisect = planned
             );
-            match bisect {
-                Some(b) => self.bisect = Some((b, from)),
-                None => self.stamp_all(from.at),
+            match plan {
+                Plan::Bisect(b) => self.bisect = Some((b, from)),
+                Plan::Stamp => self.stamp_all(from.at),
+                Plan::Head => {
+                    self.tracks.iter_mut().for_each(Track::rewind);
+                    (self.chain_offset, self.group_end) = (0, 0);
+                    self.learnt = self.learnt_first;
+                    self.land_at_link(0, 0);
+                }
+                Plan::Link(k) => {
+                    let (at, start) = self.links.as_ref().map_or((0, 0), |l| {
+                        let link = &l.links[k];
+                        (link.at, link.start_ns)
+                    });
+                    log!(&*ctx, Level::Debug, "seek_link", link = k, at = at);
+                    self.data_seen = true;
+                    self.land_at_link(at, start);
+                }
             }
         }
         let pulls = ctx.pulls(Self::IN);
@@ -1064,6 +1376,7 @@ impl OggDemux {
     fn pull(&mut self, ctx: &mut Ctx, inputs: &mut Inputs<'_>) -> Flow {
         self.ask_tail(ctx);
         self.ask_probe(ctx);
+        self.ask_chain(ctx);
         let mut held = false;
         loop {
             held = held || !self.drain(ctx);
@@ -1076,6 +1389,9 @@ impl OggDemux {
                     self.probe_in(buf.memory.data());
                     self.ask_probe(ctx);
                 }
+                Some(Fed::Aside { tag, buf }) if tag & 3 == CHAIN_TAG => {
+                    self.chain_in(ctx, tag, buf.memory.data())
+                }
                 Some(Fed::Aside { buf, .. }) => self.tail_in(ctx, buf.memory.data()),
                 None => break,
             }
@@ -1084,6 +1400,10 @@ impl OggDemux {
             (_, true) => {}
             (true, false) => ctx.hold_end(),
             (false, false) => self.feed.ask(ctx, Self::IN),
+        }
+        // the duration waits on the scan, the end with it
+        if self.scan.is_some() {
+            ctx.hold_end();
         }
         Flow::Ok
     }
@@ -1137,6 +1457,7 @@ impl Element for OggDemux {
         for t in &mut self.tracks {
             (t.stamp, t.heads, t.greet) = (Timestamp::NONE, 0, false);
             t.run.stop();
+            t.rewind();
             if self.streams {
                 t.pad = ctx.stream_pad(t.stream).filter(|pad| ctx.pad_linked(*pad));
             }
@@ -1146,6 +1467,10 @@ impl Element for OggDemux {
         (self.measured, self.teller) = (rate::ByteRate::default(), rate::Teller::default());
         ctx.want_ranges(Self::IN);
         (self.paired, self.seen) = (false, (0, 0));
+        (self.data_seen, self.switching) = (false, false);
+        (self.chain_offset, self.group_end) = (0, 0);
+        self.strays.clear();
+        self.learnt = self.learnt_first.or(self.learnt);
         self.unland();
         self.feed.set_window(WINDOW_FIRST);
         Ok(())
@@ -1440,7 +1765,7 @@ mod tests {
         let (first, rest) =
             (packet(0, GRANULE_NONE), [packet(1, GRANULE_NONE), packet(2, 5 << 6 | 2)]);
         assert_eq!(r.start(&first, rest.iter()), Some(4));
-        r.anchor_at(4);
+        r.anchor_at(4, 0);
         assert_eq!(r.stamp(Timestamp::NONE, b"f", GRANULE_NONE, false), Timestamp(4 * FRAME));
         // a zero byte packet repeats a frame and takes its slot
         assert_eq!(r.stamp(Timestamp::NONE, b"", GRANULE_NONE, false), Timestamp(5 * FRAME));
@@ -1474,7 +1799,7 @@ mod tests {
         let page: Vec<Packet> = (0..50).map(|i| packet(i == 49, 15_857)).collect();
         assert_eq!(r.start(&page[0], page[1..].iter()), Some(0), "a start before 0 is 0");
         assert_eq!(r.start(&page[1], page[2..].iter()), Some(177));
-        r.anchor_at(0);
+        r.anchor_at(0, 0);
         for (i, p) in page.iter().enumerate() {
             let pts = r.stamp(Timestamp::NONE, &p.data, p.granule, p.last);
             assert_eq!(pts, Timestamp(i as u64 * MS20), "packet {i}");

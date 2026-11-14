@@ -111,7 +111,12 @@ meaning is left to the media mapping, unaltered here.
 
 - **profluens elements.** `OggDemux` made from a file's head puts out every grouped
   logical bitstream of the first link (2026-10-19), and `OggMuxN` muxes several. A chained
-  link behind the first is dropped by the demuxer, its serials being new.
+  link behind the first goes on in the track of the same mapping, channels and granule rate,
+  stamped on from where the link before ended, and one of another configuration is dropped,
+  its track silent until a later link matches (2026-11-13). Pulled, a tail ending on a serial
+  the first link lacks starts `chain::ChainScan`, which bisects for each link's first page, so
+  the duration spans every link and a seek bisects within its link or reads another from its
+  bos pages. A file whose start granule is not 0 is still timed from granule 0.
 - **Skeleton / chained-stream seeking metadata**, and granule→time conversion, are the
   concern of the media mapping / a higher layer, not the container.
 - **`crc` SIMD / slice-by-N**: the byte-wise table CRC is already several hundred MB/s;

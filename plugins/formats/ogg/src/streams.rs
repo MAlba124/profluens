@@ -44,7 +44,7 @@ impl TagSink for Wanted<'_> {
     fn picture(&mut self, _mime: &str, _data: &[u8]) {}
 }
 
-fn channels_of(mapping: Mapping, ident: &[u8]) -> u16 {
+pub(crate) fn channels_of(mapping: Mapping, ident: &[u8]) -> u16 {
     match mapping {
         Mapping::Opus => parse_opus_head(ident).map_or(0, |h| u16::from(h.channels)),
         Mapping::Vorbis => parse_vorbis_ident(ident).map_or(0, |h| u16::from(h.channels)),

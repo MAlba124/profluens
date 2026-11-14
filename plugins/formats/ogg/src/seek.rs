@@ -64,6 +64,8 @@ pub struct Bisect {
     probes: u32,
     whole: Option<u64>,
     phase: Phase,
+    /// Where the stream's pages start, a chained link's first byte.
+    floor: u64,
 }
 
 impl Bisect {
@@ -85,7 +87,16 @@ impl Bisect {
             probes: 0,
             whole: None,
             phase: Phase::Target,
+            floor: 0,
         }
+    }
+
+    /// Searches bytes `lo` to `hi` alone, the link of a chained file the stream is in, its
+    /// stream time 0 at `lo`.
+    pub fn within(mut self, lo: u64, hi: u64) -> Bisect {
+        let hi = hi.min(self.len).max(lo);
+        (self.lo, self.hi, self.span, self.floor) = (lo, hi, hi - lo, lo);
+        self
     }
 
     /// The stream time `ns` the file's last page ends at, its duration, so the first probe
@@ -135,7 +146,7 @@ impl Bisect {
         let (lo, hi) = (self.lo, self.hi);
         let (b0, t0, b1, t1) = match self.hi_ns {
             Some(ns) => (lo, self.lo_ns, hi, ns),
-            None => (0, 0, lo, self.lo_ns),
+            None => (self.floor, 0, lo, self.lo_ns),
         };
         if self.halve || t1 <= t0 || b1 <= b0 {
             return lo + (hi - lo) / 2;
@@ -172,7 +183,8 @@ impl Bisect {
             return;
         };
         self.phase = Phase::Keyframe { found };
-        (self.target, self.lo, self.hi, self.best, self.whole) = (key, 0, found.at, None, None);
+        (self.target, self.lo, self.hi, self.best, self.whole) =
+            (key, self.floor, found.at, None, None);
         (self.lo_ns, self.hi_ns, self.halve) = (0, Some(found.ns), false);
     }
 

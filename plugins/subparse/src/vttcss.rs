@@ -7,7 +7,8 @@
 #![allow(clippy::disallowed_methods)]
 
 use crate::ir::{
-    Color, FontSize, FontStyle, Names, Outline, RubyPosition, Shadow, StyleRec, size_step,
+    Color, FontSize, FontStyle, MAX_CLASSES, Names, Outline, RubyPosition, Shadow, StyleRec,
+    size_step,
 };
 
 /// Rules a sheet keeps, every cue root and tag is matched against each one.
@@ -45,7 +46,8 @@ pub struct Compound {
     pub element: Option<String>,
     /// `#id`, matched against the cue identifier (the root node carries it).
     pub id: Option<String>,
-    /// `.class` parts, all must be present on the node.
+    /// `.class` parts, all must be present on the node. At most [`MAX_CLASSES`], a selector
+    /// with more is refused.
     pub classes: Vec<String>,
     /// `[voice="..."]`, only `<v>` nodes carry a voice.
     pub voice: Option<String>,
@@ -63,7 +65,8 @@ pub struct Compound {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Node<'a> {
     pub element: Option<&'a str>,
-    /// The node's classes as the tag wrote them, dot separated (`.a.b` or `a.b`).
+    /// The node's classes as the tag wrote them, dot separated (`.a.b` or `a.b`). Only the first
+    /// [`MAX_CLASSES`] are matched.
     pub classes: &'a str,
     pub voice: Option<&'a str>,
     pub lang: Option<&'a str>,
@@ -110,8 +113,10 @@ impl Stylesheet {
         style: &mut StyleRec,
         ruby_position: &mut RubyPosition,
     ) {
+        let mut buf = [""; MAX_CLASSES];
+        let classes = sorted_classes(node.classes, &mut buf);
         for rule in &self.rules {
-            if rule.matches(node) {
+            if rule.matches(node, classes) {
                 style.merge_from(&rule.style, &self.names, names);
                 if let Some(rp) = rule.ruby_position {
                     *ruby_position = rp;
@@ -121,18 +126,32 @@ impl Stylesheet {
     }
 }
 
+/// The first [`MAX_CLASSES`] classes of a dotted list, sorted, so a rule checks each of its own
+/// with a binary search instead of a scan of the node's.
+fn sorted_classes<'a, 'b>(dotted: &'a str, buf: &'b mut [&'a str; MAX_CLASSES]) -> &'b [&'a str] {
+    let mut n = 0;
+    for (slot, class) in buf.iter_mut().zip(dotted.split('.').filter(|c| !c.is_empty())) {
+        *slot = class;
+        n += 1;
+    }
+    let classes = &mut buf[..n];
+    classes.sort_unstable();
+    classes
+}
+
 impl Rule {
-    fn matches(&self, node: &Node) -> bool {
+    /// `classes` are the node's, sorted.
+    fn matches(&self, node: &Node, classes: &[&str]) -> bool {
         match &self.compound {
             // Argless `::cue` styles the root only, children inherit via the base style.
             None => node.element.is_none(),
-            Some(c) => c.matches(node),
+            Some(c) => c.matches(node, classes),
         }
     }
 }
 
 impl Compound {
-    fn matches(&self, node: &Node) -> bool {
+    fn matches(&self, node: &Node, classes: &[&str]) -> bool {
         if self.time_dependent || self.unsupported {
             return false;
         }
@@ -146,7 +165,7 @@ impl Compound {
         {
             return false;
         }
-        if !self.classes.iter().all(|c| node.classes.split('.').any(|n| n == c)) {
+        if !self.classes.iter().all(|c| classes.binary_search(&c.as_str()).is_ok()) {
             return false;
         }
         if let Some(v) = self.voice.as_deref()
@@ -187,8 +206,9 @@ fn parse_rules(css: &str, rules: &mut Vec<Rule>, names: &mut Names, next_order: 
             break;
         }
         if bytes[pos] == b'@' {
+            // The cached '{' stays, the `o >= pos` check drops it once passed. Forgetting it
+            // rescanned to the end per at-rule.
             pos = skip_at_rule(&css, pos);
-            next_open = None;
             continue;
         }
         // A stray top-level '}' before the '{' is a parse error, CSS discards up to and including
@@ -506,7 +526,7 @@ fn parse_compound(s: &str) -> Option<Compound> {
         match bytes[i] {
             b'.' => {
                 let (name, j) = read_ident(s, i + 1);
-                if name.is_empty() {
+                if name.is_empty() || c.classes.len() >= MAX_CLASSES {
                     return None;
                 }
                 c.classes.push(name.to_owned());

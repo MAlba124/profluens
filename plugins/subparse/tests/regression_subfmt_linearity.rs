@@ -67,6 +67,87 @@ fn webvtt_style_block_of_stray_braces_is_linear() {
 }
 
 #[test]
+fn webvtt_style_block_of_at_rules_is_linear() {
+    let body = format!(
+        "WEBVTT\n\nSTYLE\n{}\n\n00:00:01.000 --> 00:00:02.000\nx\n\n",
+        "@;}".repeat(64_000)
+    );
+    within("WebVTT STYLE of 64k '@;}'", move || {
+        let mut parser = WebVtt::default();
+        let cues = parser.parse(&body, &ParseContext::default()).unwrap();
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "x");
+        assert!(parser.stylesheet().is_none());
+    });
+}
+
+/// `rules` copies of a `c` rule of `k` classes, then one cue of `tags` empty tags of `m`
+/// classes and one more around `x`. Empty tags lay nothing out, the builder never overflows.
+fn class_heavy(rules: usize, k: usize, m: usize, tags: usize) -> String {
+    let mut body = String::from("WEBVTT\n\nSTYLE\n");
+    let class = |i: usize| format!(".z{}", i % 997);
+    let sel: String = (0..k).map(class).collect();
+    for _ in 0..rules {
+        body.push_str(&format!("::cue(c{sel}) {{ color: red }}\n"));
+    }
+    body.push_str("\n00:00:01.000 --> 00:00:02.000\n");
+    let tag: String = (0..m).rev().map(class).collect();
+    for _ in 0..tags {
+        body.push_str(&format!("<c{tag}></c>"));
+    }
+    body.push_str(&format!("<c{tag}>x</c>\n\n"));
+    body
+}
+
+#[test]
+fn webvtt_class_matching_is_bounded_by_the_class_cap() {
+    use pf_subparse::ir::MAX_CLASSES;
+    within("WebVTT 512 rules x class heavy tags", move || {
+        for (k, m, tags, styled) in [
+            (1000, 1000, 2, false),
+            (MAX_CLASSES, 1000, 7, false),
+            (MAX_CLASSES, MAX_CLASSES, 100, true),
+        ] {
+            let body = class_heavy(MAX_RULES, k, m, tags);
+            let mut parser = WebVtt::default();
+            let cues = parser.parse(&body, &ParseContext::default()).unwrap();
+            assert_eq!(cues.len(), 1);
+            let mut b = CueBuilder::new();
+            b.cue(&cues[0], OutputFormat::PangoMarkup, parser.stylesheet());
+            let ir = b.to_vec();
+            let ir = CueIr::parse(&ir).expect("valid");
+            let span = ir.line_spans(&ir.lines()[0])[0];
+            let red = ir.span_style(&span).foreground().is_some();
+            assert_eq!(red, styled, "k {k} m {m}");
+        }
+    });
+}
+
+#[test]
+fn subrip_one_huge_cue_keeps_a_bounded_text() {
+    use pf_subparse::ir::CUE_LIMIT;
+    let body = format!("1\n00:00:01,000 --> 00:00:02,000\n{}", "\"".repeat(16 << 20));
+    within("SubRip 16 MiB cue of '\"'", move || {
+        let cues = SubRip::default().parse(&body, &ParseContext::default()).unwrap();
+        assert_eq!(cues.len(), 1);
+        let raw = cues[0].raw_text.as_deref().unwrap_or_default();
+        assert!(raw.len() <= 4 * CUE_LIMIT, "raw text {} B", raw.len());
+        assert!(cues[0].text.len() <= 6 * 4 * CUE_LIMIT, "text {} B", cues[0].text.len());
+    });
+}
+
+#[test]
+fn webvtt_one_huge_cue_keeps_a_bounded_text() {
+    use pf_subparse::ir::CUE_LIMIT;
+    let body = format!("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n{}", "\"\n".repeat(8 << 20));
+    within("WebVTT 16 MiB cue of '\"'", move || {
+        let cues = WebVtt::default().parse(&body, &ParseContext::default()).unwrap();
+        assert_eq!(cues.len(), 1);
+        assert!(cues[0].text.len() <= 6 * 4 * CUE_LIMIT, "text {} B", cues[0].text.len());
+    });
+}
+
+#[test]
 fn ssa_unknown_tags_with_open_parens_are_linear() {
     let raw_text = format!("{{{}}}x", "\\(".repeat(150_000));
     within("SSA override block of 150k \\(", move || {

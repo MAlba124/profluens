@@ -200,12 +200,27 @@ pub fn with_dmabuf(
     channel: &Arc<GpuFrameChannel>,
     formats: &[DmabufFormat],
 ) -> Option<Box<dyn Element>> {
-    type Make = fn(&Arc<GpuFrameChannel>, &[DmabufFormat]) -> Box<dyn Element>;
+    with_dmabuf_rows(desc, channel, formats, 1)
+}
+
+/// [`with_dmabuf`] with the rows of an NV12 or P010 slot a multiple of `row_align` bytes
+/// apart, see [`VideoDec::with_row_align`].
+// Once per pipeline build.
+#[allow(clippy::disallowed_methods)]
+pub fn with_dmabuf_rows(
+    desc: &ElementDesc,
+    channel: &Arc<GpuFrameChannel>,
+    formats: &[DmabufFormat],
+    row_align: usize,
+) -> Option<Box<dyn Element>> {
+    type Make = fn(&Arc<GpuFrameChannel>, &[DmabufFormat], usize) -> Box<dyn Element>;
     fn boxed<C: Codec>(
         channel: &Arc<GpuFrameChannel>,
         formats: &[DmabufFormat],
+        row_align: usize,
     ) -> Box<dyn Element> {
-        Box::new(VideoDec::<C>::new().with_dmabuf(Arc::clone(channel), formats))
+        let dec = VideoDec::<C>::new().with_dmabuf(Arc::clone(channel), formats);
+        Box::new(dec.with_row_align(row_align))
     }
     let made: [(&ElementDesc, Make); 12] = [
         (&H264_DESC, boxed::<LavVideo<H264>>),
@@ -221,7 +236,9 @@ pub fn with_dmabuf(
         (&VP7_DESC, boxed::<LavVideo<VP7>>),
         (&THEORA_DESC, boxed::<LavVideo<THEORA>>),
     ];
-    made.iter().find(|(d, _)| std::ptr::eq(*d, desc)).map(|(_, make)| make(channel, formats))
+    made.iter()
+        .find(|(d, _)| std::ptr::eq(*d, desc))
+        .map(|(_, make)| make(channel, formats, row_align))
 }
 
 #[derive(Debug, PartialEq, Eq)]

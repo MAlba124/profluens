@@ -656,6 +656,15 @@ impl fmt::Display for VideoDecError {
 
 impl std::error::Error for VideoDecError {}
 
+/// The rows of `dst`, each `row` bytes long and `pitch` bytes after the one before.
+#[inline]
+fn rows_mut(dst: &mut [u8], row: usize, pitch: usize) -> impl Iterator<Item = &mut [u8]> {
+    dst.chunks_mut(pitch.max(1)).map(move |c| {
+        let n = row.min(c.len());
+        &mut c[..n]
+    })
+}
+
 /// Copy strided `planes` into `dst` packed tight. Bytes written.
 pub fn pack_planes(
     dst: &mut [u8],
@@ -663,6 +672,17 @@ pub fn pack_planes(
     width: u32,
     height: u32,
     planes: &[PlaneRef<'_>; 3],
+) -> Result<usize, VideoDecError> {
+    pack_planes_at(dst, pixfmt, (width, height), planes, None)
+}
+
+/// [`pack_planes`] with every row `pitch` bytes after the one before, tight without one.
+fn pack_planes_at(
+    dst: &mut [u8],
+    pixfmt: PixelFormat,
+    (width, height): (u32, u32),
+    planes: &[PlaneRef<'_>; 3],
+    pitch: Option<usize>,
 ) -> Result<usize, VideoDecError> {
     let mut at = 0;
     for (plane, src) in planes.iter().enumerate().take(pixfmt.plane_count()) {
@@ -682,7 +702,7 @@ pub fn pack_planes(
         for row in 0..g.height {
             let from = row * src.stride;
             dst[at..at + g.stride].copy_from_slice(&src.data[from..from + g.stride]);
-            at += g.stride;
+            at += pitch.map_or(g.stride, |p| p.max(g.stride));
         }
     }
     Ok(at)
@@ -695,15 +715,17 @@ pub fn pack_p010(
     height: u32,
     planes: &[PlaneRef<'_>; 3],
 ) -> Result<usize, VideoDecError> {
-    pack_p010_on(Lanes::detect(), dst, width, height, planes)
+    pack_p010_on(Lanes::detect(), dst, width, height, planes, None)
 }
 
+/// [`pack_p010`] on `lanes`, with a `pitch` both planes' rows lie that many bytes apart.
 pub(crate) fn pack_p010_on(
     lanes: Lanes,
     dst: &mut [u8],
     width: u32,
     height: u32,
     planes: &[PlaneRef<'_>; 3],
+    pitch: Option<usize>,
 ) -> Result<usize, VideoDecError> {
     let (w, h) = (width as usize, height as usize);
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
@@ -720,10 +742,14 @@ pub(crate) fn pack_p010_on(
             return Err(VideoDecError::PlaneShort { plane, need, have: src.data.len() });
         }
     }
-    let (luma, chroma) = (2 * w * h, 4 * cw * ch);
+    let (luma_pitch, chroma_pitch) = match pitch {
+        Some(p) => (p.max(4 * cw), p.max(4 * cw)),
+        None => (2 * w, 4 * cw),
+    };
+    let (luma, chroma) = (luma_pitch * h, chroma_pitch * ch);
     let (y_dst, rest) = dst[..luma + chroma].split_at_mut(luma);
     if w > 0 {
-        for (row, d) in y_dst.chunks_exact_mut(2 * w).enumerate() {
+        for (row, d) in rows_mut(y_dst, 2 * w, luma_pitch).enumerate() {
             let from = row * planes[0].stride;
             let src = &planes[0].data[from..from + 2 * w];
             let done = 2 * simd::shift(lanes, d, src, P010_SHIFT);
@@ -731,7 +757,7 @@ pub(crate) fn pack_p010_on(
         }
     }
     if cw > 0 {
-        for (row, d) in rest.chunks_exact_mut(4 * cw).enumerate() {
+        for (row, d) in rows_mut(rest, 4 * cw, chroma_pitch).enumerate() {
             let (fu, fv) = (row * planes[1].stride, row * planes[2].stride);
             let u = &planes[1].data[fu..fu + 2 * cw];
             let v = &planes[2].data[fv..fv + 2 * cw];
@@ -783,9 +809,12 @@ pub fn pack_reduced(
     planes: &[PlaneRef<'_>; 3],
 ) -> Result<usize, VideoDecError> {
     let lanes = Lanes::detect();
-    pack_reduced_on(lanes, dst, (width, height), chroma_shift, bits, to, planes)
+    pack_reduced_on(lanes, dst, (width, height), chroma_shift, bits, to, planes, None)
 }
 
+/// [`pack_reduced`] on `lanes`. With a `pitch` the rows of both P010 planes lie that many
+/// bytes apart, I420 stays tight.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pack_reduced_on(
     lanes: Lanes,
     dst: &mut [u8],
@@ -794,6 +823,7 @@ pub(crate) fn pack_reduced_on(
     bits: u8,
     to: PixelFormat,
     planes: &[PlaneRef<'_>; 3],
+    pitch: Option<usize>,
 ) -> Result<usize, VideoDecError> {
     let (w, h) = (width as usize, height as usize);
     let shift = (chroma_shift.0.min(1), chroma_shift.1.min(1));
@@ -821,11 +851,16 @@ pub(crate) fn pack_reduced_on(
         }
     }
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    let (luma, chroma) = (size * w * h, 2 * size * cw * ch);
+    // P010's two planes take the pitch, I420's three have a row length each
+    let (luma_pitch, chroma_pitch) = match pitch.filter(|_| wide) {
+        Some(p) => (p.max(4 * cw), p.max(4 * cw)),
+        None => (size * w, 2 * size * cw),
+    };
+    let (luma, chroma) = (luma_pitch * h, chroma_pitch * ch);
     let (y_dst, c_dst) = dst[..luma + chroma].split_at_mut(luma);
     let up = 16 - u32::from(bits.min(16));
     if w > 0 {
-        for (row, d) in y_dst.chunks_exact_mut(size * w).enumerate() {
+        for (row, d) in rows_mut(y_dst, size * w, luma_pitch).enumerate() {
             let from = row * planes[0].stride;
             let src = &planes[0].data[from..from + size * w];
             match wide {
@@ -844,7 +879,7 @@ pub(crate) fn pack_reduced_on(
     let taps = shift.0 == 0;
     let mut t = Temps::new();
     if wide {
-        for (y, d) in c_dst.chunks_exact_mut(4 * cw).enumerate() {
+        for (y, d) in rows_mut(c_dst, 4 * cw, chroma_pitch).enumerate() {
             let (u, v) = (fit.rows_of::<true>(&planes[1], y), fit.rows_of::<true>(&planes[2], y));
             let done = simd::fit_p010(lanes, taps, bits, u, v, d, up);
             for (k, d) in d[4 * done..].chunks_mut(4 * RUN).enumerate() {
@@ -969,10 +1004,22 @@ pub fn pack_gray(
 /// written.
 pub fn pack_gray_wide(
     dst: &mut [u8],
+    dims: (u32, u32),
+    bits: u8,
+    to: PixelFormat,
+    planes: &[PlaneRef<'_>; 3],
+) -> Result<usize, VideoDecError> {
+    pack_gray_wide_at(dst, dims, bits, to, planes, None)
+}
+
+/// [`pack_gray_wide`], with a `pitch` the rows of both P010 planes lie that many bytes apart.
+fn pack_gray_wide_at(
+    dst: &mut [u8],
     (width, height): (u32, u32),
     bits: u8,
     to: PixelFormat,
     planes: &[PlaneRef<'_>; 3],
+    pitch: Option<usize>,
 ) -> Result<usize, VideoDecError> {
     let lanes = Lanes::detect();
     let (w, h) = (width as usize, height as usize);
@@ -982,9 +1029,14 @@ pub fn pack_gray_wide(
     }
     check_planes(&planes[..1], &[(2 * w, h)])?;
     let size = to.bytes_per_sample();
-    let (luma, chroma) = (size * w * h, 2 * size * w.div_ceil(2) * h.div_ceil(2));
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let (luma_pitch, chroma_pitch) = match pitch.filter(|_| size == 2) {
+        Some(p) => (p.max(4 * cw), p.max(4 * cw)),
+        None => (size * w, 2 * size * cw),
+    };
+    let (luma, chroma) = (luma_pitch * h, chroma_pitch * ch);
     let (y_dst, c_dst) = dst[..luma + chroma].split_at_mut(luma);
-    let rows = y_dst.chunks_exact_mut((size * w).max(1)).take(h);
+    let rows = rows_mut(y_dst, size * w, luma_pitch).take(h);
     if size == 2 {
         let up = 16 - u32::from(bits.min(16));
         for (row, d) in rows.enumerate() {
@@ -1144,6 +1196,37 @@ fn nv12_layout(width: u32, height: u32) -> ([(usize, usize); 3], usize, (u32, u3
     ([(0, w), (w * h, w), (0, 0)], 2, (w as u32, h as u32))
 }
 
+/// The bytes between the rows of a `fourcc` slot holding a `width` wide picture when they lie
+/// a multiple of `align` apart, `None` to pack it tight. NV12 and P010 take one, their two
+/// planes share a pitch.
+fn slot_pitch(fourcc: u32, width: u32, align: usize) -> Option<usize> {
+    let cw = width.div_ceil(2) as usize;
+    let row = match fourcc {
+        DRM_FORMAT_NV12 => 2 * cw,
+        DRM_FORMAT_P010 => 4 * cw,
+        _ => return None,
+    };
+    (align > 1).then(|| row.next_multiple_of(align))
+}
+
+/// The bytes of a `fourcc` slot whose rows lie `pitch` apart, luma then interleaved chroma.
+fn pitched_size(fourcc: u32, height: u32, pitch: usize) -> usize {
+    let h = height as usize;
+    match fourcc {
+        DRM_FORMAT_NV12 => pitch * h.next_multiple_of(2) * 3 / 2,
+        _ => pitch * (h + h.div_ceil(2)),
+    }
+}
+
+/// The planes and their count of a `fourcc` slot whose rows lie `pitch` apart.
+fn pitched_layout(fourcc: u32, height: u32, pitch: usize) -> ([(usize, usize); 3], usize) {
+    let rows = match fourcc {
+        DRM_FORMAT_NV12 => (height as usize).next_multiple_of(2),
+        _ => height as usize,
+    };
+    ([(0, pitch), (pitch * rows, pitch), (0, 0)], 2)
+}
+
 fn tight_i420(s: &[u8], w: usize, h: usize) -> [PlaneRef<'_>; 3] {
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     let (y, c) = s.split_at(w * h);
@@ -1168,9 +1251,10 @@ pub fn pack_nv12(
     planes: &[PlaneRef<'_>; 3],
 ) -> Result<usize, VideoDecError> {
     let lanes = Lanes::detect();
-    pack_nv12_on(lanes, dst, scratch, (layout, pixfmt), (width, height), planes)
+    pack_nv12_on(lanes, dst, scratch, (layout, pixfmt), (width, height), planes, None)
 }
 
+/// [`pack_nv12`] on `lanes`, with a `pitch` both planes' rows lie that many bytes apart.
 pub(crate) fn pack_nv12_on(
     lanes: Lanes,
     dst: &mut [u8],
@@ -1178,6 +1262,7 @@ pub(crate) fn pack_nv12_on(
     (layout, pixfmt): (HeldLayout, PixelFormat),
     (width, height): (u32, u32),
     planes: &[PlaneRef<'_>; 3],
+    pitch: Option<usize>,
 ) -> Result<usize, VideoDecError> {
     let (w, h) = (width as usize, height as usize);
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
@@ -1202,11 +1287,20 @@ pub(crate) fn pack_nv12_on(
                 }
                 (HeldLayout::Reduce { chroma_shift, bits }, _) => {
                     let to = PixelFormat::I420;
-                    pack_reduced_on(lanes, s, (width, height), chroma_shift, bits, to, planes)?
+                    pack_reduced_on(
+                        lanes,
+                        s,
+                        (width, height),
+                        chroma_shift,
+                        bits,
+                        to,
+                        planes,
+                        None,
+                    )?
                 }
                 (HeldLayout::Planar10, _) => {
                     let to = PixelFormat::I420;
-                    pack_reduced_on(lanes, s, (width, height), (1, 1), 10, to, planes)?
+                    pack_reduced_on(lanes, s, (width, height), (1, 1), 10, to, planes, None)?
                 }
                 (layout, _) => return Err(VideoDecError::HeldLayout { layout, pixfmt: "nv12" }),
             };
@@ -1215,18 +1309,19 @@ pub(crate) fn pack_nv12_on(
     };
     check_planes(&i420, &[(w, h), (cw, ch), (cw, ch)])?;
     let (ew, eh) = nv12_even(width, height);
-    let (y_dst, uv_dst) = dst[..ew * eh * 3 / 2].split_at_mut(ew * eh);
+    let pitch = pitch.map_or(ew, |p| p.max(ew));
+    let (y_dst, uv_dst) = dst[..pitch * eh * 3 / 2].split_at_mut(pitch * eh);
     if w == 0 || h == 0 {
-        return Ok(ew * eh * 3 / 2);
+        return Ok(pitch * eh * 3 / 2);
     }
-    for (r, d) in y_dst.chunks_exact_mut(ew).enumerate() {
+    for (r, d) in rows_mut(y_dst, ew, pitch).enumerate() {
         let from = r.min(h - 1) * i420[0].stride;
         d[..w].copy_from_slice(&i420[0].data[from..from + w]);
         if ew > w {
             d[w] = d[w - 1];
         }
     }
-    for (r, d) in uv_dst.chunks_exact_mut(ew).enumerate() {
+    for (r, d) in rows_mut(uv_dst, ew, pitch).enumerate() {
         let (fu, fv) = (r * i420[1].stride, r * i420[2].stride);
         let (u, v) = (&i420[1].data[fu..fu + cw], &i420[2].data[fv..fv + cw]);
         let done = simd::interleave(lanes, d, u, v);
@@ -1235,7 +1330,35 @@ pub(crate) fn pack_nv12_on(
             *d = [u, v];
         }
     }
-    Ok(ew * eh * 3 / 2)
+    Ok(pitch * eh * 3 / 2)
+}
+
+/// Packs a picture in the codec's `layout` and `pixfmt` into a slot, as NV12 when `nv12`, its
+/// rows `pitch` apart when the slot has one. `None` for a layout no packer takes.
+fn pack_slot(
+    dst: &mut [u8],
+    scratch: Option<&mut Vec<u8>>,
+    nv12: bool,
+    (layout, pixfmt): (HeldLayout, PixelFormat),
+    (width, height): (u32, u32),
+    planes: &[PlaneRef<'_>; 3],
+    pitch: Option<usize>,
+) -> Option<Result<usize, VideoDecError>> {
+    let lanes = Lanes::detect();
+    let dims = (width, height);
+    Some(match (layout, pixfmt) {
+        _ if nv12 => pack_nv12_on(lanes, dst, scratch, (layout, pixfmt), dims, planes, pitch),
+        (HeldLayout::Native, _) => pack_planes_at(dst, pixfmt, dims, planes, pitch),
+        (HeldLayout::Planar10, PixelFormat::P010) => {
+            pack_p010_on(lanes, dst, width, height, planes, pitch)
+        }
+        (HeldLayout::Reduce { chroma_shift, bits }, f) => {
+            pack_reduced_on(lanes, dst, dims, chroma_shift, bits, f, planes, pitch)
+        }
+        (HeldLayout::Gray, PixelFormat::I420) => pack_gray(dst, width, height, planes),
+        (HeldLayout::GrayWide { bits }, f) => pack_gray_wide_at(dst, dims, bits, f, planes, pitch),
+        _ => return None,
+    })
 }
 
 struct DmabufOut {
@@ -1250,6 +1373,8 @@ struct DmabufOut {
     refused: u64,
     /// A picture as tight I420 on its way to an NV12 slot, when the codec lays it out otherwise.
     scratch: Vec<u8>,
+    /// The rows of an NV12 or P010 slot lie a multiple of this apart, 1 packs them tight.
+    row_align: usize,
 }
 
 impl DmabufOut {
@@ -1339,7 +1464,18 @@ impl<C: Codec> VideoDec<C> {
             desc,
             refused: 0,
             scratch: Vec::new(),
+            row_align: 1,
         });
+        self
+    }
+
+    /// The rows of an NV12 or P010 slot lie a multiple of `bytes` apart, for an importer that
+    /// reads rows at an aligned pitch, the frame's planes say the pitch. Other layouts stay
+    /// tight. Set after [`VideoDec::with_dmabuf`], it does nothing on a decoder without it.
+    pub fn with_row_align(mut self, bytes: usize) -> Self {
+        if let Some(d) = self.dmabuf.as_mut() {
+            d.row_align = bytes.max(1);
+        }
         self
     }
 
@@ -1398,6 +1534,9 @@ impl<C: Codec> VideoDec<C> {
             let nv12 =
                 link.is_some_and(|(f, _)| f == DRM_FORMAT_NV12) && own != Some(DRM_FORMAT_NV12);
             let layout = link.and_then(|(fourcc, _)| gpuframe::layout_of(fourcc));
+            // The pitch of a slot whose importer reads aligned rows, tight without one.
+            let row_align = self.dmabuf.as_ref().map_or(1, |d| d.row_align);
+            let pitch = link.and_then(|(fourcc, _)| slot_pitch(fourcc, width, row_align));
             if self.shape != Some(shape) {
                 let level = if self.shape.is_none() { Level::Info } else { Level::Debug };
                 log!(
@@ -1420,6 +1559,7 @@ impl<C: Codec> VideoDec<C> {
             if let (Ready::Sent(sent), Some((fourcc, _))) = (p, link)
                 && sent.layout == HeldLayout::Native
                 && own == Some(fourcc)
+                && pitch.is_none()
                 && Dmabuf::of(&sent.memory).is_ok()
             {
                 self.export_sent(ctx, fourcc)?;
@@ -1448,11 +1588,14 @@ impl<C: Codec> VideoDec<C> {
                 return Ok(false);
             };
             self.stalled = false;
-            let need = match p {
-                _ if nv12 => nv12_size(width, height),
-                Ready::Owned(p) => p.planes.iter().map(Vec::len).sum(),
-                Ready::Held(h) => packed_size(h.pixfmt, h.width, h.height),
-                Ready::Sent(s) => packed_size(s.pixfmt, s.width, s.height),
+            let need = match (p, link, pitch) {
+                (_, Some((fourcc, _)), Some(pitch)) => pitched_size(fourcc, height, pitch),
+                _ => match p {
+                    _ if nv12 => nv12_size(width, height),
+                    Ready::Owned(p) => p.planes.iter().map(Vec::len).sum(),
+                    Ready::Held(h) => packed_size(h.pixfmt, h.width, h.height),
+                    Ready::Sent(s) => packed_size(s.pixfmt, s.width, s.height),
+                },
             };
             let capacity = buf.memory.capacity();
             // Dmabuf mode sizes its slots to the stream, a larger picture grows them.
@@ -1485,9 +1628,23 @@ impl<C: Codec> VideoDec<C> {
                         let stride = plane_geometry(f, width, height, i).map_or(0, |g| g.stride);
                         *plane = PlaneRef { data, stride };
                     }
+                    let lanes = Lanes::detect();
+                    let from = (HeldLayout::Native, f);
                     let packed =
-                        pack_nv12(dst, scratch, HeldLayout::Native, f, width, height, &planes);
+                        pack_nv12_on(lanes, dst, scratch, from, (width, height), &planes, pitch);
                     if let Err(error) = packed {
+                        return Err(self.fatal(ctx, error));
+                    }
+                    (p.pts, p.duration)
+                }
+                Ready::Owned(p) if pitch.is_some() => {
+                    let f = PixelFormat::from_caps_name(p.pixfmt).unwrap_or(PixelFormat::I420);
+                    let mut planes = [PlaneRef::EMPTY; 3];
+                    for (i, (plane, data)) in planes.iter_mut().zip(&p.planes).enumerate() {
+                        let stride = plane_geometry(f, width, height, i).map_or(0, |g| g.stride);
+                        *plane = PlaneRef { data, stride };
+                    }
+                    if let Err(error) = pack_planes_at(dst, f, (width, height), &planes, pitch) {
                         return Err(self.fatal(ctx, error));
                     }
                     (p.pts, p.duration)
@@ -1502,27 +1659,10 @@ impl<C: Codec> VideoDec<C> {
                 }
                 Ready::Held(h) => {
                     let planes = self.codec.held_planes(h.handle);
-                    let packed = match (h.layout, h.pixfmt) {
-                        _ if nv12 => {
-                            pack_nv12(dst, scratch, h.layout, h.pixfmt, h.width, h.height, &planes)
-                        }
-                        (HeldLayout::Native, _) => {
-                            pack_planes(dst, h.pixfmt, h.width, h.height, &planes)
-                        }
-                        (HeldLayout::Planar10, PixelFormat::P010) => {
-                            pack_p010(dst, h.width, h.height, &planes)
-                        }
-                        (HeldLayout::Reduce { chroma_shift, bits }, f) => {
-                            pack_reduced(dst, h.width, h.height, chroma_shift, bits, f, &planes)
-                        }
-                        (HeldLayout::Gray, PixelFormat::I420) => {
-                            pack_gray(dst, h.width, h.height, &planes)
-                        }
-                        (HeldLayout::GrayWide { bits }, f) => {
-                            pack_gray_wide(dst, (h.width, h.height), bits, f, &planes)
-                        }
-                        (layout, _) => Err(VideoDecError::HeldLayout { layout, pixfmt }),
-                    };
+                    let from = (h.layout, h.pixfmt);
+                    let packed =
+                        pack_slot(dst, scratch, nv12, from, (h.width, h.height), &planes, pitch)
+                            .unwrap_or(Err(VideoDecError::HeldLayout { layout: h.layout, pixfmt }));
                     let (pts, duration, handle) = (h.pts, h.duration, h.handle);
                     match packed {
                         Ok(n) => debug_assert_eq!(n, need),
@@ -1536,27 +1676,10 @@ impl<C: Codec> VideoDec<C> {
                 }
                 Ready::Sent(s) => {
                     let planes = s.planes();
-                    let packed = match (s.layout, s.pixfmt) {
-                        _ if nv12 => {
-                            pack_nv12(dst, scratch, s.layout, s.pixfmt, s.width, s.height, &planes)
-                        }
-                        (HeldLayout::Native, _) => {
-                            pack_planes(dst, s.pixfmt, s.width, s.height, &planes)
-                        }
-                        (HeldLayout::Planar10, PixelFormat::P010) => {
-                            pack_p010(dst, s.width, s.height, &planes)
-                        }
-                        (HeldLayout::Reduce { chroma_shift, bits }, f) => {
-                            pack_reduced(dst, s.width, s.height, chroma_shift, bits, f, &planes)
-                        }
-                        (HeldLayout::Gray, PixelFormat::I420) => {
-                            pack_gray(dst, s.width, s.height, &planes)
-                        }
-                        (HeldLayout::GrayWide { bits }, f) => {
-                            pack_gray_wide(dst, (s.width, s.height), bits, f, &planes)
-                        }
-                        (layout, _) => Err(VideoDecError::HeldLayout { layout, pixfmt }),
-                    };
+                    let from = (s.layout, s.pixfmt);
+                    let packed =
+                        pack_slot(dst, scratch, nv12, from, (s.width, s.height), &planes, pitch)
+                            .unwrap_or(Err(VideoDecError::HeldLayout { layout: s.layout, pixfmt }));
                     match packed {
                         Ok(n) => debug_assert_eq!(n, need),
                         Err(error) => {
@@ -1577,9 +1700,17 @@ impl<C: Codec> VideoDec<C> {
                 (Some(dmabuf), Some((fourcc, _)), Some(d)) => {
                     let pixfmt = PixelFormat::from_caps_name(pixfmt).unwrap_or(PixelFormat::I420);
                     let ended = sync_write(dmabuf.fd, false).map_err(VideoDecError::Dmabuf);
-                    let (packed, n, coded) = match nv12 {
-                        true => nv12_layout(width, height),
-                        false => {
+                    let (packed, n, coded) = match (nv12, pitch) {
+                        (true, None) => nv12_layout(width, height),
+                        (true, Some(pitch)) => {
+                            let (planes, n) = pitched_layout(fourcc, height, pitch);
+                            (planes, n, nv12_layout(width, height).2)
+                        }
+                        (false, Some(pitch)) => {
+                            let (planes, n) = pitched_layout(fourcc, height, pitch);
+                            (planes, n, (width, height))
+                        }
+                        (false, None) => {
                             let n = pixfmt.plane_count();
                             (packed_layout(pixfmt, width, height), n, (width, height))
                         }

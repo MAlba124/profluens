@@ -64,8 +64,22 @@ pub fn with_dmabuf(
     channel: &Arc<GpuFrameChannel>,
     formats: &[DmabufFormat],
 ) -> Option<Box<dyn Element>> {
+    with_dmabuf_rows(desc, channel, formats, 1)
+}
+
+/// [`with_dmabuf`] with the rows of an NV12 or P010 slot a multiple of `row_align` bytes
+/// apart, see [`VideoDec::with_row_align`].
+// Once per pipeline build.
+#[allow(clippy::disallowed_methods)]
+pub fn with_dmabuf_rows(
+    desc: &ElementDesc,
+    channel: &Arc<GpuFrameChannel>,
+    formats: &[DmabufFormat],
+    row_align: usize,
+) -> Option<Box<dyn Element>> {
     std::ptr::eq(desc, &DESC).then(|| {
-        Box::new(Av1Dec::new().with_dmabuf(Arc::clone(channel), formats)) as Box<dyn Element>
+        let dec = Av1Dec::new().with_dmabuf(Arc::clone(channel), formats);
+        Box::new(dec.with_row_align(row_align)) as Box<dyn Element>
     })
 }
 

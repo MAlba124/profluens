@@ -479,7 +479,7 @@ mod tests {
                         let what = format!("{w}x{h} {shift:?} {bits}-bit to {to:?}");
                         same(avx2, &what, len, |lanes, d| {
                             let dims = (w as u32, h as u32);
-                            pack_reduced_on(lanes, d, dims, shift, bits, to, &planes)
+                            pack_reduced_on(lanes, d, dims, shift, bits, to, &planes, None)
                         });
                     }
                 }
@@ -497,7 +497,7 @@ mod tests {
             let pic = picture(&mut rng, (w, h), (1, 1), 16);
             let planes = refs(&pic);
             same(avx2, &format!("{w}x{h} P010"), len, |lanes, d| {
-                pack_p010_on(lanes, d, w as u32, h as u32, &planes)
+                pack_p010_on(lanes, d, w as u32, h as u32, &planes, None)
             });
         }
     }
@@ -521,7 +521,15 @@ mod tests {
                 same(avx2, &format!("{w}x{h} {layout:?} to NV12"), len, |lanes, d| {
                     let mut scratch = Vec::new();
                     let f = (layout, PixelFormat::I420);
-                    pack_nv12_on(lanes, d, Some(&mut scratch), f, (w as u32, h as u32), &planes)
+                    pack_nv12_on(
+                        lanes,
+                        d,
+                        Some(&mut scratch),
+                        f,
+                        (w as u32, h as u32),
+                        &planes,
+                        None,
+                    )
                 });
             }
         }

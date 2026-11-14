@@ -1871,6 +1871,15 @@ fn dmabuf_mode_puts_side_data_on_the_descriptor() {
 
 /// A decoder in dmabuf mode on a udmabuf pool of `slot` byte slots, its link fixed to NV12.
 fn nv12_link(slot: usize, formats: &[DmabufFormat]) -> Option<(Harness, Arc<GpuFrameChannel>)> {
+    nv12_link_rows(slot, formats, 1)
+}
+
+/// [`nv12_link`] with the rows of a slot a multiple of `row_align` bytes apart.
+fn nv12_link_rows(
+    slot: usize,
+    formats: &[DmabufFormat],
+    row_align: usize,
+) -> Option<(Harness, Arc<GpuFrameChannel>)> {
     let dev = match pf_memory::udmabuf::device() {
         Ok(dev) => dev,
         Err(e) => {
@@ -1879,7 +1888,7 @@ fn nv12_link(slot: usize, formats: &[DmabufFormat]) -> Option<(Harness, Arc<GpuF
         }
     };
     let ch = GpuFrameChannel::new();
-    let dec = FakeDec::new().with_dmabuf(Arc::clone(&ch), formats);
+    let dec = FakeDec::new().with_dmabuf(Arc::clone(&ch), formats).with_row_align(row_align);
     let page = pf_memory::udmabuf::align();
     let config =
         PoolConfig { align: page, allocator: dev.allocator(), ..PoolConfig::heap(slot, 4) };
@@ -1969,6 +1978,92 @@ fn dmabuf_mode_interleaves_an_i420_picture_into_an_nv12_slot() {
     assert_eq!(v.value_name(layout), Some(LAYOUT_NV12_DMABUF));
     let w = warnings(&mut h);
     assert!(w.is_empty(), "{:?}", w.iter().map(ToString::to_string).collect::<Vec<_>>());
+}
+
+/// The rows of `tight`, each `row` bytes, laid `pitch` bytes apart, 0xAA between them.
+fn spread(tight: &[u8], row: usize, pitch: usize) -> Vec<u8> {
+    let mut out = vec![0xAA; tight.len() / row * pitch];
+    for (from, to) in tight.chunks(row).zip(out.chunks_mut(pitch)) {
+        to[..row].copy_from_slice(from);
+    }
+    out
+}
+
+/// `got` with the bytes between its rows set to 0xAA, what a slot holds there is not the
+/// picture's.
+fn rows_only(got: &[u8], row: usize, pitch: usize) -> Vec<u8> {
+    let mut out = got.to_vec();
+    for r in out.chunks_mut(pitch) {
+        r[row..].fill(0xAA);
+    }
+    out
+}
+
+#[test]
+fn a_row_alignment_lays_the_rows_of_an_nv12_slot_that_many_bytes_apart() {
+    let page = pf_memory::udmabuf::align();
+    let Some((mut h, ch)) = nv12_link_rows(page, &nv12_only(), 64) else { return };
+    let mut rx = ch.take_rx().expect("the sink's end");
+    // 16 bytes a row, 24 rows of luma and interleaved chroma, 64 bytes apart
+    let want = spread(&nv12_of(&lent_packed(16, 0), 16, 16), 16, 64);
+    // a held picture in the codec's memory, then one decoded into a slot of the pool
+    push(&mut h, LEND, 16, 0);
+    let (fourcc, coded, shown, planes, bytes) = take_frame(&mut h, &mut rx, want.len());
+    assert_eq!(fourcc, DRM_FORMAT_NV12);
+    assert_eq!((coded, shown), ((16, 16), (16, 16)));
+    assert_eq!(planes, [(0, 64), (64 * 16, 64)], "Y then CbCr, one aligned pitch");
+    assert_eq!(rows_only(&bytes, 16, 64), want, "the held picture's rows at the pitch");
+    push(&mut h, INTO, 16, 40);
+    let (fourcc, _, _, planes, bytes) = take_frame(&mut h, &mut rx, want.len());
+    assert_eq!(fourcc, DRM_FORMAT_NV12);
+    assert_eq!(planes, [(0, 64), (64 * 16, 64)]);
+    let want = spread(&nv12_of(&lent_packed(16, 1), 16, 16), 16, 64);
+    assert_eq!(rows_only(&bytes, 16, 64), want, "the decoded slot's rows at the pitch");
+    let w = warnings(&mut h);
+    assert!(w.is_empty(), "{:?}", w.iter().map(ToString::to_string).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_row_alignment_a_picture_already_fills_changes_nothing() {
+    let page = pf_memory::udmabuf::align();
+    let Some((mut h, ch)) = nv12_link_rows(page, &nv12_only(), 16) else { return };
+    let mut rx = ch.take_rx().expect("the sink's end");
+    let want = nv12_of(&lent_packed(16, 0), 16, 16);
+    push(&mut h, LEND, 16, 0);
+    let (_, _, _, planes, bytes) = take_frame(&mut h, &mut rx, want.len());
+    assert_eq!(planes, [(0, 16), (256, 16)]);
+    assert_eq!(bytes, want);
+}
+
+#[test]
+fn a_row_alignment_lays_the_rows_of_a_p010_slot_that_many_bytes_apart() {
+    let dev = match pf_memory::udmabuf::device() {
+        Ok(dev) => dev,
+        Err(e) => return eprintln!("skip: {e}"),
+    };
+    let page = pf_memory::udmabuf::align();
+    let p010 = [DmabufFormat { fourcc: DRM_FORMAT_P010, modifiers: vec![DRM_FORMAT_MOD_LINEAR] }];
+    let ch = GpuFrameChannel::new();
+    let dec = FakeDec::new().with_dmabuf(Arc::clone(&ch), &p010).with_row_align(64);
+    let config =
+        PoolConfig { align: page, allocator: dev.allocator(), ..PoolConfig::heap(page, 4) };
+    let mut h = Harness::with_pool_config(dec, config);
+    let fixed = [
+        (F_WIDTH, ValueDesc::Int(8)),
+        (F_HEIGHT, ValueDesc::Int(8)),
+        (F_LAYOUT, ValueDesc::Id(LAYOUT_P010_DMABUF)),
+        (F_MODIFIER, ValueDesc::Int(0)),
+    ];
+    h.fix_src_format(FakeDec::OUT, FAMILY_VIDEO_GPU, &fixed);
+    let mut rx = ch.take_rx().expect("the sink's end");
+    // 16 samples of two bytes a row, 24 rows, 64 bytes apart
+    let want = spread(&lent10_p010(16, 0), 32, 64);
+    push(&mut h, LEND10, 16, 0);
+    let (fourcc, coded, _, planes, bytes) = take_frame(&mut h, &mut rx, want.len());
+    assert_eq!(fourcc, DRM_FORMAT_P010);
+    assert_eq!(coded, (16, 16));
+    assert_eq!(planes, [(0, 64), (64 * 16, 64)], "Y then CbCr, one aligned pitch");
+    assert_eq!(rows_only(&bytes, 32, 64), want, "the P010 rows at the pitch");
 }
 
 #[test]

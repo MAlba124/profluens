@@ -16,7 +16,7 @@ use profluens_core::log::Level;
 use profluens_core::time::Timestamp;
 
 use crate::BITMAP_FAMILY;
-use crate::bitmap::{BitmapBuilder, payload_len};
+use crate::bitmap::{BITMAP_HEADER_LEN, BITMAP_RECT_LEN, BitmapBuilder};
 
 /// The DVB subtitle family the mkv demuxer announces for an `S_DVBSUB` track.
 pub const DVB_FAMILY: &str = "subtitle/dvb";
@@ -45,12 +45,15 @@ pub const MAX_SIDE: u32 = 4096;
 pub const PIXEL_BUDGET: usize = MAX_SIDE as usize * MAX_SIDE as usize;
 /// Object list entries held at once over all regions.
 pub const PLACEMENT_BUDGET: usize = 64 * 1024;
-/// Runs walked plus pixels written for one object segment, so a small object placed thousands of
-/// times cannot stall the pass.
-pub const PAINT_BUDGET: u64 = 1 << 26;
+/// Work for one display set, every Block at its PTS, counted as region pixels filled or moved,
+/// placements scanned, runs walked, pixels painted and pixels composed. A set that takes, fills,
+/// paints and shows a full 4096x4096 region fits, an object placed thousands of times or a region
+/// resized over and over is a fault.
+pub const WORK_BUDGET: u64 = 6 * PIXEL_BUDGET as u64;
 
 /// No display definition, the SDTV grid (section 5.1.3).
-const DEFAULT_DISPLAY: Display = Display { width: 720, height: 576, x: 0, y: 0 };
+const DEFAULT_DISPLAY: Display =
+    Display { width: 720, height: 576, x: 0, y: 0, right: 720, bottom: 576 };
 
 const PIX: usize = 0;
 const OBJ: usize = 1;
@@ -191,13 +194,16 @@ struct PageEntry {
     y: u16,
 }
 
-/// The grid and the window offset within it (section 7.2.1).
+/// The grid, the window's top left within it and the window's exclusive right and bottom edges
+/// (section 7.2.1). Without a window it is the whole grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Display {
     width: u32,
     height: u32,
     x: u32,
     y: u32,
+    right: u32,
+    bottom: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -220,7 +226,28 @@ struct Rect {
 enum Closed {
     Blank,
     Clear { pts: Timestamp, duration: Timestamp },
-    Show { pts: Timestamp, duration: Timestamp, rect: Rect },
+    Show { pts: Timestamp, duration: Timestamp },
+}
+
+/// The work a display set may still do, see [`WORK_BUDGET`].
+#[derive(Clone, Copy, Debug, Default)]
+struct Budget {
+    spent: u64,
+    /// Every set's work, a counter.
+    done: u64,
+}
+
+impl Budget {
+    /// Charges `n` before the work is done, so `spent` never passes the budget.
+    fn charge(&mut self, n: u64) -> Result<(), DvbError> {
+        if self.spent.saturating_add(n) > WORK_BUDGET {
+            self.spent = WORK_BUDGET;
+            return Err(DvbError::Budget("a display set past the work budget"));
+        }
+        self.spent += n;
+        self.done += n;
+        Ok(())
+    }
 }
 
 static SINK_OFFERS: [OfferDesc; 2] = [OfferDesc::any(DVB_FAMILY), OfferDesc::any("bytes")];
@@ -253,6 +280,8 @@ pub struct DvbSubDec {
     placements: Vec<Placement>,
     page: Vec<PageEntry>,
     runs: Vec<Run>,
+    /// The page's visible regions at a close, reused.
+    shown: Vec<(u8, Rect)>,
     page_time_out: u8,
     display: Display,
     composed: [u64; 4],
@@ -264,6 +293,8 @@ pub struct DvbSubDec {
     open_duration: Timestamp,
     pages: Option<(u16, u16)>,
     failing: bool,
+    budget: Budget,
+    budget_pts: Timestamp,
     /// Bitmaps put out.
     pub decoded: u64,
     /// Clears put out.
@@ -297,6 +328,7 @@ impl DvbSubDec {
             placements: Vec::new(),
             page: Vec::new(),
             runs: Vec::new(),
+            shown: Vec::new(),
             page_time_out: 0,
             display: DEFAULT_DISPLAY,
             composed: [0; 4],
@@ -307,6 +339,8 @@ impl DvbSubDec {
             open_duration: Timestamp::NONE,
             pages: None,
             failing: false,
+            budget: Budget { spent: 0, done: 0 },
+            budget_pts: Timestamp::NONE,
             decoded: 0,
             cleared: 0,
             dropped: 0,
@@ -318,6 +352,16 @@ impl DvbSubDec {
     /// Region index bytes the arena holds, live and reclaimable.
     pub fn held_pixels(&self) -> usize {
         self.pixels.len()
+    }
+
+    /// Work done over every display set so far, see [`WORK_BUDGET`].
+    pub fn work_done(&self) -> u64 {
+        self.budget.done
+    }
+
+    /// Work the current display set has done.
+    pub fn work_spent(&self) -> u64 {
+        self.budget.spent
     }
 
     /// Discards what a mode change discards (section 5.1.0). The capacity stays.
@@ -382,6 +426,10 @@ impl DvbSubDec {
         if self.open && pts != self.open_pts {
             let set = self.close_set();
             self.emit(ctx, set);
+        }
+        // One budget for every Block at a PTS, an untimed Block has its own.
+        if pts.is_none() || pts != self.budget_pts {
+            (self.budget.spent, self.budget_pts) = (0, pts);
         }
         self.feed(ctx, data, pts, duration);
     }
@@ -503,13 +551,18 @@ impl DvbSubDec {
             count += 1;
         }
 
-        // The pixels persist unless the size changed, which forces a fill.
+        // The pixels persist unless the size changed, which forces a fill. A new size the old
+        // span holds keeps it.
         let old = self.regions[id];
+        let area = width * height;
         let pix = if old.defined && old.width == width && old.height == height {
             old.spans[PIX]
+        } else if old.defined && area <= old.spans[PIX].cap {
+            fill = true;
+            Span { len: area, ..old.spans[PIX] }
         } else {
             fill = true;
-            self.take(PIX, id, (width * height) as usize)?
+            self.take(PIX, id, area as usize)?
         };
         let obj = if old.defined && count <= old.spans[OBJ].cap as usize {
             Span { len: count as u32, ..old.spans[OBJ] }
@@ -517,6 +570,7 @@ impl DvbSubDec {
             self.take(OBJ, id, count)?
         };
         if fill {
+            self.budget.charge(u64::from(area))?;
             self.pixels[pix.range()].fill(background);
         }
         let mut at = 10usize;
@@ -544,10 +598,15 @@ impl DvbSubDec {
         if need > budget {
             return Err(DvbError::Budget(what));
         }
+        // A compaction moves at most the arena, the new span is written once.
+        let moved = self.arena_len(k) as u64;
+        self.budget.charge(need as u64)?;
         if self.arena_len(k) + need > budget {
+            self.budget.charge(moved)?;
             self.compact(k, id);
         }
         if self.arena_len(k) + need > budget {
+            self.budget.charge(moved)?;
             for (i, r) in self.regions.iter_mut().enumerate() {
                 let kept = i == id
                     || self.composed[i / 64] & (1 << (i % 64)) != 0
@@ -652,34 +711,38 @@ impl DvbSubDec {
         let top = &body[..top_len];
         // An empty bottom field repeats the top one (section 7.2.5.1).
         let bottom = if bottom_len > 0 { &body[top_len..top_len + bottom_len] } else { top };
-        let mut work = 0u64;
+        // One scan of every object list finds the depths that place the object.
+        self.budget.charge(self.placements.len() as u64)?;
+        let mut depths = 0u8;
+        for r in self.regions.iter().filter(|r| r.defined) {
+            if self.placements[r.spans[OBJ].range()].iter().any(|pl| pl.object == object) {
+                depths |= r.depth;
+            }
+        }
         for depth in [2u8, 4, 8] {
-            let placed = self.regions.iter().any(|r| {
-                r.defined
-                    && r.depth == depth
-                    && self.placements[r.spans[OBJ].range()].iter().any(|pl| pl.object == object)
-            });
-            if !placed {
+            if depths & depth == 0 {
                 continue;
             }
+            let mut covered = 0u64;
             for field in 0..2u32 {
                 if field == 0 || bottom_len > 0 {
-                    decode_field(
+                    covered = decode_field(
                         if field == 0 { top } else { bottom },
                         depth,
                         non_modifying,
                         &mut self.runs,
                     );
                 }
-                work = paint(
+                paint(
                     &self.runs,
+                    covered,
                     &self.regions,
                     &self.placements,
                     &mut self.pixels,
+                    &mut self.budget,
                     object,
                     depth,
                     field,
-                    work,
                 )?;
             }
         }
@@ -696,12 +759,16 @@ impl DvbSubDec {
             self.display = DEFAULT_DISPLAY;
             return;
         }
-        let (x, y) = if p[0] & 0x08 != 0 && p.len() >= 13 {
-            (u32::from(be16(&p[5..7])), u32::from(be16(&p[9..11])))
-        } else {
-            (0, 0)
-        };
-        self.display = Display { width, height, x, y };
+        let mut d = Display { width, height, x: 0, y: 0, right: width, bottom: height };
+        if p[0] & 0x08 != 0 && p.len() >= 13 {
+            let [x0, x1, y0, y1] = [5, 7, 9, 11].map(|i| u32::from(be16(&p[i..i + 2])));
+            (d.x, d.y) = (x0, y0);
+            // The maxima are inclusive, a window that is not one keeps the grid's edges.
+            if x0 <= x1 && y0 <= y1 {
+                (d.right, d.bottom) = ((x1 + 1).min(width), (y1 + 1).min(height));
+            }
+        }
+        self.display = d;
     }
 
     fn close_set(&mut self) -> Closed {
@@ -716,75 +783,62 @@ impl DvbSubDec {
         if self.page.is_empty() {
             return if saw_page { Closed::Clear { pts, duration } } else { Closed::Blank };
         }
-        let mut bounds: Option<Rect> = None;
+        self.shown.clear();
         for e in &self.page {
-            let Some(v) = self.visible(e) else { continue };
-            bounds = Some(match bounds {
-                None => v,
-                Some(b) => {
-                    let (x, y) = (b.x.min(v.x), b.y.min(v.y));
-                    let (r, d) = ((b.x + b.w).max(v.x + v.w), (b.y + b.h).max(v.y + v.h));
-                    Rect { x, y, w: r - x, h: d - y }
-                }
-            });
+            if let Some(v) = self.visible(e) {
+                self.shown.push((e.region, v));
+            }
         }
-        match bounds {
-            Some(rect) => Closed::Show { pts, duration, rect },
-            None => Closed::Blank,
-        }
+        if self.shown.is_empty() { Closed::Blank } else { Closed::Show { pts, duration } }
     }
 
-    /// A page entry's region on the grid, clipped to it. Positions are relative to the
-    /// display window when there is one (section 5.1.4).
+    /// A page entry's region on the grid, clipped to the display window. Positions are relative
+    /// to the window when there is one (section 5.1.4).
     fn visible(&self, e: &PageEntry) -> Option<Rect> {
         let r = &self.regions[usize::from(e.region)];
-        let (x, y) = (self.display.x + u32::from(e.x), self.display.y + u32::from(e.y));
-        if !r.defined || x >= self.display.width || y >= self.display.height {
+        let d = &self.display;
+        let (x, y) = (d.x + u32::from(e.x), d.y + u32::from(e.y));
+        if !r.defined || x >= d.right || y >= d.bottom {
             return None;
         }
-        Some(Rect {
-            x,
-            y,
-            w: r.width.min(self.display.width - x),
-            h: r.height.min(self.display.height - y),
-        })
+        Some(Rect { x, y, w: r.width.min(d.right - x), h: r.height.min(d.bottom - y) })
     }
 
-    fn compose(&self, out: &mut [u8], rect: Rect) {
-        out.fill(0);
-        for e in &self.page {
-            let Some(v) = self.visible(e) else { continue };
-            let r = &self.regions[usize::from(e.region)];
-            let slot = self.clut_slot[usize::from(r.clut)];
-            let clut = if slot == 0 { &DEFAULT_CLUT } else { &self.cluts[usize::from(slot) - 1] };
-            let palette = clut.of_depth(r.depth);
-            let mask = palette.len() - 1;
-            let src = &self.pixels[r.spans[PIX].range()];
-            for row in 0..v.h {
-                let s = &src[(row * r.width) as usize..][..v.w as usize];
-                let d = (((v.y - rect.y + row) * rect.w + (v.x - rect.x)) * 4) as usize;
-                for (px, &i) in
-                    out[d..d + v.w as usize * 4].as_chunks_mut::<4>().0.iter_mut().zip(s)
-                {
-                    px.copy_from_slice(&palette[usize::from(i) & mask]);
-                }
+    /// One region's visible part through its CLUT into `out`, `v.w * v.h * 4` bytes.
+    fn compose(&self, out: &mut [u8], region: u8, v: Rect) {
+        let r = &self.regions[usize::from(region)];
+        let slot = self.clut_slot[usize::from(r.clut)];
+        let clut = if slot == 0 { &DEFAULT_CLUT } else { &self.cluts[usize::from(slot) - 1] };
+        let palette = clut.of_depth(r.depth);
+        let mask = palette.len() - 1;
+        let src = &self.pixels[r.spans[PIX].range()];
+        for (row, line) in out.chunks_exact_mut(v.w as usize * 4).enumerate() {
+            let s = &src[row * r.width as usize..][..v.w as usize];
+            for (px, &i) in line.as_chunks_mut::<4>().0.iter_mut().zip(s) {
+                *px = palette[usize::from(i) & mask];
             }
         }
     }
 
     fn emit(&mut self, ctx: &mut Ctx, set: Closed) {
-        let (pts, duration, rect) = match set {
+        let (pts, duration, show) = match set {
             Closed::Blank => {
                 self.suppressed += 1;
                 log!(&*ctx, Level::Debug, "dvb_blank", reason = "a set with nothing to show");
                 return;
             }
-            Closed::Clear { pts, duration } => (pts, duration, Rect { x: 0, y: 0, w: 0, h: 0 }),
-            Closed::Show { pts, duration, rect } => (pts, duration, rect),
+            Closed::Clear { pts, duration } => (pts, duration, false),
+            Closed::Show { pts, duration } => (pts, duration, true),
         };
-        let sizes: &[(u32, u32)] = if rect.w > 0 { &[(rect.w, rect.h)] } else { &[] };
-        // The region budget bounds `w * h`, so the length fits.
-        let n = payload_len(sizes).unwrap_or(0);
+        // One rect per region, never their bounding box. A region is listed once and no larger
+        // than the arena, so the pixels are at most the region budget.
+        let rects = if show { self.shown.len() } else { 0 };
+        let pixels: u64 =
+            self.shown[..rects].iter().map(|(_, v)| u64::from(v.w) * u64::from(v.h)).sum();
+        if let Err(e) = self.budget.charge(pixels) {
+            return self.fail(ctx, e);
+        }
+        let n = BITMAP_HEADER_LEN + rects * BITMAP_RECT_LEN + pixels as usize * 4;
         let Some(mut buf) = ctx.alloc_exact(n) else {
             self.suppressed += 1;
             log!(&*ctx, Level::Warn, "dvb_refused", bytes = n);
@@ -792,14 +846,17 @@ impl DvbSubDec {
         };
         let (gw, gh) = (self.display.width, self.display.height);
         let out = &mut buf.memory.as_mut_full()[..n];
-        let Ok(mut b) = BitmapBuilder::new(out, gw, gh, sizes.len() as u32) else {
+        let Ok(mut b) = BitmapBuilder::new(out, gw, gh, rects as u32) else {
             return self.build_failed(ctx, pts, "bitmap header");
         };
-        if rect.w > 0 {
-            let Ok(px) = b.rect(rect.x, rect.y, rect.w, rect.h) else {
+        for i in 0..rects {
+            let (region, v) = self.shown[i];
+            let Ok(px) = b.rect(v.x, v.y, v.w, v.h) else {
                 return self.build_failed(ctx, pts, "bitmap rect");
             };
-            self.compose(px, rect);
+            self.compose(px, region, v);
+        }
+        if show {
             self.decoded += 1;
         } else {
             self.cleared += 1;
@@ -825,6 +882,7 @@ impl Element for DvbSubDec {
         self.reset_state();
         self.display = DEFAULT_DISPLAY;
         (self.open, self.failing, self.pages) = (false, false, None);
+        (self.budget.spent, self.budget_pts) = (0, Timestamp::NONE);
         Ok(())
     }
 
@@ -859,6 +917,7 @@ impl Element for DvbSubDec {
                 self.reset_state();
                 self.display = DEFAULT_DISPLAY;
                 self.open = false;
+                (self.budget.spent, self.budget_pts) = (0, Timestamp::NONE);
             }
             Event::Gap { .. } => ctx.push_event(Self::OUT, event.clone()),
             _ => {}
@@ -902,22 +961,25 @@ fn held(duration: Timestamp, time_out: u8) -> Timestamp {
     }
 }
 
-/// Field 0 starts on the object's first line, field 1 on its second (section 7.2.5.0).
+/// Field 0 starts on the object's first line, field 1 on its second (section 7.2.5.0). Each
+/// placement is charged its runs and the pixels they cover, at most the region, before it is drawn.
 #[allow(clippy::too_many_arguments)]
 fn paint(
     runs: &[Run],
+    covered: u64,
     regions: &[Region; 256],
     placements: &[Placement],
     pixels: &mut [u8],
+    budget: &mut Budget,
     object: u16,
     depth: u8,
     field: u32,
-    mut work: u64,
-) -> Result<u64, DvbError> {
+) -> Result<(), DvbError> {
     for r in regions.iter().filter(|r| r.defined && r.depth == depth) {
         let px = &mut pixels[r.spans[PIX].range()];
+        let most = runs.len() as u64 + covered.min(u64::from(r.width * r.height));
         for pl in placements[r.spans[OBJ].range()].iter().filter(|pl| pl.object == object) {
-            work += runs.len() as u64;
+            budget.charge(most)?;
             for run in runs {
                 let y = u32::from(pl.y) + field + 2 * u32::from(run.line);
                 if y >= r.height {
@@ -928,16 +990,12 @@ fn paint(
                     continue;
                 }
                 let n = u32::from(run.len).min(r.width - x);
-                work += u64::from(n);
                 let at = (y * r.width + x) as usize;
                 px[at..at + n as usize].fill(run.index);
             }
-            if work > PAINT_BUDGET {
-                return Err(DvbError::Budget("an object placed past the paint budget"));
-            }
         }
     }
-    Ok(work)
+    Ok(())
 }
 
 struct Field<'a> {
@@ -945,24 +1003,28 @@ struct Field<'a> {
     line: u16,
     x: u32,
     non_modifying: bool,
+    covered: u64,
 }
 
 impl Field<'_> {
-    /// `non_modifying_colour_flag` makes entry 1 leave the pixel as it is (section 7.2.5).
-    fn put(&mut self, len: u32, index: u8) {
-        if !(self.non_modifying && index == 1) && self.x < MAX_SIDE && len > 0 {
+    /// `non_modifying_colour_flag` makes pixel code 1 leave the pixel as it is, tested on the code
+    /// before any map table as ffmpeg does (section 7.2.5).
+    fn put(&mut self, len: u32, code: u32, index: u8) {
+        if !(self.non_modifying && code == 1) && self.x < MAX_SIDE && len > 0 {
             let len = len.min(MAX_SIDE - self.x) as u16;
             self.runs.push(Run { line: self.line, x: self.x as u16, len, index });
+            self.covered += u64::from(len);
         }
         self.x = self.x.saturating_add(len);
     }
 }
 
-/// One field's pixel-data sub-blocks (section 7.2.5.1, tables 20 and 21) into `runs`.
-fn decode_field(data: &[u8], depth: u8, non_modifying: bool, runs: &mut Vec<Run>) {
+/// One field's pixel-data sub-blocks (section 7.2.5.1, tables 20 and 21) into `runs`. Returns the
+/// pixels the runs cover.
+fn decode_field(data: &[u8], depth: u8, non_modifying: bool, runs: &mut Vec<Run>) -> u64 {
     runs.clear();
     let (mut m24, mut m28, mut m48) = (MAP_2_TO_4, MAP_2_TO_8, MAP_4_TO_8);
-    let mut f = Field { runs, line: 0, x: 0, non_modifying };
+    let mut f = Field { runs, line: 0, x: 0, non_modifying, covered: 0 };
     let mut at = 0usize;
     while at < data.len() {
         let kind = data[at];
@@ -1001,6 +1063,7 @@ fn decode_field(data: &[u8], depth: u8, non_modifying: bool, runs: &mut Vec<Run>
             _ => break,
         }
     }
+    f.covered
 }
 
 struct Bits<'a> {
@@ -1059,7 +1122,7 @@ fn decode_2bit(data: &[u8], map: Option<&[u8; 4]>, f: &mut Field<'_>) -> usize {
                 _ => break,
             }
         };
-        f.put(len, map.map_or(c as u8, |m| m[c as usize]));
+        f.put(len, c, map.map_or(c as u8, |m| m[c as usize]));
     }
     b.bytes()
 }
@@ -1100,7 +1163,7 @@ fn decode_4bit(data: &[u8], map: Option<&[u8; 16]>, f: &mut Field<'_>) -> usize 
                 None => break,
             }
         };
-        f.put(len, map.map_or(c as u8, |m| m[c as usize]));
+        f.put(len, c, map.map_or(c as u8, |m| m[c as usize]));
     }
     b.bytes()
 }
@@ -1122,7 +1185,7 @@ fn decode_8bit(data: &[u8], f: &mut Field<'_>) -> usize {
             };
             (l, c)
         };
-        f.put(len, c as u8);
+        f.put(len, c, c as u8);
     }
     b.bytes()
 }
@@ -1420,7 +1483,7 @@ pub mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
-    use crate::pgs::{DisplaySet, decode_bitmap};
+    use crate::pgs::{DisplaySet, decode_bitmap, decode_rects};
     use pf_harness::Harness;
     use profluens_core::bus::Bus;
     use profluens_core::id::{ElementId, FormatId};
@@ -1433,7 +1496,9 @@ mod tests {
     }
 
     struct Out {
+        /// The first rect, a clear when none.
         ds: DisplaySet,
+        all: Vec<DisplaySet>,
         pts: Timestamp,
         duration: Timestamp,
     }
@@ -1468,7 +1533,8 @@ mod tests {
             let mut out = Vec::new();
             while let Some(b) = batch.pop_front() {
                 let ds = decode_bitmap(b.memory.data()).expect("a well formed subtitle/bitmap");
-                out.push(Out { ds, pts: b.pts, duration: b.duration });
+                let all = decode_rects(b.memory.data()).expect("its rects");
+                out.push(Out { ds, all, pts: b.pts, duration: b.duration });
             }
             out
         }
@@ -1523,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn two_regions_composite_into_their_bounding_box() {
+    fn two_regions_are_two_rects() {
         let mut r = Rig::new();
         let set = block(&[
             page(5, 0, &[(1, 10, 20), (2, 300, 400)]),
@@ -1537,14 +1603,35 @@ mod tests {
         ]);
         let out = r.push(&set, 0);
         assert_eq!(out.len(), 1, "one bitmap for the page");
-        let ds = &out[0].ds;
-        assert_eq!((ds.x, ds.y, ds.width, ds.height), (10, 20, 296, 382));
-        assert_eq!(px(ds, 0, 0), WHITE, "region 1 through CLUT 1");
-        assert_eq!(px(ds, 3, 1), WHITE, "an empty bottom field repeats the top one");
-        assert_eq!(px(ds, 290, 380), RED, "region 2 through CLUT 2");
-        assert_eq!(px(ds, 295, 381), RED);
-        assert_eq!(px(ds, 100, 100), CLEAR, "between the regions");
-        assert_eq!(px(ds, 4, 0), CLEAR, "right of region 1");
+        let [a, b] = &out[0].all[..] else { panic!("a rect per region") };
+        assert_eq!((a.x, a.y, a.width, a.height), (10, 20, 4, 2));
+        assert_eq!((b.x, b.y, b.width, b.height), (300, 400, 6, 2));
+        assert_eq!(px(a, 0, 0), WHITE, "region 1 through CLUT 1");
+        assert_eq!(px(a, 3, 1), WHITE, "an empty bottom field repeats the top one");
+        assert_eq!(px(b, 0, 0), RED, "region 2 through CLUT 2");
+        assert_eq!(px(b, 5, 1), RED);
+    }
+
+    #[test]
+    fn regions_in_opposite_corners_cost_their_own_pixels_only() {
+        let mut r = Rig::new();
+        let corner = |id, w| region(id, w, 1, 4, 0, 1, true, &[]);
+        let first = block(&[
+            display(4096, 4096, None),
+            page(0, 2, &[(0, 0, 0), (1, 4095, 4095)]),
+            corner(0, 1),
+            corner(1, 1),
+            end(),
+        ]);
+        let out = r.push(&first, 0);
+        let rects: Vec<(u32, u32, u32, u32)> =
+            out[0].all.iter().map(|d| (d.x, d.y, d.width, d.height)).collect();
+        assert_eq!(rects, [(0, 0, 1, 1), (4095, 4095, 1, 1)], "not one 4096x4096 box");
+        // The same page again, as a 26 byte set would show it.
+        let again = block(&[page(0, 0, &[(0, 0, 0), (1, 4095, 4095)]), end()]);
+        let pixels: u32 = r.push(&again, 1_000)[0].all.iter().map(|d| d.width * d.height).sum();
+        assert_eq!(pixels, 2);
+        assert!(r.dec.work_done() < 64, "{} units of work for two pixels", r.dec.work_done());
     }
 
     #[test]
@@ -1689,6 +1776,41 @@ mod tests {
         ]);
         let ds = r.push(&set, 0).remove(0).ds;
         assert_eq!((ds.x, ds.y, ds.video_width, ds.video_height), (116, 58, 1920, 1080));
+    }
+
+    #[test]
+    fn a_region_is_clipped_to_the_display_window_not_the_grid() {
+        let mut r = Rig::new();
+        // The window's inclusive right edge is x 1103, region 1 spans 1100 to 1107.
+        let set = block(&[
+            display(1920, 1080, Some((100, 1103, 8, 1071))),
+            page(2, 0, &[(1, 1000, 50), (2, 1004, 0)]),
+            region(1, 8, 4, 4, 1, 0, true, &[(5, 0, 0)]),
+            region(2, 4, 2, 4, 1, 0, true, &[(5, 0, 0)]),
+            object(5, &four_bit(&[(1, 8)]), &[]),
+            end(),
+        ]);
+        let all = r.push(&set, 0).remove(0).all;
+        let rects: Vec<(u32, u32, u32, u32)> =
+            all.iter().map(|d| (d.x, d.y, d.width, d.height)).collect();
+        assert_eq!(rects, [(1100, 58, 4, 4)], "cut at the window, one region past it entirely");
+    }
+
+    #[test]
+    fn the_non_modifying_colour_is_the_code_before_the_map() {
+        let mut r = Rig::new();
+        // A 2-bit string in a 4-bit region, code 1 maps to entry 7 and still modifies nothing.
+        let string = two_bit(&[(1, 2), (3, 2)]);
+        let set = block(&[
+            page(2, 0, &[(1, 0, 0)]),
+            region(1, 4, 2, 4, 1, 2, true, &[(5, 0, 0)]),
+            clut(1, &[(2, 128, 128, 128, 0), (7, 235, 128, 128, 0), (15, 81, 240, 90, 0)]),
+            object_with(5, true, &string, &string),
+            end(),
+        ]);
+        let ds = r.push(&set, 0).remove(0).ds;
+        assert_eq!(px(&ds, 0, 0), GREY, "code 1 kept the background, not entry 7");
+        assert_eq!(px(&ds, 2, 0), RED, "code 3 through the map to entry 15");
     }
 
     #[test]
@@ -1915,9 +2037,10 @@ mod tests {
     }
 
     #[test]
-    fn an_object_placed_past_the_paint_budget_is_a_counted_fault() {
+    fn repainting_kept_object_lists_spends_one_budget_per_set() {
         let mut r = Rig::new();
-        let objects: Vec<(u16, u16, u16)> = (0..10_000).map(|_| (5, 0, 0)).collect();
+        // 5 000 placements of a 64x32 line object, about 41 M of work a paint.
+        let objects: Vec<(u16, u16, u16)> = (0..5_000).map(|_| (5, 0, 0)).collect();
         let line = [two_bit(&[(1, 1), (2, 1)].repeat(32)), eol()].concat();
         let set = block(&[
             page(5, 0, &[(1, 0, 0)]),
@@ -1926,7 +2049,16 @@ mod tests {
             end(),
         ]);
         r.push(&set, 0);
+        assert_eq!((r.dec.dropped, r.dec.budget_faults), (0, 0), "one paint fits");
+
+        // The object lists carry over, so a Block of small object segments repaints them all
+        // each time. The budget is the set's, not each segment's.
+        let again = object(5, &line.repeat(32), &[]);
+        let before = r.dec.work_done();
+        r.push(&block(&vec![again; 64]), 1_000);
         assert_eq!((r.dec.dropped, r.dec.budget_faults), (1, 1));
+        assert!(r.dec.work_done() - before <= WORK_BUDGET, "the Block stopped at its budget");
+        assert!(r.dec.work_spent() <= WORK_BUDGET);
     }
 
     #[test]
@@ -1945,21 +2077,43 @@ mod tests {
         };
         r.push(&set(4), 0);
         for (i, w) in [8u16, 16, 4, 32].into_iter().enumerate() {
-            let ds = r.push(&set(w), (i as u64 + 1) * 1_000).remove(0).ds;
-            assert_eq!(px(&ds, u32::from(w) - 1, 0), WHITE, "width {w}");
-            assert_eq!(px(&ds, 0, 100), RED, "region 2 survived");
+            let held = r.dec.held_pixels();
+            let all = r.push(&set(w), (i as u64 + 1) * 1_000).remove(0).all;
+            assert_eq!(px(&all[0], u32::from(w) - 1, 0), WHITE, "width {w}");
+            assert_eq!((all[1].y, px(&all[1], 0, 0)), (100, RED), "region 2 survived");
+            if w == 4 {
+                assert_eq!(r.dec.held_pixels(), held, "a smaller size keeps its span");
+            }
         }
         let before = r.dec.held_pixels();
         compact(&mut r.dec.pixels, &mut r.dec.regions, PIX, 256);
         assert!(r.dec.held_pixels() < before, "the old spans were garbage");
         assert_eq!(r.dec.held_pixels(), 32 * 2 + 4 * 2);
-        let ds =
-            r.push(&block(&[page(5, 0, &[(1, 0, 0), (2, 0, 100)]), end()]), 9_000).remove(0).ds;
+        let all = r.push(&block(&[page(5, 0, &[(1, 0, 0), (2, 0, 100)]), end()]), 9_000);
         assert_eq!(
-            (px(&ds, 31, 1), px(&ds, 3, 101)),
+            (px(&all[0].all[0], 31, 1), px(&all[0].all[1], 3, 1)),
             (WHITE, RED),
             "the pixels moved with their spans"
         );
+    }
+
+    #[test]
+    fn a_region_resized_back_and_forth_reuses_its_span_and_spends_the_budget() {
+        let mut r = Rig::new();
+        let toggle = |n: usize| {
+            let segs: Vec<Vec<u8>> = (0..n)
+                .map(|i| region(0, 4096, 4096 - (i % 2) as u16, 4, 0, 0, false, &[]))
+                .collect();
+            block(&segs)
+        };
+        r.push(&toggle(3), 0);
+        assert_eq!(r.dec.dropped, 0, "three fills fit a set");
+        assert_eq!(r.dec.held_pixels(), PIXEL_BUDGET, "the 4096x4095 size kept the span");
+        let before = r.dec.work_done();
+        r.push(&toggle(64), 1_000);
+        assert_eq!((r.dec.dropped, r.dec.budget_faults), (1, 1), "64 fills of 16 M");
+        assert!(r.dec.work_done() - before <= WORK_BUDGET, "the set stopped at its budget");
+        assert_eq!(r.push(&minimal(), 2_000).len(), 1, "the next set decodes");
     }
 
     #[test]

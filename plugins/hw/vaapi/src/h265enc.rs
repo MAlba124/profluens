@@ -554,7 +554,7 @@ impl VaapiH265Enc {
         self.sides.rule = encside::keeps(vui, fit);
         let colour = colour::vui_colour(vui);
         let sps_nal = write_sps(engine.coded(), fmt, level_idc, ctb_log2, refs, colour);
-        let sei = colour::hdr_sei_rbsp(&self.color.hdr)
+        let sei = colour::static_sei_rbsp(vui, &self.color.hdr)
             .map(|r| annexb_nal(&nal_header(NAL_PREFIX_SEI), &r));
         let pps_nal = write_pps(self.qp, brc, ctb_log2, refs);
         let ctu_count =
@@ -1218,10 +1218,14 @@ fn write_sps(
         if let Some((full, primaries, transfer, matrix)) = colour {
             w.u(5, 3); // video_format, unspecified
             w.flag(full); // video_full_range_flag
-            w.flag(true); // colour_description_present_flag
-            w.u(u32::from(primaries), 8); // colour_primaries
-            w.u(u32::from(transfer), 8); // transfer_characteristics
-            w.u(u32::from(matrix), 8); // matrix_coeffs
+            // an absent description reads as 2, unspecified (E.3.1)
+            let described = (primaries, transfer, matrix) != (2, 2, 2);
+            w.flag(described); // colour_description_present_flag
+            if described {
+                w.u(u32::from(primaries), 8); // colour_primaries
+                w.u(u32::from(transfer), 8); // transfer_characteristics
+                w.u(u32::from(matrix), 8); // matrix_coeffs
+            }
         }
         w.flag(false); // chroma_loc_info_present_flag
         w.flag(false); // neutral_chroma_indication_flag
@@ -1701,6 +1705,32 @@ mod tests {
         (sps, pps)
     }
 
+    /// A full range source of no stated colour keeps its range in the VUI, the description left
+    /// out, and a described one writes all three code points.
+    #[test]
+    fn the_sps_states_full_range_alone_and_the_described_colour() {
+        use profluens_video::color::{Primaries, Range, TransferFn};
+        let fmt = InFormat { width: 1920, height: 1080, pixfmt: RawPixFmt::Nv12, fps: (25, 1) };
+        let parse = |c: &StreamColor| {
+            let sps = write_sps((1920, 1088), fmt, 120, 6, 2, colour::vui_colour(c));
+            h265parse::parse_sps(&sps[4..]).expect("own SPS parses")
+        };
+        let full = StreamColor { range: Some(Range::Full), ..StreamColor::default() };
+        let p = parse(&full);
+        assert_eq!(p.colour, full, "the range alone");
+        assert!(!p.has_extension, "the VUI ends where it should");
+        let pq = StreamColor {
+            transfer: Some(TransferFn::Pq),
+            primaries: Some(Primaries::Bt2020),
+            range: Some(Range::Limited),
+            ..StreamColor::default()
+        };
+        let p = parse(&pq);
+        assert_eq!(p.colour, pq);
+        assert!(!p.has_extension);
+        assert_eq!(parse(&StreamColor::default()).colour, StreamColor::default());
+    }
+
     #[test]
     fn the_sps_has_a_reference_set_for_each_count() {
         for refs in 1..=REFS {
@@ -1895,11 +1925,18 @@ mod tests {
         kinds: Vec<u8>,
         maxscl: Option<u32>,
         rpu: Option<Vec<u8>>,
+        /// A mastering display or light level SEI.
+        static_sei: bool,
     }
 
-    /// Each picture coded under `vui` with an HDR10+ record and a two layer RPU on every input,
-    /// the source twice the picture's size where `dovi` asks for the RPUs.
-    fn coded_with_side(test: &str, vui: StreamColor, dovi: bool) -> Option<Vec<Coded>> {
+    /// Each picture of colour `input` coded under `vui` with an HDR10+ record and a two layer
+    /// RPU on every input, the source twice the picture's size where `dovi` asks for the RPUs.
+    fn coded_with_side(
+        test: &str,
+        vui: StreamColor,
+        input: StreamColor,
+        dovi: bool,
+    ) -> Option<Vec<Coded>> {
         use pf_hdr::rpu::{Sample, nal_form, sample};
         use pf_hdr::side::{FrameMeta, Kind, Writer};
         let Some(caps) = crate::probe() else {
@@ -1914,16 +1951,12 @@ mod tests {
         let enc = VaapiH265Enc::new().with_gop(2).with_colour(vui);
         let enc = if dovi { enc.with_dovi((2 * w, 2 * h), 0) } else { enc };
         let mut hx = pf_harness::Harness::with_pool(enc, 256 * 1024, 16);
-        hx.fix_sink_format(
-            VaapiH265Enc::IN,
-            "video/raw",
-            &[
-                ("width", ValueDesc::Int(w.into())),
-                ("height", ValueDesc::Int(h.into())),
-                ("pixfmt", ValueDesc::Id("nv12")),
-                ("fps", ValueDesc::Rat(25, 1)),
-            ],
-        );
+        let mut fields = [("width", ValueDesc::Int(w.into())); 16];
+        fields[1] = ("height", ValueDesc::Int(h.into()));
+        fields[2] = ("pixfmt", ValueDesc::Id("nv12"));
+        fields[3] = ("fps", ValueDesc::Rat(25, 1));
+        let n = 4 + input.write_fields(&mut fields[4..]);
+        hx.fix_sink_format(VaapiH265Enc::IN, "video/raw", &fields[..n]);
         for i in 0..3u64 {
             let frame: Vec<u8> = (0..(w * h * 3 / 2) as usize)
                 .map(|p| ((p as u64 + i * 7) % 220 + 16) as u8)
@@ -1950,13 +1983,15 @@ mod tests {
             let (mut side, mut scratch) = ([0u8; 2048], [0u8; 2048]);
             let mut scan = pf_hdr::h26x::Scan::new(Writer::new(&mut side));
             pf_hdr::h26x::scan_annexb(pf_hdr::h26x::Codec::H265, au, &mut scratch, &mut scan);
-            let n = scan.side.len();
+            let (n, static_sei) =
+                (scan.side.len(), scan.mastering.is_some() || scan.light.is_some());
             let m = FrameMeta::read(&side[..n]).expect("records");
             assert!(!m.dovi_el(), "{test} no enhancement layer");
             Coded {
                 kinds,
                 maxscl: m.hdr10plus().and_then(|h| Some(h.ok()?.windows[0].maxscl[0])),
                 rpu: m.dovi_rpu().map(|(_, b)| b.to_vec()),
+                static_sei,
             }
         };
         Some(out.iter().map(|b| read(b.memory.data())).collect())
@@ -1973,7 +2008,7 @@ mod tests {
     #[test]
     fn each_picture_carries_its_own_hdr10plus_before_its_slices_under_pq() {
         let test = "each_picture_carries_its_own_hdr10plus_before_its_slices_under_pq";
-        let Some(out) = coded_with_side(test, pq(), false) else { return };
+        let Some(out) = coded_with_side(test, pq(), StreamColor::default(), false) else { return };
         for (i, c) in out.iter().enumerate() {
             let kinds = &c.kinds;
             assert_eq!(c.maxscl, Some(1000 * (i as u32 + 1)), "{test} picture {i} its own");
@@ -1989,7 +2024,7 @@ mod tests {
     fn each_picture_carries_its_own_rpu_behind_its_slices_as_a_single_layers() {
         use pf_hdr::rpu::{Sample, nal_form, sample};
         let test = "each_picture_carries_its_own_rpu_behind_its_slices_as_a_single_layers";
-        let Some(out) = coded_with_side(test, pq(), true) else { return };
+        let Some(out) = coded_with_side(test, pq(), StreamColor::default(), true) else { return };
         for (i, c) in out.iter().enumerate() {
             let kinds = &c.kinds;
             // the source is twice the picture, so its bars are half
@@ -2009,11 +2044,32 @@ mod tests {
             transfer: Some(profluens_video::color::TransferFn::Bt709),
             ..StreamColor::default()
         };
-        let Some(out) = coded_with_side(test, sdr, true) else { return };
+        let Some(out) = coded_with_side(test, sdr, StreamColor::default(), true) else { return };
         for c in out {
             assert_eq!((c.maxscl, c.rpu), (None, None), "{test}");
             assert!(!c.kinds.contains(&NAL_PREFIX_SEI), "{test} {:?}", c.kinds);
             assert!(c.kinds.iter().all(|&k| k < 62), "{test} {:?}", c.kinds);
         }
+    }
+
+    /// An HDR10 source whose tone map failed comes in PQ with its metadata, the session pinned
+    /// to BT.709 writes none of it, one pinned to PQ writes the static SEI on its IDRs.
+    #[test]
+    fn a_session_pinned_to_sdr_drops_the_sources_static_sei() {
+        use profluens_video::color::{ContentLight, HdrStatic, TransferFn};
+        let test = "a_session_pinned_to_sdr_drops_the_sources_static_sei";
+        let hdr = HdrStatic {
+            light: ContentLight { max_cll: 1000, max_fall: 400 },
+            ..HdrStatic::default()
+        };
+        let input = StreamColor { hdr, ..pq() };
+        let sdr = StreamColor { transfer: Some(TransferFn::Bt709), ..StreamColor::default() };
+        let Some(out) = coded_with_side(test, sdr, input, false) else { return };
+        for (i, c) in out.iter().enumerate() {
+            assert!(!c.static_sei, "{test} picture {i} {:?}", c.kinds);
+            assert!(!c.kinds.contains(&NAL_PREFIX_SEI), "{test} {:?}", c.kinds);
+        }
+        let Some(out) = coded_with_side(test, pq(), input, false) else { return };
+        assert!(out[0].static_sei, "{test} the IDR under PQ {:?}", out[0].kinds);
     }
 }

@@ -10,9 +10,11 @@ const SEI_MASTERING_DISPLAY: u32 = 137;
 const SEI_CONTENT_LIGHT: u32 = 144;
 
 /// What an encoder's VUI states of `c`, the full range flag and the primaries, transfer and
-/// matrix as H.273, 2 where unstated. None when `c` states none of the three.
+/// matrix as H.273, 2 where unstated. None when `c` states none of the three and no full range,
+/// limited being what an absent signal type means.
 pub fn vui_colour(c: &StreamColor) -> Option<(bool, u8, u8, u8)> {
-    if c.primaries.is_none() && c.transfer.is_none() && c.matrix.is_none() {
+    let described = c.primaries.is_some() || c.transfer.is_some() || c.matrix.is_some();
+    if !described && c.range != Some(Range::Full) {
         return None;
     }
     Some((
@@ -52,6 +54,12 @@ pub fn hdr_sei_rbsp(h: &HdrStatic) -> Option<Vec<u8>> {
     }
     p.push(0x80);
     Some(p)
+}
+
+/// [`hdr_sei_rbsp`] of `h` where `vui` states PQ or HLG. A source whose tone map failed or was
+/// never asked keeps its metadata, an SDR VUI must not carry it.
+pub fn static_sei_rbsp(vui: &StreamColor, h: &HdrStatic) -> Option<Vec<u8>> {
+    vui.transfer.is_some_and(TransferFn::is_hdr).then(|| hdr_sei_rbsp(h)).flatten()
 }
 
 /// Each message found replaces its part whole, it persists until the next of its kind (H.265
@@ -246,10 +254,24 @@ mod tests {
             ..StreamColor::default()
         };
         assert_eq!(vui_colour(&full), Some((true, 2, 2, 1)));
-        assert_eq!(
-            vui_colour(&StreamColor { range: Some(Range::Full), ..StreamColor::default() }),
-            None
-        );
+        let range = |r| StreamColor { range: Some(r), ..StreamColor::default() };
+        assert_eq!(vui_colour(&range(Range::Full)), Some((true, 2, 2, 2)), "full range alone");
+        assert_eq!(vui_colour(&range(Range::Limited)), None, "what no signal type means");
+        assert_eq!(vui_colour(&StreamColor::default()), None);
+    }
+
+    #[test]
+    fn the_static_sei_goes_only_under_a_pq_or_hlg_vui() {
+        let hdr = HdrStatic {
+            light: ContentLight { max_cll: 1000, max_fall: 400 },
+            ..HdrStatic::default()
+        };
+        let vui = |t| StreamColor { transfer: Some(t), ..StreamColor::default() };
+        assert!(static_sei_rbsp(&vui(TransferFn::Pq), &hdr).is_some());
+        assert!(static_sei_rbsp(&vui(TransferFn::Hlg), &hdr).is_some());
+        assert_eq!(static_sei_rbsp(&vui(TransferFn::Bt709), &hdr), None, "a tone map undone");
+        assert_eq!(static_sei_rbsp(&StreamColor::default(), &hdr), None, "unstated");
+        assert_eq!(static_sei_rbsp(&vui(TransferFn::Pq), &HdrStatic::default()), None);
     }
 
     #[test]

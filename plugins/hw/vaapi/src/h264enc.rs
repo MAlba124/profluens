@@ -1164,10 +1164,14 @@ fn write_sps(
     if let Some((full, primaries, transfer, matrix)) = colour {
         w.u(5, 3); // video_format, unspecified
         w.flag(full); // video_full_range_flag
-        w.flag(true); // colour_description_present_flag
-        w.u(u32::from(primaries), 8); // colour_primaries
-        w.u(u32::from(transfer), 8); // transfer_characteristics
-        w.u(u32::from(matrix), 8); // matrix_coefficients
+        // an absent description reads as 2, unspecified (E.2.1)
+        let described = (primaries, transfer, matrix) != (2, 2, 2);
+        w.flag(described); // colour_description_present_flag
+        if described {
+            w.u(u32::from(primaries), 8); // colour_primaries
+            w.u(u32::from(transfer), 8); // transfer_characteristics
+            w.u(u32::from(matrix), 8); // matrix_coefficients
+        }
     }
     w.flag(false); // chroma_loc_info_present_flag
     let have_fps = fps.0 > 0;
@@ -1629,6 +1633,13 @@ mod tests {
         let p = h264parse::parse_sps(&sps[4..]).expect("own SPS parses");
         assert_eq!((p.colour.matrix, p.colour.range), (None, None), "no colour stated");
         assert_eq!(p.max_num_reorder_frames, Some(0));
+        // full range samples of no stated colour, the description left out
+        let range = StreamColor { range: Some(Range::Full), ..StreamColor::default() };
+        let (sps, _) = parameter_sets(720, 576, (25, 1), DEFAULT_QP, &range);
+        let p = h264parse::parse_sps(&sps[4..]).expect("own SPS parses");
+        assert_eq!((p.colour.range, p.colour.matrix), (Some(Range::Full), None), "the range alone");
+        assert_eq!((p.colour.primaries, p.colour.transfer), (None, None));
+        assert_eq!(p.max_num_reorder_frames, Some(0), "the restriction after the range");
     }
 
     #[test]

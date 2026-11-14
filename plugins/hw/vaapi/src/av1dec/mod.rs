@@ -528,22 +528,26 @@ impl VaapiAv1Dec {
         let h = &frame.header;
         let quiet = self.dpb.awaiting_key();
         let mut ev = Events::new();
+        // begin may release the slots of frames never decoded, whatever it gives
         let fate = match self.dpb.begin(h, &mut ev) {
             Ok(fate) => fate,
             Err(e) => {
+                self.apply(&ev);
                 let kind = refusal(self.dpb.slots(), h, e);
                 self.lose(ctx, quiet, Some(kind));
                 return true;
             }
         };
         if fate == Fate::Skip {
-            if ev.as_slice().is_empty() {
-                log!(&*ctx, Level::Trace, "await_key", pts = pts);
-            } else {
+            if ev.as_slice().iter().any(|e| matches!(e, DpbEvent::Output(_))) {
                 self.show_again(ctx, frame.spatial_id, &ev, quiet, pts, duration);
+            } else {
+                self.apply(&ev);
+                log!(&*ctx, Level::Trace, "await_key", pts = pts);
             }
             return true;
         }
+        self.apply(&ev);
         let Some(seq) = self.dpb.stream().seq else {
             self.abandon(ctx, h, Some(K::Av1Stream(Av1Error::NoSequenceHeader)));
             return true;
@@ -635,7 +639,7 @@ impl VaapiAv1Dec {
         self.apply(&ev);
     }
 
-    /// A frame shown again, its `Output` first in `ev`. A key frame took every slot after it.
+    /// A frame shown again, its `Output` in `ev`. A key frame took every slot after it.
     fn show_again(
         &mut self,
         ctx: &mut Ctx,
@@ -646,8 +650,12 @@ impl VaapiAv1Dec {
         duration: Timestamp,
     ) {
         let shown = self.take_shown(spatial_id);
+        let again = ev.as_slice().iter().find_map(|e| match *e {
+            DpbEvent::Output(slot) => Some(slot),
+            DpbEvent::Release(_) => None,
+        });
         if shown
-            && let Some(&DpbEvent::Output(slot)) = ev.as_slice().first()
+            && let Some(slot) = again
             && let Some(preview) = self.goes_out(ctx, pts)
         {
             let i = usize::from(slot.0);

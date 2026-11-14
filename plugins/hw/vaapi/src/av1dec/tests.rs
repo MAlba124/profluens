@@ -519,3 +519,35 @@ fn a_frame_size_override_past_the_sequence_maximum_is_rejected() {
     let h = header::parse_frame_header(&key_with_size(64, 64), &s, &refs, 0, 0).unwrap();
     assert_eq!((h.frame_width, h.frame_height, h.upscaled_width), (64, 64, 64));
 }
+
+#[test]
+fn a_refused_frame_lets_go_of_the_slots_of_frames_never_decoded() {
+    use profluens_core::bus::Bus;
+    use profluens_core::id::{ElementId, FormatId};
+    use profluens_core::memory::{Pool, PoolConfig};
+    let (bus_tx, _bus) = Bus::channel();
+    let mut ctx =
+        Ctx::new(Pool::with_config(PoolConfig::heap(64, 1)), bus_tx, ElementId(0), FormatId(0), 1);
+    let mut d = VaapiAv1Dec::new();
+    let h = parsed(&mut d, &[enc_frame(true, 0, 0xff)]);
+    let mut ev = Events::new();
+    assert_eq!(d.dpb.begin(&h[0], &mut ev), Ok(Fate::Shown));
+    d.decoded(&h[0], Fate::Shown, pic(1, 1), None);
+    assert!(d.surface_referenced(1));
+    // a failed frame, then one skipped into every slot
+    d.lose(&mut ctx, false, None);
+    let s = seq(64, 64, false);
+    let t = Tiles::single(64, 64).unwrap();
+    let mut tu = enc::sequence_header(&s, 4);
+    tu.extend_from_slice(&enc::frame_header(&s, &enc_frame(false, 1, 0xff), &t, 4).bytes);
+    tu.extend_from_slice(&enc::tile_group(&[0; 8], 4));
+    d.decode_unit(&mut ctx, &tu, Timestamp::ZERO, Timestamp::ZERO);
+    assert!(d.surface_referenced(1), "its slots empty at the next begin");
+    // the key frame of slot 0 shown again finds it empty, its surface goes
+    let mut again = h[0];
+    (again.show_existing_frame, again.frame_to_show_map_idx) = (true, 0);
+    let f = Frame { header: again, temporal_id: 0, spatial_id: 0 };
+    assert!(d.frame(&mut ctx, &[], &f, Timestamp::ZERO, Timestamp::ZERO));
+    assert!(d.dpb.slots().iter().all(Option::is_none));
+    assert!(!d.surface_referenced(1) && !d.held[0]);
+}

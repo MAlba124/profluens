@@ -115,9 +115,6 @@ pub fn probe(prefix: &[u8]) -> Result<Kind, ProbeError> {
     if prefix.starts_with(b"FLV\x01") {
         return Ok(Kind::Flv);
     }
-    if prefix.starts_with(b"fLaC") {
-        return Ok(Kind::Flac);
-    }
     if prefix.starts_with(b"RIFF") {
         match prefix.get(8..12) {
             Some(b"AVI ") => return Ok(Kind::Avi),
@@ -125,26 +122,14 @@ pub fn probe(prefix: &[u8]) -> Result<Kind, ProbeError> {
             _ => {}
         }
     }
-    // The 0B 77 sync word, then bsid, A/52 sections 5.4.1.1 and E.2.3.1.6.
-    if prefix.len() >= 6 && prefix[..2] == [0x0B, 0x77] {
-        match prefix[5] >> 3 {
-            0..=10 => return Ok(Kind::Ac3),
-            11..=16 => return Ok(Kind::Eac3),
-            _ => {}
-        }
-    }
-    // DTS core sync in its 16-bit and 14-bit forms, ETSI TS 102 114 section 5.3.1.
-    if let Some(&[a, b, c, d]) = prefix.get(..4) {
-        let sync = u32::from_be_bytes([a, b, c, d]);
-        if matches!(sync, 0x7FFE_8001 | 0xFE7F_0180 | 0x1FFF_E800 | 0xFF1F_00E8) {
-            return Ok(Kind::Dts);
-        }
+    if let Some(kind) = audio_magic(prefix) {
+        return Ok(kind);
     }
     if is_ts(prefix) {
         return Ok(Kind::Ts);
     }
     // ADTS pins layer 00, ISO/IEC 14496-3 section 1.A.2.2.1. Before MP3, which shares FF Fx.
-    if prefix.len() >= 2 && prefix[0] == 0xFF && matches!(prefix[1], 0xF1 | 0xF9) {
+    if is_adts(prefix) {
         return Ok(Kind::AdtsAac);
     }
     if prefix.starts_with(b"ID3") {
@@ -158,6 +143,29 @@ pub fn probe(prefix: &[u8]) -> Result<Kind, ProbeError> {
     let len = prefix.len().min(8);
     lead[..len].copy_from_slice(&prefix[..len]);
     Err(ProbeError { lead, len: len as u8 })
+}
+
+/// FLAC, AC-3, E-AC-3 and DTS by the magic or sync word at byte 0.
+fn audio_magic(p: &[u8]) -> Option<Kind> {
+    if p.starts_with(b"fLaC") {
+        return Some(Kind::Flac);
+    }
+    // The 0B 77 sync word, then bsid, A/52 sections 5.4.1.1 and E.2.3.1.6.
+    if p.len() >= 6 && p[..2] == [0x0B, 0x77] {
+        match p[5] >> 3 {
+            0..=10 => return Some(Kind::Ac3),
+            11..=16 => return Some(Kind::Eac3),
+            _ => {}
+        }
+    }
+    // DTS core sync in its 16-bit and 14-bit forms, ETSI TS 102 114 section 5.3.1.
+    let &[a, b, c, d] = p.get(..4)? else { return None };
+    let sync = u32::from_be_bytes([a, b, c, d]);
+    matches!(sync, 0x7FFE_8001 | 0xFE7F_0180 | 0x1FFF_E800 | 0xFF1F_00E8).then_some(Kind::Dts)
+}
+
+fn is_adts(p: &[u8]) -> bool {
+    p.len() >= 2 && p[0] == 0xFF && matches!(p[1], 0xF1 | 0xF9)
 }
 
 /// The 0x47 sync byte at 188 (H.222.0 2.4.3), 192 (M2TS) or 204 (RS parity) byte strides. Five
@@ -213,8 +221,13 @@ pub fn id3v2_len(prefix: &[u8]) -> Option<usize> {
     Some(10 + size + footer)
 }
 
+/// The stream behind an ID3v2 tag, MPEG audio unless another's magic or sync word starts it.
 pub fn behind_id3(after: &[u8]) -> Kind {
-    if after.starts_with(b"fLaC") { Kind::Flac } else { Kind::Mp3 }
+    match audio_magic(after) {
+        Some(kind) => kind,
+        None if is_adts(after) => Kind::AdtsAac,
+        None => Kind::Mp3,
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +308,42 @@ mod tests {
         assert_eq!((probe(&long), id3v2_len(&long)), (Ok(Kind::Mp3), Some(10 + 2048)));
         assert_eq!(behind_id3(b"fLaC\x00"), Kind::Flac);
         assert_eq!(behind_id3(b""), Kind::Mp3);
+    }
+
+    /// ID3v2 in front of ADTS, AC-3, E-AC-3 or DTS is that stream, as taggers write them.
+    #[test]
+    fn an_id3_tag_in_front_of_other_audio_is_that_audio() {
+        let tagged = |body: &[u8]| {
+            let mut f = b"ID3\x04\x00\x00\x00\x00\x00\x0A".to_vec();
+            f.extend_from_slice(&[0; 10]);
+            f.extend_from_slice(body);
+            f.resize(PREFIX_LEN, 0);
+            f
+        };
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/out");
+        let cases = [
+            ("audio.aac", Kind::AdtsAac),
+            ("audio.ac3", Kind::Ac3),
+            ("audio.eac3", Kind::Eac3),
+            ("audio.dts", Kind::Dts),
+            ("audio.mp3", Kind::Mp3),
+            ("audio.flac", Kind::Flac),
+        ];
+        for (name, want) in cases {
+            let Ok(body) = std::fs::read(root.join(name)) else { continue };
+            assert_eq!(probe(&body[..body.len().min(PREFIX_LEN)]), Ok(want), "{name} bare");
+            assert_eq!(probe(&tagged(&body[..PREFIX_LEN])), Ok(want), "{name} behind ID3");
+        }
+        let syncs: [(&[u8], Kind); 4] = [
+            (&[0xFF, 0xF1, 0x50, 0x80], Kind::AdtsAac),
+            (&[0x0B, 0x77, 0x1F, 0x2B, 0x14, 0x40], Kind::Ac3),
+            (&[0x0B, 0x77, 0x01, 0x7F, 0x3F, 0x84], Kind::Eac3),
+            (&[0x7F, 0xFE, 0x80, 0x01], Kind::Dts),
+        ];
+        for (sync, want) in syncs {
+            assert_eq!(probe(&tagged(sync)), Ok(want), "{sync:02X?}");
+        }
+        assert_eq!(probe(&tagged(&[0xFF, 0xFB, 0x90, 0x00])), Ok(Kind::Mp3));
     }
 
     #[test]

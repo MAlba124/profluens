@@ -4,6 +4,10 @@
 
 const NS: i64 = 1_000_000_000;
 
+/// Segments a grid holds at most, some 24 days of 2 s ones, so a hostile duration or rate makes
+/// no grid rather than an endless one.
+pub const SEGMENTS_MAX: i64 = 1 << 20;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Timeline {
     /// Segment k starts at `starts[k]`, ns, ascending.
@@ -25,6 +29,9 @@ impl Timeline {
             ((i128::from(k) * i128::from(gop) * 1_000_000_000_000 + i128::from(fps_milli) / 2)
                 / i128::from(fps_milli)) as i64
         };
+        if at(1) <= 0 || duration_ns / at(1) >= SEGMENTS_MAX {
+            return None;
+        }
         let mut starts = Vec::new();
         let mut k = 0;
         while at(k) < duration_ns {
@@ -55,7 +62,7 @@ impl Timeline {
 
     /// Segments of `seg_ns` from zero, for a rendition with no video to follow.
     pub fn uniform(duration_ns: i64, seg_ns: i64) -> Option<Timeline> {
-        if duration_ns <= 0 || seg_ns <= 0 {
+        if duration_ns <= 0 || seg_ns <= 0 || duration_ns / seg_ns >= SEGMENTS_MAX {
             return None;
         }
         let starts = (0..).map(|k| k * seg_ns).take_while(|&s| s < duration_ns).collect();
@@ -180,5 +187,14 @@ mod tests {
         assert_eq!(Timeline::keys(10 * NS, &[], 2 * NS), None);
         assert_eq!(Timeline::uniform(10 * NS, 0), None);
         assert_eq!(Timeline::uniform(3 * NS, 2 * NS).map(|t| t.len()), Some(2));
+    }
+
+    #[test]
+    fn a_hostile_duration_or_rate_makes_no_grid() {
+        assert_eq!(Timeline::uniform(i64::MAX, 1), None);
+        assert_eq!(Timeline::frames(i64::MAX, 25_000, 50), None);
+        assert_eq!(Timeline::frames(10 * NS, u32::MAX, 1), None, "43 M segments");
+        let most = SEGMENTS_MAX - 1;
+        assert_eq!(Timeline::uniform(most * 2 * NS, 2 * NS).map(|t| t.len() as i64), Some(most));
     }
 }

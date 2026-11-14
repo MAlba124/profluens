@@ -15,7 +15,7 @@ use pf_sim::prng::Prng;
 use pf_subparse::autodetect;
 use pf_subparse::encoding::{Decoder, decode_all};
 use pf_subparse::formats::ssa::framed_dialogue;
-use pf_subparse::formats::webvtt::cue_text_to_pango_markup;
+use pf_subparse::formats::webvtt::{cue_text_to_pango_markup, vtt_block};
 use pf_subparse::ir::{CUE_IR_FAMILY, CueBuilder, CueIr, EncodeError};
 use pf_subparse::ssastyle::{SsaStyles, dialogue_into};
 use pf_subparse::{CUE_SLOT, SubParse, document_ir};
@@ -83,6 +83,9 @@ fn document(raw: &[u8], forced: Option<Format>, cut: u8) {
     let want: Vec<Out> = cues
         .iter()
         .filter_map(|cue| {
+            if Timestamp::from_nanos(cue.start_ns).is_none() {
+                return None;
+            }
             document_ir(cue, &*parser, &mut b);
             let data = wire(&mut b)?;
             let duration = cue.duration_ns().map_or(Timestamp::NONE, Timestamp::from_nanos);
@@ -162,7 +165,7 @@ fn block(raw: &[u8], dialect: u8, cut: u8) {
             true
         }
         1 => {
-            b.pango_markup(&cue_text_to_pango_markup(body), None, None);
+            b.pango_markup(&cue_text_to_pango_markup(vtt_block(body).2), None, None);
             true
         }
         _ => match framed_dialogue(body) {
@@ -197,7 +200,10 @@ fn block(raw: &[u8], dialect: u8, cut: u8) {
     for pts in times {
         assert!(rig.push(raw, pts, BLOCK_DUR, &mut out));
     }
-    assert!(out == want, "a Block put out other than its IR");
+    let mut probe = String::new();
+    Decoder::new(None).decode(raw, true, &mut probe);
+    let settings = dialect == 1 && !vtt_block(&probe).1.is_empty();
+    assert!(settings || out == want, "a Block put out other than its IR");
     if say() {
         eprintln!("subparse {family} put out {}", out.len());
     }

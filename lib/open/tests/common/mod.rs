@@ -442,6 +442,11 @@ pub fn tables(pmt: u16, streams: &[(u8, u16)], out: &mut Vec<u8>, cc: &mut [u8; 
 /// A transport stream of MPEG-2 video at 25 frames and AC-3 at 48 kHz, `secs` long from
 /// `start` ticks, the tables every 10 frames.
 pub fn ts_file(secs: u64, start: u64) -> Vec<u8> {
+    ts_file_sized(secs, start, |_| 900)
+}
+
+/// [`ts_file`] with picture `f` of `pic(f)` bytes, a rate that varies.
+pub fn ts_file_sized(secs: u64, start: u64, pic_len: impl Fn(u64) -> usize) -> Vec<u8> {
     let (mut out, mut cc, mut vcc, mut acc) = (Vec::new(), [0u8; 2], 0u8, 0u8);
     let ac3 = pf_bare::fixture::ac3_frame(0, 192, false, 2);
     let mut audio = 0u64;
@@ -452,7 +457,7 @@ pub fn ts_file(secs: u64, start: u64) -> Vec<u8> {
         let t = start + f * 3600;
         let mut pic = if f % 12 == 0 { SEQ.to_vec() } else { Vec::new() };
         pic.extend_from_slice(&[0, 0, 1, 0, 0, if f % 12 == 0 { 0x0F } else { 0x17 }, 0xFF]);
-        pic.resize(pic.len() + 900, 0x5A);
+        pic.resize(pic.len() + pic_len(f), 0x5A);
         packets(0x100, &mut vcc, &pes(0xE0, Some(t), &pic), &mut out);
         while audio * 2880 <= f * 3600 {
             let p = pes(0xBD, Some(start + audio * 2880), &ac3);

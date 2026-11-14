@@ -6,6 +6,7 @@
 
 pub mod es;
 pub mod index;
+pub mod seek;
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -31,11 +32,13 @@ use profluens_core::id::{SinkPad, SrcPad};
 use profluens_core::log;
 use profluens_core::log::Level;
 use profluens_core::memory::Memory;
+use profluens_core::pull::{Fed, Feed};
 use profluens_core::rate;
 use profluens_core::time::Timestamp;
 
 use es::Adts;
 use index::{Grown, Key, Placed};
+use seek::{Base, Bisect, Landing};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TsError {
@@ -131,11 +134,20 @@ static DESC: ElementDesc = ElementDesc {
 /// A transport packet ends at most one unit, so a piece ends at most 22.
 const PIECE: usize = 22 * 188;
 
+/// Pulled windows, as large as a pool slot holds, and how many are out at once.
+const WINDOW: u32 = 256 << 10;
+const WINDOW_DEPTH: u32 = 4;
+const PROBE_TAG: u32 = 1;
+
 /// Slack below a file's first decode time for a stamp behind a seek, streams start within 1 s.
 const ORIGIN_SLACK: i64 = 10 * 90_000;
 
 fn ticks_ns(ticks: i64) -> i64 {
     (i128::from(ticks) * 100_000 / 9).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn ns_ticks(ns: u64) -> i64 {
+    (u128::from(ns) * 9 / 100_000).min(i64::MAX as u128) as i64
 }
 
 /// The families pf-ps and pf-mkv emit for the same codecs. MPEG-1 video is `mpeg1`, which
@@ -314,6 +326,15 @@ pub struct TsDemux {
     teller: rate::Teller,
     /// Demuxer anomalies since start, the first logged at warn.
     anomalies: u64,
+    /// The windows of a pulled input.
+    input: Feed,
+    /// The first pull reset of a run reads from the start, any later one is a seek or a restart.
+    paired: bool,
+    /// A pulled seek bisecting for its landing, and the probe out.
+    bisect: Option<(Bisect, SeekTarget)>,
+    probe: Option<u64>,
+    /// The pull reset ahead is a restart for one track, read from its byte without a bisection.
+    rejoined: bool,
 }
 
 impl TsDemux {
@@ -351,6 +372,11 @@ impl TsDemux {
             grown: Grown::new(),
             heads: None,
             anomalies: 0,
+            input: Feed::new(WINDOW, WINDOW_DEPTH),
+            paired: false,
+            bisect: None,
+            probe: None,
+            rejoined: false,
         }
     }
 
@@ -360,10 +386,11 @@ impl TsDemux {
         self
     }
 
-    /// For the index's proportional estimate past its last entry.
+    /// For the index's proportional estimate past its last entry and a pulled seek's bisection.
     #[must_use]
     pub fn with_len(mut self, len: u64) -> Self {
         self.grown.file_len = Some(len);
+        self.input.set_end(Some(len));
         self
     }
 
@@ -812,7 +839,7 @@ impl TsDemux {
             return;
         };
         if let Some(target) = restart.filter(|_| on) {
-            self.rejoin(at, pad, target);
+            self.rejoin(at, pad, target, ctx.pulls(Self::IN));
         }
         let track = &mut self.tracks[at];
         track.pad = on.then_some(pad);
@@ -829,7 +856,7 @@ impl TsDemux {
     /// The track drops what it parked for a full pool, it was read ahead of the restart and
     /// would go out first and again when read. The other tracks keep theirs and drop what they
     /// read again up to their last unit, what was in progress is read again whole.
-    fn rejoin(&mut self, at: usize, pad: SrcPad, target: SeekTarget) {
+    fn rejoin(&mut self, at: usize, pad: SrcPad, target: SeekTarget, pulls: bool) {
         let old = self.tracks[at].pad;
         let gone = |row: &Parked| match *row {
             Parked::Unit { pad: of, .. } | Parked::Format { pad: of, .. } => {
@@ -843,6 +870,8 @@ impl TsDemux {
             (track.read, track.quiet) = (None, on || n == at);
         }
         self.feeding = None;
+        self.input.restart(target.to_byte);
+        (self.bisect, self.probe, self.rejoined) = (None, None, pulls);
         if let Some(demux) = self.demux.as_mut() {
             demux.discontinuity();
             if self.grown.placed != Placed::Segments {
@@ -1096,6 +1125,9 @@ impl Element for TsDemux {
         (self.clock.sought, self.clock.last_ns, self.clock.broke, self.clock.marked) =
             (false, 0, false, false);
         (self.feeding, self.ending, self.anomalies) = (None, false, 0);
+        (self.paired, self.bisect, self.probe, self.rejoined) = (false, None, None, false);
+        self.input.restart(0);
+        ctx.want_ranges(Self::IN);
         self.park.rows.clear();
         self.park.bytes.clear();
         self.break_stream(None);
@@ -1107,7 +1139,13 @@ impl Element for TsDemux {
     }
 
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
-        self.take_in(ctx, &mut inputs)
+        if let Some(from) = ctx.pull_reset(Self::IN) {
+            self.restart_pull(ctx, from);
+        }
+        match ctx.pulls(Self::IN) {
+            true => Ok(self.pull(ctx, &mut inputs)),
+            false => self.take_in(ctx, &mut inputs),
+        }
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
@@ -1115,7 +1153,7 @@ impl Element for TsDemux {
     }
 
     fn stop(&mut self, _ctx: &mut Ctx) {
-        (self.demux, self.feeding) = (None, None);
+        (self.demux, self.feeding, self.bisect, self.probe) = (None, None, None, None);
         self.park.rows.clear();
         self.park.bytes.clear();
     }
@@ -1186,6 +1224,115 @@ impl TsDemux {
             if end < memory.len() {
                 self.feeding = Some((memory, end));
             }
+        }
+    }
+
+    /// Windows in file order once no bisection is out, each fed in pieces as output leaves.
+    fn pull(&mut self, ctx: &mut Ctx, inputs: &mut Inputs<'_>) -> Flow {
+        self.ask_probe(ctx);
+        let mut held = false;
+        loop {
+            if !self.unpark(ctx) {
+                held = true;
+                break;
+            }
+            if let Some((memory, at)) = self.feeding.take() {
+                let end = (at + PIECE).min(memory.len());
+                self.feed(ctx, &memory.data()[at..end], false);
+                if end < memory.len() {
+                    self.feeding = Some((memory, end));
+                }
+                continue;
+            }
+            match self.input.take(ctx, Self::IN, inputs) {
+                Some(Fed::Window { buf, .. }) if self.bisect.is_none() => {
+                    self.feeding = Some((buf.memory, 0));
+                }
+                // read before the seek's landing is known
+                Some(Fed::Window { .. }) => {}
+                Some(Fed::Aside { tag: PROBE_TAG, buf }) => {
+                    if let (Some((bisect, _)), Some(at)) = (&mut self.bisect, self.probe.take()) {
+                        bisect.served(at, buf.memory.data());
+                    }
+                    self.ask_probe(ctx);
+                }
+                Some(Fed::Aside { .. }) => {}
+                None => break,
+            }
+        }
+        match (held, self.bisect.is_some()) {
+            (_, true) => {}
+            (true, false) => ctx.hold_end(),
+            (false, false) => self.input.ask(ctx, Self::IN),
+        }
+        Flow::Ok
+    }
+
+    fn restart_pull(&mut self, ctx: &mut Ctx, from: SeekTarget) {
+        self.input.restart(from.to_byte);
+        if let Some(demux) = self.demux.as_mut() {
+            demux.set_position(from.to_byte);
+        }
+        (self.bisect, self.probe) = (None, None);
+        let rejoined = std::mem::take(&mut self.rejoined);
+        if std::mem::replace(&mut self.paired, true) && !rejoined {
+            self.bisect = self.bisector(ctx, from).map(|b| (b, from));
+            let bisect = self.bisect.is_some();
+            log!(&*ctx, Level::Debug, "seek", target = from.at, at = from.to_byte, bisect = bisect);
+        }
+    }
+
+    /// A bisection for a seek the index places by estimate, or on a keyframe further back than
+    /// the spacing, where the stretch to the target was not read. None where the plan stands.
+    fn bisector(&self, ctx: &Ctx, from: SeekTarget) -> Option<Bisect> {
+        let len = self.grown.file_len.filter(|len| *len > 0)?;
+        let key = self.grown.key.filter(|_| self.grown.placed == Placed::File)?;
+        let size = self.demux.as_ref()?.packet_size()?;
+        let origin = self.clock.origin?;
+        let target = ctx.presentation_point().unwrap_or(from.at).nanos()?;
+        if self.grown.near_key(from.to_byte, from.at.nanos()?, target) {
+            return None;
+        }
+        let aim = target.saturating_sub(self.grown.back());
+        let bounds = self.grown.bracket(aim, target, len);
+        let base = Base { origin, slack: ORIGIN_SLACK };
+        Some(Bisect::new(base, key.pid, size, ns_ticks(aim), bounds, len))
+    }
+
+    fn ask_probe(&mut self, ctx: &mut Ctx) {
+        let Some((bisect, from)) = &self.bisect else { return };
+        if self.probe.is_some() {
+            return;
+        }
+        let (step, from, floor) = (bisect.step(), *from, bisect.floor());
+        match step {
+            // A pool that cannot hold the probe never will, so the seek lands as planned.
+            seek::Step::Probe { len, .. } if u64::from(len) > ctx.pool_stats().bytes_budget => {
+                log!(&*ctx, Level::Warn, "seek_probe_unread", bytes = len, at = from.to_byte);
+                self.land(from.to_byte);
+            }
+            seek::Step::Probe { at, len } => {
+                match self.input.aside(ctx, Self::IN, at, len, PROBE_TAG) {
+                    true => self.probe = Some(at),
+                    false => ctx.wake_within(std::time::Duration::from_millis(1)),
+                }
+            }
+            // Nothing of the key stream at or before the aim past the lower bound.
+            seek::Step::Land(landing) => {
+                let Landing { at, ticks } = landing.unwrap_or(Landing { at: floor, ticks: 0 });
+                let probes = bisect.probes();
+                log!(&*ctx, Level::Debug, "seek_landed", at = at, ticks = ticks, probes = probes);
+                self.land(at);
+            }
+        }
+    }
+
+    fn land(&mut self, at: u64) {
+        self.bisect = None;
+        self.input.restart(at);
+        self.grown.jump(0, Some(at));
+        if let Some(demux) = self.demux.as_mut() {
+            demux.set_position(at);
         }
     }
 

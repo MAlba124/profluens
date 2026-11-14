@@ -161,60 +161,89 @@ fn every_container_plays_its_tracks_through_the_routes() {
     }
 }
 
-/// A transport or program stream seeks ahead of what was read, the transport stream on the
-/// duration the open found, the program stream by bisecting its packs, and lands on a key near
-/// the target.
+/// A transport or program stream seeks ahead of what was read, by bisecting the file on its
+/// stamps, and lands on a key at or a little before the target.
 #[test]
 fn a_transport_or_program_stream_seeks_where_nothing_was_read() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
     for (name, bytes) in
         [("seek.ts", common::ts_file(30, 900_000)), ("seek.vob", common::ps_file(30, true, true))]
     {
-        let path = dir.join(name);
-        std::fs::write(&path, bytes).unwrap();
-        let o = opened_at(&path);
-        let mut p = pf_reactor::pipeline();
-        p.set_select_all(false);
-        let demux = demuxer(&mut p, File::open(&path).unwrap(), &path, &o, false).unwrap();
-        p.preroll().unwrap();
-        let v = o.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap();
-        let pad = route(&p, demux, &o, v).unwrap().pad(&mut p, demux).unwrap();
-        let got = Arc::new(Mutex::new(Pcm::default()));
-        let ((first_tx, first_rx), (go_tx, go_rx)) = (channel(), channel());
-        let sink = p.add(Collect { got: Arc::clone(&got), gate: Some((first_tx, go_rx)) });
-        p.link(demux.src(pad), sink.sink(SinkPad(0))).unwrap();
-        let ctl = p.control();
-        let run = std::thread::spawn(move || {
-            let r = p.run();
-            (p, r)
-        });
-        first_rx.recv_timeout(Duration::from_secs(30)).unwrap();
         let to = Timestamp(20_000_000_000);
-        let mut plan = None;
-        for _ in 0..10_000 {
-            if ctl.seekable() != Seekable::Unknown
-                && ctl.plan_from(Timestamp::NONE, to, SeekMode::Keyframe) != SeekPlan::Deferred
-            {
-                plan = Some(ctl.seek_from(Timestamp::NONE, to, SeekMode::Keyframe).unwrap());
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        go_tx.send(()).unwrap();
-        let (p, r) = run.join().unwrap();
-        r.unwrap();
-        assert!(matches!(plan, Some(SeekPlan::Seek { .. })), "{name} {plan:?}");
-        let ix = p.index(demux).unwrap();
-        assert_eq!(ix.duration, Timestamp(o.duration_ns), "{name}");
-        let g = got.lock().unwrap();
-        let first = g.bufs[g.flushed..].iter().find(|b| b.0 != Timestamp::NONE).unwrap().0;
-        // psdemux bisects to 5 s ahead of the target, the mux delay and a few GOPs back
-        let back = if o.kind == Kind::Ps { 5_000_000_000 } else { 0 };
-        let near = (to.0 - back).saturating_sub(1_000_000_000)..to.0 + 1_000_000_000;
+        let (o, first, read) = seek_unread(name, bytes, to, SeekMode::Keyframe);
+        // both bisect to a few seconds ahead of the target, psdemux 5 s, tsdemux the keyframe
+        // spacing it read and a second
+        let back = if o.kind == Kind::Ps { 5_000_000_000 } else { 1_480_000_000 };
+        let near = (to.0 - back).saturating_sub(1_000_000_000)..to.0 + 1;
         assert!(near.contains(&first.0), "{name} lands at {first:?}");
         let left = (o.duration_ns - first.0) / 40_000_000 + 2;
-        assert!((g.bufs.len() - g.flushed) as u64 <= left, "{name} read on from where it landed");
+        assert!(read <= left, "{name} read on from where it landed");
     }
+}
+
+/// A transport stream whose rate climbs lands an accurate seek where the stamps say, not where
+/// its mean rate puts the target, which is seconds past it.
+#[test]
+fn a_transport_stream_of_a_rate_that_varies_lands_at_or_before_the_target() {
+    // 20 s of small pictures, then 10 s of pictures ten times the size
+    let bytes = common::ts_file_sized(30, 900_000, |f| if f < 500 { 900 } else { 9_000 });
+    let to = Timestamp(15_000_000_000);
+    let (o, first, _) = seek_unread("vbr.ts", bytes, to, SeekMode::Accurate);
+    // the mean rate puts 15 s in the large pictures, some 24 s in
+    let mean = o.len * 15 / 30;
+    assert!(
+        mean > common::ts_file_sized(20, 900_000, |_| 900).len() as u64,
+        "the estimate overshoots"
+    );
+    assert!((to.0 - 2_000_000_000..=to.0).contains(&first.0), "lands at {first:?}");
+}
+
+/// `bytes` played as `name`, the video only, seeked to `to` past what was read once the first
+/// buffer is out. The open, the first stamp behind the seek and the buffers behind it.
+fn seek_unread(
+    name: &str,
+    bytes: Vec<u8>,
+    to: Timestamp,
+    mode: SeekMode,
+) -> (Opened, Timestamp, u64) {
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    std::fs::write(&path, bytes).unwrap();
+    let o = opened_at(&path);
+    let mut p = pf_reactor::pipeline();
+    p.set_select_all(false);
+    let demux = demuxer(&mut p, File::open(&path).unwrap(), &path, &o, false).unwrap();
+    p.preroll().unwrap();
+    let v = o.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap();
+    let pad = route(&p, demux, &o, v).unwrap().pad(&mut p, demux).unwrap();
+    let got = Arc::new(Mutex::new(Pcm::default()));
+    let ((first_tx, first_rx), (go_tx, go_rx)) = (channel(), channel());
+    let sink = p.add(Collect { got: Arc::clone(&got), gate: Some((first_tx, go_rx)) });
+    p.link(demux.src(pad), sink.sink(SinkPad(0))).unwrap();
+    let ctl = p.control();
+    let run = std::thread::spawn(move || {
+        let r = p.run();
+        (p, r)
+    });
+    first_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let mut plan = None;
+    for _ in 0..10_000 {
+        if ctl.seekable() != Seekable::Unknown
+            && ctl.plan_from(Timestamp::NONE, to, mode) != SeekPlan::Deferred
+        {
+            plan = Some(ctl.seek_from(Timestamp::NONE, to, mode).unwrap());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    go_tx.send(()).unwrap();
+    let (p, r) = run.join().unwrap();
+    r.unwrap();
+    assert!(matches!(plan, Some(SeekPlan::Seek { .. })), "{name} {plan:?}");
+    let ix = p.index(demux).unwrap();
+    assert_eq!(ix.duration, Timestamp(o.duration_ns), "{name}");
+    let g = got.lock().unwrap();
+    let first = g.bufs[g.flushed..].iter().find(|b| b.0 != Timestamp::NONE).unwrap().0;
+    let read = (g.bufs.len() - g.flushed) as u64;
+    (o, first, read)
 }
 
 /// The Matroska demuxer publishes the Cues the open read, the AVI one the idx1 index.

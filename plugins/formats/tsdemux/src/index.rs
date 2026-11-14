@@ -16,6 +16,15 @@ pub const RESERVE: usize = 1024;
 /// Chosen, not measured. A seek floors to the entry before and the decoder cuts the rest.
 pub const AUDIO_SPACING: u64 = 1_000_000_000;
 
+/// Neighbouring keyframes further apart are taken for a stretch not read, not for the spacing.
+pub const SPACING_SEEN_MAX: u64 = 20_000_000_000;
+
+/// How far ahead of its target a bisected seek lands, the keyframe spacing read and a second for
+/// the reorder of presentation behind decode, at most [`BACK_MAX`], [`BACK_UNKNOWN`] before any.
+pub const BACK_MAX: u64 = 11_000_000_000;
+pub const BACK_UNKNOWN: u64 = 5_000_000_000;
+const REORDER: u64 = 1_000_000_000;
+
 /// Whether the counted bytes are file bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placed {
@@ -45,6 +54,8 @@ pub struct Grown {
     /// The furthest byte read while gapless.
     pub reached: u64,
     pub complete: bool,
+    /// The widest gap between neighbouring keyframes up to [`SPACING_SEEN_MAX`], 0 before two.
+    pub spacing: u64,
 }
 
 impl Grown {
@@ -60,6 +71,7 @@ impl Grown {
             gapless: true,
             reached: 0,
             complete: false,
+            spacing: 0,
         }
     }
 
@@ -92,7 +104,7 @@ impl Grown {
     pub fn rekey(&mut self, key: Option<Key>) {
         if self.key != key {
             (self.key, self.published) = (key, 0);
-            (self.gapless, self.complete) = (false, false);
+            (self.gapless, self.complete, self.spacing) = (false, false, 0);
             self.entries.clear();
         }
     }
@@ -119,7 +131,37 @@ impl Grown {
             return false;
         }
         self.entries.insert(at, IndexEntry::key(time_ns, byte));
+        let near = |gap: u64| (gap <= SPACING_SEEN_MAX).then_some(gap);
+        let before = at.checked_sub(1).and_then(|n| near(time_ns - self.entries[n].time_ns));
+        let after = self.entries.get(at + 1).and_then(|e| near(e.time_ns - time_ns));
+        self.spacing = self.spacing.max(before.unwrap_or(0)).max(after.unwrap_or(0));
         self.entries.len() >= self.published + GROWN_EVERY
+    }
+
+    /// How far ahead of its target a bisected seek lands, so a keyframe comes at or before it.
+    pub fn back(&self) -> u64 {
+        match self.spacing {
+            0 => BACK_UNKNOWN,
+            s => (s + REORDER).min(BACK_MAX),
+        }
+    }
+
+    /// Whether a seek to `target_ns` planned from the entry at `byte` and `time_ns` starts at a
+    /// keyframe read no further back than the spacing, so it needs no bisection.
+    pub fn near_key(&self, byte: u64, time_ns: u64, target_ns: u64) -> bool {
+        let at = self.entries.partition_point(|e| e.time_ns < time_ns);
+        self.entries.get(at).is_some_and(|e| (e.time_ns, e.byte) == (time_ns, byte))
+            && target_ns.saturating_sub(time_ns) <= self.back()
+    }
+
+    /// The bytes a landing `aim_ns` ahead of `target_ns` lies between by the entries, the last a
+    /// reorder ahead of the aim and the first a reorder past the target, else `0` and `len`.
+    pub fn bracket(&self, aim_ns: u64, target_ns: u64, len: u64) -> (u64, u64) {
+        let lo = self.entries.partition_point(|e| e.time_ns.saturating_add(REORDER) <= aim_ns);
+        let hi = self.entries.partition_point(|e| e.time_ns <= target_ns.saturating_add(REORDER));
+        let lo = lo.checked_sub(1).map_or(0, |n| self.entries[n].byte);
+        let hi = self.entries.get(hi).map_or(len, |e| e.byte);
+        (lo, hi.max(lo))
     }
 
     pub fn unpublished(&self) -> bool {
@@ -243,6 +285,57 @@ mod tests {
         g.open();
         g.placed = Placed::Lost;
         assert!(!g.end() && !g.index().complete);
+    }
+
+    #[test]
+    fn the_spacing_is_the_widest_gap_between_keyframes_read_side_by_side() {
+        let mut g = video();
+        assert_eq!((g.spacing, g.back()), (0, BACK_UNKNOWN), "nothing read");
+        for n in 0..5u64 {
+            g.keyframe(n * 2 * S, n * 1000);
+        }
+        g.keyframe(13 * S, 9_000);
+        assert_eq!((g.spacing, g.back()), (5 * S, 6 * S), "8 s to 13 s");
+        // a seek far ahead read on there, the stretch between is no gap
+        g.keyframe(600 * S, 900_000);
+        g.keyframe(601 * S, 901_000);
+        assert_eq!(g.spacing, 5 * S);
+        g.keyframe(613 * S, 905_000);
+        assert_eq!((g.spacing, g.back()), (12 * S, BACK_MAX), "past the cap");
+        g.rekey(Some(Key { pid: 257, stream: 1, video: false }));
+        assert_eq!(g.spacing, 0, "the new key's own");
+    }
+
+    #[test]
+    fn a_keyframe_far_behind_the_target_or_unknown_is_no_near_key() {
+        let mut g = video();
+        for n in 0..10u64 {
+            g.keyframe(n * S, n * 1000);
+        }
+        g.keyframe(700 * S, 900_000);
+        assert!(g.near_key(5000, 5 * S, 6 * S), "a second on");
+        assert!(!g.near_key(5000, 5 * S, 9 * S), "past the spacing and a second");
+        assert!(!g.near_key(4000, 5 * S, 5 * S), "not the entry's byte, an estimate");
+        // the last entry before a stretch not read, the plan for 300 s floors to it
+        assert!(!g.near_key(9000, 9 * S, 300 * S));
+    }
+
+    #[test]
+    fn the_bracket_is_the_entries_around_the_aim_and_the_target() {
+        let mut g = video();
+        for n in 0..10u64 {
+            g.keyframe(n * S, n * 1000);
+        }
+        g.keyframe(700 * S, 900_000);
+        assert_eq!(g.bracket(5 * S, 6 * S, 1 << 30), (4000, 8000));
+        assert_eq!(
+            g.bracket(300 * S, 302 * S, 1 << 30),
+            (9000, 900_000),
+            "in the stretch not read"
+        );
+        assert_eq!(g.bracket(800 * S, 802 * S, 1 << 30), (900_000, 1 << 30), "past the last");
+        assert_eq!(g.bracket(0, S / 2, 1 << 30), (0, 2000), "ahead of the first");
+        assert_eq!(Grown::new().bracket(5 * S, 6 * S, 77), (0, 77), "no entry");
     }
 
     #[test]

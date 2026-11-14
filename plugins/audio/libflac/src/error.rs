@@ -7,6 +7,7 @@ use crate::encoder::{EncodeError, SampleFormat};
 pub enum FlacError {
     Decode(DecodeError),
     NoStreamInfo,
+    SlotTooSmall { capacity: usize, need: usize },
     Encode(EncodeError),
     EncoderNotStarted,
     FormatChanged { rate: u32, channels: u32, format: SampleFormat },
@@ -19,6 +20,10 @@ impl fmt::Display for FlacError {
         match self {
             FlacError::Decode(e) => write!(f, "flacdec: {e}"),
             FlacError::NoStreamInfo => f.write_str("flacdec: frame decoded without streaminfo"),
+            FlacError::SlotTooSmall { capacity, need } => write!(
+                f,
+                "flacdec: pool slot of {capacity} bytes is smaller than one {need} byte frame"
+            ),
             FlacError::Encode(e) => write!(f, "flacenc: {e}"),
             FlacError::EncoderNotStarted => f.write_str("flacenc: not started"),
             FlacError::FormatChanged { rate, channels, format } => write!(
@@ -77,10 +82,11 @@ mod tests {
 
     #[test]
     fn messages_name_the_element_and_carry_the_data() {
-        let rows: [(FlacError, &str, &[&str]); 9] = [
+        let rows: [(FlacError, &str, &[&str]); 10] = [
             (FlacError::Decode(DecodeError::BadMagic), "flacdec: ", &["fLaC"]),
             (FlacError::Decode(DecodeError::State(7)), "flacdec: ", &["libFLAC", "state 7"]),
             (FlacError::NoStreamInfo, "flacdec: ", &["without streaminfo"]),
+            (FlacError::SlotTooSmall { capacity: 8, need: 18 }, "flacdec: ", &["8 bytes", "18"]),
             (
                 FlacError::Encode(EncodeError::UnsupportedParams("channels")),
                 "flacenc: ",

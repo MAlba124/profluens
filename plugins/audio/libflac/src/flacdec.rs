@@ -32,8 +32,8 @@ const F_SAMPLE: &str = "sample";
 /// Small so the first audio reaches the sink after about one frame's decode.
 const FRAMES_PER_BATCH: u32 = 2;
 
-static SAMPLE_VALUES: [ValueDesc; 4] =
-    [ValueDesc::Id("s8"), ValueDesc::Id("s16"), ValueDesc::Id("s24"), ValueDesc::Id("s32")];
+static SAMPLE_VALUES: [ValueDesc; 3] =
+    [ValueDesc::Id("s16"), ValueDesc::Id("s24"), ValueDesc::Id("s32")];
 
 static SRC_FIELDS: [FieldDesc; 3] = [
     FieldDesc { field: F_RATE, allowed: ConstraintDesc::Any, preferred: None },
@@ -68,12 +68,11 @@ pub(crate) static DESC: ElementDesc = ElementDesc {
     couplings: &[],
 };
 
-/// The narrowest of 8, 16, 24 and 32 bits that holds `bits`, with its name, bytes and the
-/// left shift to full scale.
+/// The narrowest of 16, 24 and 32 bits that holds `bits`, with its name, bytes and the left
+/// shift to full scale. Eight bits and less go out as s16, `audio/raw` has no signed 8 bit.
 fn container(bits: u32) -> (&'static str, usize, u32) {
     let (name, bytes) = match bits {
-        0..=8 => ("s8", 1),
-        9..=16 => ("s16", 2),
+        0..=16 => ("s16", 2),
         17..=24 => ("s24", 3),
         _ => ("s32", 4),
     };
@@ -250,8 +249,17 @@ impl FlacDec {
             } else {
                 ctx.alloc()
             };
-            let per = (buf.memory.capacity() / bytes).max(1); // whole samples per buffer
-            let end = (self.pending_pos + per).min(self.pending.len());
+            // Whole frames per buffer, a cut frame would lose its part of the stamps.
+            let ch = self.channels.max(1);
+            let frames = buf.memory.capacity() / (bytes * ch);
+            if frames == 0 {
+                let need = bytes * ch;
+                return Err(Error::element_failed(
+                    ctx.element(),
+                    FlacError::SlotTooSmall { capacity: buf.memory.capacity(), need },
+                ));
+            }
+            let end = (self.pending_pos + frames * ch).min(self.pending.len());
             let dst = buf.memory.as_mut_full();
             let mut n = 0;
             for &s in &self.pending[self.pending_pos..end] {
@@ -534,7 +542,8 @@ mod tests {
 
     #[test]
     fn every_depth_goes_out_in_the_narrowest_container_at_full_scale() {
-        assert_eq!(container(8), ("s8", 1, 0));
+        assert_eq!(container(4), ("s16", 2, 12));
+        assert_eq!(container(8), ("s16", 2, 8));
         assert_eq!(container(12), ("s16", 2, 4));
         assert_eq!(container(16), ("s16", 2, 0));
         assert_eq!(container(20), ("s24", 3, 4));
@@ -543,7 +552,8 @@ mod tests {
         for bits in 4..=32 {
             let (name, bytes, shift) = container(bits);
             assert_eq!(bits + shift, bytes as u32 * 8, "{bits} bits");
-            assert!(shift < 8 && name == ["s8", "s16", "s24", "s32"][bytes - 1], "{bits} bits");
+            assert!(bytes >= 2 && name == ["s16", "s24", "s32"][bytes - 2], "{bits} bits");
+            assert!(shift < 8 || bits <= 8, "{bits} bits");
             let (lo, hi) = (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1);
             let top = 1i64 << (bytes * 8 - 1);
             assert_eq!(

@@ -6,7 +6,7 @@
 mod support;
 
 use pf_harness::Harness;
-use pf_libflac::{FlacDecoder, FlacEncoder, SampleFormat};
+use pf_libflac::{FlacDec, FlacDecoder, FlacEncoder, SampleFormat};
 use profluens_core::format::Value;
 
 const RATE: u32 = 22_050;
@@ -223,8 +223,8 @@ fn odd_depths_go_out_in_the_next_container_at_full_scale() {
             "the decoder keeps the depth"
         );
         let (out, name) = run_flacdec(&stream, &[5]);
-        let bytes = (bits as usize).div_ceil(8);
-        let want = ["s8", "s16", "s24", "s32"][bytes - 1];
+        let bytes = (bits as usize).div_ceil(8).max(2);
+        let want = ["s16", "s24", "s32"][bytes - 2];
         assert_eq!(name.as_deref(), Some(want), "{bits} bits");
         assert_eq!(out.len(), samples.len() * bytes, "{bits} bits as {want}");
         let shift = bytes as u32 * 8 - bits;
@@ -235,4 +235,42 @@ fn odd_depths_go_out_in_the_next_container_at_full_scale() {
             assert_eq!(v, s << shift, "{bits} bits, sample {k}");
         }
     }
+}
+
+/// 24 bit 5.1 in 4096 sample blocks through 64 KiB slots, which end mid frame.
+#[test]
+fn a_slot_that_ends_mid_frame_cuts_on_a_whole_frame_and_keeps_the_stamps() {
+    const RATE: u32 = 48_000;
+    const STRIDE: usize = 6 * 3;
+    let frames = RATE as usize * 4;
+    let pcm: Vec<u8> = (0..frames * 6)
+        .flat_map(|i| (((i * 7919) % 65_536) as i32 - 32_768).to_le_bytes()[..3].to_vec())
+        .collect();
+    let (mut enc, mut flac) =
+        FlacEncoder::new_streaming(RATE, 6, SampleFormat::S24, 4096).expect("enc");
+    enc.encode_interleaved(&pcm, &mut flac).expect("encode");
+    enc.finish(&mut flac);
+
+    let mut h = Harness::with_slot_size(FlacDec::new(), 64 * 1024);
+    let mut out = Vec::new();
+    for c in flac.chunks(32 * 1024) {
+        let b = h.alloc(c);
+        h.push(b).expect("push");
+        out.extend(h.drain_outputs());
+    }
+    out.extend(h.eos().expect("eos"));
+    let mut bytes = Vec::new();
+    let mut end = 0u64;
+    for (k, b) in out.iter().enumerate() {
+        assert_eq!(b.memory.len() % STRIDE, 0, "buffer {k} ends mid frame");
+        assert_eq!(b.pts.0, end, "buffer {k} is stamped where the one before it ended");
+        end = b.pts.0 + b.duration.0;
+        bytes.extend_from_slice(b.memory.data());
+    }
+    assert_eq!(bytes, pcm, "lossless");
+    assert_eq!(
+        end,
+        frames as u64 * 1_000_000_000 / u64::from(RATE),
+        "the stamps end with the audio"
+    );
 }

@@ -557,11 +557,8 @@ impl VaapiH265Dec {
         sc: &mut AuScratch,
     ) {
         self.decode_picture(ctx, au, pts, duration, sc);
-        // an end of sequence lets every picture out, the next IRAP starts anew
+        // the next IRAP has NoRaslOutputFlag, its C.5.2.2 puts the prior pictures out or drops them
         if sc.nals.iter().any(|n| bs::is_eos(n.nal_type)) {
-            let mut ev = Events::new();
-            self.dpb.flush(&mut ev);
-            self.apply(&ev);
             self.dpb.end_of_sequence();
         }
     }
@@ -1163,7 +1160,7 @@ impl VaapiH265Dec {
         }
 
         let cx = crop_x as usize * bps;
-        let cx_c = (crop_x / 2) as usize * bps;
+        let cx_c = chroma_crop_bytes(crop_x, bps);
         let y_row = width as usize * bps;
         let c_row = cw as usize * 2 * bps;
         let dst = buf.memory.as_mut_full();
@@ -1641,6 +1638,11 @@ impl AuScratch {
     }
 }
 
+/// Bytes before chroma column `crop_x / 2` in an interleaved CbCr row, two samples a column.
+fn chroma_crop_bytes(crop_x: u32, bps: usize) -> usize {
+    (crop_x / 2) as usize * 2 * bps
+}
+
 fn unsupported(sps: &Sps) -> K {
     K::UnsupportedSps {
         chroma_format_idc: sps.chroma_format_idc,
@@ -1910,6 +1912,72 @@ mod tests {
         }
         assert_eq!(chroma_offset(0, 1000, 6, 2048), 1000, "12 bit high precision");
         assert_eq!(chroma_offset(0, 1000, 6, 128), 127);
+    }
+
+    /// CONFWIN_A crops left, the chroma row starts at a Cb sample, not at the Cr before it.
+    #[test]
+    fn a_left_crop_starts_the_interleaved_chroma_row_at_its_cb() {
+        // 8 bit row of Cb0 Cr0 Cb1 Cr1 and on, Cb the even values, Cr the odd
+        let row: Vec<u8> = (0..32).collect();
+        let at = chroma_crop_bytes(8, 1);
+        assert_eq!((row[at], row[at + 1]), (8, 9), "Cb4 then Cr4");
+        // P010, two bytes a sample
+        assert_eq!(chroma_crop_bytes(8, 2), 16);
+        assert_eq!(chroma_crop_bytes(0, 2), 0);
+    }
+
+    /// The fixture's units, cut ahead of each access unit delimiter.
+    fn units(data: &[u8]) -> Vec<&[u8]> {
+        let mut cuts = vec![0];
+        for i in 1..data.len().saturating_sub(3) {
+            if data[i..i + 3] == [0, 0, 1] && (data[i + 3] >> 1) & 0x3F == h265parse::NAL_AUD {
+                cuts.push(if data[i - 1] == 0 { i - 1 } else { i });
+            }
+        }
+        let ends = cuts.iter().skip(1).copied().chain([data.len()]);
+        cuts.iter().zip(ends).map(|(&a, b)| &data[a..b]).collect()
+    }
+
+    /// NoOutPrior_A_Qualcomm, an end of sequence leaves the waiting pictures to the IDR after
+    /// it, put out or dropped by its no_output_of_prior_pics_flag. Needs a device.
+    #[test]
+    fn the_idr_after_an_end_of_sequence_decides_the_waiting_pictures() {
+        const IPB: &[u8] = include_bytes!("../tests/fixtures/ipb_320x240.hevc");
+        if !crate::probe().is_some_and(|caps| caps.supports("h265/annexb")) {
+            eprintln!("skip, no VA-API device decodes h265");
+            return;
+        }
+        let first = units(IPB);
+        assert_eq!(first.len(), 20);
+        let eos = [0, 0, 1, h265parse::NAL_EOS << 1, 1];
+        // no_output_of_prior_pics_flag, the bit after first_slice_segment_in_pic_flag
+        let mut key = first[0].to_vec();
+        let idr = (0..key.len() - 3)
+            .find(|&i| key[i..i + 3] == [0, 0, 1] && (key[i + 3] >> 1) & 0x3F == 20)
+            .expect("an IDR_N_LP");
+        let mut shown_with = [Vec::new(), Vec::new()];
+        for (no_output, shown) in [false, true].into_iter().zip(&mut shown_with) {
+            key[idr + 5] = key[idr + 5] & !0x40 | u8::from(no_output) << 6;
+            let last = [first[19], &eos[..]].concat();
+            let stream = first[..19]
+                .iter()
+                .copied()
+                .chain([&last[..], &key])
+                .chain(first[1..].iter().copied());
+            let mut h = pf_harness::Harness::with_pool(VaapiH265Dec::new(), 1 << 17, 64);
+            for (at, unit) in stream.enumerate() {
+                let mut buf = h.alloc(unit);
+                buf.pts = Timestamp::from_nanos(at as u64);
+                h.push(buf).expect("push");
+                shown.extend(h.drain_outputs().iter().map(|b| b.pts.0));
+            }
+            shown.extend(h.eos().expect("eos").iter().map(|b| b.pts.0));
+            shown.sort_unstable();
+        }
+        let [kept, dropped] = shown_with;
+        assert_eq!(kept, (0..40).collect::<Vec<u64>>(), "the IDR lets them out");
+        assert!(dropped.len() < 40, "the waiting pictures are dropped, {dropped:?}");
+        assert!(dropped.ends_with(&(20..40).collect::<Vec<u64>>()), "{dropped:?}");
     }
 
     #[test]

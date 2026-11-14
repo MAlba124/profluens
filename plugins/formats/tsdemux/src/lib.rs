@@ -12,7 +12,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use pf_mpegts::{
-    Codec, Config, ConfigError, Demux, Encryption, Limits, PesUnit, Step, StreamInfo, Unwrapper,
+    Codec, Config, ConfigError, Demux, Encryption, Limits, PesUnit, Span, Spans, Step, StreamInfo,
+    Unwrapper, congruent,
 };
 use pf_mpegts::{UF_DISCONTINUITY, UF_ENCRYPTED, UF_RANDOM_ACCESS, UF_SCRAMBLED};
 use pf_registry::{Elements, Registry};
@@ -158,7 +159,13 @@ fn family_of(codec: Codec) -> (&'static str, StreamKind) {
 }
 
 struct Track {
+    /// The PID the stream is read from now, and the one it was mapped at, which names its pad.
     pid: u16,
+    label: u16,
+    /// The stream type, and the place among the program's streams of that type, which a stream
+    /// moved to another PID by a new map keeps.
+    stream_type: u8,
+    nth: u8,
     codec: Codec,
     family: &'static str,
     kind: StreamKind,
@@ -204,10 +211,13 @@ struct Park {
 }
 
 /// A file's earliest decode time is zero across seeks. A segment mark with a `pts` anchors the next
-/// decode time there. A new time base (PCR discontinuity, a 10 s step, DTS going back) resumes.
+/// decode time there. A new time base (PCR discontinuity, a 10 s step, DTS going back) resumes,
+/// and a seek takes up the one read at its byte.
 struct Clock {
     unwrap: Unwrapper,
     shift: i64,
+    /// The time bases read in file bytes.
+    spans: Spans,
     /// A stream time waiting for the first decode time behind a mark or a break.
     anchor: Option<u64>,
     /// The first decode time of a file in ticks, kept across seeks.
@@ -220,21 +230,29 @@ struct Clock {
 }
 
 impl Clock {
-    /// `(decode, presentation)` in stream time ns, `None` for a unit without timestamps.
+    /// `(decode, presentation)` in stream time ns, `None` for a unit without timestamps. `file`
+    /// when the unit's offset is a file byte.
     fn place(
         &mut self,
         unit: &PesUnit<'_>,
         last_dts: &mut (u32, i64),
         lead_ns: u64,
+        file: bool,
     ) -> Option<(u64, u64)> {
         let pts = unit.pts?;
         let dts = unit.dts.unwrap_or(pts);
         if std::mem::take(&mut self.sought) {
-            // The congruent value at or past the file's start, less the slack.
-            if let Some(origin) = self.origin {
-                let floor = origin - ORIGIN_SLACK;
-                let modulus = 1i64 << 33;
-                self.unwrap.prime(floor + (dts as i64 - floor).rem_euclid(modulus));
+            // The congruent value at or past the start of the time base, less the slack.
+            match self.spans.at(unit.offset).filter(|_| file) {
+                Some(span) => {
+                    self.unwrap.prime(congruent(span.ticks - ORIGIN_SLACK, dts));
+                    self.shift = span.shift_ns;
+                }
+                None => {
+                    if let Some(origin) = self.origin {
+                        self.unwrap.prime(congruent(origin - ORIGIN_SLACK, dts));
+                    }
+                }
             }
         }
         let placed = self.unwrap.unwrap(dts);
@@ -249,6 +267,13 @@ impl Clock {
             self.marked = false;
             self.shift = decode.saturating_sub(i64::try_from(lands).unwrap_or(i64::MAX));
             self.stretch = self.stretch.wrapping_add(1).max(1);
+            if file {
+                self.spans.note(Span {
+                    byte: unit.offset,
+                    ticks: placed.ticks,
+                    shift_ns: self.shift,
+                });
+            }
         }
         *last_dts = (self.stretch, placed.ticks);
         self.origin.get_or_insert(placed.ticks);
@@ -278,6 +303,10 @@ pub struct TsDemux {
     ending: bool,
     /// First decode time in the head and the earliest stream's first one, in ticks.
     opening: Option<(i64, i64)>,
+    /// The program played, found at preroll, and the PIDs its streams moved from and to in the
+    /// piece being read.
+    number: u16,
+    moved: Vec<(u16, u16)>,
     grown: Grown,
     heads: Option<Arc<AacHeads>>,
     /// Rate off the key stream's units, bytes against stamps.
@@ -302,6 +331,7 @@ impl TsDemux {
             clock: Clock {
                 unwrap: Unwrapper::for_timestamps(),
                 shift: 0,
+                spans: Spans::default(),
                 anchor: None,
                 origin: None,
                 sought: false,
@@ -316,6 +346,8 @@ impl TsDemux {
             teller: rate::Teller::default(),
             ending: false,
             opening: None,
+            number: 0,
+            moved: Vec::with_capacity(usize::from(limits().max_streams_per_program)),
             grown: Grown::new(),
             heads: None,
             anomalies: 0,
@@ -504,7 +536,8 @@ impl TsDemux {
             track.scrambled += 1;
             return;
         }
-        let stamps = clock.place(unit, &mut track.last_dts, track.lead_ns);
+        let file = grown.placed == Placed::File;
+        let stamps = clock.place(unit, &mut track.last_dts, track.lead_ns, file);
         let broke = bits & UF_DISCONTINUITY != 0;
         let mut flags = if broke { BufferFlags::DISCONT } else { BufferFlags::empty() };
         let keys = grown.keys(unit.pid);
@@ -664,7 +697,7 @@ impl TsDemux {
             let from = track.run.map(|run| run.0);
             Self::put(ctx, park, exact, pad, from, BufferFlags::HEADER, &h.config());
             if let Some(heads) = heads {
-                heads.put(track.pid, from, h.config());
+                heads.put(track.label, from, h.config());
             }
         }
         let stamp = track.run.map(|(base, samples)| {
@@ -708,6 +741,8 @@ impl TsDemux {
             measured,
             teller,
             anomalies,
+            number,
+            moved,
             ..
         } = self;
         let heads = heads.as_deref();
@@ -733,9 +768,16 @@ impl TsDemux {
                 log!(&*ctx, Level::Debug, "pat", version = version, programs = programs.len());
             }
             pf_mpegts::Event::Pmt { program, streams } => {
-                let (number, version) = (program.number, program.version);
+                let (of, version) = (program.number, program.version);
                 let n = streams.len();
-                log!(&*ctx, Level::Debug, "pmt", program = number, version = version, streams = n);
+                log!(&*ctx, Level::Debug, "pmt", program = of, version = version, streams = n);
+                if of == *number {
+                    let from = moved.len();
+                    follow(tracks, streams, moved);
+                    for &(from, to) in &moved[from..] {
+                        log!(&*ctx, Level::Info, "pid_moved", from = from, to = to);
+                    }
+                }
             }
             pf_mpegts::Event::Anomaly(a) => {
                 // A unit without a stamp is legal and common, so neither warns nor counts.
@@ -750,6 +792,15 @@ impl TsDemux {
         match end {
             false => demux.push(data, &mut sink),
             true => demux.flush(&mut sink),
+        }
+        // From the next push, what was read past the map in this one is lost.
+        for (from, to) in moved.drain(..) {
+            let on = tracks.iter().any(|t| t.pid == to && t.pad.is_some());
+            demux.select(from, false);
+            demux.select(to, on);
+            if let Some(key) = grown.key.as_mut().filter(|key| key.pid == from) {
+                key.pid = to;
+            }
         }
     }
 
@@ -802,6 +853,28 @@ impl TsDemux {
         // Same time base, so the track read again is not behind itself.
         (self.clock.sought, self.clock.broke) = (true, false);
         self.clock.stretch = self.clock.stretch.wrapping_add(1).max(1);
+    }
+}
+
+/// Each track whose PID the new map `streams` left out follows the stream of its type at its
+/// place among that type's streams, onto a PID no other track reads. `(from, to)` per move.
+fn follow(tracks: &mut [Track], streams: &[StreamInfo], moved: &mut Vec<(u16, u16)>) {
+    for at in 0..tracks.len() {
+        let t = &tracks[at];
+        if streams.iter().any(|s| s.pid == t.pid) {
+            continue;
+        }
+        let of_type = streams.iter().filter(|s| s.stream_type == t.stream_type);
+        let Some(to) = of_type.map(|s| s.pid).nth(usize::from(t.nth)) else { continue };
+        if tracks.iter().any(|o| o.pid == to) {
+            continue;
+        }
+        let t = &mut tracks[at];
+        moved.push((t.pid, to));
+        t.pid = to;
+        t.need_key = t.kind == StreamKind::Video;
+        (t.run, t.read, t.resume) = (None, None, None);
+        t.carry.clear();
     }
 }
 
@@ -888,8 +961,11 @@ impl Element for TsDemux {
         }
         self.head = Vec::new();
         self.opening = found.opening;
+        self.number = found.program;
         self.tracks.clear();
-        for info in &found.streams {
+        for (at, info) in found.streams.iter().enumerate() {
+            let same = |s: &&StreamInfo| s.stream_type == info.stream_type;
+            let nth = found.streams[..at].iter().filter(same).count().min(255) as u8;
             let (pid, stream_type) = (info.pid, info.stream_type);
             if info.encryption != Encryption::None {
                 log!(&*ctx, Level::Warn, "stream_encrypted", pid = pid, stream_type = stream_type);
@@ -934,6 +1010,9 @@ impl Element for TsDemux {
             });
             self.tracks.push(Track {
                 pid: info.pid,
+                label: info.pid,
+                stream_type: info.stream_type,
+                nth,
                 codec,
                 family,
                 kind,
@@ -996,6 +1075,7 @@ impl Element for TsDemux {
         let config = Config { limits: self.limits, select_all: false };
         let mut demux = Demux::new(config).map_err(|e| Self::failed(ctx, TsError::Config(e)))?;
         for track in &mut self.tracks {
+            track.pid = track.label;
             track.pad = ctx.stream_pad(track.stream).filter(|pad| ctx.pad_linked(*pad));
             demux.select(track.pid, track.pad.is_some());
         }
@@ -1004,11 +1084,14 @@ impl Element for TsDemux {
         self.grown.rekey(key_of(&self.tracks));
         self.grown.open();
         self.clock.unwrap.reset();
+        self.clock.spans.clear();
         (self.clock.shift, self.clock.anchor, self.clock.origin) = (0, Some(0), None);
         if let Some((first, least)) = self.opening {
             self.clock.unwrap.prime(first);
             (self.clock.shift, self.clock.anchor, self.clock.origin) =
                 (ticks_ns(least), None, Some(least));
+            let span = Span { byte: 0, ticks: least, shift_ns: ticks_ns(least) };
+            self.clock.spans.note(span);
         }
         (self.clock.sought, self.clock.last_ns, self.clock.broke, self.clock.marked) =
             (false, 0, false, false);

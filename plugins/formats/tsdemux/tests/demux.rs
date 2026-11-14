@@ -898,3 +898,180 @@ fn a_restart_drops_what_the_track_parked_and_the_other_tracks_keep_theirs() {
         eprintln!("{case}: position {position}, restart {byte} at {at:?}");
     }
 }
+
+/// `ts` with every PCR, PTS and DTS `by` ticks later, modulo 2^33.
+fn shifted(ts: &[u8], by: u64) -> Vec<u8> {
+    const M: u64 = 1 << 33;
+    let stamp = |b: &mut [u8]| {
+        let old = u64::from(b[0] >> 1 & 7) << 30
+            | u64::from(b[1]) << 22
+            | u64::from(b[2] >> 1) << 15
+            | u64::from(b[3]) << 7
+            | u64::from(b[4] >> 1);
+        let v = (old + by) % M;
+        b[0] = (b[0] & 0xF0) | ((v >> 29) as u8 & 0x0E) | 1;
+        b[1] = (v >> 22) as u8;
+        b[2] = ((v >> 14) as u8 & 0xFE) | 1;
+        b[3] = (v >> 7) as u8;
+        b[4] = ((v << 1) as u8) | 1;
+    };
+    let mut out = ts.to_vec();
+    for p in out.as_chunks_mut::<188>().0 {
+        let field = (p[3] >> 4) & 3;
+        let mut payload = 4;
+        if field & 2 != 0 {
+            if p[4] >= 7 && p[5] & 0x10 != 0 {
+                let base = u64::from(p[6]) << 25
+                    | u64::from(p[7]) << 17
+                    | u64::from(p[8]) << 9
+                    | u64::from(p[9]) << 1
+                    | u64::from(p[10] >> 7);
+                let v = (base + by) % M;
+                p[6..10].copy_from_slice(&((v >> 1) as u32).to_be_bytes());
+                p[10] = (p[10] & 0x7F) | ((v as u8 & 1) << 7);
+            }
+            payload = 5 + usize::from(p[4]);
+        }
+        let start = p[1] & 0x40 != 0;
+        let pes = &mut p[payload.min(188)..];
+        if field & 1 == 0 || !start || pes.len() < 19 || pes[..3] != [0, 0, 1] {
+            continue;
+        }
+        let flags = pes[7] >> 6;
+        if flags & 2 != 0 {
+            stamp(&mut pes[9..14]);
+        }
+        if flags == 3 {
+            stamp(&mut pes[14..19]);
+        }
+    }
+    out
+}
+
+/// A file whose clock restarts midway, its first part 10 h on as `-output_ts_offset` writes it.
+/// Each keyframe sought to after the read went past the restart stamps as the whole run did.
+#[test]
+fn a_seek_across_a_clock_reset_stamps_as_the_read_did() {
+    use profluens_core::clock::MockClock;
+    let data = fixture("h264_aac");
+    let file = [shifted(&data, 36_000 * 90_000), data.clone()].concat();
+    let pipeline = |p: &mut Pipeline| {
+        let src = p.add(PieceSrc::file(file.clone(), 1880));
+        let demux = p.add(TsDemux::new(file.clone()));
+        p.link(src.src(PieceSrc::OUT), demux.sink(TsDemux::IN)).expect("src to demux");
+        p.set_select_all(false);
+        p.preroll().expect("preroll");
+        let rec = Arc::new(Mutex::new(Recorded::default()));
+        for stream in [0, 1] {
+            let pad = p.select(demux, stream).expect("select");
+            let rec = if stream == 0 { Arc::clone(&rec) } else { Arc::default() };
+            let sink = p.add(RecSink { rec });
+            p.link(demux.src(pad), sink.sink(RecSink::IN)).expect("pad to sink");
+        }
+        (demux, rec)
+    };
+    let mut whole = Pipeline::new();
+    let (demux, rec) = pipeline(&mut whole);
+    whole.run().expect("the run ends");
+    let index = whole.index(demux).expect("an index grown to the end");
+    let stamps = |units: &[(Option<u64>, usize, u32)]| -> Vec<(Option<u64>, usize)> {
+        units.iter().map(|u| (u.0, u.1)).collect()
+    };
+    let units = rec.lock().unwrap().units.clone();
+    let all = stamps(&units);
+    let ascend: Vec<u64> = all.iter().filter_map(|u| u.0).collect();
+    assert!(ascend.windows(2).all(|w| w[0] <= w[1]), "one line across the reset, {ascend:?}");
+    let half = data.len() as u64;
+    let keys: Vec<(u64, u64)> = index.entries.iter().map(|e| (e.byte, e.time_ns)).collect();
+    assert!(keys.iter().any(|k| k.0 < half) && keys.iter().any(|k| k.0 >= half), "{keys:?}");
+
+    for &(byte, time_ns) in &keys {
+        let clock = MockClock::starting_at(Timestamp::from_secs(1));
+        let debug = profluens_core::log::DebugSpec::default();
+        let mut p = Pipeline::with(debug, false, Arc::new(clock.clone()));
+        let (_, rec) = pipeline(&mut p);
+        let (control, mut run) = (p.control(), p.step(Arc::new(clock)).expect("step"));
+        while rec.lock().unwrap().units.len() < 36 {
+            run.service();
+            let g = (0..run.groups()).find(|g| run.ready(*g)).expect("read past the reset");
+            run.pass(g).expect("pass");
+        }
+        let before = rec.lock().unwrap().units.len();
+        assert!(before < all.len(), "the seek is ahead of the end");
+        let at = Timestamp(time_ns);
+        control.seek_bytes(at, &[(profluens_core::command::ALL, byte, at)]).expect("a seek");
+        assert!(step_through(&mut run), "the run ends");
+        run.finish().expect("finish");
+        let after = stamps(&rec.lock().unwrap().units[before..]);
+        let key = |u: &(Option<u64>, usize, u32)| u.2 & BufferFlags::KEYFRAME.0 != 0;
+        let from = units.iter().position(|u| u.0 == Some(time_ns) && key(u)).expect("the key");
+        assert_eq!(after, all[from..], "sought to {time_ns} at byte {byte}");
+    }
+}
+
+/// `ts` with the stream on PID `from` on `to`, in its packets and a program map one version on.
+fn moved(ts: &[u8], from: u16, to: u16) -> Vec<u8> {
+    let payload = |p: &[u8]| match (p[3] >> 4) & 3 {
+        2 | 3 => 5 + usize::from(p[4]),
+        _ => 4,
+    };
+    let pid_of = |p: &[u8]| u16::from(p[1] & 0x1F) << 8 | u16::from(p[2]);
+    let pmt = ts
+        .as_chunks::<188>()
+        .0
+        .iter()
+        .map(|p| &p[..])
+        .find(|p| pid_of(p) == 0 && p[1] & 0x40 != 0)
+        .map(|p| {
+            let sec = &p[payload(p) + 1 + usize::from(p[payload(p)])..];
+            u16::from(sec[10] & 0x1F) << 8 | u16::from(sec[11])
+        })
+        .expect("a PAT");
+    let mut out = ts.to_vec();
+    for p in out.as_chunks_mut::<188>().0 {
+        if pid_of(p) == from {
+            p[1] = (p[1] & 0xE0) | (to >> 8) as u8;
+            p[2] = to as u8;
+        }
+        if pid_of(p) != pmt || p[1] & 0x40 == 0 {
+            continue;
+        }
+        let at = payload(p) + 1 + usize::from(p[payload(p)]);
+        let sec = &mut p[at..];
+        let total = 3 + (usize::from(sec[1] & 0x0F) << 8 | usize::from(sec[2]));
+        sec[5] = (sec[5] & 0xC1) | ((((sec[5] >> 1) + 1) & 0x1F) << 1);
+        let swap = |hi: &mut u8, lo: &mut u8| {
+            if u16::from(*hi & 0x1F) << 8 | u16::from(*lo) == from {
+                (*hi, *lo) = ((*hi & 0xE0) | (to >> 8) as u8, to as u8);
+            }
+        };
+        let (pcr_hi, rest) = sec[8..].split_at_mut(1);
+        swap(&mut pcr_hi[0], &mut rest[0]);
+        let mut es = 12 + (usize::from(sec[10] & 0x0F) << 8 | usize::from(sec[11]));
+        while es + 5 <= total - 4 {
+            let (hi, rest) = sec[es + 1..].split_at_mut(1);
+            swap(&mut hi[0], &mut rest[0]);
+            es += 5 + (usize::from(sec[es + 3] & 0x0F) << 8 | usize::from(sec[es + 4]));
+        }
+        let crc = pf_mpegts::crc32(&sec[..total - 4]);
+        sec[total - 4..total].copy_from_slice(&crc.to_be_bytes());
+    }
+    out
+}
+
+/// The video moves to another PID behind a new program map and goes on there, as the run of
+/// the same bytes on one PID does.
+#[test]
+fn a_stream_moved_to_another_pid_goes_on_there() {
+    let data = fixture("h264_aac");
+    let second = moved(&data, 0x100, 0x200);
+    let same = run(PieceSrc::file([data.clone(), data.clone()].concat(), 4096), &data, None);
+    let out = run(PieceSrc::file([data.clone(), second].concat(), 4096), &data, None);
+    let units = |o: &[(StreamKind, &'static str, Recorded)]| -> Vec<(Option<u64>, usize)> {
+        o[0].2.units.iter().map(|u| (u.0, u.1)).collect()
+    };
+    let once = run(PieceSrc::file(data.clone(), 4096), &data, None);
+    assert!(units(&same).len() > 2 * units(&once).len() - 4, "the reference reads both");
+    assert_eq!(units(&out), units(&same), "every picture");
+    assert_eq!(out[1].2, same[1].2, "the audio stayed");
+}

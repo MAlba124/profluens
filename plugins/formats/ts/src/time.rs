@@ -104,9 +104,98 @@ impl Unwrapper {
     }
 }
 
+/// The value congruent to `raw` modulo [`TS_MODULUS`] at or past `floor`.
+pub fn congruent(floor: i64, raw: u64) -> i64 {
+    let m = TS_MODULUS as i64;
+    floor.saturating_add((((raw % TS_MODULUS) as i64) - floor.rem_euclid(m)).rem_euclid(m))
+}
+
+/// Where a time base of a file starts, its first decode time unwrapped and the shift that maps
+/// its ticks in ns onto stream time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub byte: u64,
+    pub ticks: i64,
+    pub shift_ns: i64,
+}
+
+/// Bounds what hostile input with a break in every packet keeps.
+pub const SPANS_MAX: usize = 4096;
+
+/// The time bases read so far by file byte, so a seek resumes on the one it lands in.
+#[derive(Clone, Debug, Default)]
+pub struct Spans {
+    spans: Vec<Span>,
+}
+
+impl Spans {
+    pub fn clear(&mut self) {
+        self.spans.clear();
+    }
+
+    /// One starting at the same byte is replaced. Past [`SPANS_MAX`] nothing new is kept.
+    pub fn note(&mut self, span: Span) {
+        let at = self.spans.partition_point(|s| s.byte < span.byte);
+        let full = self.spans.len() >= SPANS_MAX;
+        match self.spans.get_mut(at) {
+            Some(s) if s.byte == span.byte => *s = span,
+            _ if full => {}
+            _ => self.spans.insert(at, span),
+        }
+    }
+
+    /// The last starting at or before `byte`.
+    pub fn at(&self, byte: u64) -> Option<Span> {
+        let at = self.spans.partition_point(|s| s.byte <= byte);
+        at.checked_sub(1).map(|n| self.spans[n])
+    }
+
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_seek_takes_the_span_its_byte_is_in() {
+        let mut s = Spans::default();
+        assert_eq!(s.at(0), None);
+        let span = |byte, ticks| Span { byte, ticks, shift_ns: ticks * 2 };
+        s.note(span(1_000, 50));
+        s.note(span(0, 10));
+        s.note(span(500, 30));
+        assert_eq!(
+            (s.at(0), s.at(499), s.at(500)),
+            (Some(span(0, 10)), Some(span(0, 10)), Some(span(500, 30)))
+        );
+        assert_eq!(s.at(u64::MAX), Some(span(1_000, 50)));
+        s.note(span(500, 31));
+        assert_eq!((s.len(), s.at(700)), (3, Some(span(500, 31))), "read again, replaced");
+        for n in 0..2 * SPANS_MAX as u64 {
+            s.note(span(2_000 + n, 0));
+        }
+        assert_eq!(s.len(), SPANS_MAX);
+        s.clear();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn the_congruent_value_is_at_or_past_the_floor() {
+        let m = TS_MODULUS as i64;
+        assert_eq!(congruent(0, 5), 5);
+        assert_eq!(congruent(10, 5), m + 5);
+        assert_eq!(congruent(-90_000, TS_MODULUS - 1), -1);
+        assert_eq!(congruent(3 * m + 7, 7), 3 * m + 7);
+        assert_eq!(congruent(3 * m + 8, 7), 4 * m + 7);
+        assert_eq!(congruent(i64::MAX - 3, 0), i64::MAX);
+    }
 
     #[test]
     fn forward_and_rollover() {

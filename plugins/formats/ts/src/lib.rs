@@ -23,4 +23,4 @@ pub use demux::{
 };
 pub use psi::{Codec, Encryption, Media, StreamInfo, language_str, media_of};
 pub use sync::{PacketSize, framed_len};
-pub use time::{Step, Unwrapped, Unwrapper};
+pub use time::{Span, Spans, Step, Unwrapped, Unwrapper, congruent};

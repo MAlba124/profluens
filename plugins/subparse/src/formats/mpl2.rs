@@ -25,7 +25,7 @@ impl SubtitleFormat for Mpl2 {
         at_eos: bool,
     ) -> Result<Parsed, ParseError> {
         let mut cues = Vec::new();
-        let mut consumed = self.lines.feed(body, |line| parse_line(line, &mut cues));
+        let mut consumed = self.lines.feed(body, at_eos, |line| parse_line(line, &mut cues));
 
         if at_eos {
             let tail = &body[consumed..];

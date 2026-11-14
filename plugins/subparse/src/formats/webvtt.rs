@@ -6,7 +6,7 @@
 // Cold path, once per document or cue.
 #![allow(clippy::disallowed_methods)]
 
-use crate::cue::{Cue, CueSettings, OutputFormat, ParseContext, ParseError};
+use crate::cue::{Cue, CueSettings, OutputFormat, ParseContext, ParseError, push_capped};
 use crate::format::{LineScanner, Parsed, SubtitleFormat};
 use crate::vttcss::Stylesheet;
 
@@ -33,7 +33,7 @@ impl SubtitleFormat for WebVtt {
         let Self { lines, machine } = self;
 
         let mut cues = Vec::new();
-        let mut consumed = lines.feed(body, |line| machine.feed(line, &mut cues));
+        let mut consumed = lines.feed(body, at_eos, |line| machine.feed(line, &mut cues));
 
         if at_eos {
             let tail = &body[consumed..];
@@ -68,11 +68,11 @@ enum St {
 #[derive(Debug, Default)]
 struct Machine {
     state: St,
-    /// `ParserState.start_time`, the previous end. Timing lines need `start_time <= ts_end`, a
-    /// weak monotonicity guard.
-    prev_end: u64,
+    /// The previous cue's start, its end when reversed. A cue ending before it is dropped, one
+    /// that overlaps the previous is kept.
+    floor: u64,
     cur_start: u64,
-    /// The end as parsed, what the guard compares against. May precede `cur_start`.
+    /// The end as parsed, may precede `cur_start`.
     cur_end: u64,
     cur_settings: CueSettings,
     cur_id: Option<String>,
@@ -112,9 +112,9 @@ impl Machine {
                     self.feed_seek(line);
                 } else {
                     if !self.buf.is_empty() {
-                        self.buf.push('\n');
+                        push_capped(&mut self.buf, "\n");
                     }
-                    self.buf.push_str(line);
+                    push_capped(&mut self.buf, line);
                     if line.is_empty() {
                         self.finish_cue(cues);
                     }
@@ -125,23 +125,22 @@ impl Machine {
 
     fn finish_cue(&mut self, cues: &mut Vec<Cue>) {
         let text = finalize_into(&self.buf, &mut self.markup).to_string();
-        // A reversed time line passes the guard. The guard gets the parsed end, only the cue is
-        // clamped.
+        // A reversed time line passes the guard, the cue is clamped.
         let mut cue = Cue::new(self.cur_start, Some(self.cur_end.max(self.cur_start)), text);
         cue.settings = std::mem::take(&mut self.cur_settings);
         cue.id = self.cur_id.take();
         cues.push(cue);
-        self.prev_end = self.cur_end; // element: start_time += duration
         self.buf.clear();
         self.state = St::SeekTiming;
     }
 
     fn feed_seek(&mut self, line: &str) {
         if let Some((ts_start, ts_end, settings)) = parse_timing_line(line)
-            && self.prev_end <= ts_end
+            && self.floor <= ts_end
         {
             self.cur_start = ts_start;
             self.cur_end = ts_end;
+            self.floor = ts_start.min(ts_end);
             self.cur_settings = match settings {
                 Some(s) => parse_cue_settings(s),
                 None => CueSettings::default(),
@@ -171,14 +170,15 @@ impl Machine {
     }
 }
 
-/// `start --> end [settings]`. Settings are past the first space after the end, as in the C.
+/// `start --> end [settings]`, spaces, tabs or none around the arrow. Settings are past the first
+/// space or tab after the end.
 fn parse_timing_line(line: &str) -> Option<(u64, u64, Option<&str>)> {
-    let idx = line.find(" --> ")?;
+    let idx = line.find("-->")?;
     // parse_subrip_time truncates the start at "-->" itself, like the C.
-    let after = &line[idx + 5..];
+    let after = line[idx + 3..].trim_start_matches([' ', '\t']);
     let ts_start = parse_subrip_time(line)?;
     let ts_end = parse_subrip_time(after)?;
-    let settings = after.find(' ').map(|sp| &after[sp + 1..]);
+    let settings = after.find([' ', '\t']).map(|sp| &after[sp + 1..]);
     Some((ts_start, ts_end, settings))
 }
 
@@ -399,7 +399,8 @@ fn scan_short_after(tok: &str, prefix: &str) -> Option<i16> {
     let start = i;
     let mut val: i64 = 0;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
-        val = val.wrapping_mul(10).wrapping_add((bytes[i] - b'0') as i64);
+        // A value past i64 refuses the setting, wrapping would make up one.
+        val = val.checked_mul(10)?.checked_add(i64::from(bytes[i] - b'0'))?;
         i += 1;
     }
     if i == start {
@@ -1405,6 +1406,52 @@ mod tests {
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].text, "A");
         assert_eq!(cues[0].start_ns, 5 * S);
+    }
+
+    #[test]
+    fn a_cue_inside_a_longer_one_is_kept() {
+        let body = "WEBVTT\n\n00:00:01.000 --> 00:00:10.000\nlong\n\n\
+                    00:00:02.000 --> 00:00:03.000\nshort\n\n\
+                    00:00:04.000 --> 00:00:05.000\nshort2\n\n\
+                    00:00:11.000 --> 00:00:12.000\nafter\n\n";
+        let texts: Vec<_> = parse(body).into_iter().map(|c| c.text).collect();
+        assert_eq!(texts, ["long", "short", "short2", "after"]);
+    }
+
+    #[test]
+    fn cr_only_line_endings() {
+        let cues = parse(
+            "WEBVTT\r\r00:00:01.000 --> 00:00:02.000\rA\r\r00:00:03.000 --> 00:00:04.000\rB\r",
+        );
+        assert_eq!(cues.len(), 2, "{cues:#?}");
+        assert_eq!((cues[0].start_ns, cues[0].text.as_str()), (S, "A"));
+        assert_eq!((cues[1].start_ns, cues[1].text.as_str()), (3 * S, "B"));
+    }
+
+    #[test]
+    fn one_letter_settings_past_i64_are_refused() {
+        for tail in [
+            "T:-9223372036854775808",
+            "S:-9223372036854775808",
+            "L:-9223372036854775808%",
+            "T:99999999999999999999%",
+        ] {
+            let c = one(&format!("00:00:01.000 --> 00:00:02.000 {tail}\nOne\n\n"));
+            assert_eq!(c.text, "One", "{tail}");
+            let cs = c.settings;
+            assert_eq!((cs.text_position, cs.text_size, cs.line_position), (None, None, None));
+        }
+    }
+
+    #[test]
+    fn tabs_around_the_arrow_and_between_settings() {
+        let c = one("00:00:01.000\t-->\t00:00:02.000\tline:0\talign:start\nA\n\n");
+        assert_eq!((c.start_ns, c.end_ns, c.text.as_str()), (S, Some(2 * S), "A"));
+        assert_eq!(c.settings.line_number, Some(0));
+        assert_eq!(c.settings.alignment.as_deref(), Some("start"));
+        let c = one("00:00:01.000-->00:00:02.000 align:end\nA\n\n");
+        assert_eq!((c.start_ns, c.end_ns), (S, Some(2 * S)));
+        assert_eq!(c.settings.alignment.as_deref(), Some("end"));
     }
 
     #[test]

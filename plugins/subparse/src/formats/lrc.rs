@@ -26,7 +26,7 @@ impl SubtitleFormat for Lrc {
         at_eos: bool,
     ) -> Result<Parsed, ParseError> {
         let mut cues = Vec::new();
-        let mut consumed = self.lines.feed(body, |line| {
+        let mut consumed = self.lines.feed(body, at_eos, |line| {
             if let Some(cue) = parse_line(line) {
                 cues.push(cue);
             }

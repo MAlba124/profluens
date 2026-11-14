@@ -343,6 +343,34 @@ fn every_single_split_matches_whole_with_crlf() {
     }
 }
 
+fn cr_body(body: &str) -> String {
+    body.replace('\n', "\r")
+}
+
+#[test]
+fn cr_only_bodies_parse_like_lf_ones() {
+    for f in fixtures() {
+        let expected = parse_whole(f.format, f.body);
+        assert_eq!(parse_whole(f.format, &cr_body(f.body)), expected, "{}: CR only", f.name);
+    }
+}
+
+#[test]
+fn every_single_split_matches_whole_with_cr() {
+    for f in fixtures() {
+        let body = cr_body(f.body);
+        let expected = parse_whole(f.format, &body);
+        for k in char_boundaries(&body) {
+            let got = parse_chunked(f.format, &body, &[k]);
+            assert_eq!(
+                got, expected,
+                "{}: CR body split after byte {k} changed the output",
+                f.name
+            );
+        }
+    }
+}
+
 #[test]
 fn two_splits_match_whole() {
     for f in fixtures() {

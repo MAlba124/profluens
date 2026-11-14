@@ -101,10 +101,6 @@ fn take_spaces(b: &[u8], i: &mut usize, min: usize, max: usize) -> bool {
     }
 }
 
-fn take_spaces_plus(b: &[u8], i: &mut usize) -> bool {
-    take_spaces(b, i, 1, usize::MAX)
-}
-
 fn opt_space(b: &[u8], i: &mut usize) {
     if *i < b.len() && b[*i] == b' ' {
         *i += 1;
@@ -175,11 +171,19 @@ fn matches_microdvd(b: &[u8]) -> bool {
         && lit(b, &mut i, b'}')
 }
 
+/// Index digits and spaces a SubRip preamble may hold, ffmpeg takes any index that fits an int.
+const INDEX_MAX: usize = 9;
+
 /// The C's SubRip regex `^[\s\n]*[\n]? {0,3}[ 0-9]{1,4}\s*(\x0d)?\x0a`, then a timestamp line.
+/// Wider than the C, as ffmpeg and VLC read files: an index of up to [`INDEX_MAX`] or none, CR
+/// line ends, hours of up to 5 digits and any spacing around the arrow.
 fn matches_subrip(b: &[u8]) -> bool {
+    if srt_timestamp(b, 0) {
+        return true;
+    }
     let mut preamble = Preamble::default();
     for (i, &c) in b.iter().enumerate() {
-        if c == b'\n' && preamble.ok() && srt_timestamp(b, i + 1) {
+        if matches!(c, b'\n' | b'\r') && preamble.ok() && srt_timestamp(b, i + 1) {
             return true;
         }
         if !(is_ws(c) || c.is_ascii_digit()) || !preamble.push(i, c) {
@@ -194,7 +198,6 @@ fn matches_subrip(b: &[u8]) -> bool {
 struct Preamble {
     first_digit: Option<usize>,
     last_gap: Option<usize>,
-    space: bool,
     broken: bool,
 }
 
@@ -202,19 +205,17 @@ impl Preamble {
     fn push(&mut self, i: usize, c: u8) -> bool {
         if c.is_ascii_digit() {
             let first = *self.first_digit.get_or_insert(i);
-            if i - first >= 4 || self.last_gap.is_some_and(|gap| gap > first) {
+            if i - first >= INDEX_MAX || self.last_gap.is_some_and(|gap| gap > first) {
                 self.broken = true;
             }
-        } else if c == b' ' {
-            self.space = true;
-        } else {
+        } else if c != b' ' {
             self.last_gap = Some(i);
         }
         !self.broken
     }
 
     fn ok(&self) -> bool {
-        !self.broken && (self.first_digit.is_some() || self.space)
+        !self.broken
     }
 }
 
@@ -225,15 +226,11 @@ fn preamble_ok(r: &[u8]) -> bool {
         return false;
     }
     let n = r.len();
-    for s in 0..n {
+    for s in 0..=n {
         if !r[..s].iter().all(|&c| is_ws(c)) {
             break;
         }
-        for len in 1..=4 {
-            let end = s + len;
-            if end > n {
-                break;
-            }
+        for end in s..=(s + INDEX_MAX).min(n) {
             let block = &r[s..end];
             if block.iter().all(|&c| c == b' ' || c.is_ascii_digit())
                 && r[end..].iter().all(|&c| is_ws(c))
@@ -245,9 +242,16 @@ fn preamble_ok(r: &[u8]) -> bool {
     false
 }
 
+/// `[ \t]*`.
+fn take_blanks(b: &[u8], i: &mut usize) {
+    while matches!(b.get(*i), Some(b' ' | b'\t')) {
+        *i += 1;
+    }
+}
+
 fn srt_timestamp(b: &[u8], mut i: usize) -> bool {
     opt_space(b, &mut i);
-    if !take_digits(b, &mut i, 1, 2) || !lit(b, &mut i, b':') {
+    if !take_digits(b, &mut i, 1, 5) || !lit(b, &mut i, b':') {
         return false;
     }
     opt_space(b, &mut i);
@@ -262,10 +266,12 @@ fn srt_timestamp(b: &[u8], mut i: usize) -> bool {
     if !take_digits(b, &mut i, 1, 3) {
         return false;
     }
-    if !take_spaces_plus(b, &mut i) || !lit_str(b, &mut i, b"-->") || !take_spaces_plus(b, &mut i) {
+    take_blanks(b, &mut i);
+    if !lit_str(b, &mut i, b"-->") {
         return false;
     }
-    if !take_digits(b, &mut i, 1, 2) || !lit(b, &mut i, b':') {
+    take_blanks(b, &mut i);
+    if !take_digits(b, &mut i, 1, 5) || !lit(b, &mut i, b':') {
         return false;
     }
     opt_space(b, &mut i);
@@ -452,15 +458,41 @@ mod tests {
     }
 
     #[test]
+    fn detect_subrip_with_cr_line_endings() {
+        assert_eq!(detect("1\r00:00:01,000 --> 00:00:02,000\rA\r\r"), Some(Format::SubRip));
+        assert_eq!(detect("\r\r7\r00:00:01,000 --> 00:00:02,000\rA\r"), Some(Format::SubRip));
+    }
+
+    #[test]
+    fn detect_subrip_long_index_long_hours_no_index_tight_arrow() {
+        for srt in [
+            "10000\n00:00:01,000 --> 00:00:02,000\nA\n",
+            "123456789\n00:00:01,000 --> 00:00:02,000\nA\n",
+            "1\n100:00:01,000 --> 100:00:02,000\nA\n",
+            "1\n12345:00:01,000 --> 12345:00:02,000\nA\n",
+            "00:00:01,000 --> 00:00:02,000\nA\n",
+            "\n\n00:00:01,000 --> 00:00:02,000\nA\n",
+            "1\n00:00:01,000-->00:00:02,000\nA\n",
+            "1\n00:00:01,000\t-->\t00:00:02,000\nA\n",
+        ] {
+            assert_eq!(detect(srt), Some(Format::SubRip), "{srt:?}");
+        }
+        assert_ne!(detect("1234567890\n00:00:01,000 --> 00:00:02,000\n"), Some(Format::SubRip));
+        assert_ne!(detect("1\n123456:00:01,000 --> 0:00:02,000\n"), Some(Format::SubRip));
+        assert_ne!(detect("1\n00:00:01,000 -> 00:00:02,000\n"), Some(Format::SubRip));
+    }
+
+    #[test]
     fn detect_subrip_blank_line_between_index_and_timestamp() {
         assert_eq!(detect("1\n\n00:00:01,000 --> 00:00:02,000\nOne\n"), Some(Format::SubRip));
     }
 
     #[test]
     fn preamble_matches_its_reference_on_every_short_string() {
-        const ALPHABET: [u8; 4] = *b" \n\t1";
-        let mut buf = Vec::with_capacity(8);
-        for len in 0..=8u32 {
+        // Past INDEX_MAX + 1, so the index cap is reached.
+        const ALPHABET: [u8; 3] = *b" \n1";
+        let mut buf = Vec::with_capacity(11);
+        for len in 0..=11u32 {
             for mut code in 0..ALPHABET.len().pow(len) {
                 buf.clear();
                 for _ in 0..len {

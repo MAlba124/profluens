@@ -46,7 +46,7 @@ impl SubtitleFormat for Ssa {
         let rest = &body[skipped..];
 
         let mut cues = Vec::new();
-        let mut consumed = skipped + lines.feed(rest, |line| machine.feed(line, &mut cues));
+        let mut consumed = skipped + lines.feed(rest, at_eos, |line| machine.feed(line, &mut cues));
 
         if at_eos {
             let tail = &body[consumed..];

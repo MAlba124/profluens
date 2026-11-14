@@ -143,11 +143,12 @@ const V4PLUS_FORMAT: &[&str] = &[
 ];
 
 impl SsaStyles {
-    /// Parse a whole header/init section (the `codec_data` a demuxer hands `ssaparse`).
+    /// Parse a whole header/init section (the `codec_data` a demuxer hands `ssaparse`). CR, LF
+    /// and CRLF each end a line.
     pub fn parse(text: &str) -> SsaStyles {
         let mut s = SsaStyles::default();
-        for line in text.lines() {
-            s.feed_line(line.strip_suffix('\r').unwrap_or(line));
+        for line in text.split(['\r', '\n']).filter(|l| !l.is_empty()) {
+            s.feed_line(line);
         }
         s
     }
@@ -906,6 +907,11 @@ mod tests {
         assert_eq!(
             SsaStyles::parse("[Script Info]\nPlayResX: 1280\nPlayResY: 720\n").play_res(),
             (1280.0, 720.0)
+        );
+        assert_eq!(
+            SsaStyles::parse("[Script Info]\rPlayResX: 1280\rPlayResY: 720\r").play_res(),
+            (1280.0, 720.0),
+            "CR only line ends"
         );
     }
 

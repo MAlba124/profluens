@@ -74,6 +74,20 @@ impl Cue {
     }
 }
 
+/// Cue text bytes a parser collects before it stops copying, the rest of an unterminated cue is
+/// read and dropped. Past [`crate::ir::CUE_LIMIT`] the cue is refused anyway, the margin keeps
+/// markup heavy text that lays out short.
+pub const CUE_TEXT_MAX: usize = 4 * crate::ir::CUE_LIMIT;
+
+/// Append `s` to cue text `buf` up to [`CUE_TEXT_MAX`], cut on a char boundary.
+pub(crate) fn push_capped(buf: &mut String, s: &str) {
+    let mut n = s.len().min(CUE_TEXT_MAX.saturating_sub(buf.len()));
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    buf.push_str(&s[..n]);
+}
+
 /// Context a parser may need beyond the raw text.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParseContext {

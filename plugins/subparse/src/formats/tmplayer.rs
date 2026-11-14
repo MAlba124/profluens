@@ -29,7 +29,7 @@ impl SubtitleFormat for TmPlayer {
         let Self { lines, machine } = self;
 
         let mut cues = Vec::new();
-        let mut consumed = lines.feed(body, |line| machine.feed(line, &mut cues));
+        let mut consumed = lines.feed(body, at_eos, |line| machine.feed(line, &mut cues));
 
         if at_eos {
             let tail = &body[consumed..];

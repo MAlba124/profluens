@@ -50,7 +50,7 @@ impl SubtitleFormat for Sami {
         // The C feeds complete lines and SAMI is not in the EOS force-flush list, so an
         // unterminated remainder is never processed.
         let mut cues = Vec::new();
-        let mut consumed = lines.feed(body, |line| {
+        let mut consumed = lines.feed(body, at_eos, |line| {
             if let Some(cue) = ctx.parse_line(line) {
                 cues.push(cue);
             }

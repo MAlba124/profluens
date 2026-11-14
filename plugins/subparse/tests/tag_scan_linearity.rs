@@ -9,6 +9,7 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use pf_subparse::cue::CUE_TEXT_MAX;
 use pf_subparse::formats::{SubRip, WebVtt};
 use pf_subparse::{ParseContext, SubtitleFormat};
 
@@ -60,7 +61,8 @@ fn subrip_one_huge_cue_with_a_distant_closing_marker_is_linear() {
             "text starts {:?}",
             &cues[0].text[..16.min(cues[0].text.len())]
         );
-        assert!(cues[0].text.ends_with("&gt;"), "the lone '>' must survive");
+        // The text is capped well before the '>' at 1 MB, it is read and dropped.
+        assert!(cues[0].text.len() <= 6 * CUE_TEXT_MAX, "text {} B", cues[0].text.len());
     });
 }
 
@@ -87,7 +89,7 @@ fn webvtt_one_huge_cue_with_a_distant_closing_marker_is_linear() {
             .expect("webvtt parse is infallible");
         assert_eq!(cues.len(), 1, "the body is one unterminated cue");
         assert!(cues[0].text.starts_with("&lt;5&lt;5"));
-        assert!(cues[0].text.ends_with("&gt;"), "the lone '>' must survive");
+        assert!(cues[0].text.len() <= 6 * CUE_TEXT_MAX, "text {} B", cues[0].text.len());
     });
 }
 

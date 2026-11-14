@@ -6,7 +6,7 @@
 // Cold path, once per document or cue.
 #![allow(clippy::disallowed_methods)]
 
-use crate::cue::{Cue, OutputFormat, ParseContext, ParseError};
+use crate::cue::{Cue, OutputFormat, ParseContext, ParseError, push_capped};
 use crate::format::{LineScanner, Parsed, SubtitleFormat};
 
 /// `allowed_srt_tags` in the C.
@@ -45,7 +45,7 @@ impl SubtitleFormat for SubRip {
         let rest = &body[skipped..];
 
         let mut cues = Vec::new();
-        let mut consumed = skipped + lines.feed(rest, |line| machine.feed(line, &mut cues));
+        let mut consumed = skipped + lines.feed(rest, at_eos, |line| machine.feed(line, &mut cues));
 
         if at_eos {
             let tail = &body[consumed..];
@@ -66,9 +66,9 @@ impl SubtitleFormat for SubRip {
 #[derive(Debug)]
 struct Machine {
     state: State,
-    /// The C's `state->start_time`, the previous cue's end. A time line ending before it is
-    /// rejected.
-    prev_end: u64,
+    /// The previous cue's start, its end when reversed. A cue ending before it is dropped, one
+    /// that overlaps the previous is kept.
+    floor: u64,
     cur_start: u64,
     cur_end: u64,
     textbuf: String,
@@ -76,7 +76,7 @@ struct Machine {
 
 impl Default for Machine {
     fn default() -> Self {
-        Machine { state: State::Id, prev_end: 0, cur_start: 0, cur_end: 0, textbuf: String::new() }
+        Machine { state: State::Id, floor: 0, cur_start: 0, cur_end: 0, textbuf: String::new() }
     }
 }
 
@@ -86,29 +86,27 @@ impl Machine {
             State::Id => {
                 if is_cue_id_line(line) {
                     self.state = State::Time;
+                } else if let Some(t) = parse_timeline(line) {
+                    // A file without index lines, as ffmpeg, VLC and libass read it.
+                    self.start(t);
                 }
             }
             State::Time => match parse_timeline(line) {
-                Some((ts_start, ts_end)) if self.prev_end <= ts_end => {
-                    self.cur_start = ts_start;
-                    self.cur_end = ts_end;
-                    self.prev_end = ts_end;
-                    self.state = State::Text;
-                }
-                _ => self.state = State::Id,
+                Some(t) => self.start(t),
+                None => self.state = State::Id,
             },
             State::Text => {
                 if !self.textbuf.is_empty() {
-                    self.textbuf.push('\n');
+                    push_capped(&mut self.textbuf, "\n");
                 }
-                self.textbuf.push_str(line);
+                push_capped(&mut self.textbuf, line);
                 if line.is_empty() {
                     let text = markup_from_srt(&self.textbuf, &ALLOWED_TAGS);
                     // Source text for the cue-ir path, the pango transform keeps only <i>/<b>/<u>.
                     let raw = self.textbuf.trim_end_matches(['\n', '\r']).to_owned();
                     self.textbuf.clear();
                     // A reversed time line passes the guard, the C underflows the duration. The cue
-                    // is clamped, the guard keeps the parsed end.
+                    // is clamped.
                     let end = self.cur_end.max(self.cur_start);
                     let mut cue = Cue::new(self.cur_start, Some(end), text);
                     cue.raw_text = Some(raw);
@@ -117,6 +115,18 @@ impl Machine {
                 }
             }
         }
+    }
+
+    /// Open the cue of a time line, or drop it when it ends before the previous one starts.
+    fn start(&mut self, (ts_start, ts_end): (u64, u64)) {
+        if ts_end < self.floor {
+            self.state = State::Id;
+            return;
+        }
+        self.cur_start = ts_start;
+        self.cur_end = ts_end;
+        self.floor = ts_start.min(ts_end);
+        self.state = State::Text;
     }
 }
 
@@ -127,7 +137,8 @@ enum State {
     Text,
 }
 
-/// Like the C's `g_ascii_strtoull`. An id if the number overflows (ERANGE) or consumes the line.
+/// Like the C's `g_ascii_strtoull`. An id if the number overflows (ERANGE) or only white space
+/// follows it.
 fn is_cue_id_line(line: &str) -> bool {
     let b = line.as_bytes();
     let mut i = 0;
@@ -147,14 +158,15 @@ fn is_cue_id_line(line: &str) -> bool {
     if line[digit_start..i].parse::<u64>().is_err() {
         return true;
     }
-    i == b.len()
+    b[i..].iter().all(u8::is_ascii_whitespace)
 }
 
+/// `start --> end`, any white space or none around the arrow.
 fn parse_timeline(line: &str) -> Option<(u64, u64)> {
-    let arrow = line.find(" --> ")?;
+    let arrow = line.find("-->")?;
     // The start is the whole line (truncated at "-->" internally), like the C.
     let start = parse_subrip_time(line)?;
-    let end = parse_subrip_time(&line[arrow + 5..])?;
+    let end = parse_subrip_time(line[arrow + 3..].trim_start_matches([' ', '\t']))?;
     Some((start, end))
 }
 
@@ -850,9 +862,53 @@ mod tests {
     }
 
     #[test]
-    fn timeline_without_id_is_ignored() {
-        let cues = parse("00:00:01,000 --> 00:00:02,000\nHello\n\n");
-        assert!(cues.is_empty());
+    fn cues_without_index_lines_are_kept() {
+        let cues =
+            parse("00:00:01,000 --> 00:00:02,000\nHello\n\n00:00:03,000 --> 00:00:04,000\nB\n\n");
+        assert_eq!(cues.len(), 2, "{cues:#?}");
+        assert_eq!((cues[0].start_ns, cues[0].text.as_str()), (SEC, "Hello"));
+        assert_eq!((cues[1].start_ns, cues[1].text.as_str()), (3 * SEC, "B"));
+    }
+
+    #[test]
+    fn index_line_with_trailing_whitespace_keeps_the_cue() {
+        let cues = parse(
+            "1 \n00:00:01,000 --> 00:00:02,000\nA\n\n2\t\n00:00:03,000 --> 00:00:04,000\nB\n\n",
+        );
+        assert_eq!(cues.len(), 2, "{cues:#?}");
+        assert_eq!(cues[1].text, "B");
+    }
+
+    #[test]
+    fn cr_only_and_mixed_line_endings() {
+        let cr =
+            parse("1\r00:00:01,000 --> 00:00:02,000\rA\r\r2\r00:00:03,000 --> 00:00:04,000\rB\r");
+        assert_eq!(cr.len(), 2, "{cr:#?}");
+        assert_eq!((cr[0].start_ns, cr[0].text.as_str()), (SEC, "A"));
+        assert_eq!((cr[1].start_ns, cr[1].text.as_str()), (3 * SEC, "B"));
+        let mixed =
+            parse("1\r\n00:00:01,000 --> 00:00:02,000\rA\n\n2\n00:00:03,000 --> 00:00:04,000\nB\n");
+        assert_eq!(mixed.len(), 2, "{mixed:#?}");
+        assert_eq!(mixed[0].text, "A");
+    }
+
+    #[test]
+    fn a_cue_inside_a_longer_one_is_kept() {
+        let body = "1\n00:00:01,000 --> 00:00:10,000\nlong\n\n\
+                    2\n00:00:02,000 --> 00:00:03,000\nshort\n\n\
+                    3\n00:00:04,000 --> 00:00:05,000\nshort2\n\n\
+                    4\n00:00:11,000 --> 00:00:12,000\nafter\n\n";
+        let texts: Vec<_> = parse(body).into_iter().map(|c| c.text).collect();
+        assert_eq!(texts, ["long", "short", "short2", "after"]);
+    }
+
+    #[test]
+    fn arrow_without_spaces_or_between_tabs() {
+        let cues =
+            parse("1\n00:00:01,000-->00:00:02,000\nA\n\n2\n00:00:03,000\t-->\t00:00:04,000\nB\n\n");
+        assert_eq!(cues.len(), 2, "{cues:#?}");
+        assert_eq!((cues[0].start_ns, cues[0].end_ns), (SEC, Some(2 * SEC)));
+        assert_eq!((cues[1].start_ns, cues[1].end_ns), (3 * SEC, Some(4 * SEC)));
     }
 
     #[test]
@@ -902,7 +958,9 @@ mod tests {
         assert!(is_cue_id_line("1"));
         assert!(is_cue_id_line("0"));
         assert!(is_cue_id_line("  42"));
+        assert!(is_cue_id_line("42 \t"));
         assert!(!is_cue_id_line(""));
+        assert!(!is_cue_id_line("4 2"));
         assert!(!is_cue_id_line("1a"));
         assert!(!is_cue_id_line("00:00:01,000 --> 00:00:02,000"));
         assert!(!is_cue_id_line("hello"));

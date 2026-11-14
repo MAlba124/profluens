@@ -50,8 +50,8 @@ pub trait SubtitleFormat {
     }
 }
 
-/// Hands out complete `\n`-terminated lines of a growing body and remembers how far it looked, so a
-/// body without newlines is not rescanned per call.
+/// Hands out complete lines of a growing body and remembers how far it looked, so a body without
+/// line ends is not rescanned per call. CR, LF and CRLF each end a line, as WebVTT asks.
 #[derive(Debug, Default)]
 pub struct LineScanner {
     scanned: usize,
@@ -63,25 +63,36 @@ impl LineScanner {
         LineScanner { scanned: 0 }
     }
 
-    /// Call `line` for each complete line, terminator and one `\r` removed.
-    pub fn feed<F>(&mut self, body: &str, mut line: F) -> usize
+    /// Call `line` for each complete line, its terminator removed. A CR closing `body` may be the
+    /// first half of a CRLF, so it waits for the next call unless `at_eos`.
+    pub fn feed<F>(&mut self, body: &str, at_eos: bool, mut line: F) -> usize
     where
         F: FnMut(&str),
     {
         let bytes = body.as_bytes();
         let mut consumed = 0usize;
-        // `\n` is never a UTF-8 continuation byte, so a byte search is safe.
+        // CR and LF are never UTF-8 continuation bytes, so a byte search is safe.
         let mut search = self.scanned.min(bytes.len());
+        let mut searched = bytes.len();
 
-        while let Some(rel) = bytes[search..].iter().position(|&b| b == b'\n') {
-            let nl = search + rel;
-            let raw = &body[consumed..nl];
-            line(raw.strip_suffix('\r').unwrap_or(raw));
-            consumed = nl + 1;
-            search = consumed;
+        while let Some(rel) = bytes[search..].iter().position(|&b| b == b'\n' || b == b'\r') {
+            let at = search + rel;
+            let next = match bytes.get(at + 1) {
+                _ if bytes[at] == b'\n' => at + 1,
+                Some(b'\n') => at + 2,
+                Some(_) => at + 1,
+                None if at_eos => at + 1,
+                None => {
+                    searched = at;
+                    break;
+                }
+            };
+            line(&body[consumed..at]);
+            consumed = next;
+            search = next;
         }
 
-        self.scanned = bytes.len() - consumed;
+        self.scanned = searched.max(consumed) - consumed;
         consumed
     }
 
@@ -171,7 +182,38 @@ pub fn parse_with(format: Format, body: &str, ctx: &ParseContext) -> Result<Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::Format;
+    use super::{Format, LineScanner};
+
+    /// Feed `chunks` as a growing body, dropping what is consumed, the last one at eos.
+    fn lines(chunks: &[&str]) -> Vec<String> {
+        let mut s = LineScanner::new();
+        let (mut buf, mut out) = (String::new(), Vec::new());
+        for (i, c) in chunks.iter().enumerate() {
+            buf.push_str(c);
+            let n = s.feed(&buf, i + 1 == chunks.len(), |l| out.push(l.to_owned()));
+            buf.drain(..n);
+        }
+        out.push(format!("rest {buf:?}"));
+        out
+    }
+
+    #[test]
+    fn cr_lf_and_crlf_each_end_a_line() {
+        assert_eq!(lines(&["a\rb\r\nc\nd"]), ["a", "b", "c", "rest \"d\""]);
+        assert_eq!(lines(&["a\r\r\nb\n\n"]), ["a", "", "b", "", "rest \"\""]);
+    }
+
+    #[test]
+    fn a_crlf_split_across_calls_is_one_line_end() {
+        assert_eq!(lines(&["a\r", "\nb\r", "\r", ""]), ["a", "b", "", "rest \"\""]);
+        assert_eq!(lines(&["a\r", "", "\n", ""]), ["a", "rest \"\""]);
+    }
+
+    #[test]
+    fn a_cr_closing_the_stream_ends_its_line() {
+        assert_eq!(lines(&["a\rb\r"]), ["a", "b", "rest \"\""]);
+        assert_eq!(lines(&["a", "b\r", "c"]), ["ab", "rest \"c\""]);
+    }
 
     #[test]
     fn media_type_matches_c_static_caps() {

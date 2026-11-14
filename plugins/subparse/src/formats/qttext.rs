@@ -32,7 +32,8 @@ impl SubtitleFormat for QtText {
         let ctx = ctx.get_or_insert_with(Ctx::new);
 
         let mut out = Vec::new();
-        let mut consumed = lines.feed(body, |line| ctx.parse_line(line.as_bytes(), &mut out));
+        let mut consumed =
+            lines.feed(body, at_eos, |line| ctx.parse_line(line.as_bytes(), &mut out));
 
         if at_eos {
             let tail = &body[consumed..];

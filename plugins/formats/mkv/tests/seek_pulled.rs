@@ -248,22 +248,42 @@ fn play_seeks(
     Ran { seen, index }
 }
 
+/// A film by its name, none when ffmpeg could not make it.
+type Made = (String, Option<Arc<[u8]>>);
+
+/// The file ffmpeg makes of `args`, made once a process. The tests of this file run side by
+/// side and share their films, and one that read a film while another's ffmpeg wrote it again
+/// got a file cut short.
 fn ffmpeg(name: &str, args: &[&str]) -> Option<Vec<u8>> {
+    static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, file)) = made.iter().find(|(n, _)| n == name) {
+        return file.as_deref().map(<[u8]>::to_vec);
+    }
+    let file = ffmpeg_file(name, args);
+    made.push((name.to_string(), file.clone().map(Arc::from)));
+    file
+}
+
+/// Written beside its name and moved onto it whole, for another process running these tests.
+fn ffmpeg_file(name: &str, args: &[&str]) -> Option<Vec<u8>> {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mkv_restart");
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(name);
+    let (part, path) = (dir.join(format!("{}.{name}", std::process::id())), dir.join(name));
     let ok = Command::new("ffmpeg")
         .env_remove("LD_LIBRARY_PATH")
         .current_dir(&dir)
         .args(["-v", "error", "-y"])
         .args(args)
-        .arg(&path)
+        .arg(&part)
         .status()
         .is_ok_and(|s| s.success());
     if !ok {
         eprintln!("skipped: ffmpeg could not make {name}");
+        let _ = std::fs::remove_file(&part);
         return None;
     }
+    std::fs::rename(&part, &path).ok()?;
     std::fs::read(&path).ok()
 }
 

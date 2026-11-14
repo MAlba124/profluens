@@ -229,16 +229,19 @@ fn mpeg4_vops_are_stamped_as_the_same_encode_in_matroska() {
 fn an_xvid_packed_file_unpacks_to_each_picture_once() {
     let d = std::fs::read(fixture("xvid_bf2.avi")).unwrap();
     let movi = d.windows(4).position(|w| w == b"movi").unwrap() + 4;
-    // an empty chunk takes no time on the demuxer's clock
-    let mut timed = Vec::new();
+    // an empty chunk is a dropped frame, it takes its time on the demuxer's clock but goes
+    // nowhere, XviD's two ahead of the first packed chunk are its B-frame delay
+    let (mut timed, mut chunks) = (Vec::new(), 0u64);
     let mut at = movi;
     while at + 8 <= d.len() && &d[at..at + 4] != b"idx1" {
         let n = u32::from_le_bytes([d[at + 4], d[at + 5], d[at + 6], d[at + 7]]) as usize;
         if n > 0 {
-            timed.push((d[at + 8..at + 8 + n].to_vec(), timed.len() as u64 * STEP));
+            timed.push((d[at + 8..at + 8 + n].to_vec(), chunks * STEP));
         }
+        chunks += 1;
         at += 8 + n + (n & 1);
     }
+    assert_eq!((chunks, timed.len()), (25, 23));
     let (stamps, acts) = run(&[], &timed);
     let units = acts.iter().filter(|a| matches!(a, Act::Unit { .. } | Act::Unstash)).count();
     assert_eq!(stamps.len(), units);
@@ -248,7 +251,8 @@ fn an_xvid_packed_file_unpacks_to_each_picture_once() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), stamps.len(), "no two at one time, {stamps:?}");
-    assert_eq!(&stamps[..4], [0, 3, 1, 2].map(|k| k * STEP));
+    // I0 holds through the delay, B1 and B2 show at chunks 3 and 4, P3 at 5, ffmpeg puts B2 at 4
+    assert_eq!(&stamps[..4], [0, 5, 3, 4].map(|k| k * STEP));
 }
 
 /// A first unit that never shows, a corrupt stream's, holds no more than `MOST_HELD`.

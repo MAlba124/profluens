@@ -3,13 +3,32 @@ use std::convert::Infallible;
 use profluens_core::fetch::{Fetch, Need, Step};
 
 use crate::element::{IDX1_PIECE, MAX_HOPS, MAX_IDX1};
+use crate::riff::{self, IX_HEAD, IxAt};
 
-/// The entries of an `idx1` chunk as [`Idx1At`] reads them.
+/// The entries of an `idx1` chunk as [`Idx1At`] reads them, or the OpenDML standard indexes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Idx1Body {
     pub body: Vec<u8>,
-    /// No entry the chunk declares is cut by the file's end or [`MAX_IDX1`].
+    /// No entry the chunk declares is cut by the file's end or [`MAX_IDX1`], or every standard
+    /// index was read.
     pub whole: bool,
+    /// The OpenDML standard index chunks, each whole from its header, one after another. Empty
+    /// when `idx1` was read instead.
+    pub ix: Vec<u8>,
+}
+
+impl Idx1Body {
+    // An empty Vec allocates nothing.
+    #[allow(clippy::disallowed_methods)]
+    fn of_idx1(body: Vec<u8>, whole: bool) -> Self {
+        Idx1Body { body, whole, ix: Vec::new() }
+    }
+
+    // An empty Vec allocates nothing.
+    #[allow(clippy::disallowed_methods)]
+    fn of_ix(ix: Vec<u8>) -> Self {
+        Idx1Body { body: Vec::new(), whole: true, ix }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,12 +46,17 @@ enum Idx1State {
         want: usize,
         whole: bool,
     },
+    /// The `k`th standard index chunk past the `held` bytes read of it.
+    Ix {
+        k: usize,
+        held: usize,
+    },
 }
 
 /// The `idx1` chunk behind the `movi` list ending at `movi_end` in a file of `len` bytes, the
 /// demuxer's walk as one machine. A first read of [`IDX1_PIECE`] takes the heads and a short
 /// index whole, one more the rest. Up to [`MAX_HOPS`] chunks before it are hopped over. None when
-/// no `idx1` follows.
+/// no `idx1` follows. [`with_odml`](Self::with_odml) reads the OpenDML standard indexes first.
 #[derive(Debug)]
 pub struct Idx1At {
     movi_end: u64,
@@ -40,13 +64,85 @@ pub struct Idx1At {
     state: Idx1State,
     buf: Vec<u8>,
     got: usize,
+    /// The standard index chunks the super indexes name, and those read so far.
+    ix: Vec<IxAt>,
+    ix_read: Vec<u8>,
 }
 
 impl Idx1At {
     // Empty until the first read, cold, once per open.
     #[allow(clippy::disallowed_methods)]
     pub fn new(movi_end: u64, len: u64) -> Self {
-        Idx1At { movi_end, len, state: Idx1State::Start, buf: Vec::new(), got: 0 }
+        Idx1At {
+            movi_end,
+            len,
+            state: Idx1State::Start,
+            buf: Vec::new(),
+            got: 0,
+            ix: Vec::new(),
+            ix_read: Vec::new(),
+        }
+    }
+
+    /// Reads the standard indexes the OpenDML super indexes in `head`, the file's header
+    /// through `movi`, name, all of them instead of `idx1`, which covers the first RIFF only.
+    /// `idx1` when one cannot be read.
+    // Cold path, once per open.
+    #[allow(clippy::disallowed_methods)]
+    pub fn with_odml(mut self, head: &[u8]) -> Self {
+        if let Ok((h, _)) = riff::probe_header(head) {
+            self.ix = h.streams.iter().flat_map(|s| s.super_index.iter().copied()).collect();
+        }
+        self
+    }
+
+    fn ix_at(&mut self, k: usize, held: usize) -> Step<Option<Idx1Body>> {
+        let Some(at) = self.ix.get(k).copied() else {
+            let ix = std::mem::take(&mut self.ix_read);
+            return self.done(Some(Idx1Body::of_ix(ix)));
+        };
+        let left = self.len.saturating_sub(at.offset.saturating_add(held as u64));
+        let want = match held {
+            0 => (at.size as usize).max(8 + IX_HEAD).min(usize::try_from(left).unwrap_or(0)),
+            _ => self.buf.len(),
+        };
+        let room = (MAX_IDX1 as usize).saturating_sub(self.ix_read.len());
+        if want < 8 + IX_HEAD || want > room || (want - held) as u64 > left {
+            return self.ix_failed();
+        }
+        if held == 0 {
+            self.buf.clear();
+        }
+        self.buf.resize(want, 0);
+        self.state = Idx1State::Ix { k, held };
+        Step::Need(Need { at: at.offset + held as u64, len: want - held })
+    }
+
+    /// The `k`th standard index chunk read through `held` bytes more.
+    fn ix_in(&mut self, k: usize, held: usize) -> Step<Option<Idx1Body>> {
+        let have = held + self.got;
+        if riff::ix_entries(&self.buf[..have]).is_none() {
+            return self.ix_failed();
+        }
+        let head = &self.buf[..8];
+        let declared = 8 + u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
+        if declared > have {
+            // a short read is the end of the file
+            let room = (MAX_IDX1 as usize).saturating_sub(self.ix_read.len());
+            if have < self.buf.len() || declared > room {
+                return self.ix_failed();
+            }
+            self.buf.resize(declared, 0);
+            return self.ix_at(k, have);
+        }
+        self.ix_read.extend_from_slice(&self.buf[..declared]);
+        self.ix_at(k + 1, 0)
+    }
+
+    /// A standard index that cannot be read, `idx1` instead.
+    fn ix_failed(&mut self) -> Step<Option<Idx1Body>> {
+        self.ix_read.clear();
+        self.heads_at(self.movi_end, 0)
     }
 
     fn heads_at(&mut self, at: u64, hops: u8) -> Step<Option<Idx1Body>> {
@@ -99,7 +195,8 @@ impl Idx1At {
             self.buf.drain(..from);
             if held == want {
                 let body = std::mem::take(&mut self.buf);
-                return self.done(Some(Idx1Body { body, whole: end == declared }));
+                let whole = end == declared;
+                return self.done(Some(Idx1Body::of_idx1(body, whole)));
             }
             self.buf.resize(want, 0);
             self.state = Idx1State::Body { held, want, whole: end == declared };
@@ -114,19 +211,25 @@ impl Fetch for Idx1At {
 
     fn poll(&mut self) -> Result<Step<Option<Idx1Body>>, Infallible> {
         Ok(match self.state {
+            Idx1State::Start if !self.ix.is_empty() => {
+                self.ix_read.clear();
+                self.ix_at(0, 0)
+            }
             Idx1State::Start => self.heads_at(self.movi_end, 0),
             Idx1State::Heads { base, off, hops } => self.heads(base, off, hops),
             Idx1State::Body { held, want, whole } => {
                 self.buf.truncate(held + self.got);
                 let body = std::mem::take(&mut self.buf);
-                self.done(Some(Idx1Body { body, whole: whole && held + self.got == want }))
+                let whole = whole && held + self.got == want;
+                self.done(Some(Idx1Body::of_idx1(body, whole)))
             }
+            Idx1State::Ix { k, held } => self.ix_in(k, held),
         })
     }
 
     fn buf(&mut self) -> &mut [u8] {
         match self.state {
-            Idx1State::Body { held, .. } => &mut self.buf[held..],
+            Idx1State::Body { held, .. } | Idx1State::Ix { held, .. } => &mut self.buf[held..],
             _ => &mut self.buf,
         }
     }
@@ -180,7 +283,7 @@ mod tests {
         let body = entries(10);
         let f = file(&[chunk(b"idx1", &body)]);
         let (got, log) = read(&f);
-        assert_eq!(got, Some(Idx1Body { body, whole: true }));
+        assert_eq!(got, Some(Idx1Body { body, whole: true, ix: Vec::new() }));
         assert_eq!(log, [need(MOVI_END, f.len() - MOVI_END)]);
     }
 
@@ -189,7 +292,7 @@ mod tests {
         let body = entries(10_000);
         let f = file(&[chunk(b"idx1", &body)]);
         let (got, log) = read(&f);
-        assert_eq!(got, Some(Idx1Body { body: body.clone(), whole: true }));
+        assert_eq!(got, Some(Idx1Body { body: body.clone(), whole: true, ix: Vec::new() }));
         let piece = IDX1_PIECE as usize;
         assert_eq!(log, [need(MOVI_END, piece), need(MOVI_END + piece, body.len() + 8 - piece)]);
         assert_eq!((body.len() + 8).div_ceil(piece), 3, "the demuxer reads it in 3");
@@ -231,7 +334,10 @@ mod tests {
         let mut f = file(&[chunk(b"idx1", &body)]);
         f.truncate(f.len() - 20);
         let (got, _) = read(&f);
-        assert_eq!(got, Some(Idx1Body { body: body[..body.len() - 20].to_vec(), whole: false }));
+        assert_eq!(
+            got,
+            Some(Idx1Body { body: body[..body.len() - 20].to_vec(), whole: false, ix: Vec::new() })
+        );
         let mut long = file(&[chunk(b"idx1", &entries(10_000))]);
         long.truncate(long.len() - 5);
         let mut m = Idx1At::new(MOVI_END as u64, long.len() as u64 + 5);

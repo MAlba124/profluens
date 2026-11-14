@@ -462,6 +462,8 @@ mod tests {
             bits_per_sample: 0,
             avg_bytes_per_sec: 0,
             name: String::new(),
+            start: 0,
+            super_index: Vec::new(),
         }
     }
 
@@ -487,6 +489,8 @@ mod tests {
             bits_per_sample: bits,
             avg_bytes_per_sec: 0,
             name: String::new(),
+            start: 0,
+            super_index: Vec::new(),
         }
     }
 

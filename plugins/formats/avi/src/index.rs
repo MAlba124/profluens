@@ -9,7 +9,9 @@ use profluens_core::time::Timestamp;
 
 use crate::codec;
 use crate::idx1::Idx1Body;
-use crate::riff::{self, AviHeader, IDX1_ENTRY, Idx1Entry, MAX_STREAMS, MoviLocation, StreamKind};
+use crate::riff::{
+    self, AviHeader, Clock, IDX1_ENTRY, Idx1Entry, MAX_STREAMS, MoviLocation, StreamKind,
+};
 
 /// Chunks a keyframe restart may walk back over, about 30 s of film with one audio stream.
 pub const RING: usize = 1024;
@@ -22,19 +24,24 @@ pub struct Track {
     pub number: usize,
     /// `dwSampleSize`, zero for a chunk a tick.
     pub sample_size: u32,
-    /// Nanoseconds a tick, zero for unknown timing.
-    pub tick_ns: u64,
+    /// Its `dwScale/dwRate`, untimed for unknown timing.
+    pub clock: Clock,
+    /// `dwStart`, the ticks ahead of its first chunk.
+    pub start: u64,
     /// The restart covers this stream's chunk at the keyframe.
     pub audio: bool,
     /// Nanoseconds the decoder needs ahead of a target, its pre-roll.
     pub lead_ns: u64,
 }
 
-/// The ticks a chunk of `size` bytes advances a stream's clock by.
-pub fn ticks(sample_size: u32, size: usize) -> u64 {
+/// The ticks a chunk of `size` bytes advances a stream's clock by. An empty chunk of a stream
+/// without a sample size is a dropped frame, one tick as VfW and ffmpeg count it, for audio
+/// (`frames` false) none, as ffmpeg counts its blocks.
+pub fn ticks(sample_size: u32, frames: bool, size: usize) -> u64 {
     match (sample_size, size) {
-        (_, 0) => 0,
+        (0, 0) => u64::from(frames),
         (0, _) => 1,
+        (_, 0) => 0,
         (n, s) => (s as u64 / n as u64).max(1),
     }
 }
@@ -87,14 +94,14 @@ impl Scan {
         }
         let n = tracks.len();
         Scan {
-            video: (video < n && tracks[video].tick_ns > 0).then_some(video),
+            video: (video < n && tracks[video].clock.timed()).then_some(video),
+            clocks: tracks.iter().map(|t| t.start).collect(),
             tracks,
             slot,
             movi_base: movi_data_start.saturating_sub(4),
             file_len: file_len.unwrap_or(u64::MAX),
             first_chunk,
             relative: None,
-            clocks: vec![0; n],
             back: vec![0; n],
             ring: VecDeque::new(),
             last: 0,
@@ -114,6 +121,33 @@ impl Scan {
         for b in body.as_chunks::<IDX1_ENTRY>().0 {
             self.entry(riff::idx1_entry(b));
         }
+    }
+
+    /// The OpenDML standard index chunks `ix`, each whole from its header, one after another.
+    /// Their chunks go in by file offset, each stream's index lies apart. False when one is no
+    /// standard index.
+    // Cold path, once per open.
+    #[allow(clippy::disallowed_methods)]
+    pub fn push_ix(&mut self, mut ix: &[u8]) -> bool {
+        let mut all: Vec<(u64, u8, u32, bool)> = Vec::new();
+        while let Some(head) = ix.get(..8) {
+            let size = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
+            let (chunk, rest) = ix.split_at(ix.len().min(8usize.saturating_add(size)));
+            let Some((stream, entries)) = riff::ix_entries(chunk) else { return false };
+            if let Some(&place) = self.slot.get(stream).filter(|p| **p != NONE) {
+                all.extend(entries.map(|e| (e.byte, place, e.size, e.key)));
+            }
+            ix = rest;
+        }
+        all.sort_by_key(|e| e.0);
+        if self.ring.capacity() < RING {
+            self.ring.reserve_exact(RING);
+        }
+        for (byte, place, size, key) in all {
+            self.read += 1;
+            self.chunk(usize::from(place), byte, size, key);
+        }
+        true
     }
 
     /// Every stream's clock at `byte`, where an entry restarts there or has its keyframe.
@@ -149,14 +183,20 @@ impl Scan {
             true => self.movi_base.saturating_add(e.offset as u64),
             false => e.offset as u64,
         };
+        self.chunk(place, byte, e.size, e.keyframe);
+    }
+
+    /// The chunk of the track at `place` whose header is at `byte`.
+    fn chunk(&mut self, place: usize, byte: u64, size: u32, keyframe: bool) {
         if byte < self.last {
             self.ring.clear();
         }
         self.last = byte;
-        if e.keyframe && Some(place) == self.video {
+        if keyframe && Some(place) == self.video {
             self.key(place, byte);
         }
-        let inc = ticks(self.tracks[place].sample_size, e.size as usize);
+        let t = &self.tracks[place];
+        let inc = ticks(t.sample_size, !t.audio, size as usize);
         self.clocks[place] = self.clocks[place].saturating_add(inc);
         if self.ring.len() == RING {
             self.ring.pop_front();
@@ -165,7 +205,7 @@ impl Scan {
     }
 
     fn key(&mut self, video: usize, byte: u64) {
-        let time = self.clocks[video].saturating_mul(self.tracks[video].tick_ns);
+        let time = self.tracks[video].clock.ns(self.clocks[video]);
         if self.entries.last().is_some_and(|e| e.time_ns >= time) {
             return;
         }
@@ -190,8 +230,8 @@ impl Scan {
             .tracks
             .iter()
             .zip(&self.back)
-            .filter(|(t, _)| t.audio && t.tick_ns > 0)
-            .map(|(t, c)| c.saturating_mul(t.tick_ns))
+            .filter(|(t, _)| t.audio && t.clock.timed())
+            .map(|(t, c)| t.clock.ns(*c))
             .fold(time, u64::min);
         self.entries.push(IndexEntry {
             time_ns: time,
@@ -230,7 +270,8 @@ pub(crate) fn scan_for(
             Track {
                 number: s.index,
                 sample_size: s.sample_size,
-                tick_ns: s.sample_duration_ns().unwrap_or(0),
+                clock: s.clock().unwrap_or_default(),
+                start: u64::from(s.start),
                 audio,
                 lead_ns,
             }
@@ -240,7 +281,7 @@ pub(crate) fn scan_for(
         .streams
         .iter()
         .zip(&tracks)
-        .position(|(s, t)| s.kind == StreamKind::Video && t.tick_ns > 0)?;
+        .position(|(s, t)| s.kind == StreamKind::Video && t.clock.timed())?;
     let first = riff::first_chunk(prefix, movi.movi_data_start);
     Some(Scan::new(tracks, video, movi.movi_data_start, first, len))
 }
@@ -254,14 +295,24 @@ pub struct AviIndex {
 }
 
 impl AviIndex {
-    /// The index of a file of `len` bytes from its `header` through `movi` and the `idx1`
-    /// [`crate::Idx1At`] read, an empty one for a file without. None for a header that does not
-    /// parse or has no timed video, a demuxer reads no `idx1` for it.
+    /// The index of a file of `len` bytes from its `header` through `movi` and the index
+    /// [`crate::Idx1At`] read, an empty one for a file without. The OpenDML standard indexes
+    /// when it read them, else `idx1`, which covers the first RIFF only, the index is then not
+    /// whole when more follow. None for a header that does not parse or has no timed video, a
+    /// demuxer reads no `idx1` for it.
     pub fn build(header: &[u8], idx1: Option<&Idx1Body>, len: Option<u64>) -> Option<AviIndex> {
         let (avi, movi) = riff::probe_header(header).ok()?;
-        let mut scan = scan_for(&avi, &movi?, header, len)?;
+        let movi = movi?;
+        if let Some(i) = idx1.filter(|i| !i.ix.is_empty()) {
+            let mut odml = scan_for(&avi, &movi, header, len)?;
+            if odml.push_ix(&i.ix) && !odml.entries.is_empty() {
+                return Some(AviIndex { scan: odml, whole: i.whole });
+            }
+        }
+        let mut scan = scan_for(&avi, &movi, header, len)?;
         scan.push(idx1.map_or(&[][..], |i| &i.body));
-        Some(AviIndex { scan, whole: idx1.is_some_and(|i| i.whole) })
+        let whole = idx1.is_some_and(|i| i.whole) && !riff::segmented(header, &movi, len);
+        Some(AviIndex { scan, whole })
     }
 }
 
@@ -269,8 +320,8 @@ fn covered(tracks: &[Track], clocks: &[u64], time: u64) -> bool {
     tracks
         .iter()
         .zip(clocks)
-        .filter(|(t, _)| t.audio && t.tick_ns > 0)
-        .all(|(t, c)| c.saturating_mul(t.tick_ns) <= time.saturating_sub(t.lead_ns))
+        .filter(|(t, _)| t.audio && t.clock.timed())
+        .all(|(t, c)| t.clock.ns(*c) <= time.saturating_sub(t.lead_ns))
 }
 
 /// The bitrate the demuxer tells at stream time `at`.

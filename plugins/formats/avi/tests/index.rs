@@ -613,3 +613,174 @@ fn behind_a_seek_back_the_rate_is_told_again() {
     let behind = rates.iter().rposition(Option::is_none).map_or(0, |at| rates.len() - at - 1);
     assert!(behind >= 3, "told at the seek's place and every two seconds on, {rates:?}");
 }
+
+/// An OpenDML file, 25 fps with a key every 10 frames, `first` frames in RIFF AVI with an
+/// `idx1` of them, `second` more in RIFF AVIX. With `odml` each RIFF's `movi` ends in a standard
+/// index of its frames, which a super index in the stream's `strl` names. Each frame's bytes
+/// are its number.
+fn opendml(first: usize, second: usize, odml: bool) -> Vec<u8> {
+    let mut bitmap = vec![0u8; 40];
+    bitmap[0..4].copy_from_slice(&40u32.to_le_bytes());
+    bitmap[4..8].copy_from_slice(&64i32.to_le_bytes());
+    bitmap[8..12].copy_from_slice(&48i32.to_le_bytes());
+    bitmap[16..20].copy_from_slice(b"XVID");
+    let total = (first + second) as u32;
+    // the super index, its two entries filled in once the standard indexes are placed
+    let indx_at = |hdrl_at: usize| hdrl_at + 12 + 8 + 56 + 12 + 8 + 56 + 8 + 40;
+    let indx = |ix: &[(u64, u32, u32)]| {
+        let mut b = vec![0u8; 24];
+        b[0..2].copy_from_slice(&4u16.to_le_bytes());
+        b[4..8].copy_from_slice(&(ix.len() as u32).to_le_bytes());
+        b[8..12].copy_from_slice(b"00dc");
+        for (at, size, frames) in ix {
+            b.extend_from_slice(&at.to_le_bytes());
+            b.extend_from_slice(&size.to_le_bytes());
+            b.extend_from_slice(&frames.to_le_bytes());
+        }
+        chunk(b"indx", &b)
+    };
+    let mut strl = [strh(b"vids", b"XVID", 1, 25, total), chunk(b"strf", &bitmap)].concat();
+    if odml {
+        strl.extend_from_slice(&indx(&[(0, 0, 0); 2]));
+    }
+    let hdrl = list(
+        b"hdrl",
+        &[
+            chunk(b"avih", &[0u8; 56]),
+            list(b"strl", &strl),
+            list(b"odml", &chunk(b"dmlh", &total.to_le_bytes())),
+        ]
+        .concat(),
+    );
+    let head = 12 + hdrl.len();
+    // the frames of one movi from `movi_data`, their idx1 rows and their standard index
+    let frames = |from: usize, n: usize, movi_data: usize| {
+        let (mut movi, mut idx1, mut entries) = (Vec::new(), Vec::new(), Vec::new());
+        for i in from..from + n {
+            let at = movi_data + movi.len();
+            movi.extend_from_slice(&chunk(b"00dc", &[i as u8; 10]));
+            let key = i % 10 == 0;
+            idx1.extend_from_slice(b"00dc");
+            idx1.extend_from_slice(&(if key { 0x10u32 } else { 0 }).to_le_bytes());
+            idx1.extend_from_slice(&((at - (movi_data - 4)) as u32).to_le_bytes());
+            idx1.extend_from_slice(&10u32.to_le_bytes());
+            entries.push((at as u64 + 8, key));
+        }
+        (movi, idx1, entries)
+    };
+    let ix = |entries: &[(u64, bool)]| {
+        let base = entries[0].0 - 8;
+        let mut b = vec![0u8; 24];
+        b[0..2].copy_from_slice(&2u16.to_le_bytes());
+        b[3] = 1;
+        b[4..8].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        b[8..12].copy_from_slice(b"00dc");
+        b[12..20].copy_from_slice(&base.to_le_bytes());
+        for (data, key) in entries {
+            b.extend_from_slice(&((data - base) as u32).to_le_bytes());
+            b.extend_from_slice(&(10u32 | if *key { 0 } else { 1 << 31 }).to_le_bytes());
+        }
+        chunk(b"ix00", &b)
+    };
+    let movi1_data = head + 12;
+    let (mut movi1, idx1, e1) = frames(0, first, movi1_data);
+    let ix1_at = movi1_data + movi1.len();
+    let ix1 = ix(&e1);
+    if odml {
+        movi1.extend_from_slice(&ix1);
+    }
+    let riff1 = [b"AVI ".to_vec(), hdrl, list(b"movi", &movi1), chunk(b"idx1", &idx1)].concat();
+    let mut file = chunk(b"RIFF", &riff1);
+    let movi2_data = file.len() + 12 + 12;
+    let (mut movi2, _, e2) = frames(first, second, movi2_data);
+    let ix2_at = movi2_data + movi2.len();
+    let ix2 = ix(&e2);
+    if odml {
+        movi2.extend_from_slice(&ix2);
+    }
+    file.extend_from_slice(&chunk(b"RIFF", &[b"AVIX".to_vec(), list(b"movi", &movi2)].concat()));
+    if odml {
+        let entries = [
+            (ix1_at as u64, ix1.len() as u32, first as u32),
+            (ix2_at as u64, ix2.len() as u32, second as u32),
+        ];
+        let at = indx_at(12);
+        let filled = indx(&entries);
+        file[at..at + filled.len()].copy_from_slice(&filled);
+    }
+    file
+}
+
+fn index_of(file: &[u8], odml: bool) -> (AviIndex, Vec<pf_avi::Idx1Body>, usize) {
+    let head = &file[..4096];
+    let movi = pf_avi::probe_header(head).unwrap().1.unwrap();
+    let mut read = Idx1At::new(movi.movi_end, file.len() as u64);
+    if odml {
+        read = read.with_odml(head);
+    }
+    let mut log = Vec::new();
+    let body = drive_slice_log(&mut read, file, &mut log).unwrap();
+    let index = AviIndex::build(head, body.as_ref(), Some(file.len() as u64)).unwrap();
+    (index, body.into_iter().collect(), log.len())
+}
+
+/// `idx1` holds the first RIFF's chunks only, with RIFF AVIX behind it the index is partial so a
+/// seek past it estimates instead of landing on its last keyframe.
+#[test]
+fn an_idx1_with_riff_segments_behind_it_is_partial() {
+    let file = opendml(100, 400, false);
+    let (index, _, _) = index_of(&file, false);
+    assert_eq!(index.scan.entries.len(), 10);
+    assert!(!index.whole, "four fifths of the film lie past it");
+    let path = write("odml_partial.avi", &file);
+    let (rows, published) = play(&path, &file[..4096], file.len() as u64, false);
+    assert!(!published.complete && published.entries.len() == 10);
+    let (byte, at) = published.resolve(Timestamp(15_000 * MS)).expect("a target");
+    assert_eq!(at, Timestamp(15_000 * MS), "estimated, not the last key at 3.6 s");
+    assert!(byte > published.entries[9].byte);
+    assert_eq!(rows[0].len(), 500, "every frame read");
+    // one RIFF, the same idx1 is whole
+    let one = film(2, 0, Tail::Idx1);
+    let movi = pf_avi::probe_header(&one.data).unwrap().1.unwrap();
+    assert!(!pf_avi::riff::segmented(&one.data, &movi, Some(one.len)));
+}
+
+/// The OpenDML standard indexes cover every RIFF, read in place of `idx1`.
+#[test]
+fn the_opendml_standard_indexes_index_every_riff() {
+    let file = opendml(100, 400, true);
+    let (index, body, reads) = index_of(&file, true);
+    assert_eq!(reads, 2, "the two standard indexes, no idx1");
+    assert!(body[0].body.is_empty() && !body[0].ix.is_empty());
+    assert!(index.whole);
+    let entries = &index.scan.entries;
+    assert_eq!(entries.len(), 50, "a key every 10 of 500 frames");
+    for (k, e) in entries.iter().enumerate() {
+        assert_eq!(e.time_ns, k as u64 * 400 * MS);
+        let at = e.byte as usize;
+        assert_eq!(&file[at..at + 4], b"00dc", "{k}");
+        assert_eq!(file[at + 8], (k * 10) as u8, "{k}, the frame's own bytes");
+    }
+    let path = write("odml.avi", &file);
+    let index = Arc::new(index);
+    let shared = |d: AviDemux| d.with_index(Arc::clone(&index));
+    let (rows, published) = play_by(&path, &file[..4096], file.len() as u64, false, shared);
+    assert!(published.complete);
+    let key = published.keyframe(Timestamp(15_000 * MS)).expect("a keyframe");
+    assert_eq!((key.time_ns, file[key.byte as usize + 8]), (14_800 * MS, (370 % 256) as u8));
+    assert_eq!(rows[0].len(), 500);
+    // without the super index read, idx1 and partial
+    let (plain, body, _) = index_of(&file, false);
+    assert!(body[0].ix.is_empty() && !plain.whole && plain.scan.entries.len() == 10);
+}
+
+/// A standard index that is not one falls back to `idx1`, partial.
+#[test]
+fn a_broken_standard_index_falls_back_to_idx1() {
+    let mut file = opendml(100, 400, true);
+    let ix = pf_avi::probe_header(&file[..4096]).unwrap().0.streams[0].super_index[1];
+    file[ix.offset as usize + 8 + 3] = 7;
+    let (index, body, _) = index_of(&file, true);
+    assert!(body[0].ix.is_empty() && !body[0].body.is_empty());
+    assert!(!index.whole && index.scan.entries.len() == 10);
+}

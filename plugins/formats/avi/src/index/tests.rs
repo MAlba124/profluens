@@ -6,11 +6,13 @@ use super::*;
 const MS: u64 = 1_000_000;
 const MOVI_DATA: u64 = 2_048;
 const BASE: u64 = MOVI_DATA - 4;
+const FPS25: Clock = Clock { scale: 1, rate: 25 };
+const AC3: Clock = Clock { scale: 1_536, rate: 48_000 };
 
 fn tracks() -> Vec<Track> {
     vec![
-        Track { number: 0, sample_size: 0, tick_ns: 40 * MS, audio: false, lead_ns: 0 },
-        Track { number: 1, sample_size: 0, tick_ns: 32 * MS, audio: true, lead_ns: 5 * MS },
+        Track { number: 0, sample_size: 0, clock: FPS25, start: 0, audio: false, lead_ns: 0 },
+        Track { number: 1, sample_size: 0, clock: AC3, start: 0, audio: true, lead_ns: 5 * MS },
     ]
 }
 
@@ -152,9 +154,58 @@ fn audio_past_the_ring_restarts_at_the_keyframe() {
 
 #[test]
 fn a_sample_size_counts_samples() {
-    assert_eq!(ticks(0, 999), 1);
-    assert_eq!(ticks(4, 4_096), 1_024);
-    assert_eq!(ticks(4, 2), 1, "a short chunk is one");
+    assert_eq!(ticks(0, true, 999), 1);
+    assert_eq!(ticks(0, true, 0), 1, "an empty chunk is a dropped frame");
+    assert_eq!(ticks(0, false, 0), 0, "an empty audio chunk holds no block");
+    assert_eq!(ticks(0, false, 999), 1);
+    assert_eq!(ticks(4, true, 4_096), 1_024);
+    assert_eq!(ticks(4, false, 2), 1, "a short chunk is one");
+    assert_eq!(ticks(4, false, 0), 0, "no samples");
+}
+
+/// VfW and ffmpeg count each video chunk as a frame, an empty one too, a capture's dropped
+/// frames.
+#[test]
+fn an_empty_video_chunk_takes_a_frame() {
+    let rows = [
+        (b"00dc", K, 4, 100),
+        (b"00dc", 0, 112, 0),
+        (b"01wb", 0, 120, 0),
+        (b"00dc", 0, 128, 0),
+        (b"00dc", K, 136, 100),
+    ];
+    let mut s = scan(100_000);
+    s.push(&body(&rows));
+    let times: Vec<u64> = s.entries.iter().map(|e| e.time_ns).collect();
+    assert_eq!(times, [0, 120 * MS]);
+    assert_eq!(s.clocks_at(BASE + 136), Some(&[3, 0][..]), "the empty audio chunk takes none");
+}
+
+/// A stream's `dwStart` is where its clock starts.
+#[test]
+fn the_clocks_start_at_each_streams_start() {
+    let mut tracks = tracks();
+    tracks[0].start = 5;
+    tracks[1].start = 2;
+    let mut s = Scan::new(tracks, 0, MOVI_DATA, Some(MOVI_DATA), Some(100_000));
+    s.push(&body(&lagging()));
+    assert_eq!(s.entries[0], IndexEntry::key(200 * MS, BASE + 4));
+    assert_eq!(s.clocks_at(BASE + 336), Some(&[7, 4][..]));
+}
+
+/// A tick's time is scaled from the count at once, NTSC video an hour in is not 72 us early.
+#[test]
+fn key_times_do_not_drift() {
+    let ntsc = Clock { scale: 1_001, rate: 30_000 };
+    let mut t = tracks();
+    t[0].clock = ntsc;
+    let frames = 107_892u32;
+    let mut rows: Vec<(&[u8; 4], u32, u32, u32)> =
+        (0..frames).map(|n| (b"00dc", 0, 4 + n * 18, 10)).collect();
+    rows.push((b"00dc", K, 4 + frames * 18, 10));
+    let mut s = Scan::new(t, 0, MOVI_DATA, Some(MOVI_DATA), Some(1 << 30));
+    s.push(&body(&rows));
+    assert_eq!(s.entries.last().map(|e| e.time_ns), Some(3_599_996_400_000));
 }
 
 #[test]

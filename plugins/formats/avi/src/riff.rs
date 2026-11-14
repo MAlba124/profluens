@@ -24,6 +24,8 @@ pub struct Stream {
     /// `strh.dwSampleSize`. 0 means one frame per chunk, else `size/sample_size` samples.
     pub sample_size: u32,
     pub length: u32,
+    /// `strh.dwStart`, the ticks before the stream's first chunk.
+    pub start: u32,
     pub width: u32,
     /// Absolute value, since top-down DIBs store `biHeight` negative.
     pub height: u32,
@@ -37,15 +39,56 @@ pub struct Stream {
     pub avg_bytes_per_sec: u32,
     /// The `strn` chunk's name, empty without one.
     pub name: String,
+    /// The standard index chunks its OpenDML `indx` super index names, empty without one.
+    pub super_index: Vec<IxAt>,
+}
+
+/// A stream's clock, ticks of `scale / rate` seconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Clock {
+    pub scale: u32,
+    pub rate: u32,
+}
+
+impl Clock {
+    /// Whether a tick takes time.
+    pub fn timed(self) -> bool {
+        self.scale > 0 && self.rate > 0
+    }
+
+    /// The time of tick `ticks` in ns, rounded down once so no error builds up, 0 untimed.
+    pub fn ns(self, ticks: u64) -> u64 {
+        if self.rate == 0 {
+            return 0;
+        }
+        let ns = u128::from(ticks) * u128::from(self.scale) * 1_000_000_000 / u128::from(self.rate);
+        u64::try_from(ns).unwrap_or(u64::MAX)
+    }
+
+    /// The tick nearest `ns`, 0 untimed.
+    pub fn ticks_near(self, ns: u64) -> u64 {
+        let per = u128::from(self.scale) * 1_000_000_000;
+        if per == 0 {
+            return 0;
+        }
+        let ticks = (u128::from(ns) * u128::from(self.rate) + per / 2) / per;
+        u64::try_from(ticks).unwrap_or(u64::MAX)
+    }
 }
 
 impl Stream {
-    /// One sample's duration in ns from `dwScale/dwRate`, `None` when `rate` is zero.
+    /// One sample's duration in ns from `dwScale/dwRate`, `None` when `rate` is zero. Rounded
+    /// down, stamps come from [`Clock::ns`] instead.
     pub fn sample_duration_ns(&self) -> Option<u64> {
         if self.rate == 0 {
             return None;
         }
         Some((self.scale as u64).saturating_mul(1_000_000_000) / self.rate as u64)
+    }
+
+    /// Its `dwScale/dwRate` clock, `None` when `rate` is zero.
+    pub fn clock(&self) -> Option<Clock> {
+        (self.rate > 0).then_some(Clock { scale: self.scale, rate: self.rate })
     }
 
     /// The codec's own bytes behind the fixed format header of `strf`, behind the 40 octets of
@@ -140,19 +183,12 @@ pub struct AviHeader {
 }
 
 impl AviHeader {
-    /// Presentation duration in ns, the longest stream's `length * scale / rate`.
+    /// Presentation duration in ns, where the longest stream ends, `(start + length) * scale /
+    /// rate`.
     pub fn duration_ns(&self) -> Option<u64> {
         self.streams
             .iter()
-            .filter_map(|s| {
-                if s.rate == 0 {
-                    return None;
-                }
-                Some(
-                    (s.length as u64).saturating_mul(s.scale as u64).saturating_mul(1_000_000_000)
-                        / s.rate as u64,
-                )
-            })
+            .filter_map(|s| Some(s.clock()?.ns(u64::from(s.start) + u64::from(s.length))))
             .max()
     }
 }
@@ -360,9 +396,10 @@ fn parse_avih(b: &[u8], header: &mut AviHeader) {
 #[allow(clippy::disallowed_methods)]
 fn parse_strl(body: &[u8], index: usize) -> Option<Stream> {
     let mut c = Cursor::new(body);
-    let mut strh: Option<(StreamKind, FourCc, u32, u32, u32, u32)> = None;
+    let mut strh: Option<Strh> = None;
     let mut strf: Vec<u8> = Vec::new();
     let mut name = String::new();
+    let mut super_index = Vec::new();
     while c.remaining() >= 8 {
         let id = c.fourcc()?;
         let size = c.u32le()? as usize;
@@ -383,6 +420,10 @@ fn parse_strl(body: &[u8], index: usize) -> Option<Stream> {
                 strf = b.to_vec();
                 c.at = advance_padded(c.at, size);
             }
+            b"indx" => {
+                super_index_into(c.peek(size.min(c.remaining()))?, &mut super_index);
+                c.at = advance_padded(c.at, size);
+            }
             _ => {
                 c.at = advance_padded(c.at, size);
             }
@@ -391,7 +432,7 @@ fn parse_strl(body: &[u8], index: usize) -> Option<Stream> {
             break;
         }
     }
-    let (kind, handler, scale, rate, sample_size, length) = strh?;
+    let Strh { kind, handler, scale, rate, start, length, sample_size } = strh?;
     let mut s = Stream {
         index,
         kind,
@@ -400,6 +441,7 @@ fn parse_strl(body: &[u8], index: usize) -> Option<Stream> {
         rate,
         sample_size,
         length,
+        start,
         width: 0,
         height: 0,
         strf,
@@ -409,6 +451,7 @@ fn parse_strl(body: &[u8], index: usize) -> Option<Stream> {
         bits_per_sample: 0,
         avg_bytes_per_sec: 0,
         name,
+        super_index,
     };
     match kind {
         StreamKind::Video => parse_bitmapinfoheader(&s.strf.clone(), &mut s),
@@ -418,7 +461,18 @@ fn parse_strl(body: &[u8], index: usize) -> Option<Stream> {
     Some(s)
 }
 
-fn parse_strh(b: &[u8]) -> (StreamKind, FourCc, u32, u32, u32, u32) {
+/// What a stream takes from its `strh`.
+struct Strh {
+    kind: StreamKind,
+    handler: FourCc,
+    scale: u32,
+    rate: u32,
+    start: u32,
+    length: u32,
+    sample_size: u32,
+}
+
+fn parse_strh(b: &[u8]) -> Strh {
     let get_u32 = |off: usize| -> u32 {
         b.get(off..off + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]])).unwrap_or(0)
     };
@@ -429,11 +483,96 @@ fn parse_strh(b: &[u8]) -> (StreamKind, FourCc, u32, u32, u32, u32) {
         b"auds" => StreamKind::Audio,
         _ => StreamKind::Other,
     };
-    let scale = get_u32(20);
-    let rate = get_u32(24);
-    let length = get_u32(32);
-    let sample_size = get_u32(44);
-    (kind, handler, scale, rate, sample_size, length)
+    Strh {
+        kind,
+        handler,
+        scale: get_u32(20),
+        rate: get_u32(24),
+        start: get_u32(28),
+        length: get_u32(32),
+        sample_size: get_u32(44),
+    }
+}
+
+/// Where a standard index chunk lies, an entry of an OpenDML super index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IxAt {
+    /// Absolute offset of the `ix##` chunk's header.
+    pub offset: u64,
+    /// Its `dwSize`, writers differ on whether the header counts.
+    pub size: u32,
+}
+
+/// `bIndexType` of a super index.
+const AVI_INDEX_OF_INDEXES: u8 = 0;
+/// `bIndexType` of a standard index.
+const AVI_INDEX_OF_CHUNKS: u8 = 1;
+/// Bytes of an index header ahead of its entries, `qwBaseOffset` and `dwReserved3` included.
+pub const IX_HEAD: usize = 24;
+/// The `dwSize` bit of a chunk that is no keyframe.
+const AVI_INDEX_DELTAFRAME: u32 = 1 << 31;
+
+/// The entries of the super index `body` onto `out` (OpenDML AVI File Format Extensions, 2.3.1).
+// Cold path, once per stream.
+#[allow(clippy::disallowed_methods)]
+fn super_index_into(body: &[u8], out: &mut Vec<IxAt>) {
+    let le32 =
+        |at: usize| body.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let (Some(head), Some(n)) = (body.get(..4), le32(4)) else { return };
+    if u16::from_le_bytes([head[0], head[1]]) != 4 || head[3] != AVI_INDEX_OF_INDEXES {
+        return;
+    }
+    let entries = body.get(IX_HEAD..).unwrap_or_default().as_chunks::<16>().0;
+    for e in entries.iter().take(n as usize) {
+        let offset = u64::from_le_bytes([e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]]);
+        let size = u32::from_le_bytes([e[8], e[9], e[10], e[11]]);
+        if offset > 0 {
+            out.push(IxAt { offset, size });
+        }
+    }
+}
+
+/// One chunk a standard index names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IxEntry {
+    /// Absolute offset of the chunk's header.
+    pub byte: u64,
+    pub size: u32,
+    pub key: bool,
+}
+
+/// The stream number and entries of a standard index chunk, `chunk` from its `ix##` header,
+/// None when it is no standard index. Entries cut by the slice's end are left out.
+pub fn ix_entries(chunk: &[u8]) -> Option<(usize, impl Iterator<Item = IxEntry> + '_)> {
+    let body = chunk.get(8..)?;
+    let head = body.get(..IX_HEAD)?;
+    let le32 = |at: usize| u32::from_le_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]]);
+    let longs = usize::from(u16::from_le_bytes([head[0], head[1]]));
+    if head[3] != AVI_INDEX_OF_CHUNKS || !(2..=3).contains(&longs) {
+        return None;
+    }
+    let stream = stream_of([head[8], head[9], head[10], head[11]])?;
+    let base = u64::from(le32(12)) | u64::from(le32(16)) << 32;
+    let n = le32(4) as usize;
+    let entries = body[IX_HEAD..].chunks_exact(longs * 4).take(n).map(move |e| {
+        let off = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+        let size = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
+        IxEntry {
+            byte: base.saturating_add(u64::from(off)).saturating_sub(8),
+            size: size & !AVI_INDEX_DELTAFRAME,
+            key: size & AVI_INDEX_DELTAFRAME == 0,
+        }
+    });
+    Some((stream, entries))
+}
+
+/// Whether RIFF segments follow the first, an OpenDML file's `RIFF AVIX`, so `idx1` covers part
+/// of it. The first RIFF's size is believed only when it reaches past `movi`.
+pub fn segmented(head: &[u8], movi: &MoviLocation, len: Option<u64>) -> bool {
+    let Some(b) = head.get(4..8) else { return false };
+    let end = 8 + u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let end = end + (end & 1);
+    end >= movi.movi_end && len.is_some_and(|len| end.saturating_add(12) <= len)
 }
 
 fn parse_bitmapinfoheader(strf: &[u8], s: &mut Stream) {
@@ -470,10 +609,15 @@ pub struct Idx1Entry {
 impl Idx1Entry {
     /// The stream number from the id's first two ASCII digits.
     pub fn stream_index(&self) -> Option<usize> {
-        let d0 = (self.ckid[0] as char).to_digit(10)?;
-        let d1 = (self.ckid[1] as char).to_digit(10)?;
-        Some((d0 * 10 + d1) as usize)
+        stream_of(self.ckid)
     }
+}
+
+/// The stream number a chunk id names by its first two ASCII digits.
+pub fn stream_of(ckid: FourCc) -> Option<usize> {
+    let d0 = (ckid[0] as char).to_digit(10)?;
+    let d1 = (ckid[1] as char).to_digit(10)?;
+    Some((d0 * 10 + d1) as usize)
 }
 
 /// A parsed `idx1` chunk with the `movi` data start for resolving relative offsets.
@@ -918,6 +1062,8 @@ mod tests {
             bits_per_sample: 0,
             avg_bytes_per_sec: 0,
             name: String::new(),
+            start: 0,
+            super_index: Vec::new(),
         };
         assert_eq!(s.codec_head(), [0, 0, 1, 0xB0, 1], "the VOL behind 40 octets");
         s.strf[..4].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -1251,6 +1397,74 @@ mod tests {
         assert_eq!(si.entries.len(), 2, "two video keyframes");
         assert_eq!(si.entries[0], profluens_core::pipeline::IndexEntry::key(0, 1004)); // frame 0 at base(1000)+4
         assert_eq!(si.entries[1], profluens_core::pipeline::IndexEntry::key(2 * dur, 1400)); // frame 2 at base+400
+    }
+
+    /// An hour of ticks is an hour, where a tick rounded down to the ns would come up short
+    /// by 117 ms for PCM at 44.1 kHz, 230 ms for DTS byte ticks and 58 ms for MP3 CBR ones.
+    #[test]
+    fn an_hour_of_ticks_stamps_an_hour() {
+        const HOUR: u64 = 3_600_000_000_000;
+        for rate in [44_100u32, 192_000, 24_000, 48_000] {
+            let c = Clock { scale: 1, rate };
+            assert_eq!(c.ns(u64::from(rate) * 3_600), HOUR, "{rate}");
+            assert_eq!(c.ticks_near(HOUR), u64::from(rate) * 3_600);
+        }
+        let ntsc = Clock { scale: 1_001, rate: 30_000 };
+        assert_eq!((ntsc.ns(1), ntsc.ns(3)), (33_366_666, 100_100_000));
+        assert_eq!(ntsc.ticks_near(33_366_000), 1, "the nearest");
+        assert_eq!(Clock { scale: u32::MAX, rate: 1 }.ns(u64::MAX), u64::MAX, "saturates");
+        assert!(!Clock { scale: 0, rate: 25 }.timed() && Clock::default().ns(9) == 0);
+        assert_eq!(Clock { scale: 0, rate: 25 }.ticks_near(1_000), 0);
+    }
+
+    /// The super index names the standard indexes, which name each chunk by the offset of its
+    /// data from their base and flag those that are no keyframe.
+    #[test]
+    fn opendml_indexes_parse() {
+        let mut indx = vec![4, 0, 0, 0];
+        indx.extend_from_slice(&3u32.to_le_bytes());
+        indx.extend_from_slice(b"00dc");
+        indx.extend_from_slice(&[0; 12]);
+        for (at, size) in [(5_000u64, 64u32), (0, 0), (1 << 32, 80)] {
+            indx.extend_from_slice(&at.to_le_bytes());
+            indx.extend_from_slice(&size.to_le_bytes());
+            indx.extend_from_slice(&25u32.to_le_bytes());
+        }
+        let mut out = Vec::new();
+        super_index_into(&indx, &mut out);
+        let want = [IxAt { offset: 5_000, size: 64 }, IxAt { offset: 1 << 32, size: 80 }];
+        assert_eq!(out, want, "an empty slot left out");
+        let mut chunks = Vec::new();
+        indx[3] = AVI_INDEX_OF_CHUNKS;
+        super_index_into(&indx, &mut chunks);
+        assert!(chunks.is_empty(), "no index of indexes");
+        let mut ix = b"ix01".to_vec();
+        ix.extend_from_slice(&(24u32 + 3 * 8).to_le_bytes());
+        ix.extend_from_slice(&[2, 0, 0, AVI_INDEX_OF_CHUNKS]);
+        ix.extend_from_slice(&3u32.to_le_bytes());
+        ix.extend_from_slice(b"01wb");
+        ix.extend_from_slice(&(1u64 << 32).to_le_bytes());
+        ix.extend_from_slice(&[0; 4]);
+        for (off, size) in [(8u32, 100u32), (120, 50 | 1 << 31), (180, 0)] {
+            ix.extend_from_slice(&off.to_le_bytes());
+            ix.extend_from_slice(&size.to_le_bytes());
+        }
+        let (stream, entries) = ix_entries(&ix).expect("a standard index");
+        let entries: Vec<IxEntry> = entries.collect();
+        let base = 1u64 << 32;
+        assert_eq!(stream, 1);
+        assert_eq!(
+            entries,
+            [
+                IxEntry { byte: base, size: 100, key: true },
+                IxEntry { byte: base + 112, size: 50, key: false },
+                IxEntry { byte: base + 172, size: 0, key: true },
+            ]
+        );
+        assert_eq!(ix_entries(&ix[..ix.len() - 4]).map(|(_, e)| e.count()), Some(2), "cut");
+        assert!(ix_entries(&ix[..30]).is_none(), "its header cut");
+        ix[8 + 3] = AVI_INDEX_OF_INDEXES;
+        assert!(ix_entries(&ix).is_none());
     }
 
     #[test]

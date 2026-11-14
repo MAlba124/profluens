@@ -25,7 +25,7 @@ use profluens_core::time::Timestamp;
 use crate::codec;
 use crate::index::{self, AviIndex, Scan};
 use crate::retime::{Act, Order, Retime};
-use crate::riff::{self, AviError, ChunkHead, FourCc, MoviWalker, Stream, StreamKind};
+use crate::riff::{self, AviError, ChunkHead, Clock, FourCc, MoviWalker, Stream, StreamKind};
 
 /// Most of `idx1` asked for at a time, its 8 octet header in the first piece.
 pub const IDX1_PIECE: u32 = 64 << 10;
@@ -75,7 +75,8 @@ struct PadStream {
     pad: SrcPad,
     family: &'static str,
     stream: Stream,
-    sample_dur_ns: Option<u64>,
+    /// Its `dwScale/dwRate`, None for a rate of zero, its chunks then go unstamped.
+    clock: Option<Clock>,
     ticks: u64,
     gate: u64,
     started: bool,
@@ -229,9 +230,10 @@ impl Reorder {
 
 impl PadStream {
     fn next_pts_ns(&mut self, payload_size: usize) -> Option<u64> {
-        let dur = self.sample_dur_ns?;
-        let pts = self.ticks.saturating_mul(dur);
-        self.ticks = self.ticks.saturating_add(index::ticks(self.stream.sample_size, payload_size));
+        let pts = self.clock?.ns(self.ticks);
+        let frames = self.stream.kind != StreamKind::Audio;
+        let inc = index::ticks(self.stream.sample_size, frames, payload_size);
+        self.ticks = self.ticks.saturating_add(inc);
         Some(pts)
     }
 }
@@ -300,6 +302,8 @@ pub struct AviDemux {
     /// The index read once for the file, so this run reads no `idx1`.
     shared: Option<Arc<AviIndex>>,
     whole: bool,
+    /// OpenDML RIFF segments follow the first, `idx1` is never whole.
+    segmented: bool,
     piece: u32,
     rated: Index,
     key: usize,
@@ -339,6 +343,7 @@ impl AviDemux {
             scan: None,
             shared: None,
             whole: false,
+            segmented: false,
             piece: IDX1_PIECE,
             rated: Index::default(),
             key: 0,
@@ -677,7 +682,9 @@ impl AviDemux {
             let dropped = framer.push(ps.family, self.walker.data(&chunk));
             self.walker.take(&chunk);
             ps.junk += dropped as u64;
-            ps.ticks = ps.ticks.saturating_add(index::ticks(ps.stream.sample_size, dropped));
+            let frames = ps.stream.kind != StreamKind::Audio;
+            let inc = index::ticks(ps.stream.sample_size, frames, dropped);
+            ps.ticks = ps.ticks.saturating_add(inc);
             self.framing = Some((i, stream_index, id));
         }
     }
@@ -865,6 +872,7 @@ impl AviDemux {
     }
 
     fn idx1_over(&mut self, ctx: &Ctx, whole: bool) {
+        let whole = whole && !self.segmented;
         (self.read, self.whole) = (Idx1Read::Off, whole);
         if let Some(scan) = &self.scan {
             log!(
@@ -941,6 +949,7 @@ impl Element for AviDemux {
             movi.ok_or_else(|| Error::element_failed(ctx.element(), AviError::MoviNotReached))?;
         self.movi_data_start = movi.movi_data_start;
         self.duration_ns = header.duration_ns();
+        self.segmented = riff::segmented(&self.header, &movi, self.file_len);
 
         for stream in &header.streams {
             let family = codec::family_for(stream);
@@ -957,8 +966,8 @@ impl Element for AviDemux {
                 stream_index: stream.index,
                 pad,
                 family,
-                sample_dur_ns: stream.sample_duration_ns(),
-                ticks: 0,
+                clock: stream.clock(),
+                ticks: u64::from(stream.start),
                 gate: 0,
                 started: false,
                 greet: false,
@@ -1020,7 +1029,8 @@ impl Element for AviDemux {
         (self.taken, self.measured, self.teller) =
             (0, rate::ByteRate::default(), rate::Teller::default());
         for ps in &mut self.pad_streams {
-            (ps.started, ps.greet, ps.ticks, ps.gate, ps.junk) = (false, false, 0, 0, 0);
+            let start = u64::from(ps.stream.start);
+            (ps.started, ps.greet, ps.ticks, ps.gate, ps.junk) = (false, false, start, 0, 0);
             (ps.read_to, ps.resume) = (None, None);
             ps.reorder.iter_mut().for_each(Reorder::reset);
         }
@@ -1121,8 +1131,8 @@ impl AviDemux {
                 for (n, ps) in self.pad_streams.iter_mut().enumerate() {
                     (ps.started, ps.greet, ps.read_to, ps.resume) = (false, false, None, None);
                     ps.reorder.iter_mut().for_each(Reorder::reset);
-                    let tick = ps.sample_dur_ns.filter(|ns| *ns > 0);
-                    let at = to.zip(tick).map_or(0, |(to, ns)| (to + ns / 2) / ns);
+                    let clock = ps.clock.filter(|c| c.timed());
+                    let at = to.zip(clock).map_or(0, |(to, c)| c.ticks_near(to));
                     (ps.ticks, ps.gate) = match clocks.and_then(|c| c.get(n)) {
                         Some(&ticks) => (ticks, if ps.is_video { at } else { 0 }),
                         None => (at, 0),
@@ -1159,8 +1169,8 @@ impl AviDemux {
                     continue;
                 }
                 ps.reorder.iter_mut().for_each(Reorder::reset);
-                let tick = ps.sample_dur_ns.filter(|ns| *ns > 0);
-                let at = target.at.nanos().zip(tick).map_or(0, |(to, ns)| (to + ns / 2) / ns);
+                let timed = ps.clock.filter(|c| c.timed());
+                let at = target.at.nanos().zip(timed).map_or(0, |(to, c)| c.ticks_near(to));
                 (ps.ticks, ps.gate) = match clock {
                     Some(ticks) => (ticks, if ps.is_video { at } else { 0 }),
                     None => (at, 0),
@@ -1177,7 +1187,7 @@ impl AviDemux {
             return;
         }
         // units read before the link go out first, the head goes ahead of them now
-        let next = ps.sample_dur_ns.map(|ns| ps.ticks.saturating_mul(ns));
+        let next = ps.clock.map(|c| c.ns(ps.ticks));
         let pts = held.and_then(|r| r.rt.peek()).or(carried.and_then(|c| c.1)).or(next);
         self.greet(ctx, pad, pts);
     }

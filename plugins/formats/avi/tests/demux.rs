@@ -440,13 +440,9 @@ fn byte_sliced_ac3_chunks_come_out_as_frames_stamped_by_their_bytes() {
     assert!(lens.len() >= 19, "whole frames, not slices, got {lens:?}");
     assert!(lens.iter().all(|&n| n == 1792), "{lens:?}");
     let pts: Vec<i64> = audio.buffers.iter().map(|b| b.1).collect();
-    assert_eq!(pts[0], 0);
-    assert_eq!(
-        pts[1],
-        1792 * (1_000_000_000 / 56_000),
-        "a frame is 32 ms of bytes, a byte's tick rounded down"
-    );
-    assert!(pts.windows(2).all(|w| w[1] - w[0] == pts[1]), "{pts:?}");
+    // a byte is 17857.14 ns, rounded down per tick the frames would drift 256 ns each
+    let want: Vec<i64> = (0..pts.len() as i64).map(|k| k * 32_000_000).collect();
+    assert_eq!(pts, want, "a frame is 32 ms of bytes");
     assert_eq!(audio.total_bytes, lens.len() as u64 * 1792);
 }
 
@@ -535,8 +531,9 @@ fn the_buffers_put_out_are_unchanged() {
     let (path, file) = sliced_file(20);
     let sliced = digests(&path, file, 32, Duration::ZERO);
     let _ = std::fs::remove_file(&path);
-    assert_eq!(tiny, [Digest(76, 0x9ed7_62e7_0068_f03b), Digest(87, 0xb1fd_8cd6_fb7c_cf9b)]);
-    assert_eq!(sliced, [Digest(16, 0xe821_b637_bf5a_6b5b), Digest(20, 0x436d_f936_e6d1_2260)]);
+    // the audio stamped by its tick count scaled at once, no longer a rounded down tick apart
+    assert_eq!(tiny, [Digest(76, 0x9ed7_62e7_0068_f03b), Digest(87, 0xf22f_93a9_edcb_673d)]);
+    assert_eq!(sliced, [Digest(16, 0x206c_768b_dea6_55a8), Digest(20, 0xdfe8_7a79_3d12_bc05)]);
     if std::path::Path::new(AC3).exists() {
         let header = std::fs::read(AC3).expect("fixture")[..64 << 10].to_vec();
         let ac3 = digests(AC3, header, 32, Duration::ZERO);
@@ -557,4 +554,125 @@ fn a_pool_that_runs_dry_puts_out_the_same_buffers() {
         assert_eq!(digests(&path, file.clone(), slots, pace), framed, "framed, {slots} slots");
     }
     let _ = std::fs::remove_file(&path);
+}
+
+static ANY_OFFERS: [OfferDesc; 1] = [OfferDesc::wildcard()];
+static ANY_PADS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &ANY_OFFERS }];
+static ANY_DESC: ElementDesc = ElementDesc {
+    name: "stampsink",
+    sinks: &ANY_PADS,
+    srcs: &[],
+    props: &[],
+    sched: SchedHint::Active,
+    inputs: InputPolicy::Single,
+    latency: LatencyDesc::NONE,
+    make_default: None,
+    io: false,
+    couplings: &[],
+};
+
+/// Every media buffer's pts.
+struct StampSink(Arc<Mutex<Vec<i64>>>);
+
+impl Element for StampSink {
+    fn desc(&self) -> &'static ElementDesc {
+        &ANY_DESC
+    }
+    fn process(&mut self, _ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        let mut stamps = self.0.lock().unwrap();
+        while let Some(buf) = inputs.pop() {
+            if !buf.flags.contains(profluens_core::buffer::BufferFlags::HEADER) {
+                stamps.push(buf.pts.nanos().map_or(-1, |n| n as i64));
+            }
+        }
+        Ok(Flow::Ok)
+    }
+}
+
+/// Each pad's stamps of the file `data`, read whole.
+fn stamps(name: &str, data: &[u8]) -> Vec<Vec<i64>> {
+    let path = std::env::temp_dir().join(format!("pf-avi-{name}-{}.avi", std::process::id()));
+    std::fs::write(&path, data).expect("write");
+    let path = path.to_string_lossy().into_owned();
+    let mut p = pf_reactor::pipeline();
+    p.set_pool(1 << 20, 16);
+    let src = p.add(FileSrc::new(&path));
+    let demux = p.add(AviDemux::new(data[..data.len().min(4096)].to_vec()));
+    p.link(src.src(FileSrc::OUT), demux.sink(AviDemux::IN)).expect("src ! demux");
+    let added = p.preroll().expect("preroll").srcs;
+    let mut all = Vec::new();
+    for ap in &added {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let sink = p.add(StampSink(Arc::clone(&got)));
+        p.link(ap.element.src(ap.pad), sink.sink(SinkPad(0))).expect("demux ! sink");
+        all.push(got);
+    }
+    p.run().expect("run");
+    let _ = std::fs::remove_file(&path);
+    all.iter().map(|s| s.lock().unwrap().clone()).collect()
+}
+
+/// A file of 8 bit mono PCM at `rate`, a sample a tick, its `dwStart` `start`, in `chunks`
+/// chunks of `chunk_len` samples, behind 25 fps video chunks of the sizes in `frames`.
+fn pcm_file(rate: u32, start: u32, chunks: usize, chunk_len: usize, frames: &[usize]) -> Vec<u8> {
+    let mut bitmap = vec![0u8; 40];
+    bitmap[0..4].copy_from_slice(&40u32.to_le_bytes());
+    bitmap[4..8].copy_from_slice(&16i32.to_le_bytes());
+    bitmap[8..12].copy_from_slice(&16i32.to_le_bytes());
+    bitmap[16..20].copy_from_slice(b"XVID");
+    let mut wave = 1u16.to_le_bytes().to_vec();
+    wave.extend_from_slice(&1u16.to_le_bytes());
+    wave.extend_from_slice(&rate.to_le_bytes());
+    wave.extend_from_slice(&rate.to_le_bytes());
+    wave.extend_from_slice(&1u16.to_le_bytes());
+    wave.extend_from_slice(&8u16.to_le_bytes());
+    wave.extend_from_slice(&0u16.to_le_bytes());
+    let mut astrh = strh(b"auds", &[0; 4], 1, rate, (chunks * chunk_len) as u32, 1);
+    astrh[8 + 28..8 + 32].copy_from_slice(&start.to_le_bytes());
+    let hdrl = [
+        chunk(b"avih", &[0u8; 56]),
+        list(
+            b"strl",
+            &[strh(b"vids", b"XVID", 1, 25, frames.len() as u32, 0), chunk(b"strf", &bitmap)]
+                .concat(),
+        ),
+        list(b"strl", &[astrh, chunk(b"strf", &wave)].concat()),
+    ]
+    .concat();
+    let mut movi = Vec::new();
+    for &n in frames {
+        movi.extend_from_slice(&chunk(b"00dc", &vec![7; n]));
+    }
+    for k in 0..chunks {
+        movi.extend_from_slice(&chunk(b"01wb", &vec![k as u8; chunk_len]));
+    }
+    chunk(b"RIFF", &[b"AVI ".to_vec(), list(b"hdrl", &hdrl), list(b"movi", &movi)].concat())
+}
+
+/// A tick of 44.1 kHz is 22675.74 ns, rounded down it would put an hour 117 ms early. Stamps
+/// are the tick count scaled at once.
+#[test]
+fn long_tick_counts_are_stamped_without_drift() {
+    let got = stamps("drift", &pcm_file(44_100, 0, 4, 1_000_000, &[8]));
+    let want: Vec<i64> = (0..4).map(|k| k * 1_000_000 * 1_000_000_000 / 44_100).collect();
+    assert_eq!(got[1], want);
+    assert_eq!(want[3], 68_027_210_884, "0.7 s later than a rounded down tick puts it");
+}
+
+/// `dwStart` delays a stream by its ticks, the duration counts them.
+#[test]
+fn a_streams_start_offsets_its_stamps() {
+    let file = pcm_file(8_000, 4_000, 2, 800, &[8, 8, 8]);
+    let got = stamps("start", &file);
+    assert_eq!(got[0], [0, 40_000_000, 80_000_000], "the video starts at once");
+    assert_eq!(got[1], [500_000_000, 600_000_000], "the audio half a second in");
+    let (header, _) = riff::probe_header(&file).expect("probe");
+    assert_eq!((header.streams[1].start, header.duration_ns()), (4_000, Some(700_000_000)));
+}
+
+/// An empty chunk of a stream without a sample size is a dropped frame, it takes its tick.
+#[test]
+fn an_empty_video_chunk_takes_its_frame_time() {
+    let got = stamps("dropped", &pcm_file(8_000, 0, 1, 80, &[8, 0, 0, 8]));
+    assert_eq!(got[0], [0, 120_000_000], "two frames dropped between");
 }

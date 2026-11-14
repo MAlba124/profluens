@@ -351,7 +351,7 @@ impl TrackTable {
                 None => chunk_count,
             };
             // The total is checked below, a run past it is never read.
-            let (first_entry, first_group) = (mapped.min(u64::MAX), grouped);
+            let (first_entry, first_group) = (mapped, grouped);
             let chunks = (end - start) as u64;
             mapped = mapped.saturating_add(chunks * u64::from(run.samples_per_chunk));
             grouped = grouped

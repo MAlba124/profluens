@@ -239,6 +239,8 @@ pub struct VaapiAv1Dec {
     in_flight: Vec<(ffi::VASurfaceID, FrameToken)>,
     link: Option<(u32, u64)>,
     only: bool,
+    /// leaves the film grain off every picture
+    no_grain: bool,
 }
 
 // SAFETY: `SchedHint::Active`, the element runs on one scheduler thread and never
@@ -261,6 +263,12 @@ impl VaapiAv1Dec {
 
     pub fn new_zerocopy(channel: Arc<GpuFrameChannel>) -> Self {
         Self::with_zerocopy(Some(channel))
+    }
+
+    /// With false the pictures go out without their film grain.
+    pub fn with_film_grain(mut self, apply: bool) -> Self {
+        self.no_grain = !apply;
+        self
     }
 
     // Cold: once per element. The lists are sized for their bound here.
@@ -297,6 +305,7 @@ impl VaapiAv1Dec {
             in_flight: Vec::with_capacity(16),
             link: None,
             only: false,
+            no_grain: false,
         }
     }
 
@@ -501,7 +510,7 @@ impl VaapiAv1Dec {
         loop {
             let quiet = self.dpb.awaiting_key();
             // a parse error resets the parser and waits for a key frame
-            let frame = match self.dpb.next_frame(tu, &mut at) {
+            let mut frame = match self.dpb.next_frame(tu, &mut at) {
                 Ok(Some(f)) => f,
                 Ok(None) => return,
                 Err(e) => return self.lose(ctx, quiet, Some(K::Av1Stream(e))),
@@ -510,6 +519,7 @@ impl VaapiAv1Dec {
                 // A new sequence starts at a key frame, section 7.5.
                 log!(&*ctx, Level::Debug, "seq_change", key = false, pts = pts);
             }
+            frame.header.film_grain.apply_grain &= !self.no_grain;
             if !self.frame(ctx, tu, &frame, pts, duration) {
                 return;
             }

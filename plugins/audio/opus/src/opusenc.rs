@@ -98,11 +98,13 @@ static SRC_OFFERS: [OfferDesc; 2] = [OfferDesc::any(FAMILY_OPUS), OfferDesc::any
 static SINKS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &SINK_OFFERS }];
 static SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: &SRC_OFFERS }];
 
-/// `bitrate` 0 derives from channels, `vbr` 0 is CBR, `complexity` 0 to 10, `aligned` 1 puts
-/// frames on absolute multiples of the frame duration.
-static PROPS: [PropDesc; 4] = [
+/// `bitrate` 0 derives from channels, `vbr` 0 is CBR, `constrained` 1 holds VBR to the
+/// bitrate within a frame, `complexity` 0 to 10, `aligned` 1 puts frames on absolute multiples
+/// of the frame duration.
+static PROPS: [PropDesc; 5] = [
     PropDesc { name: "bitrate", allowed: Constraint::Any, live: true },
     PropDesc { name: "vbr", allowed: Constraint::Any, live: false },
+    PropDesc { name: "constrained", allowed: Constraint::Any, live: false },
     PropDesc { name: "complexity", allowed: Constraint::Any, live: false },
     PropDesc { name: "aligned", allowed: Constraint::Any, live: false },
 ];
@@ -128,6 +130,7 @@ pub struct OpusEnc {
     frame_ms_tenths: u16,
     application: Application,
     vbr: bool,
+    constrained: bool,
     complexity: u8,
     aligned: bool,
     enc: Option<Box<dyn EncBackend>>,
@@ -161,6 +164,7 @@ impl OpusEnc {
             frame_ms_tenths: DEFAULT_FRAME_TENTHS,
             application: Application::Audio,
             vbr: true,
+            constrained: false,
             complexity: 10,
             aligned: false,
             enc: None,
@@ -186,6 +190,14 @@ impl OpusEnc {
     /// The bitrate, bit/s, 0 derives from the channels. The `bitrate` prop moves it live.
     pub fn with_bitrate(mut self, bps: u32) -> Self {
         self.bitrate_bps = bps;
+        self
+    }
+
+    /// VBR held to the bitrate, a frame's worth of it over at most. Unconstrained, a dense
+    /// signal runs well over the bitrate for as long as it lasts, which a sender that budgets
+    /// a link by the bitrate does not see.
+    pub fn constrained(mut self) -> Self {
+        self.constrained = true;
         self
     }
 
@@ -382,6 +394,7 @@ impl OpusEnc {
             application: self.application,
             frame_ms_tenths: self.frame_ms_tenths,
             vbr: self.vbr,
+            vbr_constrained: self.constrained,
             complexity: self.complexity,
             ..EncoderConfig::new(channels as u8)
         };
@@ -394,14 +407,15 @@ impl OpusEnc {
                     channels = channels,
                     bitrate = bitrate,
                     vbr = self.vbr,
-                    complexity = self.complexity
+                    constrained = self.constrained
                 );
                 log!(
                     &*ctx,
                     Level::Debug,
                     "frame",
                     tenths_ms = self.frame_ms_tenths,
-                    bytes = enc.frame_bytes()
+                    bytes = enc.frame_bytes(),
+                    complexity = self.complexity
                 );
                 self.frame_bytes = enc.frame_bytes();
                 self.channels = channels;
@@ -519,6 +533,9 @@ impl Element for OpusEnc {
         }
         if let Some(Value::Int(v)) = ctx.prop("vbr") {
             self.vbr = v != 0;
+        }
+        if let Some(Value::Int(v)) = ctx.prop("constrained") {
+            self.constrained = v != 0;
         }
         if let Some(Value::Int(c)) = ctx.prop("complexity") {
             self.complexity = c.clamp(0, 10) as u8;

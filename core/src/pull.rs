@@ -72,6 +72,8 @@ pub(crate) struct Port {
     pub(crate) out: u32,
     pub(crate) over: bool,
     pub(crate) reset: Option<SeekTarget>,
+    /// The source reads its ranges one at a time in the order asked, told to the consumer.
+    pub(crate) in_order: bool,
 }
 
 impl Port {

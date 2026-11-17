@@ -116,7 +116,7 @@ fn tmp(name: &str) -> PathBuf {
 fn a_file_is_created_written_read_stat_renamed_and_unlinked() {
     let mut r = rig(4096);
     let (a, b) = (tmp("file-a"), tmp("file-b"));
-    let IoResult::File { handle: w, len: 0 } = r.open(&a, OpenMode::Create) else {
+    let IoResult::File { handle: w, len: 0, .. } = r.open(&a, OpenMode::Create) else {
         panic!("create")
     };
     let first = r.submit(Op::Write { handle: w, offset: 0 }, Some(r.buf(b"hello ")));
@@ -127,7 +127,7 @@ fn a_file_is_created_written_read_stat_renamed_and_unlinked() {
 
     assert_eq!(
         r.path_op(&a, |path| Op::Stat { path }),
-        IoResult::File { handle: Handle::NONE, len: 13 }
+        IoResult::File { handle: Handle::NONE, len: 13, in_order: false }
     );
     let both = [a.as_os_str().as_encoded_bytes(), b.as_os_str().as_encoded_bytes()].concat();
     let (la, lb) = (a.as_os_str().len() as u32, b.as_os_str().len() as u32);
@@ -136,7 +136,7 @@ fn a_file_is_created_written_read_stat_renamed_and_unlinked() {
     assert_eq!(r.wait(op).result, IoResult::Ok(0));
     assert_eq!(r.open(&a, OpenMode::Read), IoResult::Err(IoError::NotFound));
 
-    let IoResult::File { handle, len: 13 } = r.open(&b, OpenMode::Read) else { panic!("open") };
+    let IoResult::File { handle, len: 13, .. } = r.open(&b, OpenMode::Read) else { panic!("open") };
     let read = r.submit(Op::Read { handle, offset: 6, at: 0, len: u32::MAX }, Some(r.buf(b"")));
     let got = r.wait(read);
     assert_eq!(got.result, IoResult::Ok(7));
@@ -493,7 +493,9 @@ fn a_reactor_of_files_reads_them_and_on_epoll_waits_on_nothing() {
     let mut r = Rig { r: super::make_files(), pool: Pool::new(64), next: 0, seen: Vec::new() };
     let path = tmp("files-only");
     std::fs::write(&path, b"only files").expect("fixture");
-    let IoResult::File { handle, len: 10 } = r.open(&path, OpenMode::Read) else { panic!("open") };
+    let IoResult::File { handle, len: 10, .. } = r.open(&path, OpenMode::Read) else {
+        panic!("open")
+    };
     let read = r.submit(Op::Read { handle, offset: 5, at: 0, len: u32::MAX }, Some(r.buf(b"")));
     assert_eq!(r.wait(read).buf.expect("the buffer rides back").memory.data(), b"files");
     let pipe = fifo("files-only-pipe");
@@ -522,7 +524,7 @@ fn a_pipe_opens_with_no_writer_and_its_read_waits_is_cancelled_and_ends() {
     let mut r = rig(64);
     let path = fifo("pipe");
     let began = Instant::now();
-    let IoResult::File { handle, len: NO_LEN } = r.open(&path, OpenMode::Read) else {
+    let IoResult::File { handle, len: NO_LEN, .. } = r.open(&path, OpenMode::Read) else {
         panic!("open")
     };
     assert!(began.elapsed() < Duration::from_secs(2), "the open waited for a writer");
@@ -562,7 +564,7 @@ fn an_adopted_file_reads_on_a_descriptor_of_its_own() {
     let file = std::fs::File::open(&a).expect("open");
     let fd = file.as_raw_fd();
     let op = r.submit(Op::Adopt { fd, mode: OpenMode::Read }, None);
-    let IoResult::File { handle, len: 9 } = r.wait(op).result else { panic!("adopt") };
+    let IoResult::File { handle, len: 9, .. } = r.wait(op).result else { panic!("adopt") };
     drop(file);
     std::fs::remove_file(&a).expect("unlink");
     let read = r.submit(Op::Read { handle, offset: 5, at: 0, len: u32::MAX }, Some(r.buf(b"")));

@@ -912,6 +912,14 @@ impl Ctx {
         }
     }
 
+    /// Whether the ranges of src pad `pad` are read one at a time in the order asked, as a file
+    /// on a slow disk is. The consumer then asks fewer and longer ones.
+    pub fn serve_in_order(&mut self, pad: SrcPad, in_order: bool) {
+        if pad.0 == 0 {
+            self.serving.in_order = in_order;
+        }
+    }
+
     /// Takes the offer back, from `process` before any range is served.
     pub fn withdraw_ranges(&mut self, pad: SrcPad) {
         if pad.0 == 0 && self.serving.mode != Mode::Off {
@@ -956,6 +964,12 @@ impl Ctx {
     /// Whether sink pad `pad` pulls ranges from its source.
     pub fn pulls(&self, pad: SinkPad) -> bool {
         pad.0 == 0 && self.pulling.is_on()
+    }
+
+    /// Whether the source of sink pad `pad` reads its ranges one at a time in the order asked,
+    /// false until it has said so.
+    pub fn pulls_in_order(&self, pad: SinkPad) -> bool {
+        self.pulls(pad) && self.pulling.in_order
     }
 
     /// Ranges sink pad `pad` may still ask before one is served.

@@ -1,5 +1,6 @@
-//! The samples a pulled `mp4demux` asked for, in file order. Each sample or run of small
-//! neighbours is one range read, served in any order and paired by tag.
+//! The samples a pulled `mp4demux` asked for, in file order. A sample and the small neighbours
+//! behind it are one range read, served in any order and paired by tag. A source that reads in
+//! order takes each range one turn through the reactor, so there the ranges are few and long.
 
 use std::collections::VecDeque;
 
@@ -8,8 +9,20 @@ use profluens_core::pull::RangeError;
 
 use crate::reader::{Sample, SampleId};
 
+/// The largest sample that shares a range and is copied out of it. A larger one is read alone
+/// and reframed where it lies.
 pub(crate) const SMALL: u32 = 64 << 10;
+/// The most a range of several samples reads.
 pub(crate) const RUN: u32 = 256 << 10;
+/// A source that reads in order is asked ranges of at most one part in this many of what was
+/// asked since the restart, where the samples are copied out of them. The reads behind a seek
+/// stay the size of its samples, so the next seek waits for no more than it did, and a long read
+/// comes to [`RUN`] within 16 MiB. With a part in 8 a USB disk read three times the bytes behind
+/// a seek, and a seek 150 ms after it took 16 ms against 14.
+const RAMP: u64 = 64;
+/// The most bytes between two samples of a range a source reads in order, a track that is off
+/// stored there. Reading them costs less than a read of its own.
+pub(crate) const GAP: u32 = 64 << 10;
 
 pub(crate) enum State {
     Waiting,
@@ -37,14 +50,52 @@ pub(crate) struct Plan {
     pub(crate) ranges: u32,
     pub(crate) asked_all: bool,
     pub(crate) warned: bool,
+    /// The pool charge of the ranges asked since the last reset.
+    asked: u64,
 }
 
 impl Plan {
     pub(crate) fn reset(&mut self) -> Option<SampleId> {
         let first = self.items.front().map(|p| p.index);
         self.items.clear();
-        (self.held, self.ranges, self.asked_all) = (0, 0, false);
+        (self.held, self.ranges, self.asked_all, self.asked) = (0, 0, false, 0);
         first
+    }
+
+    /// The most a range read in order and copied out of reads now, see [`RAMP`].
+    pub(crate) fn run(&self) -> u32 {
+        (self.asked / RAMP).min(u64::from(RUN)) as u32
+    }
+
+    /// Plans `first` and the samples behind it that share its range, each `small`, no more than
+    /// `gap` past the one before and the range within `room`. Gives the range's length and the
+    /// sample taken from `next` that did not join, for the walk to go back to.
+    pub(crate) fn join(
+        &mut self,
+        (index, first): (SampleId, Sample),
+        (room, gap): (u32, u32),
+        small: impl Fn(&Sample) -> bool,
+        mut next: impl FnMut() -> Option<(SampleId, Sample)>,
+    ) -> (u32, Option<SampleId>) {
+        self.push(index, first, 0);
+        let room = u64::from(room);
+        let mut len = first.size();
+        if !small(&first) {
+            return (len, None);
+        }
+        while let Some((i, s)) = next() {
+            let past = s.offset().checked_sub(first.offset() + u64::from(len));
+            let at = match past {
+                Some(past) if past <= u64::from(gap) && small(&s) => u64::from(len) + past,
+                _ => return (len, Some(i)),
+            };
+            if at + u64::from(s.size()) > room {
+                return (len, Some(i));
+            }
+            self.push(i, s, at as u32);
+            len = at as u32 + s.size();
+        }
+        (len, None)
     }
 
     pub(crate) fn push(&mut self, index: SampleId, sample: Sample, at: u32) {
@@ -57,6 +108,7 @@ impl Plan {
         if let Some(last) = last {
             last.last_of = charge;
             (self.held, self.ranges) = (self.held + charge as u64, self.ranges + 1);
+            self.asked += u64::from(charge);
         }
         self.next_tag += 1;
     }
@@ -168,6 +220,80 @@ mod tests {
         assert!(matches!(out[1].state, State::Ready(_, false)));
         assert!(matches!(out[2].state, State::Empty));
         assert_eq!((plan.held, plan.ranges), (0, 0));
+    }
+
+    /// The range `plan` joins from the head of `walk`, its length and how much of the walk is left.
+    fn joined(plan: &mut Plan, walk: &[(u64, u32)], small: u32, room: u32) -> (u32, usize) {
+        let mut all =
+            walk.iter().enumerate().map(|(n, &(at, size))| (id(n as u32), sample(at, size)));
+        let (first, before) = (all.next().expect("a first sample"), plan.items.len());
+        let (len, past) = plan.join(first, (room, GAP), |s| s.size() <= small, || all.next());
+        let left = walk.len() - (plan.items.len() - before);
+        assert_eq!(past.is_some(), left > 0 && walk[0].1 <= small, "one not joined is given back");
+        (len, left)
+    }
+
+    #[test]
+    fn samples_of_any_track_join_over_short_gaps_up_to_the_room() {
+        let pool = Pool::new(1 << 16);
+        let k = 1 << 10;
+        let mut plan = Plan::default();
+        // a gap behind the second, then one past the most read through
+        let walk = [(100, 30 * k), (100 + 30 * u64::from(k), 500), (100 + 32 * u64::from(k), k)];
+        let far =
+            [walk.to_vec(), vec![(100 + 33 * u64::from(k) + u64::from(GAP) + 1, 10)]].concat();
+        assert_eq!(joined(&mut plan, &far, SMALL, RUN), (33 * k, 1), "the far one starts its own");
+        plan.asked(33 * k);
+        let bytes: Vec<u8> = (0..33 * k).map(|n| (n % 251) as u8).collect();
+        plan.served(0, filled(&pool, &bytes)).expect("whole");
+        for (at, size) in [(0, 30 * k), (30 * k, 500), (32 * k, k)] {
+            let p = plan.pop_ready().expect("ready");
+            assert_eq!(data(&p), bytes[at as usize..(at + size) as usize], "the sample at {at}");
+        }
+
+        let mut plan = Plan::default();
+        assert_eq!(
+            joined(&mut plan, &walk, SMALL, 31 * k),
+            (30 * k + 500, 1),
+            "no room for the third"
+        );
+        let mut plan = Plan::default();
+        let big = [(0, SMALL + 1), (u64::from(SMALL) + 1, 10)];
+        assert_eq!(joined(&mut plan, &big, SMALL, RUN), (SMALL + 1, 1), "a large one reads alone");
+        let mut plan = Plan::default();
+        let behind = [(0, 10), (10, SMALL + 1)];
+        assert_eq!(joined(&mut plan, &behind, SMALL, RUN), (10, 1), "and joins no range");
+        let mut plan = Plan::default();
+        let back = [(500, 10), (400, 10)];
+        assert_eq!(joined(&mut plan, &back, SMALL, RUN), (10, 1), "nor one stored before");
+        let mut plan = Plan::default();
+        let (first, mut rest) = ((id(0), sample(0, 10)), [(id(1), sample(11, 10))].into_iter());
+        let (len, past) = plan.join(first, (RUN, 0), |_| true, || rest.next());
+        assert_eq!((len, past), (10, Some(id(1))), "nor one past a gap where none is read");
+    }
+
+    #[test]
+    fn a_range_reads_a_share_of_what_its_restart_asked_before_it() {
+        const FRAME: u32 = 4096;
+        let frames: Vec<(u64, u32)> = (0..20_000).map(|n| (n * u64::from(FRAME), FRAME)).collect();
+        let mut plan = Plan::default();
+        for round in 0..2 {
+            let (mut left, mut asked, mut lens) = (&frames[..], 0u64, Vec::new());
+            while asked < 2 * RAMP * u64::from(RUN) {
+                let run = plan.run();
+                let (len, rest) = joined(&mut plan, left, SMALL, run);
+                assert!(u64::from(len) <= (asked / RAMP).max(u64::from(FRAME)), "{len} at {asked}");
+                plan.asked(len);
+                asked += u64::from(len);
+                lens.push(len);
+                left = &left[left.len() - rest..];
+            }
+            let alone = lens.iter().take_while(|len| **len == FRAME).count();
+            assert_eq!(alone as u64, 2 * RAMP, "round {round}, each alone until two fit the share");
+            assert!(lens.windows(2).all(|w| w[0] <= w[1]), "round {round}");
+            assert_eq!(lens.last(), Some(&RUN), "round {round}");
+            plan.reset();
+        }
     }
 
     #[test]

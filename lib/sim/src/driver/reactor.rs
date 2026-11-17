@@ -399,12 +399,15 @@ impl SimReactor {
                 IoResult::File {
                     handle: self.insert(What::File(at)),
                     len: w.files[at].data.len() as u64,
+                    in_order: false,
                 }
             }
             Op::Stat { path } => match find(w, path.of(names)) {
-                Some(i) => {
-                    IoResult::File { handle: Handle::NONE, len: w.files[i].data.len() as u64 }
-                }
+                Some(i) => IoResult::File {
+                    handle: Handle::NONE,
+                    len: w.files[i].data.len() as u64,
+                    in_order: false,
+                },
                 None => IoResult::Err(IoError::NotFound),
             },
             // An open handle keeps its index, so an entry that loses its name is emptied in place.

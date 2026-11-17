@@ -23,7 +23,7 @@ use profluens_video::format::COLOR_OFFER_FIELDS;
 
 use crate::boxes::FourCc;
 use crate::codec::{self, Reframer};
-use crate::pull::{Plan, RUN, SMALL, State};
+use crate::pull::{GAP, Plan, RUN, SMALL, State};
 use crate::reader::{Keyed, Limits, Mp4Error, Mp4Reader, ResolvedSample, SamplePayload};
 
 static SINK_OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
@@ -882,15 +882,20 @@ impl Mp4Demux {
             return;
         };
         let AskCaps { bytes, ranges, small: most } = self.ask_caps;
-        let pad_tracks = &self.pad_tracks;
+        // A source that reads in order is asked few long ranges, the samples of every track
+        // copied out of them. One that reads them at once keeps a sample that is reframed in a
+        // buffer of its own, rewritten where it lies.
+        let in_order = ctx.pulls_in_order(Self::IN);
+        let (pad_tracks, remux) = (&self.pad_tracks, self.passthrough);
         let small = |s: &crate::reader::Sample| {
-            let passthrough = pad_tracks
+            let as_is = pad_tracks
                 .get(s.track())
                 .is_some_and(|pt| matches!(pt.reframer, Reframer::Passthrough));
-            s.size() <= most && passthrough
+            s.size() <= most && (in_order || as_is)
         };
+        let gap = if in_order { GAP } else { 0 };
         while ctx.asks_left(Self::IN) > 0 && self.plan.held < bytes && self.plan.ranges < ranges {
-            let Some((index, first)) = reader.next_wanted() else {
+            let Some(first) = reader.next_wanted() else {
                 // a landing may go back for an earlier sample while one is planned
                 let held = reader.is_landing() && !self.plan.items.is_empty();
                 if !self.plan.asked_all && !held {
@@ -900,20 +905,11 @@ impl Mp4Demux {
                 }
                 return;
             };
-            self.plan.push(index, first, 0);
-            let mut len = first.size();
-            let run = RUN.min(within(bytes - self.plan.held));
-            while small(&first) {
-                let Some((i, s)) = reader.next_wanted() else {
-                    break;
-                };
-                if s.offset() != first.offset() + len as u64 || !small(&s) || len + s.size() > run {
-                    reader.rewind_to(i);
-                    break;
-                }
-                self.plan.push(i, s, len);
-                len += s.size();
-            }
+            // a remux puts samples out as views of their range, a small pool needs many to one
+            let run = if in_order && !remux { self.plan.run() } else { RUN };
+            let (offset, room) = (first.1.offset(), run.min(within(bytes - self.plan.held)));
+            let (len, past) = self.plan.join(first, (room, gap), small, || reader.next_wanted());
+            past.inspect(|at| reader.rewind_to(*at));
             if len == 0 {
                 self.plan.asked(0);
                 continue;
@@ -927,9 +923,9 @@ impl Mp4Demux {
             match ctx.try_alloc_sized(len as usize) {
                 Ok(Some(buf)) => {
                     let charge = buf.memory.capacity().min(u32::MAX as usize) as u32;
-                    let ask = Ask { offset: first.offset(), len, tag: self.plan.next_tag, buf };
+                    let ask = Ask { offset, len, tag: self.plan.next_tag, buf };
                     if ctx.ask(Self::IN, ask).is_err() {
-                        log!(&*ctx, Level::Debug, "ask_refused", at = first.offset(), bytes = len);
+                        log!(&*ctx, Level::Debug, "ask_refused", at = offset, bytes = len);
                         self.plan.unplan().inspect(|at| reader.rewind_to(*at));
                         return;
                     }

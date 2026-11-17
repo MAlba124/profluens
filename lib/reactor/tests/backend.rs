@@ -11,6 +11,20 @@ fn make() -> Box<dyn Reactor> {
     Box::new(pf_reactor::OsReactor::on(WANT).expect("a ring on this kernel"))
 }
 
+/// Reads of each file one at a time in submission order, whatever the storage.
+fn make_in_order() -> Box<dyn Reactor> {
+    let mut r = pf_reactor::OsReactor::on(WANT).expect("a ring on this kernel");
+    r.set_reads(pf_reactor::Reads::InOrder);
+    Box::new(r)
+}
+
+/// Reads of each file as many at once as asked, whatever the storage.
+fn make_free() -> Box<dyn Reactor> {
+    let mut r = pf_reactor::OsReactor::on(WANT).expect("a ring on this kernel");
+    r.set_reads(pf_reactor::Reads::Free);
+    Box::new(r)
+}
+
 fn make_files() -> Box<dyn Reactor> {
     Box::new(pf_reactor::OsReactor::files(WANT, 32).expect("a ring on this kernel"))
 }

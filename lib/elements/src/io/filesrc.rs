@@ -16,7 +16,7 @@ use profluens_core::error::Error;
 use profluens_core::event::Event;
 use profluens_core::format::{Constraint, OfferDesc};
 use profluens_core::id::SrcPad;
-use profluens_core::io::{Handle, IoResult, NO_LEN, OpenMode};
+use profluens_core::io::{Handle, IoResult, NO_LEN, OpId, OpenMode};
 use profluens_core::log;
 use profluens_core::log::Level;
 use profluens_core::pipeline::Serves;
@@ -94,6 +94,8 @@ pub struct FileSrc {
     once: bool,
     offer: bool,
     ranges: Vec<Option<Range>>,
+    /// Reads on the reactor by `seq`, cancelled at a flush so a slow disk is free for the seek's.
+    flying: Vec<(u64, OpId)>,
 }
 
 impl FileSrc {
@@ -121,6 +123,7 @@ impl FileSrc {
             once: false,
             offer: true,
             ranges: Vec::new(),
+            flying: Vec::new(),
         }
     }
 
@@ -191,10 +194,25 @@ impl FileSrc {
 }
 
 impl FileSrc {
+    fn landed(&mut self, seq: u64) {
+        if let Some(i) = self.flying.iter().position(|f| f.0 == seq) {
+            self.flying.swap_remove(i);
+        }
+    }
+
+    /// Cancel every read on the reactor. One that started still lands, its completion is
+    /// dropped below the `seq` floor like the rest.
+    fn cancel_flying(&mut self, ctx: &mut Ctx) {
+        for (_, op) in self.flying.drain(..) {
+            ctx.io().cancel(op);
+        }
+    }
+
     fn open_done(&mut self, ctx: &mut Ctx, result: IoResult) -> Result<(), Error> {
         match result {
-            IoResult::File { handle, len } => {
+            IoResult::File { handle, len, in_order } => {
                 (self.file, self.piped) = (handle, len == NO_LEN);
+                ctx.serve_in_order(Self::OUT, in_order);
                 log!(&*ctx, Level::Info, "open", len = len, piped = len == NO_LEN);
                 Ok(())
             }
@@ -218,6 +236,7 @@ impl FileSrc {
                 continue;
             }
             self.in_flight = self.in_flight.saturating_sub(1);
+            self.landed(c.user);
             let Some(at) = self.ranges.iter().position(|r| r.is_some_and(|r| r.seq == c.user))
             else {
                 continue; // a read a seek left, its buffer goes back to the consumer's pool
@@ -230,7 +249,9 @@ impl FileSrc {
                     r.got += n as u32;
                     if n > 0 && r.got < r.len {
                         let off = r.offset + r.got as u64;
-                        ctx.io().read_range(self.file, off, r.got, r.len - r.got, buf, r.seq);
+                        let op =
+                            ctx.io().read_range(self.file, off, r.got, r.len - r.got, buf, r.seq);
+                        self.flying.push((r.seq, op));
                         self.in_flight += 1;
                         self.ranges[at] = Some(r);
                         continue;
@@ -261,7 +282,8 @@ impl FileSrc {
             };
             let seq = self.seq;
             self.seq += 1;
-            ctx.io().read_range(self.file, ask.offset, 0, ask.len, ask.buf, seq);
+            let op = ctx.io().read_range(self.file, ask.offset, 0, ask.len, ask.buf, seq);
+            self.flying.push((seq, op));
             self.ranges[free] =
                 Some(Range { seq, tag: ask.tag, offset: ask.offset, len: ask.len, got: 0 });
             self.in_flight += 1;
@@ -311,6 +333,8 @@ impl Element for FileSrc {
             self.window.resize_with(depth, Slot::default);
             self.wmask = depth as u64 - 1;
             self.ranges.resize(ctx.io().credits() as usize, None);
+            self.flying.clear();
+            self.flying.reserve(ctx.io().credits() as usize);
         }
         if self.offer {
             ctx.offer_ranges(Self::OUT);
@@ -339,8 +363,9 @@ impl Element for FileSrc {
             };
             if c.user == OPEN {
                 match c.result {
-                    IoResult::File { handle, len } => {
+                    IoResult::File { handle, len, in_order } => {
                         (self.file, self.piped) = (handle, len == NO_LEN);
+                        ctx.serve_in_order(Self::OUT, in_order);
                         log!(&*ctx, Level::Info, "open", len = len, piped = len == NO_LEN);
                     }
                     IoResult::Err(kind) => {
@@ -355,6 +380,7 @@ impl Element for FileSrc {
                 continue;
             }
             self.in_flight = self.in_flight.saturating_sub(1);
+            self.landed(c.user);
             if c.user < self.valid_from {
                 continue; // read submitted before a seek: wrong offset, discard (buf recycles)
             }
@@ -426,10 +452,11 @@ impl Element for FileSrc {
             };
             self.window[slot].offset = self.offset;
             self.seq += 1;
-            match self.piped {
+            let op = match self.piped {
                 true => ctx.io().recv(self.file, buf, user),
                 false => ctx.io().read(self.file, self.offset, buf, user),
             };
+            self.flying.push((user, op));
             self.offset += cap;
             self.in_flight += 1;
         }
@@ -443,6 +470,9 @@ impl Element for FileSrc {
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        if matches!(event, Event::FlushStart) {
+            self.cancel_flying(ctx);
+        }
         if matches!(event, Event::FlushStart) && ctx.pulled(Self::OUT) {
             log!(&*ctx, Level::Debug, "flush", in_flight = self.in_flight);
             self.valid_from = self.seq;

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -67,8 +68,14 @@ fn ramp(len: usize) -> Vec<u8> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Got {
     Reset(u64),
-    Range { offset: u64, want: u32, bytes: Vec<u8> },
+    Range {
+        offset: u64,
+        want: u32,
+        bytes: Vec<u8>,
+    },
     Pushed(usize),
+    /// The source said it reads in order.
+    InOrder,
 }
 
 struct Puller {
@@ -80,13 +87,15 @@ struct Puller {
     seq: u64,
     asked: HashMap<u64, (u64, u32)>,
     over: bool,
+    told: bool,
     got: Arc<Mutex<Vec<Got>>>,
 }
 
 impl Puller {
     fn new(chunk: u32, end: u64, take: usize, got: Arc<Mutex<Vec<Got>>>) -> Puller {
         let asked = HashMap::new();
-        Puller { chunk, end, take, next: 0, epoch: 0, seq: 0, asked, over: false, got }
+        let (over, told) = (false, false);
+        Puller { chunk, end, take, next: 0, epoch: 0, seq: 0, asked, over, told, got }
     }
 }
 
@@ -105,6 +114,10 @@ impl Element for Puller {
             (self.next, self.over, self.epoch) = (from.to_byte, false, self.epoch + 1);
             self.asked.clear();
             self.got.lock().unwrap().push(Got::Reset(from.to_byte));
+        }
+        if !self.told && ctx.pulls_in_order(IN) {
+            self.told = true;
+            self.got.lock().unwrap().push(Got::InOrder);
         }
         if !ctx.pulls(IN) {
             while let Some(buf) = inputs.pop() {
@@ -147,7 +160,8 @@ impl Element for Puller {
     }
 }
 
-/// An in-memory reactor that completes, splits and fails reads by seed.
+/// An in-memory reactor that completes, splits and fails reads by seed, and cancels the ones it
+/// still holds.
 struct Mem {
     data: Arc<Vec<u8>>,
     held: Vec<Submission>,
@@ -155,20 +169,37 @@ struct Mem {
     rng: Rng,
     split: bool,
     fail_at: Option<u64>,
+    in_order: bool,
+    cancelled: Arc<AtomicUsize>,
 }
 
 impl Reactor for Mem {
     fn submit(&mut self, subs: &mut Vec<Submission>, _names: &[u8]) {
         for s in subs.drain(..) {
             let result = match s.kind {
-                Op::Open { .. } => {
-                    IoResult::File { handle: Handle::new(1, 1), len: self.data.len() as u64 }
-                }
+                Op::Open { .. } => IoResult::File {
+                    handle: Handle::new(1, 1),
+                    len: self.data.len() as u64,
+                    in_order: self.in_order,
+                },
                 Op::Read { .. } => {
                     self.held.push(s);
                     continue;
                 }
-                Op::Cancel { .. } => continue,
+                Op::Cancel { target } => {
+                    if let Some(i) = self.held.iter().position(|h| h.op == target) {
+                        let h = self.held.swap_remove(i);
+                        self.cancelled.fetch_add(1, Ordering::Relaxed);
+                        let c = Completion {
+                            op: h.op,
+                            user: h.user,
+                            result: IoResult::Cancelled,
+                            buf: h.buf,
+                        };
+                        self.done.push((h.element, c));
+                    }
+                    continue;
+                }
                 _ => IoResult::Ok(0),
             };
             self.done.push((s.element, Completion { op: s.op, user: s.user, result, buf: s.buf }));
@@ -223,6 +254,7 @@ struct Plan {
     split: bool,
     fail_at: Option<u64>,
     seek_after: Option<(usize, u64)>,
+    in_order: bool,
 }
 
 const PLAN: Plan = Plan {
@@ -233,19 +265,31 @@ const PLAN: Plan = Plan {
     split: true,
     fail_at: None,
     seek_after: None,
+    in_order: false,
 };
 
 fn stepped(plan: &Plan, seed: u64) -> (Result<(), Error>, Vec<Got>) {
+    let (result, got, _) = stepped_counting(plan, seed);
+    (result, got)
+}
+
+/// A run and the reads the reactor cancelled while it held them.
+fn stepped_counting(plan: &Plan, seed: u64) -> (Result<(), Error>, Vec<Got>, usize) {
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&cancelled);
     let data = Arc::new(ramp(plan.len));
     let clock = MockClock::new();
     let shared: Arc<dyn Clock> = Arc::new(clock.clone());
     let mut p = Pipeline::with(DebugSpec::default(), false, Arc::clone(&shared));
-    let (split, fail_at) = (plan.split, plan.fail_at);
+    let (split, fail_at, in_order) = (plan.split, plan.fail_at, plan.in_order);
     let world = Arc::clone(&data);
     let factory: ReactorFactory = Arc::new(move || {
         let held = Vec::new();
         let rng = Rng(seed);
-        Ok(Box::new(Mem { data: Arc::clone(&world), held, done: Vec::new(), rng, split, fail_at })
+        let cancelled = Arc::clone(&counted);
+        let world = Arc::clone(&world);
+        let done = Vec::new();
+        Ok(Box::new(Mem { data: world, held, done, rng, split, fail_at, in_order, cancelled })
             as Box<dyn Reactor>)
     });
     p.set_reactor_factory(factory);
@@ -288,7 +332,7 @@ fn stepped(plan: &Plan, seed: u64) -> (Result<(), Error>, Vec<Got>) {
         run.finish().map(drop)
     });
     let got = got.lock().unwrap().clone();
-    (result, got)
+    (result, got, cancelled.load(Ordering::Relaxed))
 }
 
 fn after_reset(got: &[Got]) -> (u64, Vec<(u64, u32, Vec<u8>)>) {
@@ -318,6 +362,22 @@ fn assert_whole(data: &[u8], plan: &Plan, from: u64, ranges: &[(u64, u32, Vec<u8
         at += *want as u64;
     }
     assert!(at >= plan.end);
+}
+
+/// The reactor says with the open whether the file's reads go out in order, and the source
+/// passes it on with its ranges, across a seek too.
+#[test]
+fn a_consumer_is_told_a_source_whose_reads_go_out_in_order() {
+    let told = |got: &[Got]| got.iter().filter(|g| matches!(g, Got::InOrder)).count();
+    let (result, got) = stepped(&PLAN, 1);
+    result.expect("the run");
+    assert_eq!(told(&got), 0, "a file read freely");
+    let plan = Plan { in_order: true, seek_after: Some((3, 30_000)), ..PLAN };
+    let (result, got) = stepped(&plan, 1);
+    result.expect("the run");
+    assert_eq!(told(&got), 1);
+    let (from, ranges) = after_reset(&got);
+    assert_whole(&ramp(plan.len), &plan, from, &ranges);
 }
 
 #[test]
@@ -352,6 +412,21 @@ fn a_seek_drops_the_reads_in_flight_and_the_pull_restarts_at_its_byte() {
         let (from, ranges) = after_reset(&got);
         assert_whole(&ramp(plan.len), &plan, from, &ranges);
     }
+}
+
+#[test]
+fn a_seek_cancels_the_reads_it_leaves_on_the_reactor_and_serves_whole_ranges_after() {
+    let mut cancelled = 0;
+    for seed in 0..40 {
+        let plan = Plan { take: 1, split: false, seek_after: Some((4, 21_000)), ..PLAN };
+        let (result, got, n) = stepped_counting(&plan, seed);
+        result.expect("the run");
+        let (from, ranges) = after_reset(&got);
+        assert_eq!(from, 21_000, "seed {seed}");
+        assert_whole(&ramp(plan.len), &plan, from, &ranges);
+        cancelled += n;
+    }
+    assert!(cancelled > 0, "no seek found a read still held");
 }
 
 #[test]

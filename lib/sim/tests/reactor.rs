@@ -209,7 +209,7 @@ fn file_reads_complete_out_of_order_and_a_written_file_reads_back() {
         let mut r = rig(Faults { latency: (0, 5 * MS), ..Faults::NONE }, seed, 8);
         r.world.lock().unwrap().file("in", (0u8..32).collect());
         let op = r.submit_named(Op::Open { path: name("in"), mode: OpenMode::Read }, None, b"in");
-        let IoResult::File { handle, len: 32 } = r.wait(op).result else { panic!("open") };
+        let IoResult::File { handle, len: 32, .. } = r.wait(op).result else { panic!("open") };
         let ops: Vec<OpId> = (0..4)
             .map(|i| {
                 r.submit(Op::Read { handle, offset: i * 8, at: 0, len: u32::MAX }, Some(r.buf(&[])))
@@ -235,7 +235,7 @@ fn file_reads_complete_out_of_order_and_a_written_file_reads_back() {
 
     let mut r = rig(Faults::NONE, 0, 8);
     let op = r.submit_named(Op::Open { path: name("out"), mode: OpenMode::Create }, None, b"out");
-    let IoResult::File { handle, len: 0 } = r.wait(op).result else { panic!("create") };
+    let IoResult::File { handle, len: 0, .. } = r.wait(op).result else { panic!("create") };
     let late = r.submit(Op::Write { handle, offset: 4 }, Some(r.buf(b"5678")));
     let early = r.submit(Op::Write { handle, offset: 0 }, Some(r.buf(b"1234")));
     assert_eq!((r.wait(late).result, r.wait(early).result), (IoResult::Ok(4), IoResult::Ok(4)));
@@ -247,7 +247,7 @@ fn file_reads_complete_out_of_order_and_a_written_file_reads_back() {
     );
     assert_eq!(r.wait(op).result, IoResult::Ok(0));
     let op = r.submit_named(Op::Stat { path: name("to") }, None, b"to");
-    assert_eq!(r.wait(op).result, IoResult::File { handle: Handle::NONE, len: 8 });
+    assert_eq!(r.wait(op).result, IoResult::File { handle: Handle::NONE, len: 8, in_order: false });
     let op = r.submit_named(Op::Open { path: name("out"), mode: OpenMode::Read }, None, b"out");
     assert_eq!(r.wait(op).result, IoResult::Err(IoError::NotFound));
     let op = r.submit_named(Op::Unlink { path: name("to") }, None, b"to");

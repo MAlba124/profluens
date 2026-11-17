@@ -242,10 +242,12 @@ pub const COALESCE_ROOM: usize = LEND_HEAD + 65_535;
 pub enum IoResult {
     /// Bytes moved, and zero for an op that moves none.
     Ok(usize),
-    /// An opened file and its length, [`NO_LEN`] for a pipe read with `Recv`.
+    /// An opened file and its length, [`NO_LEN`] for a pipe read with `Recv`. `in_order` when
+    /// its reads go out one at a time in the order submitted, each a turn through the reactor.
     File {
         handle: Handle,
         len: u64,
+        in_order: bool,
     },
     /// A socket and the address its op names.
     Socket {

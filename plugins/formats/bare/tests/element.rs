@@ -110,9 +110,11 @@ impl Reactor for GateReactor {
         let mut g = self.gate.lock().unwrap();
         for s in subs.drain(..) {
             let result = match s.kind {
-                Op::Adopt { .. } => {
-                    IoResult::File { handle: Handle::new(1, 1), len: self.data.len() as u64 }
-                }
+                Op::Adopt { .. } => IoResult::File {
+                    handle: Handle::new(1, 1),
+                    len: self.data.len() as u64,
+                    in_order: false,
+                },
                 Op::Read { offset, len, .. } => {
                     g.asked.push((offset, len));
                     let epoch = g.epoch;

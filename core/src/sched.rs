@@ -760,6 +760,7 @@ impl Group {
             *progressed |= !from.asks.is_empty() || from.over != to.over;
             to.asks.append(&mut from.asks);
             to.over = from.over;
+            from.in_order = to.in_order;
         }
         if i + 1 < self.elements.len() && self.ctxs[i].serving.mode == Mode::Withdrawn {
             self.reset_pull(i);

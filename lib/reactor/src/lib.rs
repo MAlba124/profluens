@@ -5,6 +5,7 @@
 #![allow(clippy::disallowed_types)]
 
 mod bell;
+mod disk;
 mod hygiene;
 mod lend;
 mod ops;
@@ -29,6 +30,7 @@ use profluens_core::pipeline::Pipeline;
 use rustix::io::Errno;
 use stein_io::queue::{self, Cqe, Key, Owned, Queue, Setup};
 
+pub use disk::Reads;
 pub use hygiene::{
     HYGIENE_WINDOW, Hint, POSIX_FADV_DONTNEED, POSIX_FADV_SEQUENTIAL, SYNC_FILE_RANGE_WRITE,
     StreamHygiene,
@@ -158,13 +160,15 @@ struct Slot {
     generation: u32,
     kind: Kind,
     fd: Option<OwnedFd>,
-    /// A receive or accept is on the queue. The next waits, since the ring keeps no order on one
-    /// fd.
+    /// A receive, an accept or a read of a file kept in order is on the queue. The next waits,
+    /// since the ring keeps no order on one fd.
     busy_read: bool,
     busy_write: bool,
     flying: u32,
     closing: u32,
     lent: Option<Box<lend::Lent>>,
+    /// Reads of the file go out one at a time in submission order, see [`Reads`].
+    ordered: bool,
 }
 
 impl Slot {
@@ -243,6 +247,7 @@ pub struct OsReactor {
     /// File ops on the queue. They complete on their own, so teardown waits for them.
     file_flying: u32,
     hygiene_window: u64,
+    reads: Reads,
     enters: Enters,
 }
 
@@ -300,6 +305,7 @@ impl OsReactor {
             urgent: false,
             file_flying: 0,
             hygiene_window: HYGIENE_WINDOW,
+            reads: Reads::Auto,
             enters: Enters::default(),
             tells,
         })
@@ -322,6 +328,12 @@ impl OsReactor {
         }
     }
 
+    /// How reads of the files opened from now on go out, [`Reads::Auto`] by default. Only the
+    /// ring keeps them in order, `epoll` reads a file in push order anyway.
+    pub fn set_reads(&mut self, reads: Reads) {
+        self.reads = reads;
+    }
+
     fn slot(&self, h: Handle) -> Result<&Slot, IoError> {
         match self.slots.get(h.slot() as usize) {
             Some(s) if s.generation == h.generation() && !matches!(s.kind, Kind::Free) => Ok(s),
@@ -339,8 +351,8 @@ impl OsReactor {
     fn insert(&mut self, kind: Kind, fd: OwnedFd) -> Result<Handle, IoError> {
         if let Some(i) = self.free_slots.pop() {
             let s = &mut self.slots[i as usize];
-            (s.kind, s.fd, s.busy_read, s.busy_write, s.flying, s.closing) =
-                (kind, Some(fd), false, false, 0, NONE);
+            (s.kind, s.fd, s.busy_read, s.busy_write, s.flying, s.closing, s.ordered) =
+                (kind, Some(fd), false, false, 0, NONE, false);
             if let Some(lent) = s.lent.as_mut() {
                 lent.reset();
             }
@@ -358,6 +370,7 @@ impl OsReactor {
             flying: 0,
             closing: NONE,
             lent: None,
+            ordered: false,
         };
         self.slots.push(s);
         Ok(Handle::new(self.slots.len() as u32 - 1, 0))

@@ -2,7 +2,7 @@
 #![allow(unsafe_code)]
 
 use std::io;
-use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 use profluens_core::buffer::Buffer;
 use stein_io::queue::{Group, Mem, Queue, RingPage};
@@ -18,6 +18,50 @@ pub fn sync_file_range(fd: RawFd, offset: u64, len: u64, flags: u32) -> io::Resu
     let ret =
         unsafe { libc::sync_file_range(fd, offset as libc::off64_t, len as libc::off64_t, flags) };
     if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// `BTRFS_IOC_FS_INFO`, `_IOR(0x94, 31, 1024 bytes)`.
+const BTRFS_FS_INFO: libc::c_ulong = 0x8400_941F;
+/// `BTRFS_IOC_DEV_INFO`, `_IOWR(0x94, 30, 4096 bytes)`.
+const BTRFS_DEV_INFO: libc::c_ulong = 0xD000_941E;
+/// Where `path` lies in `btrfs_ioctl_dev_info_args`, in u64 words.
+const BTRFS_DEV_PATH: usize = 384;
+
+/// `btrfs_ioctl_dev_info_args`, the device id first and the path last.
+pub(crate) struct BtrfsDev([u64; 512]);
+
+impl Default for BtrfsDev {
+    fn default() -> Self {
+        BtrfsDev([0; 512])
+    }
+}
+
+/// The highest device id of the btrfs `fd` is on, an error on any other file system.
+pub(crate) fn btrfs_max_id(fd: BorrowedFd<'_>) -> io::Result<u64> {
+    // `btrfs_ioctl_fs_info_args`, `max_id` first
+    let mut info = [0u64; 128];
+    // SAFETY: the kernel writes the 1024 bytes the request names into `info`.
+    let ret = unsafe { libc::ioctl(fd.as_raw_fd(), BTRFS_FS_INFO as _, info.as_mut_ptr()) };
+    if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(info[0]) }
+}
+
+/// The path of device `id` of the btrfs `fd` is on, none for an id the file system does not hold.
+pub(crate) fn btrfs_dev_path<'a>(
+    fd: BorrowedFd<'_>,
+    id: u64,
+    room: &'a mut BtrfsDev,
+) -> Option<&'a std::ffi::CStr> {
+    room.0.fill(0);
+    room.0[0] = id;
+    // SAFETY: the kernel reads and writes the 4096 bytes the request names in `room`.
+    let ret = unsafe { libc::ioctl(fd.as_raw_fd(), BTRFS_DEV_INFO as _, room.0.as_mut_ptr()) };
+    if ret < 0 {
+        return None;
+    }
+    let path = &room.0[BTRFS_DEV_PATH..];
+    // SAFETY: the words are plain bytes, the slice stays inside `room`.
+    let bytes = unsafe { std::slice::from_raw_parts(path.as_ptr().cast::<u8>(), path.len() * 8) };
+    std::ffi::CStr::from_bytes_until_nul(bytes).ok()
 }
 
 /// A descriptor of its own on the open file description `fd` names, no path resolved.

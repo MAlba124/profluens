@@ -2,7 +2,7 @@
 //! and not the group. Names are copied into reused blocks held until the op lands.
 
 use std::ffi::OsStr;
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -143,7 +143,9 @@ impl OsReactor {
             },
             (Op::Stat { .. }, _) => {
                 let result = match (c.result(), self.statx(idx)) {
-                    (Ok(_), Some((_, len))) => IoResult::File { handle: Handle::NONE, len },
+                    (Ok(_), Some((_, len))) => {
+                        IoResult::File { handle: Handle::NONE, len, in_order: false }
+                    }
                     (Ok(_), None) => IoResult::Err(IoError::Os(Errno::IO.raw_os_error())),
                     (Err(e), _) => IoResult::Err(errno(e)),
                 };
@@ -187,12 +189,18 @@ impl OsReactor {
                 Kind::File { hygiene }
             }
         };
-        let (pipe, handle) = (matches!(kind, Kind::Pipe), self.insert(kind, fd));
-        match handle {
-            Ok(handle) if pipe => IoResult::File { handle, len: NO_LEN },
+        let pipe = matches!(kind, Kind::Pipe);
+        let ordered = !pipe
+            && self.q.backend() == stein_io::Backend::Uring
+            && self.reads.in_order(fd.as_fd(), st.st_dev);
+        match self.insert(kind, fd) {
+            Ok(handle) if pipe => IoResult::File { handle, len: NO_LEN, in_order: false },
             Ok(handle) => {
+                if let Ok(s) = self.slot_mut(handle) {
+                    s.ordered = ordered;
+                }
                 self.hint(handle, Hint::Sequential);
-                IoResult::File { handle, len }
+                IoResult::File { handle, len, in_order: ordered }
             }
             Err(e) => IoResult::Err(e),
         }
@@ -221,7 +229,7 @@ impl OsReactor {
                     {
                         Ok(handle) => {
                             self.hint(handle, Hint::Sequential);
-                            IoResult::File { handle, len: 0 }
+                            IoResult::File { handle, len: 0, in_order: false }
                         }
                         Err(e) => IoResult::Err(e),
                     };

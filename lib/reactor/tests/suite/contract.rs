@@ -125,7 +125,7 @@ fn a_create_replaces_a_file_writes_through_a_symlink_and_makes_its_parents() {
     let old = tmp("create-old");
     std::fs::write(&old, b"old contents").expect("fixture");
     let held = std::fs::File::open(&old).expect("held");
-    let IoResult::File { handle, len: 0 } = r.open(&old, OpenMode::Create) else {
+    let IoResult::File { handle, len: 0, .. } = r.open(&old, OpenMode::Create) else {
         panic!("create")
     };
     r.write(handle, 0, b"new");
@@ -232,7 +232,9 @@ fn hints_ride_the_queue_and_a_close_waits_for_them() {
     r.close(handle);
     assert!(r.r.is_idle(), "nothing of the file is left in flight");
     assert_eq!(std::fs::metadata(&path).expect("meta").len(), 8 * chunk.len() as u64);
-    let IoResult::File { handle, len } = r.open(&path, OpenMode::ReadOnce) else { panic!("open") };
+    let IoResult::File { handle, len, .. } = r.open(&path, OpenMode::ReadOnce) else {
+        panic!("open")
+    };
     assert_eq!(len, 8 << 16);
     for i in 0..8u64 {
         let op =

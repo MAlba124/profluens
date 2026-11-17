@@ -93,7 +93,7 @@ impl Reactor for Mem {
             let result = match s.kind {
                 Op::Open { .. } => {
                     self.files = self.files.wrapping_add(1);
-                    IoResult::File { handle: Handle::new(self.files, 1), len: feed.claimed }
+                    IoResult::File { handle: Handle::new(self.files, 1), len: feed.claimed, in_order: false }
                 }
                 Op::Read { offset, at, len, .. } => match buf.as_mut() {
                     Some(b) => feed.read(&mut b.memory, offset, at as usize, len as usize),

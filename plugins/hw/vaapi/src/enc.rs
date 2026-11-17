@@ -1287,7 +1287,7 @@ mod tests {
     };
 
     fn adopted(handle: Handle) -> IoResult {
-        IoResult::File { handle, len: 0 }
+        IoResult::File { handle, len: 0, in_order: false }
     }
 
     #[test]

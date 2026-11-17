@@ -10,7 +10,6 @@ use profluens_core::pipeline::IndexEntry;
 use crate::codec::{family_for, is_audio_family, is_video_family, lead_of};
 use crate::cued::{IN_FLIGHT, Ref};
 use crate::cues::{Cues, TrackView};
-use crate::element::LEAD_MIN;
 use crate::reader::Track;
 
 /// A caption track's cue as `(track, start, end, byte)`.
@@ -23,11 +22,10 @@ pub type CaptionSpan = (u64, u64, u64, u64);
 /// only run keeps every lead.
 pub const SHORT_PRE_ROLL: u64 = 25_000_000;
 
-/// The most a long pre-roll steps back of the keyframe's Cluster beside linked video, the first
-/// read of a seek before any keyframe sized it, so the step costs about no read. The step back
-/// over it was a whole group for a few KB of audio. Audio then starts without pre-roll, as in
-/// ffmpeg.
-pub const PRE_ROLL_BYTES: u64 = LEAD_MIN as u64;
+/// The most a long pre-roll steps back of the keyframe's Cluster beside linked video, read in
+/// order ahead of the keyframe, 17 ms of a 30 MB/s disk. The step back over it was a whole group
+/// for a few KB of audio. Audio then starts without pre-roll, as in ffmpeg.
+pub const PRE_ROLL_BYTES: u64 = 512 << 10;
 
 /// The most a restart steps back of the keyframe's Cluster for a caption beside linked video.
 /// A caption up at a key was read from its block, up to [`CAPTION_REACH`] of the stream before

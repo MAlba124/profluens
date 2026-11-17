@@ -291,7 +291,7 @@ impl Reads {
         while let Some(c) = ctx.io().next_completion() {
             if c.user == OPEN {
                 match c.result {
-                    IoResult::File { handle, len } => {
+                    IoResult::File { handle, len, .. } => {
                         self.file = handle;
                         log!(&*ctx, Level::Debug, "open", len = len);
                     }

@@ -1072,10 +1072,12 @@ enum Hold {
     Holding,
 }
 
-/// A seek's first read holds the Cluster's head and its keyframe, so the kernel reads them as
-/// one random read instead of ramping its readahead behind a small window. The keyframes seen
-/// size it, or the stream's rate over [`LEAD_NS`] before any was.
-pub(crate) const LEAD_MIN: u32 = 512 << 10;
+/// A seek's first read holds the Cluster's head and its keyframe. The keyframes seen size it, or
+/// the stream's rate over [`LEAD_NS`] before any was. What it misses the windows behind it read
+/// on in order, what it holds past the first frames a slow disk reads before them. Over an
+/// emulated 30 MB/s disk a 7 Mbit/s film's seek took 22 ms behind FUSE and 34 ms under ext4 with
+/// 128 KiB, 42 and 36 ms with 512 KiB.
+const LEAD_MIN: u32 = 128 << 10;
 const LEAD_MAX: u32 = 4 << 20;
 const LEAD_NS: u64 = 150_000_000;
 /// Room past a seen keyframe for the Cluster's head and blocks before it.

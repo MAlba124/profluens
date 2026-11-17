@@ -14,9 +14,11 @@ pub(crate) enum Started {
     Done(IoResult),
 }
 
-fn side(kind: &Op) -> (bool, bool) {
+/// The sides of its fd `kind` holds while on the queue, a read of a file only when kept in order.
+fn side(kind: &Op, ordered: bool) -> (bool, bool) {
     match kind {
         Op::Recv { .. } | Op::Accept { .. } | Op::RecvMany { .. } => (true, false),
+        Op::Read { .. } => (ordered, false),
         Op::Send { .. } | Op::SendTo { .. } | Op::SendMany { .. } => (false, true),
         _ => (false, false),
     }
@@ -54,11 +56,11 @@ impl OsReactor {
         if is_path(&kind) {
             return self.start_path(idx);
         }
-        let (fd, tag, busy_read, busy_write) = match self.slot(on) {
-            Ok(s) => (s.raw(), tag(&s.kind), s.busy_read, s.busy_write),
+        let (fd, tag, busy_read, busy_write, ordered) = match self.slot(on) {
+            Ok(s) => (s.raw(), tag(&s.kind), s.busy_read, s.busy_write, s.ordered),
             Err(e) => return Started::Done(IoResult::Err(e)),
         };
-        let (read, write) = side(&kind);
+        let (read, write) = side(&kind, ordered);
         if (read && busy_read) || (write && busy_write) {
             return Started::Wait;
         }
@@ -131,11 +133,11 @@ impl OsReactor {
         p.state = State::Flying;
         self.queued = true;
         let (kind, on) = (p.kind, p.on);
-        let (read, write) = side(&kind);
         if is_file(&kind) {
             self.file_flying += 1;
         }
         if let Ok(s) = self.slot_mut(on) {
+            let (read, write) = side(&kind, s.ordered);
             s.busy_read |= read;
             s.busy_write |= write;
             s.flying += 1;
@@ -149,11 +151,11 @@ impl OsReactor {
         let (kind, on, state) = (p.kind, p.on, p.state);
         p.key = None;
         p.state = State::Waiting;
-        let (read, write) = side(&kind);
         if is_file(&kind) {
             self.file_flying = self.file_flying.saturating_sub(1);
         }
         if let Ok(s) = self.slot_mut(on) {
+            let (read, write) = side(&kind, s.ordered);
             s.busy_read &= !read;
             s.busy_write &= !write;
             s.flying = s.flying.saturating_sub(1);

@@ -26,6 +26,10 @@ fn rig(slot: usize) -> Rig {
     Rig { r: super::make(), pool: Pool::new(slot), next: 0, seen: Vec::new() }
 }
 
+fn rig_in_order(slot: usize) -> Rig {
+    Rig { r: super::make_in_order(), pool: Pool::new(slot), next: 0, seen: Vec::new() }
+}
+
 impl Rig {
     fn buf(&self, bytes: &[u8]) -> Buffer {
         let mut memory = self.pool.acquire();
@@ -81,17 +85,46 @@ impl Rig {
     }
 
     fn open(&mut self, path: &std::path::Path, mode: OpenMode) -> Handle {
+        self.open_told(path, mode).0
+    }
+
+    /// The handle and whether the open said the file's reads go out in order.
+    fn open_told(&mut self, path: &std::path::Path, mode: OpenMode) -> (Handle, bool) {
         let bytes = path.as_os_str().as_encoded_bytes();
         let name = Name { off: 0, len: bytes.len() as u32 };
         let op = self.submit_named(Op::Open { path: name, mode }, None, bytes);
         match self.wait(op).result {
-            IoResult::File { handle, .. } => handle,
+            IoResult::File { handle, in_order, .. } => (handle, in_order),
             other => panic!("open gave {other:?}"),
         }
     }
 
     fn count(&self, op: OpId) -> usize {
         self.seen.iter().filter(|c| c.op == op).count()
+    }
+
+    /// The completions of `ops` in the order they came, once all of them did.
+    fn all(&mut self, ops: &[OpId]) -> Vec<Completion> {
+        let start = Instant::now();
+        while ops.iter().any(|op| self.count(*op) == 0) {
+            self.turn();
+            assert!(start.elapsed() < PATIENCE, "not all of {ops:?} completed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut got = Vec::new();
+        let mut i = 0;
+        while i < self.seen.len() {
+            if ops.contains(&self.seen[i].op) {
+                got.push(self.seen.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        got
+    }
+
+    fn read(&mut self, handle: Handle, offset: u64, len: u32) -> OpId {
+        self.submit(Op::Read { handle, offset, at: 0, len }, Some(self.buf(b"")))
     }
 }
 
@@ -568,4 +601,128 @@ fn a_paced_lent_receive_enters_the_kernel_once_a_datagram() {
     let enters = spent.submits + spent.waits - start.submits - start.waits;
     assert!(spent.submits - start.submits <= 2, "{spent:?}");
     assert!(enters <= N + 2, "{enters} enters for {N} datagrams, {spent:?}");
+}
+
+/// The open says so where the reads are held in order, for an element to ask fewer of them. Only
+/// the ring holds them, epoll reads a file as it is pushed, and a file written is not held.
+#[test]
+fn an_open_says_whether_the_reads_of_its_file_go_out_in_order() {
+    let path = tmp("says-order");
+    std::fs::write(&path, b"in order").expect("fixture");
+    let mut r = rig_in_order(4096);
+    assert_eq!(r.open_told(&path, OpenMode::Read).1, super::NAME == "uring");
+    assert!(!r.open_told(&tmp("says-order-out"), OpenMode::Create).1);
+    let mut r = rig(4096);
+    r.r = super::make_free();
+    assert!(!r.open_told(&path, OpenMode::Read).1, "reads left free");
+}
+
+#[test]
+fn reads_of_a_file_in_order_complete_in_the_order_submitted() {
+    const PART: usize = 64 << 10;
+    let mut r = rig_in_order(PART);
+    let path = tmp("in-order");
+    let payload: Vec<u8> = (0..16 * PART).map(|i| (i * 13 % 251) as u8).collect();
+    std::fs::write(&path, &payload).expect("fixture");
+    let h = r.open(&path, OpenMode::Read);
+    // scrambled, so file order and submission order differ
+    let at: Vec<u64> = (0..16u64).map(|i| (i * 7 % 16) * PART as u64).collect();
+    let reads: Vec<OpId> = at.iter().map(|o| r.read(h, *o, u32::MAX)).collect();
+    let got = r.all(&reads);
+    assert_eq!(got.iter().map(|c| c.op).collect::<Vec<_>>(), reads, "in submission order");
+    for (c, o) in got.iter().zip(&at) {
+        let o = *o as usize;
+        assert_eq!(c.result, IoResult::Ok(PART));
+        assert_eq!(c.buf.as_ref().expect("buffer").memory.data(), &payload[o..o + PART]);
+    }
+}
+
+/// The kernel workers a thread's free reads left outlive a cap on their count, so order kept by
+/// one worker alone broke on a thread that read before.
+#[test]
+fn reads_of_a_file_in_order_keep_it_on_a_thread_that_read_freely_before() {
+    const PART: usize = 64 << 10;
+    let path = tmp("in-order-after-free");
+    let payload: Vec<u8> = (0..16 * PART).map(|i| (i * 11 % 251) as u8).collect();
+    std::fs::write(&path, &payload).expect("fixture");
+    let mut free = rig(PART);
+    let h = free.open(&path, OpenMode::Read);
+    for _ in 0..8 {
+        let reads: Vec<OpId> =
+            (0..16u64).map(|i| free.read(h, i * PART as u64, u32::MAX)).collect();
+        free.all(&reads);
+    }
+    let mut r = rig_in_order(PART);
+    let h = r.open(&path, OpenMode::Read);
+    for round in 0..8 {
+        let at: Vec<u64> = (0..16u64).map(|i| (i * 7 % 16) * PART as u64).collect();
+        let reads: Vec<OpId> = at.iter().map(|o| r.read(h, *o, u32::MAX)).collect();
+        let got = r.all(&reads);
+        assert_eq!(got.iter().map(|c| c.op).collect::<Vec<_>>(), reads, "round {round}");
+    }
+}
+
+#[test]
+fn a_read_in_order_over_the_end_lets_the_reads_behind_it_go() {
+    let mut r = rig_in_order(64 << 10);
+    let path = tmp("in-order-end");
+    let payload: Vec<u8> = (0..100_000).map(|i| (i % 249) as u8).collect();
+    std::fs::write(&path, &payload).expect("fixture");
+    let h = r.open(&path, OpenMode::Read);
+    let reads = [r.read(h, 0, 65_536), r.read(h, 65_536, 65_536), r.read(h, 131_072, 65_536)];
+    let again = r.read(h, 10, 10);
+    let got = r.all(&[reads[0], reads[1], reads[2], again]);
+    let results: Vec<IoResult> = got.iter().map(|c| c.result).collect();
+    let short = 100_000 - 65_536;
+    let want = [IoResult::Ok(65_536), IoResult::Ok(short), IoResult::Ok(0), IoResult::Ok(10)];
+    assert_eq!(results, want);
+    assert_eq!(got[1].buf.as_ref().expect("buffer").memory.data(), &payload[65_536..]);
+    assert_eq!(got[3].buf.as_ref().expect("buffer").memory.data(), &payload[10..20]);
+}
+
+#[test]
+fn reads_waiting_behind_one_in_order_cancel_at_once_and_the_file_reads_on() {
+    const PART: usize = 256 << 10;
+    let mut r = rig_in_order(PART);
+    let path = tmp("in-order-cancel");
+    let payload: Vec<u8> = (0..8 * PART).map(|i| (i * 5 % 241) as u8).collect();
+    std::fs::write(&path, &payload).expect("fixture");
+    let h = r.open(&path, OpenMode::Read);
+    let reads: Vec<OpId> = (0..8).map(|i| r.read(h, (i * PART) as u64, u32::MAX)).collect();
+    for op in &reads[1..] {
+        r.submit(Op::Cancel { target: *op }, None);
+    }
+    let got = r.all(&reads);
+    let first = got.iter().find(|c| c.op == reads[0]).expect("the first read");
+    assert_eq!(first.result, IoResult::Ok(PART));
+    assert_eq!(first.buf.as_ref().expect("buffer").memory.data(), &payload[..PART]);
+    for c in got.iter().filter(|c| c.op != reads[0]) {
+        assert!(c.buf.is_some(), "the buffer rides back");
+        if super::NAME == "uring" {
+            assert_eq!(c.result, IoResult::Cancelled, "{:?} never started, it waited", c.op);
+        }
+    }
+    r.settle(Duration::from_millis(50));
+    for op in &reads {
+        assert_eq!(r.count(*op), 0, "{op:?} completed again");
+    }
+    let next = r.read(h, (5 * PART) as u64, u32::MAX);
+    let c = r.wait(next);
+    assert_eq!(c.result, IoResult::Ok(PART));
+    assert_eq!(c.buf.expect("buffer").memory.data(), &payload[5 * PART..6 * PART]);
+}
+
+#[test]
+fn a_close_cancels_the_reads_in_order_it_finds_queued() {
+    let mut r = rig_in_order(256 << 10);
+    let path = tmp("in-order-close");
+    std::fs::write(&path, vec![3u8; 2 << 20]).expect("fixture");
+    let h = r.open(&path, OpenMode::Read);
+    let reads: Vec<OpId> = (0..6).map(|i| r.read(h, i * (256 << 10), u32::MAX)).collect();
+    let close = r.submit(Op::Close { handle: h }, None);
+    assert_eq!(r.wait(close).result, IoResult::Ok(0));
+    let got = r.all(&reads);
+    assert!(got.iter().all(|c| c.result == IoResult::Cancelled && c.buf.is_some()));
+    r.settle(Duration::from_millis(50));
+    assert!(reads.iter().all(|op| r.count(*op) == 0), "a read completed twice");
 }

@@ -788,3 +788,73 @@ fn a_frame_put_out_that_never_fits_beside_the_walks_window_goes_out_unpooled() {
         assert_eq!(lens(&ran, 0), want, "{pool:?}, every caption whole");
     }
 }
+
+/// `secs` of 2 KiB pictures each 40 ms, a keyframe and a Cluster each 2 s, no Cues, as a muxer
+/// writing to a pipe leaves it.
+fn cueless(secs: u64) -> Vec<u8> {
+    let mut w = MatroskaWriter::new(vec![TrackConfig::vp8(1, 320, 240)]);
+    w.set_duration_ns(secs * S);
+    let mut out = Vec::new();
+    w.write_header(&mut out).unwrap();
+    let picture = vec![0x10; 2 << 10];
+    for ms in (0..secs * 1_000).step_by(40) {
+        w.write_frame(&mut out, 1, ms * MS, &picture, ms % 2_000 == 0).unwrap();
+    }
+    w.finalize(&mut out);
+    sized(out)
+}
+
+/// Seeks once pad 0 saw `flushes` flushes and `n` pictures after the last.
+fn after_pictures(flushes: usize, n: usize) -> impl Fn(&[(usize, Seen)]) -> bool {
+    move |seen| {
+        let of = |s: &&(usize, Seen)| s.0 == 0;
+        let at = seen.iter().filter(of).filter(|s| s.1 == Seen::Flush).count();
+        let from =
+            seen.iter().rposition(|(p, s)| *p == 0 && *s == Seen::Flush).map_or(0, |i| i + 1);
+        let shown = seen[from..].iter().filter(of).filter(|s| matches!(s.1, Seen::Frame { .. }));
+        at == flushes && shown.count() >= n
+    }
+}
+
+/// The first picture pad 0 put out after each flush.
+fn firsts(ran: &Ran) -> Vec<(u64, bool)> {
+    let (mut out, mut want) = (Vec::new(), false);
+    for (_, s) in ran.seen.iter().filter(|(p, _)| *p == 0) {
+        match s {
+            Seen::Flush => want = true,
+            Seen::Frame { pts: Some(pts), key, .. } if want => {
+                out.push((*pts, *key));
+                want = false;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A cue-less file grows its index from the keyframes read, so seeks far apart leave stretches
+/// not read between its entries. A seek into one lands on a keyframe shortly before the target,
+/// not on the last one read before the stretch, and one into a stretch read lands on its
+/// keyframe as before.
+#[test]
+fn a_seek_into_a_stretch_of_a_cueless_file_not_read_lands_shortly_before_the_target() {
+    let file = cueless(240);
+    let targets = [40, 200, 180, 110, 150, 43];
+    for mode in [SeekMode::Keyframe, SeekMode::Accurate] {
+        let whens: Vec<Box<When>> =
+            (0..targets.len()).map(|k| Box::new(after_pictures(k, 25)) as Box<When>).collect();
+        let seeks: Vec<(Timestamp, SeekMode, &When)> =
+            targets.iter().zip(&whens).map(|(t, w)| (Timestamp(t * S), mode, &**w)).collect();
+        let ran = play_seeks(&file, &|_| true, &seeks);
+        let index = ran.index.as_ref().expect("an index");
+        assert!(!index.unread.is_empty(), "{mode:?}, stretches not read");
+        let got = firsts(&ran);
+        assert_eq!(got.len(), targets.len(), "{mode:?}, a picture after each seek, {got:?}");
+        for (&target, &(pts, key)) in targets.iter().zip(&got) {
+            let early = (target * S).checked_sub(pts);
+            assert!(key, "{mode:?}, a keyframe first at {pts}");
+            assert!(early.is_some_and(|e| e <= 6 * S), "{mode:?}, {target} s landed at {pts}");
+        }
+        assert_eq!(got[5].0, 42 * S, "{mode:?}, a stretch read seeks to its keyframe");
+    }
+}

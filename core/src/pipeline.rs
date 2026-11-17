@@ -313,6 +313,10 @@ pub struct Index {
     pub captions: Vec<Caption>,
     /// Caption streams the container indexes no caption of, one may be up at any time.
     pub uncued: Vec<u32>,
+    /// Ascending times of the entries the stretch before was not read, back to the entry before
+    /// or for the first back to the start. While not `complete` the keyframe there is unknown and
+    /// a target there estimated.
+    pub unread: Vec<u64>,
 }
 
 impl Default for Index {
@@ -328,8 +332,16 @@ impl Default for Index {
             grouped: false,
             captions: Vec::new(),
             uncued: Vec::new(),
+            unread: Vec::new(),
         }
     }
+}
+
+/// The entries around a target and whether its keyframe is unknown, see [`Index::around`].
+struct Around<'a> {
+    floor: Option<&'a IndexEntry>,
+    next: Option<&'a IndexEntry>,
+    unknown: bool,
 }
 
 impl Index {
@@ -349,36 +361,58 @@ impl Index {
         }
     }
 
-    /// Past the last entry of an index still growing, where its keyframe is not known yet.
-    fn past(&self, ns: u64) -> bool {
-        !self.complete && self.entries.last().is_some_and(|last| ns > last.time_ns)
+    /// The entries at or before and after `ns`, and whether the keyframe at `ns` is unknown, past
+    /// the last entry of an index still growing or inside a stretch it did not read.
+    fn around(&self, ns: u64) -> Around<'_> {
+        let n = self.entries.partition_point(|e| e.time_ns <= ns);
+        let (floor, next) = (n.checked_sub(1).map(|k| &self.entries[k]), self.entries.get(n));
+        let unread = match next {
+            Some(e) => self.unread.binary_search(&e.time_ns).is_ok(),
+            None => floor.is_some(),
+        };
+        let unknown = !self.complete && unread && floor.is_none_or(|e| ns > e.time_ns);
+        Around { floor, next, unknown }
+    }
+
+    fn unknown(&self, ns: u64) -> bool {
+        self.around(ns).unknown
     }
 
     /// The keyframe at or before `target`, `None` before the first entry and where it is unknown.
     pub fn keyframe(&self, target: Timestamp) -> Option<&IndexEntry> {
-        target.nanos().and_then(|ns| self.floor(ns).filter(|_| !self.past(ns)))
+        let around = self.around(target.nanos()?);
+        around.floor.filter(|_| !around.unknown)
     }
 
     /// The byte to resume reading from and the stream time it lands on, `None` if unseekable.
     pub fn resolve(&self, target: Timestamp) -> Option<(u64, Timestamp)> {
         let ns = target.nanos()?;
-        // Before the first keyframe an estimate lands past it, so the first is where to start.
-        let first = self.entries.first().filter(|e| ns < e.time_ns);
-        // Past a growing index an estimate behind its last entry would read more than the entry.
-        let last = self.entries.last().filter(|e| self.estimate(ns).is_none_or(|b| b <= e.byte));
-        match first.or(self.keyframe(target)).or(last) {
-            Some(e) => Some((e.byte, Timestamp(e.time_ns))),
-            None => self.estimate(ns).map(|byte| (byte, target)),
+        let Around { floor, next, unknown } = self.around(ns);
+        let entry = |e: &IndexEntry| (e.byte, Timestamp(e.time_ns));
+        if !unknown {
+            // Before the first keyframe an estimate lands past it, so the first is where to start.
+            return floor.or(next).map(entry).or_else(|| self.estimate(ns).map(|b| (b, target)));
+        }
+        let byte = match (floor, next) {
+            // Inside a stretch not read the keyframes around it place the target.
+            (Some(a), Some(b)) => Some(between(a, b, ns)),
+            // One past the entry after lands past the target.
+            _ => self.estimate(ns).filter(|&byte| next.is_none_or(|e| byte < e.byte)),
+        };
+        // An estimate behind the entry before would read more than the entry.
+        match byte.filter(|&byte| floor.is_none_or(|e| byte > e.byte)) {
+            Some(byte) => Some((byte, target)),
+            None => floor.or(next).map(entry),
         }
     }
 
     /// Where the source restarts to link stream `stream` at `at`, the entry at or before `at`, or
     /// for a caption stream the one below the block of a caption of the stream up at `at` or
-    /// stored between that entry and the next. Past a growing index, where [`Self::keyframe`] is
-    /// unknown, it is resolved as a seek there. None without an entry.
+    /// stored between that entry and the next. Where [`Self::keyframe`] is unknown it is resolved
+    /// as a seek there. None without an entry.
     pub fn restart_for(&self, stream: u32, at: Timestamp) -> Option<(u64, Timestamp)> {
         let ns = at.nanos()?;
-        if self.past(ns) {
+        if self.unknown(ns) {
             return self.resolve(at);
         }
         let k = self.entries.partition_point(|e| e.time_ns <= ns).saturating_sub(1);
@@ -427,8 +461,8 @@ impl Index {
         let Some((to_byte, key)) = self.resolve(target) else {
             return SeekPlan::Unseekable;
         };
-        // Past a growing index the keyframe is unknown, presentation starts at the target.
-        let lands = if target.nanos().is_some_and(|ns| self.past(ns)) { target } else { key };
+        // Where the keyframe is unknown presentation starts at the target.
+        let lands = if target.nanos().is_some_and(|ns| self.unknown(ns)) { target } else { key };
         let read = demuxed.is_some_and(|out| out.is_some() && lands <= out);
         // An estimated byte names no keyframe, and only what was read is skipped to.
         let known = self.keyframe(target).is_some();
@@ -446,6 +480,14 @@ impl Index {
             }
         }
     }
+}
+
+/// The byte of `ns` between entries `a` and `b`, by the bytes per nanosecond between them.
+fn between(a: &IndexEntry, b: &IndexEntry, ns: u64) -> u64 {
+    let span = u128::from(b.time_ns.saturating_sub(a.time_ns).max(1));
+    let into = u128::from(ns.saturating_sub(a.time_ns)).min(span);
+    let bytes = u128::from(b.byte.saturating_sub(a.byte));
+    a.byte + (into * bytes / span) as u64
 }
 
 /// How far ahead a skip may reach, by what the decoder costs on the way.

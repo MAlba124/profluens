@@ -1426,12 +1426,11 @@ impl MkvDemux {
     #[allow(clippy::disallowed_methods)]
     fn publish(&mut self, ctx: &Ctx) {
         self.seek.due = false;
-        let (entries, complete, key) = match self.seek.cues.is_empty() {
-            false => (self.cued_entries(ctx), self.seek.whole, self.seek.of_cues.key),
+        let (entries, unread, complete, key) = match self.seek.cues.is_empty() {
+            false => (self.cued_entries(ctx), Vec::new(), self.seek.whole, self.seek.of_cues.key),
             true => {
-                let grown = &mut self.seek.grown;
-                grown.published = grown.entries.len();
-                (grown.entries.clone(), false, grown.key)
+                let (entries, unread) = self.seek.grown.publish();
+                (entries, unread, false, self.seek.grown.key)
             }
         };
         let seek = &self.seek;
@@ -1449,8 +1448,17 @@ impl MkvDemux {
         let (stream, grouped) =
             (key.map(|pt| pt.stream), key.is_some_and(|pt| pt.kind == Kind::Video));
         let (file_len, duration) = (seek.file_len, seek.duration);
-        let index =
-            Index { entries, file_len, duration, complete, stream, grouped, captions, uncued };
+        let index = Index {
+            entries,
+            file_len,
+            duration,
+            complete,
+            stream,
+            grouped,
+            captions,
+            uncued,
+            unread,
+        };
         self.rated = Some(index.clone());
         ctx.publish_index(index);
     }
@@ -2206,11 +2214,10 @@ impl MkvDemux {
                 dropped.then_some(prior)
             }
             true => {
-                let entries = &mut self.seek.grown.entries;
-                let n = entries.len();
-                entries.retain(|e| !near(e.time_ns));
-                let prior = entries.iter().rev().find(|e| e.time_ns < pts);
-                (entries.len() < n).then(|| prior.map(|e| (e.byte, e.time_ns)))
+                let grown = &mut self.seek.grown;
+                let dropped = grown.drop_near(near);
+                let prior = grown.entries.iter().rev().find(|e| e.time_ns < pts);
+                dropped.then(|| prior.map(|e| (e.byte, e.time_ns)))
             }
         };
         log!(ctx, Level::Warn, "false_key", pts = pts, indexed = before.is_some());
@@ -2232,6 +2239,7 @@ impl MkvDemux {
         pull.plan.reset();
         (pull.win, pull.stash) = (None, None);
         pull.walk.restart(byte, byte != 0 && byte != self.seek.segment_data_start);
+        self.seek.grown.jump(false);
         self.walk_from = byte;
         while let Some(frame) = self.front.pop_front() {
             Self::recycle(&mut self.reader, frame);
@@ -2325,6 +2333,7 @@ impl MkvDemux {
 
     fn resync(&mut self) {
         self.reader.resync_streaming();
+        self.seek.grown.jump(false);
         while let Some(frame) = self.front.pop_front() {
             Self::recycle(&mut self.reader, frame);
         }
@@ -2519,6 +2528,19 @@ impl MkvDemux {
         byte != 0 && byte != self.seek.segment_data_start
     }
 
+    /// Where the walk restarts for `from`. A cue-less file's estimated byte lands on the first
+    /// keyframe after it, so it aims the keyframe spacing ahead of the target for one before it.
+    fn aimed(&self, from: SeekTarget) -> u64 {
+        let (grown, byte) = (&self.seek.grown, from.to_byte);
+        let estimated = self.seek.cues.is_empty() && self.mid_segment(byte) && !grown.keyed(byte);
+        let (Some(index), Some(at)) = (self.rated.as_ref().filter(|_| estimated), from.at.nanos())
+        else {
+            return byte;
+        };
+        let aim = Timestamp(at.saturating_sub(grown.back()));
+        index.resolve(aim).map_or(byte, |(aimed, _)| aimed.min(byte))
+    }
+
     fn restart_pull(&mut self, from: SeekTarget) {
         if let CuesRead::Asked { at, len, .. } = self.seek.read {
             self.seek.read = CuesRead::Want { at, len };
@@ -2527,16 +2549,18 @@ impl MkvDemux {
         if let Some(c) = self.cued.as_mut() {
             c.restart(self.cued_from);
         }
-        self.walk_from = from.to_byte;
+        let byte = self.aimed(from);
+        self.walk_from = byte;
         self.up = self.up_from(from.to_byte);
         (self.read_to, self.restart_ns) = (0, from.at.nanos().unwrap_or(0));
         self.pad_tracks.iter_mut().for_each(|pt| pt.read_to = None);
-        let resync = self.mid_segment(from.to_byte);
+        let resync = self.mid_segment(byte);
+        self.seek.grown.jump(!resync);
         let lead = self.lead(from.at);
         let pull = &mut self.pull;
         pull.plan.reset();
         (pull.win, pull.stash) = (None, None);
-        pull.walk.restart(from.to_byte, resync);
+        pull.walk.restart(byte, resync);
         pull.walk.lead = lead;
         if let Some(video_from) = self.video_from.take() {
             self.hold_video(video_from, from.at);
@@ -2835,6 +2859,9 @@ impl MkvDemux {
             };
             let seek = &mut self.seek;
             let grow = seek.cues.is_empty();
+            if std::mem::take(&mut pull.walk.skipped) {
+                seek.grown.jump(false);
+            }
             if let Some(byte) = pull.walk.cluster_at.take().filter(|_| grow) {
                 seek.grown.cluster(byte);
             }

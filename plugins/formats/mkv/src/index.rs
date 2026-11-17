@@ -291,19 +291,55 @@ pub(crate) fn segment_end(header: &[u8]) -> Option<u64> {
 
 pub const MAX_GROWN: usize = 1 << 18;
 
+/// Where the read stands for the grown index.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Run {
+    /// From the start of the file, no keyframe indexed yet.
+    #[default]
+    Start,
+    /// After a jump, the stretch up to the next keyframe is not read.
+    Broken,
+    /// On from the indexed keyframe at this time.
+    At(u64),
+}
+
 #[derive(Default)]
 pub(crate) struct Grown {
     pub(crate) key: Option<u64>,
     cluster: Option<u64>,
     pub(crate) entries: Vec<IndexEntry>,
+    /// Ascending times of the entries the stretch before was not read, see `Index::unread`.
+    unread: Vec<u64>,
+    run: Run,
     pub(crate) published: usize,
+    /// A stretch not read was read since the last publication.
+    closed: bool,
+    /// The widest gap between keyframes read side by side up to [`SPACING_SEEN_MAX`], 0 before
+    /// two.
+    spacing: u64,
 }
 
 pub(crate) const GROWN_EVERY: usize = 64;
 
+/// Neighbouring keyframes further apart are taken for a stretch not read, not for the spacing.
+pub(crate) const SPACING_SEEN_MAX: u64 = 20_000_000_000;
+
+/// How far ahead of its target a seek to an estimated byte aims, the keyframe spacing read and a
+/// second for the reorder of presentation behind decode, at most [`BACK_MAX`], [`BACK_UNKNOWN`]
+/// before any. Chosen, not measured.
+pub(crate) const BACK_MAX: u64 = 11_000_000_000;
+pub(crate) const BACK_UNKNOWN: u64 = 5_000_000_000;
+const REORDER: u64 = 1_000_000_000;
+
 impl Grown {
     pub(crate) fn cluster(&mut self, byte: u64) {
         self.cluster = Some(byte);
+    }
+
+    /// Reading goes on elsewhere, `start` at the start of the file.
+    pub(crate) fn jump(&mut self, start: bool) {
+        self.run = if start { Run::Start } else { Run::Broken };
+        self.cluster = None;
     }
 
     pub(crate) fn block(&mut self, track: u64, pts_ns: u64, keyframe: bool) -> bool {
@@ -314,11 +350,29 @@ impl Grown {
             return false;
         };
         let at = self.entries.partition_point(|e| e.time_ns < pts_ns);
-        let after = self.entries.get(at).is_some_and(|e| e.time_ns == pts_ns || e.byte <= byte);
+        let next = self.entries.get(at);
+        if next.is_some_and(|e| (e.time_ns, e.byte) == (pts_ns, byte)) {
+            if self.read(at, pts_ns)
+                && let Ok(n) = self.unread.binary_search(&pts_ns)
+            {
+                self.unread.remove(n);
+                self.closed = true;
+            }
+            return false;
+        }
+        let after = next.is_some_and(|e| e.time_ns == pts_ns || e.byte <= byte);
         let before =
             at.checked_sub(1).and_then(|n| self.entries.get(n)).is_some_and(|e| e.byte >= byte);
         if after || before || self.entries.len() >= MAX_GROWN {
+            // a keyframe left out, the stretch read on from it joins no entry
+            self.run = Run::Broken;
             return false;
+        }
+        // a stretch read whole holds the keyframes inside it
+        let whole = next.is_some_and(|e| self.unread.binary_search(&e.time_ns).is_err());
+        if !self.read(at, pts_ns) && !whole {
+            let n = self.unread.partition_point(|&t| t < pts_ns);
+            self.unread.insert(n, pts_ns);
         }
         self.entries.insert(at, IndexEntry::key(pts_ns, byte));
         // Every publish clones the whole index, so the step grows with it, or a long walk of tiny
@@ -326,8 +380,67 @@ impl Grown {
         self.entries.len() >= self.published + GROWN_EVERY.max(self.published / 2)
     }
 
+    /// The keyframe at `time` is read as entry `at`. True when the read came on to it from the
+    /// entry before, or the start for the first, the stretch between then read.
+    fn read(&mut self, at: usize, time: u64) -> bool {
+        let from = at.checked_sub(1).map_or(Run::Start, |n| Run::At(self.entries[n].time_ns));
+        let on = self.run == from;
+        if let Run::At(before) = from
+            && on
+            && time - before <= SPACING_SEEN_MAX
+        {
+            self.spacing = self.spacing.max(time - before);
+        }
+        self.run = Run::At(time);
+        on
+    }
+
+    /// How far ahead of its target a seek to an estimated byte aims, so a keyframe comes at or
+    /// before the target.
+    pub(crate) fn back(&self) -> u64 {
+        match self.spacing {
+            0 => BACK_UNKNOWN,
+            s => (s + REORDER).min(BACK_MAX),
+        }
+    }
+
+    /// Whether `byte` is an entry's, a keyframe's Cluster rather than an estimate.
+    pub(crate) fn keyed(&self, byte: u64) -> bool {
+        self.entries.binary_search_by_key(&byte, |e| e.byte).is_ok()
+    }
+
+    /// Drops the entries at the times `near` names, a stretch through one not read stays not
+    /// read. True when one went.
+    pub(crate) fn drop_near(&mut self, near: impl Fn(u64) -> bool) -> bool {
+        let (n, mut carry) = (self.entries.len(), false);
+        for e in &self.entries {
+            match (near(e.time_ns), self.unread.binary_search(&e.time_ns)) {
+                (true, Ok(k)) => {
+                    self.unread.remove(k);
+                    carry = true;
+                }
+                (true, Err(_)) => {}
+                (false, Err(k)) if carry => {
+                    self.unread.insert(k, e.time_ns);
+                    carry = false;
+                }
+                (false, _) => carry = false,
+            }
+        }
+        self.entries.retain(|e| !near(e.time_ns));
+        self.entries.len() < n
+    }
+
     pub(crate) fn unpublished(&self) -> bool {
-        self.entries.len() != self.published
+        self.entries.len() != self.published || self.closed
+    }
+
+    /// The entries and the stretches not read, counted as published.
+    // Cold path, one copy per publication.
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) fn publish(&mut self) -> (Vec<IndexEntry>, Vec<u64>) {
+        (self.published, self.closed) = (self.entries.len(), false);
+        (self.entries.clone(), self.unread.clone())
     }
 }
 
@@ -758,6 +871,80 @@ mod tests {
         assert!(!g.block(1, 150_000, true), "a step of half the published, not 64");
         g.cluster(1_500_010);
         assert!(g.block(1, 150_001, true), "the step reached");
+    }
+
+    /// Reads the keyframe at `secs` heading its Cluster, at a thousand bytes a second.
+    fn key(g: &mut Grown, secs: u64) {
+        g.cluster(secs * 1_000);
+        g.block(1, secs * S, true);
+    }
+
+    fn unread(g: &Grown) -> Vec<u64> {
+        g.unread.iter().map(|t| t / S).collect()
+    }
+
+    #[test]
+    fn a_grown_index_keeps_the_stretches_its_jumps_left_unread() {
+        let mut g = Grown { key: Some(1), ..Grown::default() };
+        [0, 2, 4].into_iter().for_each(|s| key(&mut g, s));
+        assert_eq!(unread(&g), [] as [u64; 0], "read from the start");
+        g.jump(false);
+        [20, 22].into_iter().for_each(|s| key(&mut g, s));
+        assert_eq!(unread(&g), [20], "4 s to 20 s");
+        g.jump(false);
+        [10, 12].into_iter().for_each(|s| key(&mut g, s));
+        assert_eq!(unread(&g), [10, 20], "a landing inside it splits it");
+        let _ = g.publish();
+        assert!(!g.unpublished());
+        [14, 16, 18, 20].into_iter().for_each(|s| key(&mut g, s));
+        assert_eq!(unread(&g), [10], "read on into 20 s");
+        let (entries, published) = g.publish();
+        assert_eq!((entries.len(), published), (10, vec![10 * S]));
+        g.jump(false);
+        key(&mut g, 20);
+        assert!(!g.unpublished(), "a keyframe read again changes nothing");
+        g.jump(true);
+        key(&mut g, 0);
+        assert_eq!(unread(&g), [10], "the start read again");
+    }
+
+    #[test]
+    fn a_keyframe_left_out_or_dropped_leaves_the_stretch_over_it_unread() {
+        let mut g = Grown { key: Some(1), ..Grown::default() };
+        [0, 2, 4].into_iter().for_each(|s| key(&mut g, s));
+        g.jump(false);
+        [10, 12].into_iter().for_each(|s| key(&mut g, s));
+        assert_eq!(unread(&g), [10]);
+        g.jump(false);
+        key(&mut g, 1);
+        assert_eq!(unread(&g), [10], "inside a stretch read whole");
+        assert!(g.drop_near(|t| t == 10 * S));
+        assert_eq!(unread(&g), [12], "4 s to 12 s");
+        assert!(g.drop_near(|t| t == 2 * S) && !g.drop_near(|t| t == 3 * S));
+        assert_eq!(unread(&g), [12]);
+        g.jump(false);
+        key(&mut g, 12);
+        g.cluster(5_000);
+        assert!(!g.block(1, 14 * S, true), "out of order with the bytes");
+        key(&mut g, 16);
+        assert_eq!(unread(&g), [12, 16], "nothing joins the read past it");
+    }
+
+    #[test]
+    fn a_grown_index_aims_back_by_the_widest_gap_read_side_by_side() {
+        let mut g = Grown { key: Some(1), ..Grown::default() };
+        key(&mut g, 0);
+        assert_eq!(g.back(), BACK_UNKNOWN, "one keyframe");
+        g.jump(false);
+        key(&mut g, 3);
+        assert_eq!(g.back(), BACK_UNKNOWN, "not side by side");
+        key(&mut g, 7);
+        assert_eq!(g.back(), 5 * S, "4 s and a second");
+        key(&mut g, 40);
+        assert_eq!(g.back(), 5 * S, "far apart, a stretch not read");
+        key(&mut g, 52);
+        assert_eq!(g.back(), BACK_MAX);
+        assert!(g.keyed(7_000) && !g.keyed(7_001));
     }
 
     /// A restart reads aside the captions stored before its byte that still show, one up at

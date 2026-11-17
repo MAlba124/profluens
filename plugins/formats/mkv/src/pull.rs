@@ -103,6 +103,8 @@ pub(crate) struct Walk {
     pub(crate) damage_at: u64,
     /// The least the next ask reads, once. A seek's first read holds the keyframe with it.
     pub(crate) lead: u32,
+    /// Bytes were passed unread scanning for a Cluster since asked.
+    pub(crate) skipped: bool,
 }
 
 impl Walk {
@@ -124,6 +126,7 @@ impl Walk {
             damage: None,
             damage_at: 0,
             lead: 0,
+            skipped: false,
         }
     }
 
@@ -134,7 +137,7 @@ impl Walk {
 
     /// Damage at `pos` is noted and the walk scans on from the next octet for a Cluster.
     fn lost(&mut self, e: ReadError) -> Step {
-        (self.damage, self.damage_at) = (Some(e), self.pos);
+        (self.damage, self.damage_at, self.skipped) = (Some(e), self.pos, true);
         (self.resync, self.cluster_end) = (true, None);
         Step::Skip { to: self.pos + 1 }
     }

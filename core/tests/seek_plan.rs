@@ -342,6 +342,60 @@ fn past_the_last_entry_of_an_incomplete_index_the_keyframe_is_unknown() {
     assert_eq!(video(&dense, 15_000, 9_000, Some(12_000)), seek(30_000, 10_000, 15_000));
 }
 
+/// Read 0 to 4 s, then from 20 s on, of 40 s over 40 000 bytes, the stretch between not read.
+fn jumped() -> Index {
+    let entries = [(0, 0), (2_000, 2_000), (4_000, 4_000), (20_000, 26_000), (22_000, 28_000)];
+    let mut index = Index { complete: false, ..whole(&entries.map(|(t, b)| (MS(t).0, b)), 40_000) };
+    index.unread = vec![MS(20_000).0];
+    index
+}
+
+/// A read that jumped left a stretch between two entries not read. The keyframe inside it is
+/// unknown, a target there is placed between the entries around it, not floored to the one
+/// before the stretch, and presented from the target.
+#[test]
+fn inside_a_stretch_not_read_the_byte_is_placed_between_the_entries_around_it() {
+    let index = jumped();
+    assert_eq!(index.keyframe(MS(12_000)), None);
+    assert_eq!(index.resolve(MS(12_000)), Some((15_000, MS(12_000))), "half way from 4 s");
+    let key = index.plan(MS(12_000), SeekMode::Keyframe, MS(30_000), None, Reach::Group);
+    assert_eq!(key, seek(15_000, 12_000, 12_000), "from the target");
+    assert_eq!(video(&index, 12_000, 30_000, None), seek(15_000, 12_000, 12_000));
+    assert_eq!(index.restart_for(7, MS(12_000)), index.resolve(MS(12_000)));
+    assert_eq!(index.restart(key), Some((15_000, MS(12_000))), "an estimate restarts at itself");
+    assert_eq!(index.resolve(MS(4_001)), Some((4_001, MS(4_001))));
+    let whole = Index { complete: true, ..jumped() };
+    assert_eq!(whole.resolve(MS(12_000)), Some((4_000, MS(4_000))), "a whole index floors");
+}
+
+/// Around a stretch not read the entries read side by side still floor, and past the last
+/// entry the estimate stands.
+#[test]
+fn beside_a_stretch_not_read_the_entries_read_floor() {
+    let index = jumped();
+    assert_eq!(index.keyframe(MS(4_000)), Some(&index.entries[2]), "on the entry before");
+    assert_eq!(index.resolve(MS(3_000)), Some((2_000, MS(2_000))));
+    assert_eq!(index.resolve(MS(21_000)), Some((26_000, MS(20_000))), "read from 20 s on");
+    assert_eq!(index.keyframe(MS(21_000)), Some(&index.entries[3]));
+    assert_eq!(index.resolve(MS(30_000)), Some((30_000, MS(30_000))), "past the last");
+    assert_eq!(video(&index, 21_000, 30_000, None), seek(26_000, 20_000, 21_000));
+}
+
+/// A first entry read after a jump says nothing of the stretch before it, a target there is
+/// estimated, unless the estimate lands past the entry.
+#[test]
+fn before_a_first_entry_not_read_from_the_start_the_byte_is_estimated() {
+    let late = |byte| {
+        let entries = [(MS(10_000).0, byte), (MS(12_000).0, byte + 2_000)];
+        Index { complete: false, unread: vec![MS(10_000).0], ..whole(&entries, 40_000) }
+    };
+    assert_eq!(late(10_000).resolve(MS(5_000)), Some((5_000, MS(5_000))));
+    assert_eq!(late(10_000).keyframe(MS(5_000)), None);
+    assert_eq!(late(4_000).resolve(MS(5_000)), Some((4_000, MS(10_000))), "the entry's byte");
+    let from_start = Index { unread: Vec::new(), ..late(10_000) };
+    assert_eq!(from_start.resolve(MS(5_000)), Some((10_000, MS(10_000))), "the first");
+}
+
 #[test]
 fn a_seek_restarts_the_source_where_its_keyframe_entry_says() {
     let mut index = gops();

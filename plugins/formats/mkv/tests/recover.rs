@@ -430,7 +430,10 @@ fn a_time_seek_sent_before_the_first_pass_plays_from_a_cluster() {
             play(&f, pull, chunk, Seek::Time { to: Timestamp(7 * S), mode: SeekMode::Keyframe });
         assert!(!ran.failed, "{how}: the run failed");
         let first = ran.frames.first().unwrap_or_else(|| panic!("{how}: nothing played"));
-        assert!(first.key && first.pts.is_some_and(|t| t >= 4 * S), "{how}: {:?}", ran.pts());
+        // pulled it aims back by a guess of the spacing, none read yet, for a keyframe before
+        // the target, pushed it reads on from the estimated byte
+        let near = |t: u64| if pull { (2 * S..=7 * S).contains(&t) } else { t >= 4 * S };
+        assert!(first.key && first.pts.is_some_and(near), "{how}: {:?}", ran.pts());
         assert_eq!(ran.frames.last().and_then(|f| f.pts), Some(10_020 * MS), "{how}");
     }
 }

@@ -451,15 +451,19 @@ fn a_seek_before_the_cues_are_in_lands_on_the_estimate_and_the_next_exactly() {
     let SeekPlan::Seek { to_byte, key, to_time } = plan else { panic!("{plan:?}") };
     assert_eq!((key, to_byte), (target, file.len() as u64 * 55 / 80), "the estimate");
     let _ = control.seek_bytes(to_time, &[(profluens_core::command::ALL, to_byte, key)]);
-    let landed = at.iter().find(|c| c.0 >= to_byte).expect("a Cluster behind the estimate").1;
+    let behind = at.iter().find(|c| c.0 >= to_byte).expect("a Cluster behind the estimate").1;
+    assert!(behind > target.0, "the estimated byte alone lands past the target");
     let first = |seen: &Arc<Mutex<Seen>>, n: usize| {
         let rows = rows(seen);
         let flush = rows.iter().enumerate().filter(|(_, r)| r.is_none()).nth(n).map(|(i, _)| i)?;
         rows.get(flush + 1).copied().flatten()
     };
     until("the first seek", || first(&seen[0], 0).is_some());
-    assert_eq!(first(&seen[0], 0), Some(landed), "the keyframe behind the estimated byte");
-    assert_ne!(landed, 5_000 * MS, "which is not the target's");
+    let landed = first(&seen[0], 0).expect("a picture");
+    assert!(at.iter().any(|c| c.1 == landed), "a Cluster's keyframe, {landed}");
+    // aimed back by the keyframe spacing read and a second
+    let near = (target.0 - 3_000 * MS..=target.0).contains(&landed);
+    assert!(near, "a keyframe shortly before the target, {landed}");
     release.store(true, Ordering::Release);
     until("the Cues", || tap.index(demux).is_some_and(|index| index.complete));
     let index = tap.index(demux).expect("published");

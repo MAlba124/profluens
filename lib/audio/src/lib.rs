@@ -47,7 +47,7 @@ pub use restart::{Lead, RESTARTS, Restart, lead_of};
 pub use stamp::{push_pcm, take_pcm};
 pub use stretch::{AudioStretch, RATE_MAX, RATE_MIN, rate_supported};
 pub use trim::{
-    Place, Rebase, Trim, Trimmed, declared_delay, delay_frames, frames_before, place, position_at,
+    Place, Rebase, StampGrid, Trim, Trimmed, declared_delay, delay_frames, frames_before, place, position_at,
     span_at, time_at, trim_frames, trim_pcm,
 };
 pub use wav::{

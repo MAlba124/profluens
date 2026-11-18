@@ -81,6 +81,58 @@ impl Rebase {
     }
 }
 
+/// Stamps a [`StampGrid`] looks back over.
+const GRID_STAMPS: usize = 16;
+
+/// What the stamps of a container resolve, from the last stamps seen. Frames are whole, so an
+/// exact stamp parts from the count by whole frames. One that does not was rounded, by less than
+/// the common step of the stamps, and a parting within that step is no lost frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct StampGrid {
+    steps: [u64; GRID_STAMPS],
+    next: usize,
+    last: Option<u64>,
+    /// Stamps left before the stamps count as exact again.
+    rounded: usize,
+}
+
+impl StampGrid {
+    /// Takes the stamp of a frame it puts `diff` samples past the count. True when the two agree
+    /// as far as the stamps resolve, within half a frame or within the rounding of the stamps.
+    pub fn agrees(&mut self, stamp: Timestamp, diff: i128, frame_len: usize, rate: u32) -> bool {
+        if stamp.is_none() || frame_len == 0 {
+            return true;
+        }
+        if let Some(last) = self.last.replace(stamp.0)
+            && last != stamp.0
+        {
+            self.steps[self.next] = last.abs_diff(stamp.0);
+            self.next = (self.next + 1) % GRID_STAMPS;
+        }
+        // A sample of slack, an exact stamp is carried in ns.
+        let off = diff.rem_euclid(frame_len as i128);
+        let off_grid = off.min(frame_len as i128 - off) > 1;
+        self.rounded = if off_grid { GRID_STAMPS } else { self.rounded.saturating_sub(1) };
+        let apart = diff.unsigned_abs();
+        if apart <= (frame_len / 2) as u128 {
+            return true;
+        }
+        // Under two steps nothing tells a rounded stamp from a lost frame, a later stamp does.
+        if self.steps[1] == 0 {
+            return true;
+        }
+        let step = self.steps.iter().fold(0, |g, s| gcd(g, *s));
+        self.rounded > 0 && apart * NANOS < u128::from(step) * u128::from(rate)
+    }
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
 /// The delay the format on `pad` declares ([`FIELD_DELAY`]), zero for none.
 pub fn declared_delay(ctx: &Ctx, pad: SinkPad) -> Timestamp {
     let declared = ctx.field_id(FIELD_DELAY).and_then(|id| ctx.negotiated_sink(pad)?.get(id));
@@ -185,6 +237,91 @@ mod tests {
 
     use super::*;
     use crate::format::SampleFormat;
+
+    /// Stamps of frames `frame` samples long at 48 kHz, one every `per` frames, on a grid of
+    /// `grid_ns` (`floor` or to nearest), `lost.1` frames gone ahead of stamp `lost.0`. The count
+    /// starts at the first stamp. Gives the stamps the grid did not agree with.
+    fn disagreed(
+        frame: u64,
+        per: u64,
+        grid_ns: u64,
+        floor: bool,
+        phase: u64,
+        lost: (u64, u64),
+    ) -> Vec<u64> {
+        let on_grid = |sample: u64| {
+            let ns = sample * 1_000_000_000 / 48_000;
+            if grid_ns == 0 {
+                return Timestamp(ns);
+            }
+            Timestamp((if floor { ns } else { ns + grid_ns / 2 }) / grid_ns * grid_ns)
+        };
+        let mut grid = StampGrid::default();
+        let mut counted = position_at(on_grid(phase * frame), 48_000);
+        let mut out = Vec::new();
+        for k in 0..400u64 {
+            let gone = if k >= lost.0 { lost.1 } else { 0 };
+            let stamp = on_grid((phase + k * per + gone) * frame);
+            let diff = i128::from(position_at(stamp, 48_000)) - i128::from(counted);
+            if !grid.agrees(stamp, diff, frame as usize, 48_000) {
+                out.push(k);
+                counted = position_at(stamp, 48_000);
+            }
+            counted += per * frame;
+        }
+        out
+    }
+
+    #[test]
+    fn stamps_rounded_past_half_a_short_frame_agree_with_the_count() {
+        // TrueHD frames of 40 samples under millisecond stamps, 48 samples apart.
+        for per in [1, 2, 3, 5, 6, 7, 24] {
+            for phase in 0..6 {
+                for floor in [false, true] {
+                    let got = disagreed(40, per, 1_000_000, floor, phase, (u64::MAX, 0));
+                    assert!(got.is_empty(), "per {per} phase {phase} floor {floor}: {got:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_frame_lost_under_exact_stamps_disagrees_at_once() {
+        // AC-3 frames of 1536 samples, two a stamp, the stamps exact.
+        for grid_ns in [0, 11_111] {
+            assert_eq!(disagreed(1536, 2, grid_ns, true, 0, (u64::MAX, 0)), [], "grid {grid_ns}");
+            assert_eq!(disagreed(1536, 2, grid_ns, true, 0, (100, 1)), [100], "grid {grid_ns}");
+        }
+        // The same frames under millisecond stamps they land on.
+        assert_eq!(disagreed(1536, 1, 1_000_000, false, 0, (100, 1)), [100]);
+    }
+
+    #[test]
+    fn a_frame_lost_under_rounded_stamps_of_long_frames_disagrees_at_once() {
+        // AAC frames of 1024 samples under millisecond stamps.
+        assert_eq!(disagreed(1024, 1, 1_000_000, false, 0, (u64::MAX, 0)), []);
+        assert_eq!(disagreed(1024, 1, 1_000_000, false, 0, (100, 1)), [100]);
+    }
+
+    #[test]
+    fn a_stretch_lost_under_rounded_stamps_of_short_frames_disagrees_at_once() {
+        // Less than a stamp step of TrueHD lost is not told from the rounding, more is.
+        assert_eq!(disagreed(40, 3, 1_000_000, false, 0, (100, 30)), [100]);
+    }
+
+    #[test]
+    fn one_stamp_off_the_frames_does_not_blunt_exact_stamps_for_good() {
+        let mut grid = StampGrid::default();
+        let at = |k: u64| Timestamp(k * 64_000_000);
+        assert!(grid.agrees(at(0), 0, 1536, 48_000));
+        assert!(grid.agrees(at(1), 0, 1536, 48_000));
+        // A damaged stamp, 1000 samples late.
+        assert!(!grid.agrees(Timestamp(at(2).0 + 20_833_333), 1000, 1536, 48_000));
+        for k in 3..3 + GRID_STAMPS as u64 + 1 {
+            assert!(grid.agrees(at(k), 0, 1536, 48_000), "stamp {k}");
+        }
+        assert!(!grid.agrees(at(30), 1536, 1536, 48_000), "a frame lost of two a stamp");
+    }
 
     fn grid(n: u64, rate: u32) -> Timestamp {
         Timestamp((u128::from(n) * NANOS / u128::from(rate)) as u64)

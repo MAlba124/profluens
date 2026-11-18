@@ -683,3 +683,42 @@ fn a_frame_lost_in_transport_leaves_the_audio_after_it_at_its_stamps() {
     assert!(worst.is_some_and(|d| d <= 2), "the audio after the lost frame moved, {worst:?} apart");
     assert!(lossy[10 * 1536 * stride..11 * 1536 * stride].iter().all(|b| *b == 0), "silence");
 }
+
+/// TrueHD access units three a stamped unit as Matroska blocks carry them, the stamps rounded to
+/// the millisecond, past half a 40 sample frame.
+#[test]
+fn truehd_under_millisecond_stamps_decodes_as_under_none() {
+    let args = ["-strict", "-2", "-c:a", "truehd", "-f", "truehd"];
+    let Some(bytes) = stream("51.thd", 6, &args) else {
+        return;
+    };
+    // An access unit opens with its length in 16 bit words, 12 bits.
+    let (mut units, mut at) = (Vec::new(), 0);
+    while at + 2 <= bytes.len() {
+        let len = (usize::from(bytes[at] & 0x0f) << 8 | usize::from(bytes[at + 1])) * 2;
+        if len == 0 || at + len > bytes.len() {
+            break;
+        }
+        units.push(&bytes[at..at + len]);
+        at += len;
+    }
+    assert!(units.len() > 1000, "{} access units", units.len());
+    let mut plain = Harness::with_slot_size(LibavAudioDec::truehd(), SLOT);
+    let (want, _) = decode(&mut plain, &chunks(&bytes[..at], 999));
+    let mut h = Harness::with_slot_size(LibavAudioDec::truehd(), SLOT);
+    let mut got = Vec::new();
+    let mut take = |out: Vec<profluens_core::buffer::Buffer>| {
+        out.iter().for_each(|b| got.extend_from_slice(b.memory.data()));
+    };
+    for (k, block) in units.chunks(3).enumerate() {
+        let mut b = h.alloc(&block.concat());
+        let ns = k as u64 * 120 * 1_000_000_000 / 48_000;
+        b.pts = Timestamp::from_millis((ns + 500_000) / 1_000_000);
+        h.push(b).expect("push");
+        take(h.drain_outputs());
+    }
+    take(h.eos().expect("eos"));
+    assert_eq!(got.len(), want.len(), "frames were cut or filled in");
+    assert!(got == want, "the sound moved");
+    assert_eq!(warnings(&mut h), 0);
+}

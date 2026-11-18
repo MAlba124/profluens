@@ -8,7 +8,7 @@ use std::fmt;
 use profluens_audio::bytes_in::ByteIn;
 use profluens_audio::{
     DELAY_FIELDS, FIELD_DELAY, FIELD_LAYOUT, LAYOUT_FIELD, Place, Rebase, SampleFormat,
-    SampleFormats, convert_interleaved, converted_len, layout_or_default, link_samples,
+    SampleFormats, StampGrid, convert_interleaved, converted_len, layout_or_default, link_samples,
 };
 use profluens_core::batch::Inputs;
 use profluens_core::bus::BusMessage;
@@ -256,6 +256,7 @@ pub struct LibavAudioDec {
     frame_end: u64,
     /// Times the count moved to an input stamp.
     resyncs: u64,
+    grid: StampGrid,
     /// Backpressure carry. Nothing is decoded while it holds anything.
     pending: Vec<u8>,
     pending_pos: usize,
@@ -308,6 +309,7 @@ impl LibavAudioDec {
             stamps: std::collections::VecDeque::with_capacity(STAMPS),
             frame_end: 0,
             resyncs: 0,
+            grid: StampGrid::default(),
             pending: Vec::new(),
             pending_pos: 0,
             errors: 0,
@@ -423,6 +425,7 @@ impl LibavAudioDec {
         self.rebase = Rebase::Open;
         self.stamps.clear();
         (self.frame_end, self.resyncs) = (0, 0);
+        self.grid = StampGrid::default();
         self.pending.clear();
         self.pending_pos = 0;
         self.errors = 0;
@@ -753,9 +756,10 @@ impl LibavAudioDec {
         due
     }
 
-    /// Moves the count to the frame's stamp `due` when they part by more than half a frame, a
-    /// lost packet in a transport stream. A gap is filled with silence, an overlap returns the
-    /// frames to cut from the frame's start. Past a second the count jumps instead.
+    /// Moves the count to the frame's stamp `due` when they part by more than half a frame and
+    /// more than the stamps round by, a lost packet in a transport stream. A gap is filled with
+    /// silence, an overlap returns the frames to cut from the frame's start. Past a second the
+    /// count jumps instead.
     fn restamp(&mut self, ctx: &mut Ctx, due: Timestamp) -> usize {
         let counting = self.rebase == Rebase::Counting && self.at.lead == 0;
         if due.is_none() || !counting || self.reformat || self.held.is_some() {
@@ -772,7 +776,7 @@ impl LibavAudioDec {
         );
         let stamped = profluens_audio::position_at(due, self.rate).saturating_sub(delay);
         let diff = i128::from(stamped) - i128::from(counted);
-        if diff.unsigned_abs() <= (self.frame_len / 2) as u128 {
+        if self.grid.agrees(due, diff, self.frame_len, self.rate) {
             return 0;
         }
         self.resyncs += 1;

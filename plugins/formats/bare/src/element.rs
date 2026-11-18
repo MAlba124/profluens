@@ -636,10 +636,14 @@ impl Element for BareSrc {
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
-        if !matches!(event, Event::FlushStart) || !self.started {
-            return Ok(());
-        }
-        let at = ctx.seek_target().and_then(|t| t.at.nanos()).unwrap_or(0);
+        // A splice that links a new reader restarts the file at its point, as a seek does, the
+        // head first for a decoder that opens on it, not from where the old reader had read to
+        let at = match event {
+            Event::FlushStart if self.started => ctx.seek_target().and_then(|t| t.at.nanos()),
+            Event::SrcLinked { on: true, restart: Some(t), .. } if self.started => t.at.nanos(),
+            _ => return Ok(()),
+        };
+        let at = at.unwrap_or(0);
         let at = at.min(i64::MAX as u64) as i64;
         let back = self.lead_frames() * u64::from(self.head.spf);
         let at =

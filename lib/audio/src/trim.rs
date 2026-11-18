@@ -85,8 +85,9 @@ impl Rebase {
 const GRID_STAMPS: usize = 16;
 
 /// What the stamps of a container resolve, from the last stamps seen. Frames are whole, so an
-/// exact stamp parts from the count by whole frames. One that does not was rounded, by less than
-/// the common step of the stamps, and a parting within that step is no lost frame.
+/// exact stamp parts from the count by whole frames. One that does not was rounded, up or down
+/// by less than the common step of the stamps. The count stands on such a stamp too, so a
+/// parting within two steps is no lost frame.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct StampGrid {
     steps: [u64; GRID_STAMPS],
@@ -122,7 +123,7 @@ impl StampGrid {
             return true;
         }
         let step = self.steps.iter().fold(0, |g, s| gcd(g, *s));
-        self.rounded > 0 && apart * NANOS < u128::from(step) * u128::from(rate)
+        self.rounded > 0 && apart * NANOS < 2 * u128::from(step) * u128::from(rate)
     }
 }
 
@@ -239,29 +240,35 @@ mod tests {
     use crate::format::SampleFormat;
 
     /// Stamps of frames `frame` samples long at 48 kHz, one every `per` frames, on a grid of
-    /// `grid_ns` (`floor` or to nearest), `lost.1` frames gone ahead of stamp `lost.0`. The count
-    /// starts at the first stamp. Gives the stamps the grid did not agree with.
+    /// `grid_ns` (`round` 0 to nearest, 1 down, 2 down and up in turn), `lost.1` frames gone
+    /// ahead of stamp `lost.0`. The count starts at the first stamp. Gives the stamps the grid did
+    /// not agree with.
     fn disagreed(
         frame: u64,
         per: u64,
         grid_ns: u64,
-        floor: bool,
+        round: u8,
         phase: u64,
         lost: (u64, u64),
     ) -> Vec<u64> {
-        let on_grid = |sample: u64| {
+        let on_grid = |sample: u64, k: u64| {
             let ns = sample * 1_000_000_000 / 48_000;
             if grid_ns == 0 {
                 return Timestamp(ns);
             }
-            Timestamp((if floor { ns } else { ns + grid_ns / 2 }) / grid_ns * grid_ns)
+            let up = match round {
+                0 => grid_ns / 2,
+                1 => 0,
+                _ => (k % 2) * (grid_ns - 1),
+            };
+            Timestamp((ns + up) / grid_ns * grid_ns)
         };
         let mut grid = StampGrid::default();
-        let mut counted = position_at(on_grid(phase * frame), 48_000);
+        let mut counted = position_at(on_grid(phase * frame, 0), 48_000);
         let mut out = Vec::new();
         for k in 0..400u64 {
             let gone = if k >= lost.0 { lost.1 } else { 0 };
-            let stamp = on_grid((phase + k * per + gone) * frame);
+            let stamp = on_grid((phase + k * per + gone) * frame, k);
             let diff = i128::from(position_at(stamp, 48_000)) - i128::from(counted);
             if !grid.agrees(stamp, diff, frame as usize, 48_000) {
                 out.push(k);
@@ -277,9 +284,9 @@ mod tests {
         // TrueHD frames of 40 samples under millisecond stamps, 48 samples apart.
         for per in [1, 2, 3, 5, 6, 7, 24] {
             for phase in 0..6 {
-                for floor in [false, true] {
-                    let got = disagreed(40, per, 1_000_000, floor, phase, (u64::MAX, 0));
-                    assert!(got.is_empty(), "per {per} phase {phase} floor {floor}: {got:?}");
+                for round in 0..3 {
+                    let got = disagreed(40, per, 1_000_000, round, phase, (u64::MAX, 0));
+                    assert!(got.is_empty(), "per {per} phase {phase} round {round}: {got:?}");
                 }
             }
         }
@@ -289,24 +296,26 @@ mod tests {
     fn a_frame_lost_under_exact_stamps_disagrees_at_once() {
         // AC-3 frames of 1536 samples, two a stamp, the stamps exact.
         for grid_ns in [0, 11_111] {
-            assert_eq!(disagreed(1536, 2, grid_ns, true, 0, (u64::MAX, 0)), [], "grid {grid_ns}");
-            assert_eq!(disagreed(1536, 2, grid_ns, true, 0, (100, 1)), [100], "grid {grid_ns}");
+            assert_eq!(disagreed(1536, 2, grid_ns, 1, 0, (u64::MAX, 0)), [], "grid {grid_ns}");
+            assert_eq!(disagreed(1536, 2, grid_ns, 1, 0, (100, 1)), [100], "grid {grid_ns}");
         }
         // The same frames under millisecond stamps they land on.
-        assert_eq!(disagreed(1536, 1, 1_000_000, false, 0, (100, 1)), [100]);
+        assert_eq!(disagreed(1536, 1, 1_000_000, 0, 0, (100, 1)), [100]);
     }
 
     #[test]
     fn a_frame_lost_under_rounded_stamps_of_long_frames_disagrees_at_once() {
         // AAC frames of 1024 samples under millisecond stamps.
-        assert_eq!(disagreed(1024, 1, 1_000_000, false, 0, (u64::MAX, 0)), []);
-        assert_eq!(disagreed(1024, 1, 1_000_000, false, 0, (100, 1)), [100]);
+        for round in 0..3 {
+            assert_eq!(disagreed(1024, 1, 1_000_000, round, 0, (u64::MAX, 0)), []);
+            assert_eq!(disagreed(1024, 1, 1_000_000, round, 0, (100, 1)), [100]);
+        }
     }
 
     #[test]
     fn a_stretch_lost_under_rounded_stamps_of_short_frames_disagrees_at_once() {
-        // Less than a stamp step of TrueHD lost is not told from the rounding, more is.
-        assert_eq!(disagreed(40, 3, 1_000_000, false, 0, (100, 30)), [100]);
+        // Under two stamp steps of TrueHD lost is not told from the rounding, more is.
+        assert_eq!(disagreed(40, 3, 1_000_000, 2, 0, (100, 30)), [100]);
     }
 
     #[test]

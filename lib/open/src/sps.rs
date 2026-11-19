@@ -88,11 +88,12 @@ pub(crate) fn av1c_chroma(head: &[u8]) -> Chroma {
     }
 }
 
-/// `t` with what the first SPS of its head states over the container's colour, its SEI's HDR
-/// over the container's, and its size, depth, chroma and pixel aspect where the container states
-/// none. A Matroska file may leave the colour to the bitstream, a PQ track would then read as
-/// SDR. An AV1 head that is its config record states the chroma, an MP4's record set it before.
-/// The NAL codec of a family whose heads are Annex B.
+/// `t` with what the first SPS of its head states over the container's colour and depth, its
+/// SEI's HDR over the container's, and its size, chroma and pixel aspect where the container
+/// states none. A Matroska avcC states no depth, a High 10 track read as 8 bits otherwise. A
+/// Matroska file may leave the colour to the bitstream, a PQ track would then read as SDR. An AV1
+/// head that is its config record states the chroma, an MP4's record set it before. The NAL codec
+/// of a family whose heads are Annex B.
 pub(crate) fn nal_codec(family: &str) -> Option<NalCodec> {
     match family {
         "h264/annexb" => Some(NalCodec::H264),
@@ -118,7 +119,7 @@ pub(crate) fn fill(t: &mut TrackDesc, head: &[u8]) {
     if t.width == 0 || t.height == 0 {
         (t.width, t.height) = (s.width, s.height);
     }
-    if t.depth == 0 {
+    if s.depth > 0 {
         t.depth = s.depth;
     }
     if (t.par.0 == 0 || t.par.1 == 0) && s.sar.0 > 0 && s.sar.1 > 0 {

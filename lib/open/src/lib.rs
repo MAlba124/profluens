@@ -173,6 +173,9 @@ pub struct TrackDesc {
     pub layout: u64,
     /// The NAL length prefix size of the stored units, 0 for Annex B or codecs without NALs.
     pub nal_length: u8,
+    /// Its units are PES payloads a frame may lie across, a parser frames them. The program
+    /// stream and transport stream demuxers hand every audio stream so but ADTS AAC and PCM.
+    pub unframed: bool,
     pub duration_ns: u64,
     /// Where the track's first unit carries an HDR10+ T.35 message, an MP4's first sync sample,
     /// a Matroska track's first block, HDR10+ riding every picture. None unless
@@ -199,6 +202,15 @@ impl Hdr10Plus {
 }
 
 impl TrackDesc {
+    /// A track of a transport or program stream, its units as the demuxer hands them.
+    fn of_pes(id: u32, kind: TrackKind, family: &'static str) -> TrackDesc {
+        let mut t = TrackDesc::new(id, kind, family);
+        t.unframed = kind == TrackKind::Audio
+            && family != "aac"
+            && family != profluens_audio::format::FAMILY;
+        t
+    }
+
     fn new(id: u32, kind: TrackKind, family: &'static str) -> TrackDesc {
         TrackDesc {
             id,
@@ -226,6 +238,7 @@ impl TrackDesc {
             chroma: Chroma::Unknown,
             layout: 0,
             nal_length: 0,
+            unframed: false,
             duration_ns: 0,
             hdr10plus: Hdr10Plus::None,
         }
@@ -730,6 +743,52 @@ mod tests {
         d.push(t);
         assert_eq!(d.tracks[2].chroma, Chroma::C444);
         assert_eq!((Chroma::from_idc(0), Chroma::from_idc(4)), (Chroma::Mono, Chroma::Unknown));
+    }
+
+    /// An H.264 High 10 SPS states 10 bits over the 8 a Matroska avcC is read as.
+    #[test]
+    fn the_depth_is_what_the_sps_states_over_the_containers() {
+        let mut w = profluens_video::bits::BitWriter::new();
+        w.u(110, 8);
+        w.u(0, 8);
+        w.u(30, 8);
+        // sps id, chroma_format_idc 1, both depths 10, no transform bypass, no scaling matrix
+        for v in [0, 1, 2, 2] {
+            w.ue(v);
+        }
+        w.flag(false);
+        w.flag(false);
+        // log2_max_frame_num 4, poc type 2, one reference, 320 x 192 frames
+        for v in [0, 2, 1] {
+            w.ue(v);
+        }
+        w.flag(false);
+        w.ue(19);
+        w.ue(11);
+        for b in [true, true, false, false] {
+            w.flag(b);
+        }
+        w.rbsp_trailing_bits();
+        let mut head = vec![0, 0, 0, 1, 0x67];
+        profluens_video::bits::push_ebsp(w.as_bytes(), &mut head);
+        let mut d = Desc::default();
+        let mut t = TrackDesc::new(1, TrackKind::Video, "h264/annexb");
+        t.head = d.put(&head);
+        t.depth = 8;
+        d.push(t);
+        assert_eq!((d.tracks[0].depth, d.tracks[0].width), (10, 320));
+    }
+
+    /// A PES demuxer frames ADTS AAC and PCM, any other audio goes as PES payloads.
+    #[test]
+    fn pes_audio_is_unframed_but_adts_aac_and_pcm() {
+        let of = |kind, family| TrackDesc::of_pes(1, kind, family).unframed;
+        assert!(of(TrackKind::Audio, "ac3"));
+        assert!(of(TrackKind::Audio, "mp3"));
+        assert!(!of(TrackKind::Audio, "aac"));
+        assert!(!of(TrackKind::Audio, profluens_audio::format::FAMILY));
+        assert!(!of(TrackKind::Video, "h264/annexb"));
+        assert!(!TrackDesc::new(1, TrackKind::Audio, "ac3").unframed, "another container frames");
     }
 
     /// An audio track's layout is its head's, a video track has none.

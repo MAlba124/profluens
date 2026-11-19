@@ -22,6 +22,7 @@ use profluens_core::log::Level;
 use profluens_core::time::Timestamp;
 use profluens_video::color::StreamColor;
 use profluens_video::keys::keyed;
+use profluens_video::level;
 
 use crate::bitwriter::{BitWriter, annexb_nal};
 use crate::colour;
@@ -98,34 +99,6 @@ pub(crate) static DESC: ElementDesc = ElementDesc {
 
 static DESC_GPU: ElementDesc = ElementDesc { sinks: &SINKS_GPU, make_default: None, ..DESC };
 
-/// level_idc, MaxMBPS, MaxFS and MaxDpbMbs (Table A-1).
-const LEVELS: [(u8, u32, u32, u32); 12] = [
-    (10, 1_485, 99, 396),
-    (11, 3_000, 396, 900),
-    (12, 6_000, 396, 2_376),
-    (13, 11_880, 396, 2_376),
-    (21, 19_800, 792, 4_752),
-    (22, 20_250, 1_620, 8_100),
-    (30, 40_500, 1_620, 8_100),
-    (31, 108_000, 3_600, 18_000),
-    (32, 216_000, 5_120, 20_480),
-    (41, 245_760, 8_192, 32_768),
-    (42, 522_240, 8_704, 34_816),
-    (51, 983_040, 36_864, 184_320),
-];
-
-fn pick_level(mbs_w: u32, mbs_h: u32, fps: (u32, u32)) -> u8 {
-    let fs = mbs_w * mbs_h;
-    let fps_int = if fps.0 > 0 { fps.0.div_ceil(fps.1) } else { 30 };
-    let mbps = fs.saturating_mul(fps_int);
-    for (idc, max_mbps, max_fs, _) in LEVELS {
-        if fs <= max_fs && mbps <= max_mbps {
-            return idc;
-        }
-    }
-    52
-}
-
 /// References a P picture takes at most. VDEnc searches two at the balanced target usage and
 /// three at the best (iHD MaxRefIdx0), the shader encoder more.
 pub const REFS: u32 = 3;
@@ -133,8 +106,7 @@ pub const REFS: u32 = 3;
 /// max_num_ref_frames of the SPS, [`REFS`] or what the level's DPB holds of the picture
 /// (A.3.1 item h), the same before a session and in it.
 fn sps_refs(mbs_w: u32, mbs_h: u32, level: u8) -> u32 {
-    let dpb = LEVELS.iter().find(|l| l.0 == level).map_or(184_320, |l| l.3);
-    (dpb / (mbs_w * mbs_h).max(1)).clamp(1, REFS)
+    (level::h264_dpb_mbs(level) / (mbs_w * mbs_h).max(1)).clamp(1, REFS)
 }
 
 const PROFILE_HIGH: u8 = 100;
@@ -152,7 +124,7 @@ pub fn parameter_sets(
     color: &StreamColor,
 ) -> (Vec<u8>, Vec<u8>) {
     let (coded_w, coded_h) = (enc::align_up(width.max(2), 16), enc::align_up(height.max(2), 16));
-    let level = pick_level(coded_w / 16, coded_h / 16, fps);
+    let level = level::h264(coded_w / 16, coded_h / 16, fps);
     let refs = sps_refs(coded_w / 16, coded_h / 16, level);
     let vui = colour::vui_colour(color);
     (write_sps(coded_w, coded_h, width.max(2), height.max(2), fps, level, refs, vui), write_pps(qp))
@@ -160,7 +132,7 @@ pub fn parameter_sets(
 
 /// profile_idc, constraint flags and level_idc of the SPS, the RFC 6381 `avc1` bytes.
 pub fn profile_level(width: u32, height: u32, fps: (u32, u32)) -> [u8; 3] {
-    [PROFILE_HIGH, 0, pick_level(width.div_ceil(16), height.div_ceil(16), fps)]
+    [PROFILE_HIGH, 0, level::h264(width.div_ceil(16), height.div_ceil(16), fps)]
 }
 
 struct Session {
@@ -453,7 +425,7 @@ impl VaapiH264Enc {
         let has_enc = profile_caps.is_none_or(|p| p.enc);
         let (mbs_w, mbs_h) =
             (enc::align_up(fmt.width, 16) / 16, enc::align_up(fmt.height, 16) / 16);
-        let level = pick_level(mbs_w, mbs_h, fmt.fps);
+        let level = level::h264(mbs_w, mbs_h, fmt.fps);
         let sps_refs = sps_refs(mbs_w, mbs_h, level);
         let order = match (lp, has_enc) {
             (true, true) => [Some(ffi::VAEntrypointEncSliceLP), Some(ffi::VAEntrypointEncSlice)],
@@ -976,7 +948,7 @@ fn seq_param(
     let crop_b = (engine.coded_h - engine.height) / 2;
     ffi::VAEncSequenceParameterBufferH264 {
         seq_parameter_set_id: 0,
-        level_idc: pick_level(engine.coded_w / 16, engine.coded_h / 16, fmt.fps),
+        level_idc: level::h264(engine.coded_w / 16, engine.coded_h / 16, fmt.fps),
         intra_period: gop,
         intra_idr_period: gop,
         ip_period: 1,
@@ -1522,16 +1494,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn level_ladder_picks_sane_levels() {
-        // 1080p60, 8160 MBs, 489600 MB/s -> 4.2.
-        assert_eq!(pick_level(120, 68, (60, 1)), 42);
-        // 720p30, 3600 MBs, 108000 MB/s -> 3.1.
-        assert_eq!(pick_level(80, 45, (30, 1)), 31);
-        // 99 MBs fits L1 but 2970 MB/s exceeds its 1485 MaxMBPS -> 1.1.
-        assert_eq!(pick_level(11, 9, (30, 1)), 11);
-    }
-
-    #[test]
     fn the_avc1_bytes_are_known_from_size_and_rate() {
         assert_eq!(profile_level(1920, 1038, (23_976, 1000)), [100, 0, 41]);
         assert_eq!(profile_level(1920, 1080, (60, 1)), [100, 0, 42]);
@@ -1557,7 +1519,7 @@ mod tests {
             let mut w = BitWriter::new();
             w.u(100, 8);
             w.u(0, 8);
-            w.u(pick_level(mbs_w, mbs_h, fmt.fps) as u32, 8);
+            w.u(level::h264(mbs_w, mbs_h, fmt.fps) as u32, 8);
             w.ue(0);
             w.ue(1);
             w.ue(0);

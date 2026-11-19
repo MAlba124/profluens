@@ -297,33 +297,50 @@ fn coded(rng: &mut Rng, nals: &[&[u8]]) -> Vec<u8> {
 }
 
 /// The single walk against `strip_param_sets` and `unreferenced`, and `kept_bytes` cut at
-/// every offset and fragment size against the stripped copy.
+/// every offset and fragment size against the whole copy, behind start codes and lengths.
 fn check_walk(codec: NalCodec, heads: &[&[u8]], au: &[u8], kept: &mut Vec<(usize, usize)>) {
     let s = scan_unit(codec, au, kept);
     let mut stripped = Vec::new();
     assert_eq!(s.param_sets, strip_param_sets(codec, au, &mut stripped), "{au:x?}");
-    let mut whole = Vec::new();
-    extend_kept(au, kept, &mut whole);
-    assert_eq!(whole.len(), s.kept_len);
-    if s.param_sets {
-        assert_eq!(whole, stripped, "{au:x?}");
-    }
     for head in heads {
         assert_eq!(scan_unreferenced(codec, head, &s), unreferenced(codec, head, au), "{au:x?}");
     }
-    for frag in [1, 3, 5, 64] {
-        let mut out = vec![0u8; frag];
-        let mut cut = Vec::new();
-        let mut at = 0;
-        while at < whole.len() {
-            let n = kept_bytes(au, kept, at, &mut out);
-            assert_eq!(n, frag.min(whole.len() - at));
-            cut.extend_from_slice(&out[..n]);
-            at += n;
+    for prefix in [NalPrefix::StartCode, NalPrefix::Length] {
+        let mut whole = Vec::new();
+        extend_kept(au, kept, prefix, &mut whole);
+        assert_eq!(whole.len(), s.kept_len);
+        if s.param_sets && prefix == NalPrefix::StartCode {
+            assert_eq!(whole, stripped, "{au:x?}");
         }
-        assert_eq!(cut, whole);
-        assert_eq!(kept_bytes(au, kept, whole.len(), &mut out), 0, "past the end");
+        for frag in [1, 3, 5, 64] {
+            let mut out = vec![0u8; frag];
+            let mut cut = Vec::new();
+            let mut at = 0;
+            while at < whole.len() {
+                let n = kept_bytes(au, kept, prefix, at, &mut out);
+                assert_eq!(n, frag.min(whole.len() - at));
+                cut.extend_from_slice(&out[..n]);
+                at += n;
+            }
+            assert_eq!(cut, whole);
+            assert_eq!(kept_bytes(au, kept, prefix, whole.len(), &mut out), 0, "past the end");
+        }
     }
+}
+
+#[test]
+fn kept_nals_go_behind_their_lengths_without_the_parameter_sets() {
+    let au = [
+        0, 0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x68, 0xce, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x65, 0x88,
+        0x84, 0, 0,
+    ];
+    let mut kept = Vec::new();
+    let s = scan_unit(NalCodec::H264, &au, &mut kept);
+    let want = [0, 0, 0, 2, 0x09, 0xf0, 0, 0, 0, 3, 0x65, 0x88, 0x84];
+    assert_eq!(s.kept_len, want.len());
+    let mut whole = Vec::new();
+    extend_kept(&au, &kept, NalPrefix::Length, &mut whole);
+    assert_eq!(whole, want);
 }
 
 #[test]

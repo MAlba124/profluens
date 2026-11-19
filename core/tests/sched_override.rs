@@ -145,3 +145,17 @@ fn a_passive_override_on_two_inputs_is_refused() {
         r.err()
     );
 }
+
+/// What a chain builder set on an element reads back, the element's own where it set nothing.
+#[test]
+fn an_elements_own_pool_and_hint_read_back() {
+    let mut p = Pipeline::new();
+    let ([src, a, _, _], _) = line(&mut p, 0);
+    p.set_element_pool(a, 4096, 6);
+    p.set_element_sched(a, SchedHint::Passive);
+    assert_eq!(p.element_pool(a), Some((4096, 6)));
+    assert_eq!(p.element_sched(a), Some(SchedHint::Passive));
+    assert_eq!(p.element_pool(src), None, "the pipeline's pool");
+    assert_eq!(p.element_sched(src), Some(SchedHint::Active), "its own hint");
+    assert_eq!(p.element_align(a), None, "the pipeline's allocator");
+}

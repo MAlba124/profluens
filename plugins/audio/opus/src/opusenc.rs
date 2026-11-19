@@ -22,6 +22,7 @@ use profluens_core::time::Timestamp;
 
 use crate::config::{Application, EncoderConfig, OPUS_RATE};
 use crate::error::{CodecError, OpusError};
+use crate::head::{OPUS_HEAD_MAGIC, OPUS_HEAD_MIN_LEN};
 
 trait EncBackend: Send {
     fn frame_bytes(&self) -> usize;
@@ -199,6 +200,17 @@ impl OpusEnc {
     pub fn constrained(mut self) -> Self {
         self.constrained = true;
         self
+    }
+
+    /// The OpusHead of its stream of `channels`, mapping family 0 (RFC 7845 section 5.1), the
+    /// lookahead as the pre-skip.
+    pub fn head(&self, channels: u8) -> [u8; OPUS_HEAD_MIN_LEN] {
+        let mut h = [0u8; OPUS_HEAD_MIN_LEN];
+        h[..8].copy_from_slice(OPUS_HEAD_MAGIC);
+        (h[8], h[9]) = (1, channels);
+        h[10..12].copy_from_slice(&(lookahead(self.application) as u16).to_le_bytes());
+        h[12..16].copy_from_slice(&OPUS_RATE.to_le_bytes());
+        h
     }
 
     fn frame_ns(&self) -> u64 {
@@ -625,7 +637,17 @@ impl Element for OpusEnc {
 #[allow(clippy::disallowed_methods)] // tests: one-shot fixtures, not a hot path
 mod tests {
     use super::*;
+    use crate::head::OpusHead;
     use crate::libopus::{LibopusDecoder, LibopusEncoder};
+
+    #[test]
+    fn the_head_states_the_channels_and_the_lookahead_as_pre_skip() {
+        let h = OpusEnc::new().head(2);
+        let parsed = OpusHead::parse(&h).expect("a valid head");
+        assert_eq!((parsed.channel_count, parsed.pre_skip), (2, 312));
+        assert_eq!(parsed.input_sample_rate, 48_000);
+        assert_eq!((parsed.output_gain_q7_8, parsed.mapping_family), (0, 0));
+    }
 
     #[test]
     fn desc_is_named_and_registered_shape() {

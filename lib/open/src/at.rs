@@ -441,12 +441,15 @@ impl OpenAt {
         Ok(None)
     }
 
-    /// The bitrates the statistics tags state for tracks whose head states none.
+    /// The bitrates and durations the statistics tags state for tracks whose head states none.
     fn mkv_meta_done(&mut self, meta: walk::Meta) -> Result<Option<Need>, OpenError> {
         if !meta.tags.is_empty() {
             for (t, &uid) in self.desc.tracks.iter_mut().zip(&self.mkv.uids) {
                 if t.bitrate == 0 && uid != 0 {
                     t.bitrate = pf_mkv::tags::bitrate_of(&meta.tags, uid).unwrap_or(0);
+                }
+                if t.duration_ns == 0 && uid != 0 {
+                    t.duration_ns = pf_mkv::tags::duration_of(&meta.tags, uid).unwrap_or(0);
                 }
             }
         }

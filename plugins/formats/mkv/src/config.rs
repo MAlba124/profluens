@@ -265,14 +265,39 @@ pub fn scan_unreferenced(codec: NalCodec, head: &[u8], s: &UnitScan) -> bool {
 
 const START4: [u8; 4] = [0, 0, 0, 1];
 
-/// Bytes `at..` of the unit `kept` of `scan_unit` describes onto `out`, each NAL behind a four
-/// byte start code as `strip_param_sets` writes it. A fragment is cut without the whole copy.
-/// Gives how many it wrote, short of `out` only at the end.
-pub fn kept_bytes(au: &[u8], kept: &[(usize, usize)], mut at: usize, out: &mut [u8]) -> usize {
+/// What leads each NAL `kept_bytes` writes, four bytes either way so `kept_len` holds for both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NalPrefix {
+    /// A four byte start code, as `strip_param_sets` writes it.
+    StartCode,
+    /// Its length in four big endian bytes, as ISO/IEC 14496-15 samples carry it.
+    Length,
+}
+
+impl NalPrefix {
+    fn of(self, nal: &[u8]) -> [u8; 4] {
+        match self {
+            NalPrefix::StartCode => START4,
+            NalPrefix::Length => (nal.len() as u32).to_be_bytes(),
+        }
+    }
+}
+
+/// Bytes `at..` of the unit `kept` of `scan_unit` describes onto `out`, each NAL behind
+/// `prefix`. A fragment is cut without the whole copy. Gives how many it wrote, short of `out`
+/// only at the end.
+pub fn kept_bytes(
+    au: &[u8],
+    kept: &[(usize, usize)],
+    prefix: NalPrefix,
+    mut at: usize,
+    out: &mut [u8],
+) -> usize {
     let mut w = 0usize;
     for &(a, b) in kept {
         let Some(nal) = au.get(a..b) else { break };
-        for seg in [&START4[..], nal] {
+        let lead = prefix.of(nal);
+        for seg in [&lead[..], nal] {
             if at >= seg.len() {
                 at -= seg.len();
                 continue;
@@ -289,11 +314,11 @@ pub fn kept_bytes(au: &[u8], kept: &[(usize, usize)], mut at: usize, out: &mut [
     w
 }
 
-/// The unit `kept` of `scan_unit` describes onto `out`, as `strip_param_sets` writes it.
-pub fn extend_kept(au: &[u8], kept: &[(usize, usize)], out: &mut Vec<u8>) {
+/// The unit `kept` of `scan_unit` describes onto `out`, each NAL behind `prefix`.
+pub fn extend_kept(au: &[u8], kept: &[(usize, usize)], prefix: NalPrefix, out: &mut Vec<u8>) {
     for &(a, b) in kept {
         let Some(nal) = au.get(a..b) else { break };
-        out.extend_from_slice(&START4);
+        out.extend_from_slice(&prefix.of(nal));
         out.extend_from_slice(nal);
     }
 }

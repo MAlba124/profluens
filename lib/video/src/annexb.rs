@@ -3,6 +3,11 @@
 
 use pf_hdr::h26x::start_code;
 
+/// An H.264 end of sequence NAL behind a four byte start code (7.3.2.5).
+pub const H264_EOS: [u8; 5] = [0, 0, 0, 1, 0x0a];
+/// An HEVC end of sequence NAL behind a four byte start code (7.3.2.6), type 36.
+pub const HEVC_EOS: [u8; 6] = [0, 0, 0, 1, 0x48, 0x01];
+
 pub struct Nals<'a> {
     rest: &'a [u8],
 }

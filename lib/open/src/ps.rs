@@ -29,7 +29,7 @@ pub(crate) fn describe(head: &[u8], tail: &[u8], d: &mut Desc) -> Result<u64, Op
             StreamKind::Text => TrackKind::Text,
             StreamKind::Other => TrackKind::Other,
         };
-        let mut t = TrackDesc::new(u32::from(s.key), kind, family);
+        let mut t = TrackDesc::of_pes(u32::from(s.key), kind, family);
         t.default = !std::mem::replace(&mut first[kind as usize], true);
         match (codec, s.lpcm) {
             (Codec::Lpcm, Some(l)) => {

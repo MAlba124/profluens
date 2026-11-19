@@ -4,6 +4,7 @@
 
 pub mod av1dec;
 pub mod av1enc;
+pub mod chain;
 pub use profluens_video::bits as bitwriter;
 pub mod colour;
 pub mod decproc;

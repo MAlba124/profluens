@@ -210,7 +210,7 @@ fn titles(given: Vec<ChapterTitle>, used: &mut usize) -> Vec<ChapterTitle> {
     for t in given {
         let text =
             cut(t.text.trim_matches(|c: char| c.is_whitespace() || c == '\0'), MAX_CHAPTER_TITLE);
-        let language = bcp47(&t.language);
+        let language = profluens_core::language::bcp47(&t.language).as_str().to_string();
         if out.len() == MAX_CHAPTER_TITLES
             || text.is_empty()
             || *used + text.len() + language.len() > MAX_CHAPTER_TEXT
@@ -222,83 +222,6 @@ fn titles(given: Vec<ChapterTitle>, used: &mut usize) -> Vec<ChapterTitle> {
         }
         *used += text.len() + language.len();
         out.push(ChapterTitle { language, text: text.to_string() });
-    }
-    out
-}
-
-/// ISO 639-2 codes, bibliographic and terminology, with an ISO 639-1 code, which BCP 47 takes
-/// instead, and the withdrawn `scc` and `scr`.
-#[rustfmt::skip]
-static ISO639_1: [([u8; 3], [u8; 2]); 205] = [
-    (*b"aar", *b"aa"), (*b"abk", *b"ab"), (*b"afr", *b"af"), (*b"aka", *b"ak"), (*b"alb", *b"sq"),
-    (*b"amh", *b"am"), (*b"ara", *b"ar"), (*b"arg", *b"an"), (*b"arm", *b"hy"), (*b"asm", *b"as"),
-    (*b"ava", *b"av"), (*b"ave", *b"ae"), (*b"aym", *b"ay"), (*b"aze", *b"az"), (*b"bak", *b"ba"),
-    (*b"bam", *b"bm"), (*b"baq", *b"eu"), (*b"bel", *b"be"), (*b"ben", *b"bn"), (*b"bis", *b"bi"),
-    (*b"bod", *b"bo"), (*b"bos", *b"bs"), (*b"bre", *b"br"), (*b"bul", *b"bg"), (*b"bur", *b"my"),
-    (*b"cat", *b"ca"), (*b"ces", *b"cs"), (*b"cha", *b"ch"), (*b"che", *b"ce"), (*b"chi", *b"zh"),
-    (*b"chu", *b"cu"), (*b"chv", *b"cv"), (*b"cor", *b"kw"), (*b"cos", *b"co"), (*b"cre", *b"cr"),
-    (*b"cym", *b"cy"), (*b"cze", *b"cs"), (*b"dan", *b"da"), (*b"deu", *b"de"), (*b"div", *b"dv"),
-    (*b"dut", *b"nl"), (*b"dzo", *b"dz"), (*b"ell", *b"el"), (*b"eng", *b"en"), (*b"epo", *b"eo"),
-    (*b"est", *b"et"), (*b"eus", *b"eu"), (*b"ewe", *b"ee"), (*b"fao", *b"fo"), (*b"fas", *b"fa"),
-    (*b"fij", *b"fj"), (*b"fin", *b"fi"), (*b"fra", *b"fr"), (*b"fre", *b"fr"), (*b"fry", *b"fy"),
-    (*b"ful", *b"ff"), (*b"geo", *b"ka"), (*b"ger", *b"de"), (*b"gla", *b"gd"), (*b"gle", *b"ga"),
-    (*b"glg", *b"gl"), (*b"glv", *b"gv"), (*b"gre", *b"el"), (*b"grn", *b"gn"), (*b"guj", *b"gu"),
-    (*b"hat", *b"ht"), (*b"hau", *b"ha"), (*b"heb", *b"he"), (*b"her", *b"hz"), (*b"hin", *b"hi"),
-    (*b"hmo", *b"ho"), (*b"hrv", *b"hr"), (*b"hun", *b"hu"), (*b"hye", *b"hy"), (*b"ibo", *b"ig"),
-    (*b"ice", *b"is"), (*b"ido", *b"io"), (*b"iii", *b"ii"), (*b"iku", *b"iu"), (*b"ile", *b"ie"),
-    (*b"ina", *b"ia"), (*b"ind", *b"id"), (*b"ipk", *b"ik"), (*b"isl", *b"is"), (*b"ita", *b"it"),
-    (*b"jav", *b"jv"), (*b"jpn", *b"ja"), (*b"kal", *b"kl"), (*b"kan", *b"kn"), (*b"kas", *b"ks"),
-    (*b"kat", *b"ka"), (*b"kau", *b"kr"), (*b"kaz", *b"kk"), (*b"khm", *b"km"), (*b"kik", *b"ki"),
-    (*b"kin", *b"rw"), (*b"kir", *b"ky"), (*b"kom", *b"kv"), (*b"kon", *b"kg"), (*b"kor", *b"ko"),
-    (*b"kua", *b"kj"), (*b"kur", *b"ku"), (*b"lao", *b"lo"), (*b"lat", *b"la"), (*b"lav", *b"lv"),
-    (*b"lim", *b"li"), (*b"lin", *b"ln"), (*b"lit", *b"lt"), (*b"ltz", *b"lb"), (*b"lub", *b"lu"),
-    (*b"lug", *b"lg"), (*b"mac", *b"mk"), (*b"mah", *b"mh"), (*b"mal", *b"ml"), (*b"mao", *b"mi"),
-    (*b"mar", *b"mr"), (*b"may", *b"ms"), (*b"mkd", *b"mk"), (*b"mlg", *b"mg"), (*b"mlt", *b"mt"),
-    (*b"mon", *b"mn"), (*b"mri", *b"mi"), (*b"msa", *b"ms"), (*b"mya", *b"my"), (*b"nau", *b"na"),
-    (*b"nav", *b"nv"), (*b"nbl", *b"nr"), (*b"nde", *b"nd"), (*b"ndo", *b"ng"), (*b"nep", *b"ne"),
-    (*b"nld", *b"nl"), (*b"nno", *b"nn"), (*b"nob", *b"nb"), (*b"nor", *b"no"), (*b"nya", *b"ny"),
-    (*b"oci", *b"oc"), (*b"oji", *b"oj"), (*b"ori", *b"or"), (*b"orm", *b"om"), (*b"oss", *b"os"),
-    (*b"pan", *b"pa"), (*b"per", *b"fa"), (*b"pli", *b"pi"), (*b"pol", *b"pl"), (*b"por", *b"pt"),
-    (*b"pus", *b"ps"), (*b"que", *b"qu"), (*b"roh", *b"rm"), (*b"ron", *b"ro"), (*b"rum", *b"ro"),
-    (*b"run", *b"rn"), (*b"rus", *b"ru"), (*b"sag", *b"sg"), (*b"san", *b"sa"), (*b"scc", *b"sr"),
-    (*b"scr", *b"hr"), (*b"sin", *b"si"), (*b"slk", *b"sk"), (*b"slo", *b"sk"), (*b"slv", *b"sl"),
-    (*b"sme", *b"se"), (*b"smo", *b"sm"), (*b"sna", *b"sn"), (*b"snd", *b"sd"), (*b"som", *b"so"),
-    (*b"sot", *b"st"), (*b"spa", *b"es"), (*b"sqi", *b"sq"), (*b"srd", *b"sc"), (*b"srp", *b"sr"),
-    (*b"ssw", *b"ss"), (*b"sun", *b"su"), (*b"swa", *b"sw"), (*b"swe", *b"sv"), (*b"tah", *b"ty"),
-    (*b"tam", *b"ta"), (*b"tat", *b"tt"), (*b"tel", *b"te"), (*b"tgk", *b"tg"), (*b"tgl", *b"tl"),
-    (*b"tha", *b"th"), (*b"tib", *b"bo"), (*b"tir", *b"ti"), (*b"ton", *b"to"), (*b"tsn", *b"tn"),
-    (*b"tso", *b"ts"), (*b"tuk", *b"tk"), (*b"tur", *b"tr"), (*b"twi", *b"tw"), (*b"uig", *b"ug"),
-    (*b"ukr", *b"uk"), (*b"urd", *b"ur"), (*b"uzb", *b"uz"), (*b"ven", *b"ve"), (*b"vie", *b"vi"),
-    (*b"vol", *b"vo"), (*b"wel", *b"cy"), (*b"wln", *b"wa"), (*b"wol", *b"wo"), (*b"xho", *b"xh"),
-    (*b"yid", *b"yi"), (*b"yor", *b"yo"), (*b"zha", *b"za"), (*b"zho", *b"zh"), (*b"zul", *b"zu"),
-];
-
-/// A language as BCP 47, an ISO 639-2 code as its ISO 639-1 one where it has one, case folded.
-/// Empty for none, `und` or what is no language tag.
-// Owned result, once per title.
-#[allow(clippy::disallowed_methods)]
-pub fn bcp47(code: &str) -> String {
-    let code = code.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-    let valid = |c: u8| c.is_ascii_alphanumeric() || c == b'-';
-    let b = code.as_bytes();
-    if b.is_empty() || b.len() > MAX_LANGUAGE || !b.iter().all(|&c| valid(c)) {
-        return String::new();
-    }
-    let primary = b.split(|&c| c == b'-').next().unwrap_or_default();
-    if !(2..=8).contains(&primary.len()) || !primary.iter().all(u8::is_ascii_alphabetic) {
-        return String::new();
-    }
-    let mut out = code.to_string();
-    out[..primary.len()].make_ascii_lowercase();
-    if out == "und" {
-        return String::new();
-    }
-    if let [a, b, c] = primary {
-        let key = [a.to_ascii_lowercase(), b.to_ascii_lowercase(), c.to_ascii_lowercase()];
-        if let Ok(i) = ISO639_1.binary_search_by_key(&key, |e| e.0) {
-            let two = ISO639_1[i].1;
-            out.replace_range(..3, std::str::from_utf8(&two).unwrap_or_default());
-        }
     }
     out
 }

@@ -36,6 +36,7 @@ use crate::stats::Stats;
 use crate::va::{self, Buffer as VaBuffer, Display, SurfaceFormat};
 use pf_hdr::rpu::Fit;
 use profluens_video::color::StreamColor;
+use profluens_video::level;
 
 const FAM_ANNEXB: &str = "h265/annexb";
 const FAM_HVCC: &str = "h265/hvcc";
@@ -109,29 +110,6 @@ fn ten_bit(fmt: InFormat) -> bool {
     fmt.pixfmt == RawPixFmt::P010
 }
 
-const LEVELS: [(u8, u32, u64); 8] = [
-    (60, 122_880, 3_686_400),      // 2
-    (63, 245_760, 7_372_800),      // 2.1
-    (90, 552_960, 16_588_800),     // 3
-    (93, 983_040, 33_177_600),     // 3.1
-    (120, 2_228_224, 66_846_720),  // 4
-    (123, 2_228_224, 133_693_440), // 4.1
-    (150, 8_912_896, 267_386_880), // 5
-    (153, 8_912_896, 534_773_760), // 5.1
-];
-
-fn pick_level(coded_w: u32, coded_h: u32, fps: (u32, u32)) -> u8 {
-    let ps = (coded_w * coded_h) as u64;
-    let fps_int = if fps.0 > 0 { fps.0.div_ceil(fps.1) } else { 30 } as u64;
-    let sr = ps * fps_int;
-    for (idc, max_ps, max_sr) in LEVELS {
-        if ps <= max_ps as u64 && sr <= max_sr {
-            return idc;
-        }
-    }
-    156 // 5.2
-}
-
 /// References a P picture takes at most, VDEnc's low delay B takes three (iHD 26).
 pub const REFS: u32 = 3;
 
@@ -180,7 +158,7 @@ pub fn parameter_sets(
     let coded = (enc::align_up(width, 16), enc::align_up(height, 16));
     let pixfmt = if ten { RawPixFmt::P010 } else { RawPixFmt::Nv12 };
     let fmt = InFormat { width, height, pixfmt, fps };
-    let level_idc = pick_level(coded.0, coded.1, fps);
+    let level_idc = level::hevc(coded.0, coded.1, fps);
     let vps = write_vps(level_idc, ten, refs);
     let sps = write_sps(coded, fmt, level_idc, ctb_log2, refs, colour::vui_colour(color));
     Some(concat_nals(&vps, &sps, &write_pps(qp, brc, ctb_log2, refs)))
@@ -546,7 +524,7 @@ impl VaapiH265Enc {
         let refs = engine.refs() as u32;
         let ctb_log2 = if entrypoint == ffi::VAEntrypointEncSliceLP { 6 } else { 5 };
 
-        let level_idc = pick_level(engine.coded_w, engine.coded_h, fmt.fps);
+        let level_idc = level::hevc(engine.coded_w, engine.coded_h, fmt.fps);
         let brc = self.bitrate_kbps > 0;
         let vps_nal = write_vps(level_idc, ten, refs);
         let vui = self.pinned.as_ref().unwrap_or(&self.color);
@@ -1687,14 +1665,6 @@ impl Element for VaapiH265Enc {
 mod tests {
     use super::*;
     use crate::h265parse;
-
-    #[test]
-    fn level_ladder_picks_sane_levels() {
-        assert_eq!(pick_level(1920, 1088, (30, 1)), 120, "1080p30 → L4");
-        assert_eq!(pick_level(1920, 1088, (60, 1)), 123, "1080p60 → L4.1");
-        assert_eq!(pick_level(1280, 720, (30, 1)), 93, "720p30 → L3.1");
-        assert_eq!(pick_level(320, 240, (30, 1)), 60, "tiny → L2");
-    }
 
     fn parsed_sets(refs: u32) -> (h265parse::Sps, h265parse::Pps) {
         let fmt = InFormat { width: 1920, height: 1080, pixfmt: RawPixFmt::Nv12, fps: (25, 1) };

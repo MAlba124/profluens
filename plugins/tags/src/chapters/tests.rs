@@ -138,34 +138,6 @@ fn caps_bound_chapters_depth_titles_and_text() {
     assert_eq!(normalise(ChapterSource::Matroska, eds, all, None).editions.len(), MAX_EDITIONS);
 }
 
-#[test]
-fn languages_are_bcp_47() {
-    for (given, want) in [
-        ("ger", "de"),
-        ("deu", "de"),
-        ("fre", "fr"),
-        ("ENG", "en"),
-        ("chi", "zh"),
-        ("scc", "sr"),
-        ("fil", "fil"),
-        ("haw", "haw"),
-        ("fr-CA", "fr-CA"),
-        ("FRA-ca", "fr-ca"),
-        ("en", "en"),
-        ("und", ""),
-        ("", ""),
-        (" spa\0", "es"),
-        ("e", ""),
-        ("en_US", ""),
-        ("123", ""),
-        ("abcdefghi", ""),
-        ("de-1996-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", ""),
-    ] {
-        assert_eq!(bcp47(given), want, "{given:?}");
-    }
-    assert!(ISO639_1.windows(2).all(|w| w[0].0 < w[1].0), "sorted for the search");
-}
-
 fn el(element: &[u8], children: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     write_binary(&mut out, element, &children.concat());

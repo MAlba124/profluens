@@ -383,6 +383,23 @@ impl Control {
         self.planned(&mut pending.1, position, to, mode)
     }
 
+    /// A seek from no position, None while the pipeline cannot take it yet, a source that has
+    /// not answered, an index read, no run or an element the seek targets not in it. Nothing is
+    /// held, the owner asks again. Never waits.
+    pub fn seek_when_ready(
+        &self,
+        to: Timestamp,
+        mode: SeekMode,
+    ) -> Option<Result<SeekPlan, CommandError>> {
+        if self.plan_from(Timestamp::NONE, to, mode) == SeekPlan::Deferred {
+            return None;
+        }
+        match self.seek_from(Timestamp::NONE, to, mode) {
+            Err(CommandError::NotRunning | CommandError::NoSuchElement) => None,
+            r => Some(r),
+        }
+    }
+
     /// The plan, its targets left in `s`.
     pub(crate) fn planned(
         &self,

@@ -972,6 +972,23 @@ impl Pipeline {
         }
     }
 
+    /// The slot size and count `el`'s own pool was given, None where it takes the pipeline's.
+    pub fn element_pool(&self, el: ElementId) -> Option<(usize, u32)> {
+        let p = self.tune.get(self.slot(el)?)?.pool.as_ref()?;
+        Some((p.slot, p.slots))
+    }
+
+    /// The alignment of the allocator `el`'s pool maps from, None for the pipeline's own.
+    pub fn element_align(&self, el: ElementId) -> Option<usize> {
+        self.tune.get(self.slot(el)?)?.alloc.as_ref().map(|a| a.0)
+    }
+
+    /// The hint `el` runs by, the pipeline's over the element's own.
+    pub fn element_sched(&self, el: ElementId) -> Option<SchedHint> {
+        let i = self.slot(el)?;
+        (i < self.tune.len() && i < self.rows.len()).then(|| self.sched_at(i))
+    }
+
     /// The hint `el` runs by, the pipeline's over the element's own.
     fn sched_at(&self, i: usize) -> SchedHint {
         self.tune[i].sched.unwrap_or(self.rows[i].desc.sched)

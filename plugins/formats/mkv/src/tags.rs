@@ -238,7 +238,7 @@ pub fn bitrates(tags: &[u8], tracks: &mut [Track]) {
 
 /// [`bitrates`] over the `Tags` element's data.
 pub(crate) fn bitrates_in(body: &[u8], tracks: &mut [Track]) {
-    track_bps(body, |uid, bps| {
+    track_stat(body, b"BPS", bps, |uid, bps| {
         for track in tracks.iter_mut().filter(|track| track.uid == uid) {
             track.bitrate = bps;
         }
@@ -248,29 +248,45 @@ pub(crate) fn bitrates_in(body: &[u8], tracks: &mut [Track]) {
 /// The bits a second the `BPS` statistics tag of the track whose TrackUID is `uid` states in a
 /// `Tags` element, the last such tag as [`bitrates`] takes it.
 pub fn bitrate_of(tags: &[u8], uid: u64) -> Option<u64> {
+    stat_of(tags, uid, b"BPS", bps)
+}
+
+/// The nanoseconds the `DURATION` statistics tag of the track whose TrackUID is `uid` states in
+/// a `Tags` element, as mkvmerge and ffmpeg write it, the last such tag.
+pub fn duration_of(tags: &[u8], uid: u64) -> Option<u64> {
+    stat_of(tags, uid, b"DURATION", duration_ns)
+}
+
+fn stat_of(tags: &[u8], uid: u64, name: &[u8], read: fn(&str) -> Option<u64>) -> Option<u64> {
     let body = master_body(tags, id::TAGS)?;
     let mut out = None;
-    track_bps(body, |of, bps| {
+    track_stat(body, name, read, |of, v| {
         if of == uid {
-            out = Some(bps);
+            out = Some(v);
         }
     });
     out
 }
 
-/// Each `BPS` statistics tag of the Tags data `body` with every TrackUID it targets.
-fn track_bps(body: &[u8], mut each: impl FnMut(u64, u64)) {
+/// Each statistics tag `name` of the Tags data `body`, as `read` takes its value, with every
+/// TrackUID it targets.
+fn track_stat(
+    body: &[u8],
+    name: &[u8],
+    read: fn(&str) -> Option<u64>,
+    mut each: impl FnMut(u64, u64),
+) {
     for_each_child(body, |h, tag| {
         if h.id != id::TAG {
             return;
         }
-        let mut bps = None;
+        let mut stat = None;
         for_each_child(tag, |c, simple| {
             if c.id == id::SIMPLE_TAG {
-                bps = bps.or_else(|| stat_bps(simple));
+                stat = stat.or_else(|| stat_value(simple, name, read));
             }
         });
-        let Some(bps) = bps else { return };
+        let Some(v) = stat else { return };
         for_each_child(tag, |c, targets| {
             if c.id != id::TARGETS {
                 return;
@@ -278,24 +294,46 @@ fn track_bps(body: &[u8], mut each: impl FnMut(u64, u64)) {
             for_each_child(targets, |t, uid| {
                 let uid = read_uint(uid);
                 if t.id == id::TAG_TRACK_UID && uid != 0 {
-                    each(uid, bps);
+                    each(uid, v);
                 }
             });
         });
     });
 }
 
-/// The bits a second of a `BPS` SimpleTag, `BPS-eng` as some tools name it.
-fn stat_bps(simple: &[u8]) -> Option<u64> {
-    let (mut name, mut value) = (&[][..], &[][..]);
+/// The value of a SimpleTag named `name`, `name-eng` as some tools name it, as `read` takes it.
+fn stat_value(simple: &[u8], name: &[u8], read: fn(&str) -> Option<u64>) -> Option<u64> {
+    let (mut named, mut value) = (&[][..], &[][..]);
     for_each_child(simple, |h, body| match h.id {
-        i if i == id::TAG_NAME => name = ebml::read_string(body),
+        i if i == id::TAG_NAME => named = ebml::read_string(body),
         i if i == id::TAG_STRING => value = ebml::read_string(body),
         _ => {}
     });
-    let bps = name == b"BPS" || name.starts_with(b"BPS-");
-    let value = core::str::from_utf8(value).ok().filter(|_| bps)?;
-    value.trim().parse::<u64>().ok().filter(|&v| v > 0)
+    let ours = named.strip_prefix(name).is_some_and(|rest| rest.is_empty() || rest[0] == b'-');
+    core::str::from_utf8(value).ok().filter(|_| ours).and_then(read)
+}
+
+fn bps(v: &str) -> Option<u64> {
+    v.trim().parse::<u64>().ok().filter(|&v| v > 0)
+}
+
+/// `HH:MM:SS.nnnnnnnnn` in nanoseconds, the fraction up to nine digits.
+fn duration_ns(v: &str) -> Option<u64> {
+    let mut it = v.trim().splitn(3, ':');
+    let (h, m, s) = (it.next()?, it.next()?, it.next()?);
+    let (s, frac) = s.split_once('.').unwrap_or((s, ""));
+    let num = |d: &str| {
+        (!d.is_empty() && d.len() <= 9 && d.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| d.parse::<u64>().ok())
+            .flatten()
+    };
+    let frac = match frac {
+        "" => 0,
+        f => num(f)? * 10u64.pow(9 - f.len() as u32),
+    };
+    let secs =
+        num(h)?.checked_mul(3600)?.checked_add(num(m)?.checked_mul(60)?)?.checked_add(num(s)?)?;
+    secs.checked_mul(1_000_000_000)?.checked_add(frac)
 }
 
 fn has_track_level(body: &[u8]) -> bool {
@@ -579,6 +617,30 @@ mod tests {
 
     fn tags_element(tags: &[Vec<u8>]) -> Vec<u8> {
         master(id::TAGS, tags)
+    }
+
+    #[test]
+    fn a_duration_tag_reads_to_the_nanosecond() {
+        assert_eq!(duration_ns("00:04:22.800000000"), Some(262_800_000_000));
+        assert_eq!(duration_ns("01:00:00"), Some(3_600_000_000_000));
+        assert_eq!(duration_ns("00:00:10.5"), Some(10_500_000_000));
+        for bad in ["", "10.5", "00:00:1x", "00:00:01.1234567890", "-1:00:00"] {
+            assert_eq!(duration_ns(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The statistics mkvmerge and ffmpeg write each track, ffmpeg names them `DURATION-eng`.
+    #[test]
+    fn a_tracks_duration_is_its_statistics_tag() {
+        let tags = tags_element(&[
+            tag(targets(None, Some(7), None), &[simple_tag("DURATION", "00:00:10.000000000", &[])]),
+            tag(targets(None, Some(9), None), &[simple_tag("DURATION-eng", "00:01:00", &[])]),
+            tag(targets(None, Some(11), None), &[simple_tag("DURATIONS", "00:01:00", &[])]),
+        ]);
+        assert_eq!(duration_of(&tags, 7), Some(10_000_000_000));
+        assert_eq!(duration_of(&tags, 9), Some(60_000_000_000));
+        assert_eq!(duration_of(&tags, 11), None, "another name");
+        assert_eq!(duration_of(&tags, 8), None, "no tag of it");
     }
 
     fn attached_file(name: &str, mime: &str, data: &[u8]) -> Vec<u8> {

@@ -56,6 +56,18 @@ pub(crate) fn describe(
     Ok((duration, if want.index { Index::Mp4(Arc::new(tables)) } else { Index::None }))
 }
 
+/// MP4 has no default flag. ffmpeg enables the default track of each kind and not the others,
+/// so tkhd's enabled flag states a default only where some tracks of the kind are enabled and
+/// others not. A muxer enabling every track, or the one track of its kind, states none.
+fn stated_defaults(tracks: &mut [TrackDesc]) {
+    for kind in [TrackKind::Video, TrackKind::Audio, TrackKind::Text, TrackKind::Other] {
+        let mixed = tracks.iter().filter(|t| t.kind == kind).any(|t| !t.default);
+        if !mixed {
+            tracks.iter_mut().filter(|t| t.kind == kind).for_each(|t| t.default = false);
+        }
+    }
+}
+
 /// The first sync sample of each H.264, H.265 or AV1 track, the tracks described from `first` in
 /// the tables' order. A fragmented track's samples are not in the head and give none.
 fn first_keys(tables: &Tables, len: u64, first: usize, d: &Desc, keys: &mut Vec<Key>) {
@@ -74,6 +86,7 @@ fn first_keys(tables: &Tables, len: u64, first: usize, d: &Desc, keys: &mut Vec<
 }
 
 fn tracks_into(tracks: &[Track], d: &mut Desc) -> Result<u64, OpenError> {
+    let first = d.tracks.len();
     let mut duration = 0;
     for t in tracks {
         let family = t.family();
@@ -95,7 +108,6 @@ fn tracks_into(tracks: &[Track], d: &mut Desc) -> Result<u64, OpenError> {
             false => d.put(t.language_tag.as_bytes()),
         };
         out.title = d.put(t.title.as_bytes());
-        // ffmpeg marks the default track of each kind enabled, as the demuxer takes it
         out.default = t.enabled;
         out.forced = t.forced;
         out.channels = e.channels.min(u32::from(u16::MAX)) as u16;
@@ -132,6 +144,7 @@ fn tracks_into(tracks: &[Track], d: &mut Desc) -> Result<u64, OpenError> {
     if d.tracks.is_empty() {
         return Err(OpenError::NoStreams);
     }
+    stated_defaults(&mut d.tracks[first..]);
     Ok(duration)
 }
 
@@ -207,4 +220,27 @@ pub(crate) fn head_in(window: &[u8], len: u64) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_enabled_track_is_a_default_only_beside_a_disabled_one_of_its_kind() {
+        let track = |kind, enabled| {
+            let mut t = TrackDesc::new(1, kind, "x");
+            t.default = enabled;
+            t
+        };
+        let mut tracks = [
+            track(TrackKind::Audio, true),
+            track(TrackKind::Audio, false),
+            track(TrackKind::Text, true),
+            track(TrackKind::Text, true),
+            track(TrackKind::Video, true),
+        ];
+        stated_defaults(&mut tracks);
+        assert_eq!(tracks.map(|t| t.default), [true, false, false, false, false]);
+    }
 }

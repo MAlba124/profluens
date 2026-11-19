@@ -853,6 +853,18 @@ impl Ctx {
         self.pool.acquire_exact(n).map(|m| self.buffer(m))
     }
 
+    /// A copy of `b` in an exact buffer of its own with `room` bytes past its data, its stamps,
+    /// flags and format kept. `None` when [`alloc_exact`](Self::alloc_exact) refuses.
+    pub fn copy_with_room(&mut self, b: &Buffer, room: usize) -> Option<Buffer> {
+        let n = b.memory.len();
+        let mut out = self.alloc_exact(n.checked_add(room)?)?;
+        out.memory.as_mut_full()[..n].copy_from_slice(b.memory.data());
+        out.memory.set_len(n);
+        (out.pts, out.dts, out.duration) = (b.pts, b.dts, b.duration);
+        (out.flags, out.format) = (b.flags, b.format);
+        Some(out)
+    }
+
     /// The failure of an exact buffer of `n` bytes refused, scoped to the buffer so the element
     /// drops what needed it and goes on.
     pub fn exact_refused(&self, n: usize) -> Error {

@@ -199,7 +199,7 @@ impl State {
                 d.skip(pid, family, SkipWhy::NoFamily);
                 continue;
             }
-            let mut t = TrackDesc::new(u32::from(info.pid), kind, family);
+            let mut t = TrackDesc::of_pes(u32::from(info.pid), kind, family);
             t.language = d.put(pf_mpegts::language_str(info).unwrap_or("").as_bytes());
             t.default = !std::mem::replace(&mut first[kind as usize], true);
             let sniff = self.seen.iter().find(|s| s.pid == info.pid).map_or(&[][..], |s| &s.sniff);

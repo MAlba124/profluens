@@ -427,6 +427,25 @@ mod tests {
     }
 
     #[test]
+    fn a_seek_when_ready_waits_for_a_run_and_its_index_and_holds_nothing() {
+        let mut p = Pipeline::new();
+        let [_, demux, _] = chain(&mut p, &FILE);
+        p.publish_index(demux, gops(true));
+        let control = p.control();
+        assert_eq!(control.seek_when_ready(MS(5_000), SeekMode::Accurate), None, "no run");
+        let _run = p.step(Arc::new(MockClock::new())).expect("runs");
+        p.counters_of(demux).set_indexing(true);
+        assert_eq!(control.seek_when_ready(MS(5_000), SeekMode::Accurate), None, "indexing");
+        assert_eq!((control.pending(), control.seek_gen()), (None, 0), "nothing held or sent");
+        p.counters_of(demux).set_indexing(false);
+        assert!(matches!(
+            control.seek_when_ready(MS(5_000), SeekMode::Accurate),
+            Some(Ok(SeekPlan::Seek { .. }))
+        ));
+        assert_eq!(control.seek_gen(), 1);
+    }
+
+    #[test]
     fn a_source_without_ranges_only_skips() {
         let mut p = Pipeline::new();
         let [source, demux, _] = chain(&mut p, &NET);

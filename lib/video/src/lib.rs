@@ -6,6 +6,7 @@
 
 pub mod annexb;
 pub mod bits;
+pub mod chain;
 pub mod color;
 pub mod decoder;
 pub mod fixed;
@@ -16,6 +17,7 @@ pub mod gpuframe;
 pub mod h264parse;
 pub mod h265parse;
 pub mod keys;
+pub mod level;
 pub mod parse;
 pub mod prefixed;
 pub mod props;

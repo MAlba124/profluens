@@ -4,8 +4,8 @@ use crate::flacmeta;
 pub use crate::chapters::{
     ChapterEdition, ChapterSource, ChapterTitle, ItemChapter, ItemChapters, MAX_CHAPTER_DEPTH,
     MAX_CHAPTER_TEXT, MAX_CHAPTER_TITLE, MAX_CHAPTER_TITLES, MAX_CHAPTERS, MAX_EDITIONS,
-    MAX_LANGUAGE, RawChapter, bcp47, chapters, is_chapter_key, mkv_chapters, moov_chapters,
-    normalise, vorbis_chapters,
+    MAX_LANGUAGE, RawChapter, chapters, is_chapter_key, mkv_chapters, moov_chapters, normalise,
+    vorbis_chapters,
 };
 use profluens_core::event::TagSink;
 use profluens_core::scratch::Arena;

@@ -11,12 +11,12 @@ use profluens_core::buffer::{Buffer, BufferFlags};
 use profluens_core::bus::BusMessage;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
-    Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
+    Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
 use profluens_core::error::Error;
 use profluens_core::event::Event;
 use profluens_core::format::{
-    ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, OfferSpec, Value, ValueDesc,
+    Constraint, ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, OfferSpec, Value, ValueDesc,
 };
 use profluens_core::id::{SinkPad, SrcPad};
 use profluens_core::log;
@@ -87,6 +87,12 @@ static GPU_SRCS: [PadDesc; 1] = [PadDesc { name: "src", offers: OfferDesc::PROBE
 
 type MakeFn = fn() -> Box<dyn Element>;
 
+/// The box's sides, live, the next picture is fitted to the new one.
+static PROPS: [PropDesc; 2] = [
+    PropDesc { name: "max-width", allowed: Constraint::Any, live: true },
+    PropDesc { name: "max-height", allowed: Constraint::Any, live: true },
+];
+
 const fn desc(
     sinks: &'static [PadDesc],
     srcs: &'static [PadDesc],
@@ -96,7 +102,7 @@ const fn desc(
         name: NAME,
         sinks,
         srcs,
-        props: &[],
+        props: &PROPS,
         sched: SchedHint::Active,
         inputs: InputPolicy::Single,
         latency: LatencyDesc::NONE,
@@ -525,6 +531,23 @@ impl VaapiPostProc {
     /// The colour the output states, BT.709 when tone mapped, else the input's.
     fn out_color(&self, out: Kind) -> StreamColor {
         if self.maps_tones(out) { sdr() } else { self.color }
+    }
+
+    /// A side of the box from the `max-width` or `max-height` prop, a new one opens a new session
+    /// at the next picture.
+    fn set_side(&mut self, ctx: &Ctx, name: &str, v: i64) {
+        let v = u32::try_from(v).unwrap_or(0);
+        let side = match name {
+            "max-width" => &mut self.target.max_width,
+            _ => &mut self.target.max_height,
+        };
+        if *side == v {
+            return;
+        }
+        *side = v;
+        self.session = None;
+        let (w, h) = (self.target.max_width, self.target.max_height);
+        log!(ctx, Level::Debug, "box", width = w, height = h);
     }
 
     fn plan_of(&self, f: InFormat) -> Option<Plan> {
@@ -1414,6 +1437,7 @@ impl Element for VaapiPostProc {
                     g.link = read_link(ctx, Some(f)).or(g.link);
                 }
             }
+            Event::PropChanged { name, value: Value::Int(v) } => self.set_side(ctx, name, *v),
             Event::FlushStart => {
                 log!(&*ctx, Level::Debug, "flush");
                 self.warned.summary(ctx, "flush");
@@ -1556,6 +1580,41 @@ mod tests {
         fix(&mut hn, &hdr10(600), true);
         one(&mut hn);
         assert_eq!(hn.format_changes(), 2, "{test} the same colour, the same format");
+    }
+
+    fn announced_size(hn: &Harness) -> (i64, i64) {
+        let f = hn.announced().expect("a format");
+        let side = |name| match hn.vocabulary().field_id(name).and_then(|id| f.get(id)) {
+            Some(Value::Int(v)) => v,
+            _ => 0,
+        };
+        (side(FIELD_WIDTH), side(FIELD_HEIGHT))
+    }
+
+    #[test]
+    fn a_new_box_fits_the_next_picture_to_it() {
+        let test = "a_new_box_fits_the_next_picture_to_it";
+        if proc_device(test).is_none() {
+            return;
+        }
+        let target = Target { max_width: W / 2, max_height: H / 2, depth: 10 };
+        let vpp = VaapiPostProc::new(target);
+        let stats = vpp.stats();
+        let mut hn = Harness::with_pool(vpp, 1 << 20, 8);
+        fix(&mut hn, &hdr10(1000), false);
+        one(&mut hn);
+        assert_eq!(announced_size(&hn), (64, 32), "{test}");
+        let made = stats.snapshot().surfaces;
+        for (name, v) in [("max-width", 32), ("max-height", 32)] {
+            hn.push_event(Event::PropChanged { name, value: Value::Int(v) }).expect("the box");
+        }
+        one(&mut hn);
+        assert_eq!((hn.format_changes(), announced_size(&hn)), (2, (32, 16)), "{test} the new box");
+        assert!(stats.snapshot().surfaces > made, "{test} surfaces of the new size");
+        hn.push_event(Event::PropChanged { name: "max-width", value: Value::Int(32) })
+            .expect("the same box");
+        one(&mut hn);
+        assert_eq!(hn.format_changes(), 2, "{test} the same box, the same format");
     }
 
     #[test]

@@ -324,6 +324,16 @@ pub const NONE: i64 = i64::MIN;
 /// The most frame threads a decoder takes, more are cut to it.
 pub const MAX_THREADS: u32 = ffi::PF_LAV_MAX_THREADS as u32;
 
+/// What an audio decoder is asked for at open.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct AudioOpts {
+    /// The layout wanted out as a channel mask, 0 for the stream's own. A request the frames
+    /// answer. AC-3 and E-AC-3 fold by the stream's mix levels, DTS only with coefficients in
+    /// the stream, TrueHD and MLP only with a presentation of the layout, the other codecs
+    /// ignore it.
+    pub downmix: u64,
+}
+
 impl Decoder {
     /// `threads` past 1 runs frame threads on a video codec that has them, its pictures then in
     /// libavcodec's memory, never in `supply`. `reorder` is the pictures a video decoder holds
@@ -336,6 +346,29 @@ impl Decoder {
         threads: u32,
         reorder: Option<u32>,
     ) -> Result<Decoder, LavError> {
+        Self::open_with(codec, extradata, supply, parse, threads, reorder, AudioOpts::default())
+    }
+
+    /// An audio decoder, single threaded, its frames in libavcodec's memory.
+    pub fn open_audio(
+        codec: Codec,
+        extradata: &[u8],
+        parse: bool,
+        opts: AudioOpts,
+    ) -> Result<Decoder, LavError> {
+        Self::open_with(codec, extradata, None, parse, 1, None, opts)
+    }
+
+    fn open_with(
+        codec: Codec,
+        extradata: &[u8],
+        supply: Option<&Supply>,
+        parse: bool,
+        threads: u32,
+        reorder: Option<u32>,
+        audio: AudioOpts,
+    ) -> Result<Decoder, LavError> {
+        let audio = ffi::pf_lav_audio_opts { downmix: audio.downmix };
         let slots = supply.map(|s| ffi::pf_lav_slots {
             opaque: s.cookie(),
             acquire: Some(acquire),
@@ -343,7 +376,7 @@ impl Decoder {
         });
         let slots_ptr = slots.as_ref().map_or(ptr::null(), |s| s as *const ffi::pf_lav_slots);
         let mut raw = ptr::null_mut();
-        // SAFETY: pointers live for the call, the shim copies extradata and slots.
+        // SAFETY: pointers live for the call, the shim copies extradata, slots and options.
         let code = unsafe {
             ffi::pf_lav_open(
                 &mut raw,
@@ -354,6 +387,7 @@ impl Decoder {
                 c_int::from(parse),
                 threads.clamp(1, MAX_THREADS) as c_int,
                 reorder.map_or(-1, |n| n.min(ffi::PF_LAV_MAX_REORDER as u32) as c_int),
+                &audio,
             )
         };
         if code != ffi::PF_LAV_OK || raw.is_null() {

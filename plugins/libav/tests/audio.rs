@@ -157,9 +157,7 @@ fn mp4_units(file: &[u8]) -> Vec<Vec<u8>> {
     let r = pf_mp4::reader::Mp4Reader::new(file).expect("mp4");
     let t = r.tables();
     let mut out = vec![t.tracks()[0].codec_head().to_vec()];
-    out.extend(
-        t.samples().map(|s| file[s.offset() as usize..][..s.size() as usize].to_vec()),
-    );
+    out.extend(t.samples().map(|s| file[s.offset() as usize..][..s.size() as usize].to_vec()));
     out
 }
 
@@ -720,5 +718,206 @@ fn truehd_under_millisecond_stamps_decodes_as_under_none() {
     take(h.eos().expect("eos"));
     assert_eq!(got.len(), want.len(), "frames were cut or filled in");
     assert!(got == want, "the sound moved");
+    assert_eq!(warnings(&mut h), 0);
+}
+
+const STEREO: u64 = 0x3;
+
+/// Two seconds of 5.1, a tone of its own on each channel, so a fold is told from a front pair.
+fn surround(name: &str, args: &[&str]) -> Option<Vec<u8>> {
+    let tones = "aevalsrc=0.25*sin(2*PI*440*t)|0.25*sin(2*PI*554*t)|0.25*sin(2*PI*659*t)|\
+                 0.5*sin(2*PI*60*t)|0.25*sin(2*PI*880*t)|0.25*sin(2*PI*1109*t):s=48000:c=5.1:d=2";
+    let mut all = vec!["-f", "lavfi", "-i", tones];
+    all.extend_from_slice(args);
+    support::make(name, &all)
+}
+
+/// ffmpeg's decode of `name` with its decoder asked for stereo.
+fn folded_oracle(name: &str) -> Option<Vec<u8>> {
+    let out = format!("{name}.dm.s16");
+    support::oracle_in(name, &out, &["-downmix", "stereo"], &["-f", "s16le", "-c:a", "pcm_s16le"])
+}
+
+fn s16(b: &[u8]) -> Vec<i16> {
+    b.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)).collect()
+}
+
+/// The decoder folds by the stream's mix levels, as `ffmpeg -downmix stereo` does. The fold
+/// carries the centre and the surrounds, a front pair alone would not.
+#[test]
+fn ac3_and_eac3_5_1_fold_to_stereo_where_asked() {
+    let cases = [
+        ("dm51.ac3", ["-c:a", "ac3", "-b:a", "384k", "-f", "ac3"]),
+        ("dm51.eac3", ["-c:a", "eac3", "-b:a", "256k", "-f", "eac3"]),
+    ];
+    for (name, args) in cases {
+        let Some(bytes) = surround(name, &args) else { return };
+        let Some(want) = folded_oracle(name) else { return };
+        let mut h = Harness::with_slot_size(LibavAudioDec::ac3().downmix(STEREO), SLOT);
+        let (got, _) = decode(&mut h, &chunks(&bytes, 1500));
+        close(name, &got, &want);
+        assert_eq!(announced(&h, "channels"), Some(2), "{name}");
+        assert_eq!(announced(&h, "layout"), Some(STEREO as i64), "{name}");
+        assert_eq!(h.format_changes(), 1, "{name}");
+        assert_eq!(warnings(&mut h), 0, "{name}");
+
+        let mut whole = Harness::with_slot_size(LibavAudioDec::ac3(), SLOT);
+        let (all, _) = decode(&mut whole, &chunks(&bytes, 1500));
+        assert_eq!(all.len(), got.len() * 3, "{name}: as many sample frames folded as whole");
+        let fronts: Vec<i16> = s16(&all).chunks_exact(6).flat_map(|f| [f[0], f[1]]).collect();
+        let apart = s16(&got).iter().zip(&fronts).filter(|(a, b)| a.abs_diff(**b) > 64).count();
+        assert!(apart > fronts.len() / 2, "{name}: the fold is the front pair, {apart} apart");
+    }
+}
+
+/// The streamer makes its decoders from the registry and sets the prop.
+#[test]
+fn the_downmix_prop_asks_as_the_builder_does() {
+    let args = ["-c:a", "ac3", "-b:a", "384k", "-f", "ac3"];
+    let Some(bytes) = surround("dm51p.ac3", &args) else { return };
+    let mut built = Harness::with_slot_size(LibavAudioDec::ac3().downmix(STEREO), SLOT);
+    let (want, _) = decode(&mut built, &chunks(&bytes, 1500));
+    let mut h = Harness::with_slot_size(LibavAudioDec::ac3(), SLOT);
+    assert!(h.set_prop("downmix", Value::Int(STEREO as i64)));
+    let (got, _) = decode(&mut h, &chunks(&bytes, 1500));
+    assert_eq!(announced(&h, "channels"), Some(2));
+    assert!(got == want, "the prop and the builder fold alike");
+    for element in [LibavAudioDec::dts(), LibavAudioDec::truehd(), LibavAudioDec::mlp()] {
+        assert!(Harness::new(element).set_prop("downmix", Value::Int(STEREO as i64)));
+    }
+    for element in [LibavAudioDec::aac(), LibavAudioDec::mp3(), LibavAudioDec::vorbis()] {
+        assert!(!Harness::new(element).set_prop("downmix", Value::Int(STEREO as i64)));
+    }
+}
+
+/// A request for stereo leaves a stereo and a mono stream as they are.
+#[test]
+fn a_stereo_or_mono_stream_is_not_touched_by_a_stereo_request() {
+    for (name, ch) in [("dmst.ac3", 2u32), ("dmmono.ac3", 1)] {
+        let Some(bytes) = stream(name, ch, &["-c:a", "ac3", "-b:a", "192k", "-f", "ac3"]) else {
+            return;
+        };
+        let mut plain = Harness::with_slot_size(LibavAudioDec::ac3(), SLOT);
+        let (want, _) = decode(&mut plain, &chunks(&bytes, 1500));
+        let mut h = Harness::with_slot_size(LibavAudioDec::ac3().downmix(STEREO), SLOT);
+        let (got, _) = decode(&mut h, &chunks(&bytes, 1500));
+        assert_eq!(announced(&h, "channels"), Some(i64::from(ch)), "{name}");
+        assert!(got == want, "{name}: the sound moved");
+    }
+}
+
+/// libavcodec's AAC decoder has no fold of its own, the request passes it by.
+#[test]
+fn aac_5_1_comes_out_whole_under_a_stereo_request() {
+    let Some(bytes) = surround("dm51.aac", &["-c:a", "aac", "-b:a", "256k", "-f", "adts"]) else {
+        return;
+    };
+    let mut plain = Harness::with_slot_size(LibavAudioDec::aac(), SLOT);
+    let (want, _) = decode(&mut plain, &chunks(&bytes, 1500));
+    let mut h = Harness::with_slot_size(LibavAudioDec::aac().downmix(STEREO), SLOT);
+    let (got, _) = decode(&mut h, &chunks(&bytes, 1500));
+    assert_eq!(announced(&h, "channels"), Some(6));
+    assert!(got == want, "the sound moved");
+    assert_eq!(warnings(&mut h), 0);
+}
+
+/// ffmpeg's DTS encoder writes no downmix coefficients (dcaenc.c "Embedded down mix:
+/// disabled"), and without them the decoder folds nothing (dca_core.c
+/// ff_dca_core_filter_frame).
+#[test]
+fn dts_without_coefficients_comes_out_whole_under_a_stereo_request() {
+    let args = ["-strict", "-2", "-c:a", "dca", "-b:a", "768k", "-f", "dts"];
+    let Some(bytes) = surround("dm51.dts", &args) else { return };
+    let mut plain = Harness::with_slot_size(LibavAudioDec::dts(), SLOT);
+    let (want, _) = decode(&mut plain, &chunks(&bytes, 1000));
+    let mut h = Harness::with_slot_size(LibavAudioDec::dts().downmix(STEREO), SLOT);
+    let (got, _) = decode(&mut h, &chunks(&bytes, 1000));
+    assert_eq!(announced(&h, "channels"), Some(6));
+    assert!(got == want, "the sound moved");
+    assert_eq!(warnings(&mut h), 0);
+}
+
+/// ffmpeg's TrueHD encoder writes a 2 channel presentation in substream 0 of a 5.1 stream
+/// (mlpenc.c), which the decoder puts out alone, lossless, so the oracle's bytes exactly.
+#[test]
+fn truehd_puts_out_its_stereo_presentation_where_asked() {
+    let args = ["-strict", "-2", "-c:a", "truehd", "-f", "truehd"];
+    let Some(bytes) = surround("dm51.thd", &args) else { return };
+    let Some(want) = folded_oracle("dm51.thd") else { return };
+    let mut h = Harness::with_slot_size(LibavAudioDec::truehd().downmix(STEREO), SLOT);
+    let (got, _) = decode(&mut h, &chunks(&bytes, 999));
+    assert_eq!(announced(&h, "channels"), Some(2));
+    assert_eq!(announced(&h, "layout"), Some(STEREO as i64));
+    close("truehd 2.0 of 5.1", &got, &want);
+    assert_eq!(h.format_changes(), 1);
+    assert_eq!(warnings(&mut h), 0);
+}
+
+/// The fold changes the channels of a frame, not its length, so the stamps out are those of
+/// the whole decode.
+#[test]
+fn the_stamps_of_a_folded_stream_are_those_of_the_whole_one() {
+    let args = ["-c:a", "ac3", "-b:a", "384k", "-f", "ac3"];
+    let Some(bytes) = surround("dm51s.ac3", &args) else { return };
+    let run = |element: LibavAudioDec, channels: usize| {
+        let mut h = Harness::with_slot_size(element, SLOT);
+        let mut out = Vec::new();
+        for (k, frame) in bytes.chunks(1536).enumerate() {
+            let mut b = h.alloc(frame);
+            b.pts = Timestamp::from_nanos(k as u64 * 32_000_000);
+            h.push(b).expect("push");
+            out.extend(h.drain_outputs());
+        }
+        out.extend(h.eos().expect("eos"));
+        let stride = channels * if announced_sample(&h) == "f32" { 4 } else { 2 };
+        out.iter().map(|b| (b.pts, b.duration, b.memory.len() / stride)).collect::<Vec<_>>()
+    };
+    let whole = run(LibavAudioDec::ac3(), 6);
+    let folded = run(LibavAudioDec::ac3().downmix(STEREO), 2);
+    assert!(whole.len() > 50, "{} buffers", whole.len());
+    assert_eq!(folded, whole);
+}
+
+/// A flush drops the decoder's state, not what it was opened with.
+#[test]
+fn a_flush_keeps_the_request() {
+    let args = ["-c:a", "ac3", "-b:a", "384k", "-f", "ac3"];
+    let Some(bytes) = surround("dm51f.ac3", &args) else { return };
+    let mut h = Harness::with_slot_size(LibavAudioDec::ac3().downmix(STEREO), SLOT);
+    let first = h.alloc(&bytes[..20 * 1536]);
+    h.push(first).expect("push");
+    let before: usize = h.drain_outputs().iter().map(|b| b.memory.len()).sum();
+    assert!(before > 0);
+    h.seek(0, Timestamp::from_nanos(960_000_000)).expect("seek");
+    let _ = h.drain_outputs();
+    let mut buf = h.alloc(&bytes[30 * 1536..40 * 1536]);
+    buf.pts = Timestamp::from_nanos(960_000_000);
+    h.push(buf).expect("push");
+    let mut out = h.drain_outputs();
+    out.extend(h.eos().expect("eos"));
+    let frames: usize = out.iter().map(|b| b.memory.len() / 4).sum();
+    assert!((9 * 1536..=10 * 1536).contains(&frames), "{frames} stereo sample frames");
+    assert_eq!(out.first().map(|b| b.pts), Some(Timestamp::from_nanos(960_000_000)));
+    assert_eq!(announced(&h, "channels"), Some(2));
+    assert_eq!(h.format_changes(), 1, "stereo before the flush and behind it");
+}
+
+/// A broadcast moving between 5.1 and 2.0 changes format out of a whole decode and stays
+/// stereo out of a folded one.
+#[test]
+fn a_5_1_to_stereo_change_is_no_format_change_under_a_stereo_request() {
+    let args = ["-c:a", "ac3", "-b:a", "384k", "-f", "ac3"];
+    let Some(wide) = surround("dm51c.ac3", &args) else { return };
+    let Some(narrow) = stream("dmstc.ac3", 2, &args) else { return };
+    let joined = [wide, narrow].concat();
+    let mut whole = Harness::with_slot_size(LibavAudioDec::ac3(), SLOT);
+    let _ = decode(&mut whole, &chunks(&joined, 1500));
+    assert_eq!(whole.format_changes(), 2);
+    let mut h = Harness::with_slot_size(LibavAudioDec::ac3().downmix(STEREO), SLOT);
+    let (got, _) = decode(&mut h, &chunks(&joined, 1500));
+    assert_eq!(h.format_changes(), 1);
+    assert_eq!(announced(&h, "channels"), Some(2));
+    let frames = got.len() / 4;
+    assert!((4 * 48_000 - 3072..=4 * 48_000 + 3072).contains(&frames), "{frames} sample frames");
     assert_eq!(warnings(&mut h), 0);
 }

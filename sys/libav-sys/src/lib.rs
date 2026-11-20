@@ -111,6 +111,16 @@ const _: () = assert!(offset_of!(pf_lav_frame, chroma_location) == 256);
 const _: () = assert!(offset_of!(pf_lav_frame, skip) == 260);
 const _: () = assert!(size_of::<pf_lav_slots>() == 24);
 
+/// What an audio decoder is asked for at open, all zero for nothing.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct pf_lav_audio_opts {
+    /// The layout wanted out as a WAVE style mask, 0 for the stream's own.
+    pub downmix: u64,
+}
+
+const _: () = assert!(size_of::<pf_lav_audio_opts>() == 8);
+
 #[repr(C)]
 pub struct pf_lav_dec {
     _private: [u8; 0],
@@ -131,6 +141,7 @@ unsafe extern "C" {
         parse: c_int,
         threads: c_int,
         reorder: c_int,
+        audio: *const pf_lav_audio_opts,
     ) -> c_int;
     pub fn pf_lav_close(d: *mut pf_lav_dec);
     pub fn pf_lav_send(
@@ -182,6 +193,7 @@ unsafe extern "C" {
     pub fn pf_lav_strerror(code: c_int, buf: *mut c_char, len: usize);
     pub fn pf_lav_version() -> *const c_char;
     pub fn pf_lav_frame_size() -> usize;
+    pub fn pf_lav_audio_opts_size() -> usize;
 }
 
 #[cfg(test)]
@@ -194,6 +206,8 @@ mod tests {
     fn the_frame_layout_agrees_with_the_shim() {
         // SAFETY: a pure function of the shim.
         assert_eq!(unsafe { pf_lav_frame_size() }, size_of::<pf_lav_frame>());
+        // SAFETY: a pure function of the shim.
+        assert_eq!(unsafe { pf_lav_audio_opts_size() }, size_of::<pf_lav_audio_opts>());
         // SAFETY: a static NUL-terminated string.
         let v = unsafe { std::ffi::CStr::from_ptr(pf_lav_version()) };
         assert_eq!(v.to_str().ok(), Some(FFMPEG_VERSION));
@@ -224,17 +238,78 @@ mod tests {
             let mut d = std::ptr::null_mut();
             // SAFETY: an out pointer and no extradata or slots.
             let rc = unsafe {
-                pf_lav_open(&mut d, codec, std::ptr::null(), 0, std::ptr::null(), 0, 1, -1)
+                pf_lav_open(
+                    &mut d,
+                    codec,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    1,
+                    -1,
+                    std::ptr::null(),
+                )
             };
             assert_eq!(rc, PF_LAV_OK, "codec {codec}");
             // SAFETY: opened above, closed once.
             unsafe { pf_lav_close(d) };
         }
         let mut d = std::ptr::null_mut();
-        let rc =
-            unsafe { pf_lav_open(&mut d, 99, std::ptr::null(), 0, std::ptr::null(), 0, 1, -1) };
+        let rc = unsafe {
+            pf_lav_open(
+                &mut d,
+                99,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                1,
+                -1,
+                std::ptr::null(),
+            )
+        };
         assert_eq!(rc, PF_LAV_ERR_NO_CODEC);
         assert!(d.is_null());
+    }
+
+    /// The codecs with a `downmix` option take the request, those without one (AAC, MP3 with
+    /// no option class at all) and a video codec open as they would without it. A mask the
+    /// decoder has no fold for (mono on DTS and TrueHD) is its to ignore.
+    #[test]
+    fn a_downmix_request_opens_on_every_codec() {
+        let codecs = [
+            PF_LAV_AC3,
+            PF_LAV_EAC3,
+            PF_LAV_DTS,
+            PF_LAV_TRUEHD,
+            PF_LAV_MLP,
+            PF_LAV_AAC,
+            PF_LAV_MP3,
+            PF_LAV_H264,
+        ];
+        for codec in codecs {
+            for downmix in [0x3, 0x4] {
+                let opts = pf_lav_audio_opts { downmix };
+                let mut d = std::ptr::null_mut();
+                // SAFETY: an out pointer, options that outlive the call, closed below.
+                let rc = unsafe {
+                    pf_lav_open(
+                        &mut d,
+                        codec,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        1,
+                        -1,
+                        &opts,
+                    )
+                };
+                assert_eq!(rc, PF_LAV_OK, "codec {codec}, mask {downmix:#x}");
+                // SAFETY: opened above, closed once.
+                unsafe { pf_lav_close(d) };
+            }
+        }
     }
 
     #[test]
@@ -252,6 +327,7 @@ mod tests {
                     0,
                     1,
                     reorder,
+                    std::ptr::null(),
                 )
             };
             assert_eq!(rc, PF_LAV_OK);
@@ -269,7 +345,17 @@ mod tests {
             let mut d = std::ptr::null_mut();
             // SAFETY: an out pointer and no extradata or slots.
             let rc = unsafe {
-                pf_lav_open(&mut d, codec, std::ptr::null(), 0, std::ptr::null(), 0, 1, -1)
+                pf_lav_open(
+                    &mut d,
+                    codec,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    1,
+                    -1,
+                    std::ptr::null(),
+                )
             };
             assert!(rc < 0 && rc != PF_LAV_ERR_NO_CODEC, "codec {codec}, {rc}");
             assert!(d.is_null());
@@ -283,7 +369,17 @@ mod tests {
         let mut d = std::ptr::null_mut();
         // SAFETY: an out pointer, the header outlives the call, closed below.
         let rc = unsafe {
-            pf_lav_open(&mut d, PF_LAV_SPEEX, head.as_ptr(), head.len(), std::ptr::null(), 0, 1, -1)
+            pf_lav_open(
+                &mut d,
+                PF_LAV_SPEEX,
+                head.as_ptr(),
+                head.len(),
+                std::ptr::null(),
+                0,
+                1,
+                -1,
+                std::ptr::null(),
+            )
         };
         assert_eq!(rc, PF_LAV_OK);
         // SAFETY: opened above, closed once.
@@ -349,7 +445,17 @@ mod tests {
         let mut d = std::ptr::null_mut();
         // SAFETY: the encoder's AudioSpecificConfig as extradata.
         let rc = unsafe {
-            pf_lav_open(&mut d, PF_LAV_AAC, asc.as_ptr(), asc.len(), std::ptr::null(), 0, 1, -1)
+            pf_lav_open(
+                &mut d,
+                PF_LAV_AAC,
+                asc.as_ptr(),
+                asc.len(),
+                std::ptr::null(),
+                0,
+                1,
+                -1,
+                std::ptr::null(),
+            )
         };
         assert_eq!(rc, PF_LAV_OK);
         let mut left = Vec::new();

@@ -131,6 +131,16 @@ typedef struct pf_lav_dec pf_lav_dec;
 /* The deepest starting reorder delay pf_lav_open takes, more is cut to it. */
 #define PF_LAV_MAX_REORDER 16
 
+/* What an audio decoder is asked for at open, all zero for nothing. */
+typedef struct pf_lav_audio_opts {
+    /* The layout wanted out as a WAVE style mask, the decoder's `downmix` option, 0 for the
+     * stream's own. A request, not a promise. AC-3, E-AC-3, DTS, TrueHD and MLP have the
+     * option, the other codecs ignore it, and those put the stream's channels out where it
+     * carries no mix of the layout (DTS without coefficients, TrueHD without a presentation
+     * of it). The frame's channels say what came. */
+    uint64_t downmix;
+} pf_lav_audio_opts;
+
 /* Open a decoder. `slots` may be NULL. `parse` adds a parser that frames a byte stream
  * (pf_lav_parse). Vorbis takes its three headers as extradata, Xiph laced or each behind
  * a 16-bit big-endian length. `threads` 1 is single threaded. More runs frame threads on
@@ -138,9 +148,11 @@ typedef struct pf_lav_dec pf_lav_dec;
  * `slots`, and pf_lav_delay grows by threads - 1. Other codecs stay single threaded.
  * `reorder` is the pictures a video decoder holds back for reordering from the start, the
  * stream's num_reorder_frames, negative for the codec's own guess. H.264 grows it, never
- * shrinks it, where the stream reorders deeper. */
+ * shrinks it, where the stream reorders deeper. `audio` may be NULL, a video codec ignores
+ * it. */
 int pf_lav_open(pf_lav_dec **out, int codec, const uint8_t *extradata, size_t extradata_len,
-                const pf_lav_slots *slots, int parse, int threads, int reorder);
+                const pf_lav_slots *slots, int parse, int threads, int reorder,
+                const pf_lav_audio_opts *audio);
 void pf_lav_close(pf_lav_dec *d);
 
 /* One packet, copied into padded memory. pts, dts and duration are carried to the
@@ -202,5 +214,6 @@ int pf_lav_enc_receive(pf_lav_enc *e, const uint8_t **data, size_t *len, int64_t
 void pf_lav_strerror(int code, char *buf, size_t len);
 const char *pf_lav_version(void);
 size_t pf_lav_frame_size(void);
+size_t pf_lav_audio_opts_size(void);
 
 #endif

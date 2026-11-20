@@ -31,6 +31,7 @@ _Static_assert(offsetof(pf_lav_frame, channel_mask) == 248, "pf_lav_frame.channe
 _Static_assert(offsetof(pf_lav_frame, chroma_location) == 256, "pf_lav_frame.chroma_location");
 _Static_assert(offsetof(pf_lav_frame, skip) == 260, "pf_lav_frame.skip");
 _Static_assert(sizeof(pf_lav_slots) == 24, "pf_lav_slots layout");
+_Static_assert(sizeof(pf_lav_audio_opts) == 8, "pf_lav_audio_opts layout");
 
 /* libavcodec/internal.h, STRIDE_ALIGN, from the same configuration. */
 #if HAVE_SIMD_ALIGN_64
@@ -161,8 +162,23 @@ static int get_buffer2(AVCodecContext *avctx, AVFrame *frame, int flags)
     return 0;
 }
 
+/* The decoder's private options from `audio`. A codec without a class has no options, its
+ * priv_data starts with no AVClass to look them up in. */
+static int audio_opts(AVCodecContext *ctx, const AVCodec *c, const pf_lav_audio_opts *audio)
+{
+    if (!audio || !audio->downmix || c->type != AVMEDIA_TYPE_AUDIO || !c->priv_class || !ctx->priv_data)
+        return 0;
+    AVChannelLayout want = { 0 };
+    if (av_channel_layout_from_mask(&want, audio->downmix) < 0)
+        return PF_LAV_ERR_ARG;
+    int ret = av_opt_set_chlayout(ctx->priv_data, "downmix", &want, 0);
+    av_channel_layout_uninit(&want);
+    return ret == AVERROR_OPTION_NOT_FOUND ? 0 : ret;
+}
+
 int pf_lav_open(pf_lav_dec **out, int codec, const uint8_t *extradata, size_t extradata_len,
-                const pf_lav_slots *slots, int parse, int threads, int reorder)
+                const pf_lav_slots *slots, int parse, int threads, int reorder,
+                const pf_lav_audio_opts *audio)
 {
     *out = NULL;
     pthread_once(&log_once, quiet);
@@ -235,7 +251,9 @@ int pf_lav_open(pf_lav_dec **out, int codec, const uint8_t *extradata, size_t ex
         memcpy(ctx->extradata, extradata, extradata_len);
         ctx->extradata_size = (int)extradata_len;
     }
-    int ret = avcodec_open2(ctx, c, NULL);
+    int ret = audio_opts(ctx, c, audio);
+    if (ret >= 0)
+        ret = avcodec_open2(ctx, c, NULL);
     if (ret < 0) {
         pf_lav_close(d);
         return ret;
@@ -684,3 +702,5 @@ void pf_lav_strerror(int code, char *buf, size_t len)
 const char *pf_lav_version(void) { return FFMPEG_VERSION; }
 
 size_t pf_lav_frame_size(void) { return sizeof(pf_lav_frame); }
+
+size_t pf_lav_audio_opts_size(void) { return sizeof(pf_lav_audio_opts); }

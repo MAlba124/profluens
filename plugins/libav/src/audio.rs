@@ -1,6 +1,8 @@
 //! libavcodec audio decoders (AAC, AC-3/E-AC-3, MP3, DTS, TrueHD/MLP, Vorbis, ALAC, Speex) as
 //! elements.
 //! Compressed audio in, interleaved `audio/raw` out in libavutil's native channel order.
+//! AC-3, E-AC-3, DTS, TrueHD and MLP take a `downmix` layout and put the stream's own mix of
+//! it out where it carries one.
 //! Float to s16 matches `ffmpeg -f s16le` (libswresample audioconvert.c).
 
 use std::fmt;
@@ -15,17 +17,17 @@ use profluens_core::bus::BusMessage;
 use profluens_core::couple::Coupling;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
-    Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
+    Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
 use profluens_core::error::Error;
 use profluens_core::event::Event;
-use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::format::{Constraint, ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
 use profluens_core::id::{SinkPad, SrcPad};
 use profluens_core::log;
 use profluens_core::log::Level;
 use profluens_core::time::Timestamp;
 
-use crate::lav::{self, Decoder, Frame, LavError, Received, Samples};
+use crate::lav::{self, AudioOpts, Decoder, Frame, LavError, Received, Samples};
 
 const SINK_PAD: SinkPad = SinkPad(0);
 const SRC_PAD: SrcPad = SrcPad(0);
@@ -89,9 +91,16 @@ static SPEEX_SINK: [OfferDesc; 2] =
     [OfferDesc { family: "speex", fields: &DELAY_FIELDS }, OfferDesc::any("bytes")];
 static SPEEX_SINKS: [PadDesc; 1] = [PadDesc { name: "sink", offers: &SPEEX_SINK }];
 
+/// The layout asked of the decoder as a channel mask (`Value::Int`), read at start. On the
+/// codecs whose libavcodec decoder has a `downmix` option.
+pub const PROP_DOWNMIX: &str = "downmix";
+static DOWNMIX_PROPS: [PropDesc; 1] =
+    [PropDesc { name: PROP_DOWNMIX, allowed: Constraint::Any, live: false }];
+
 const fn desc(
     name: &'static str,
     sinks: &'static [PadDesc],
+    props: &'static [PropDesc],
     sched: SchedHint,
     make: fn() -> Box<dyn Element>,
 ) -> ElementDesc {
@@ -99,7 +108,7 @@ const fn desc(
         name,
         sinks,
         srcs: &SRCS,
-        props: &[],
+        props,
         sched,
         inputs: InputPolicy::Single,
         latency: LatencyDesc::NONE,
@@ -112,31 +121,43 @@ const fn desc(
 // One-time construction.
 #[allow(clippy::disallowed_methods)]
 pub(crate) static AAC_DESC: ElementDesc =
-    desc("libavaacdec", &AAC_SINKS, SchedHint::Active, || Box::new(LibavAudioDec::aac()));
+    desc("libavaacdec", &AAC_SINKS, &[], SchedHint::Active, || Box::new(LibavAudioDec::aac()));
 #[allow(clippy::disallowed_methods)]
 pub(crate) static AC3_DESC: ElementDesc =
-    desc("libavac3dec", &AC3_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::ac3()));
+    desc("libavac3dec", &AC3_SINKS, &DOWNMIX_PROPS, SchedHint::Passive, || {
+        Box::new(LibavAudioDec::ac3())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static MP3_DESC: ElementDesc =
-    desc("libavmp3dec", &MP3_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::mp3()));
+    desc("libavmp3dec", &MP3_SINKS, &[], SchedHint::Passive, || Box::new(LibavAudioDec::mp3()));
 #[allow(clippy::disallowed_methods)]
 pub(crate) static DTS_DESC: ElementDesc =
-    desc("libavdtsdec", &DTS_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::dts()));
+    desc("libavdtsdec", &DTS_SINKS, &DOWNMIX_PROPS, SchedHint::Passive, || {
+        Box::new(LibavAudioDec::dts())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static TRUEHD_DESC: ElementDesc =
-    desc("libavtruehddec", &TRUEHD_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::truehd()));
+    desc("libavtruehddec", &TRUEHD_SINKS, &DOWNMIX_PROPS, SchedHint::Passive, || {
+        Box::new(LibavAudioDec::truehd())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static MLP_DESC: ElementDesc =
-    desc("libavmlpdec", &MLP_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::mlp()));
+    desc("libavmlpdec", &MLP_SINKS, &DOWNMIX_PROPS, SchedHint::Passive, || {
+        Box::new(LibavAudioDec::mlp())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static VORBIS_DESC: ElementDesc =
-    desc("libavvorbisdec", &VORBIS_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::vorbis()));
+    desc("libavvorbisdec", &VORBIS_SINKS, &[], SchedHint::Passive, || {
+        Box::new(LibavAudioDec::vorbis())
+    });
 #[allow(clippy::disallowed_methods)]
 pub(crate) static ALAC_DESC: ElementDesc =
-    desc("libavalacdec", &ALAC_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::alac()));
+    desc("libavalacdec", &ALAC_SINKS, &[], SchedHint::Passive, || Box::new(LibavAudioDec::alac()));
 #[allow(clippy::disallowed_methods)]
 pub(crate) static SPEEX_DESC: ElementDesc =
-    desc("libavspeexdec", &SPEEX_SINKS, SchedHint::Passive, || Box::new(LibavAudioDec::speex()));
+    desc("libavspeexdec", &SPEEX_SINKS, &[], SchedHint::Passive, || {
+        Box::new(LibavAudioDec::speex())
+    });
 
 const FRAMES_PER_BATCH: u32 = 2;
 
@@ -238,6 +259,8 @@ pub struct LibavAudioDec {
     desc: &'static ElementDesc,
     codec: lav::Codec,
     framing: Framing,
+    /// What every open of the decoder asks, the builder's or the `downmix` prop's.
+    opts: AudioOpts,
     decoder: Option<Decoder>,
     buf: Vec<u8>,
     id3: Option<usize>,
@@ -294,6 +317,7 @@ impl LibavAudioDec {
             desc,
             codec,
             framing,
+            opts: AudioOpts::default(),
             decoder: None,
             buf: Vec::new(),
             id3: None,
@@ -331,6 +355,14 @@ impl LibavAudioDec {
             vorbis: VorbisHeads { ident: Vec::new(), laced: Vec::new() },
             speex: SpeexHeads { ident: [0; SPEEX_HEAD], skip: 0 },
         }
+    }
+
+    /// Asks the decoder for `layout`, a channel mask, where the stream carries a mix of it.
+    /// The frames say what came, a stream without one comes out whole. The `downmix` prop
+    /// overrides it.
+    pub fn downmix(mut self, layout: u64) -> Self {
+        self.opts.downmix = layout;
+        self
     }
 
     /// MP3 only. Publish the file's seek index from its head.
@@ -465,9 +497,15 @@ impl LibavAudioDec {
         if self.open_failed {
             return false;
         }
-        match Decoder::open(self.codec, &[], None, true, 1, None) {
+        match Decoder::open_audio(self.codec, &[], true, self.opts) {
             Ok(d) => {
-                log!(&*ctx, Level::Info, "parser_open", codec = self.codec.name());
+                log!(
+                    &*ctx,
+                    Level::Info,
+                    "parser_open",
+                    codec = self.codec.name(),
+                    downmix = self.opts.downmix
+                );
                 self.decoder = Some(d);
                 true
             }
@@ -489,7 +527,7 @@ impl LibavAudioDec {
             }
             return Ok(());
         }
-        match Decoder::open(lav::Codec::Aac, data, None, false, 1, None) {
+        match Decoder::open_audio(lav::Codec::Aac, data, false, self.opts) {
             Ok(d) => {
                 log!(&*ctx, Level::Info, "decoder_open", codec = "aac", config = data.len());
                 self.decoder = Some(d);
@@ -508,7 +546,7 @@ impl LibavAudioDec {
     fn open_alac(&mut self, ctx: &mut Ctx, data: &[u8]) -> Result<(), Error> {
         let fail = |e| Err(Error::element_failed(ctx.element(), LavAudioError::Open(e)));
         let Some(atom) = alac_atom(data) else { return fail(LavError::Argument) };
-        match Decoder::open(lav::Codec::Alac, &atom, None, false, 1, None) {
+        match Decoder::open_audio(lav::Codec::Alac, &atom, false, self.opts) {
             Ok(d) => {
                 log!(&*ctx, Level::Info, "decoder_open", codec = "alac", config = data.len());
                 self.decoder = Some(d);
@@ -565,7 +603,7 @@ impl LibavAudioDec {
     }
 
     fn open_vorbis(&mut self, ctx: &mut Ctx) {
-        match Decoder::open(lav::Codec::Vorbis, &self.vorbis.laced, None, false, 1, None) {
+        match Decoder::open_audio(lav::Codec::Vorbis, &self.vorbis.laced, false, self.opts) {
             Ok(d) => {
                 log!(
                     &*ctx,
@@ -600,7 +638,7 @@ impl LibavAudioDec {
             if self.framing == Framing::SpeexRaw && ident == self.speex.ident.as_slice() {
                 return false;
             }
-            match Decoder::open(lav::Codec::Speex, ident, None, false, 1, None) {
+            match Decoder::open_audio(lav::Codec::Speex, ident, false, self.opts) {
                 Ok(d) => {
                     log!(&*ctx, Level::Info, "decoder_open", codec = "speex", extra = extra);
                     self.decoder = Some(d);
@@ -1177,7 +1215,7 @@ impl LibavAudioDec {
                     }
                     if changed
                         && data.len() <= HEAD_MAX
-                        && let Ok(d) = Decoder::open(lav::Codec::Aac, data, None, false, 1, None)
+                        && let Ok(d) = Decoder::open_audio(lav::Codec::Aac, data, false, self.opts)
                     {
                         log!(&*ctx, Level::Debug, "aac_reconfig", config = data.len());
                         self.decoder = Some(d);
@@ -1245,6 +1283,11 @@ impl Element for LibavAudioDec {
             ctx.will_index();
         }
         self.reset();
+        if let Some(Value::Int(mask)) = ctx.prop(PROP_DOWNMIX)
+            && mask >= 0
+        {
+            self.opts.downmix = mask as u64;
+        }
         self.takes = link_samples(ctx, SRC_PAD);
         self.input.start(ctx, self.indexing.flatten());
         Ok(())

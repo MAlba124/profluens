@@ -62,11 +62,17 @@ pub fn make(name: &str, args: &[&str]) -> Option<Vec<u8>> {
 }
 
 pub fn oracle(input: &str, out_name: &str, args: &[&str]) -> Option<Vec<u8>> {
+    oracle_in(input, out_name, &[], args)
+}
+
+/// [`oracle`] with `decoder` options ahead of the input, the decoder's own.
+pub fn oracle_in(input: &str, out_name: &str, decoder: &[&str], args: &[&str]) -> Option<Vec<u8>> {
     let part = staging(out_name);
     let p = part.to_str().expect("utf-8 path");
     let src = tmp(input);
     let s = src.to_str().expect("utf-8 path");
-    let mut all = vec!["-i", s, "-fps_mode", "passthrough"];
+    let mut all = decoder.to_vec();
+    all.extend_from_slice(&["-i", s, "-fps_mode", "passthrough"]);
     all.extend_from_slice(args);
     all.push(p);
     if !ffmpeg(&all) {

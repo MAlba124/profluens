@@ -726,3 +726,65 @@ fn a_close_cancels_the_reads_in_order_it_finds_queued() {
     r.settle(Duration::from_millis(50));
     assert!(reads.iter().all(|op| r.count(*op) == 0), "a read completed twice");
 }
+
+#[test]
+fn a_closing_handle_refuses_new_work_and_the_close_completes() {
+    let mut r = rig(2048);
+    let bind = r.submit(Op::Bind { addr: loopback() }, None);
+    let IoResult::Socket { handle: sock, .. } = r.wait(bind).result else { panic!("bind") };
+    let recv = r.submit(Op::Recv { handle: sock }, Some(r.buf(b"")));
+    r.r.park(Duration::ZERO);
+    let close = r.submit(Op::Close { handle: sock }, None);
+    // before the receive's cancel lands, a poll that would keep the slot busy for ever
+    let ready = r.submit(Op::Ready { handle: sock }, None);
+    let send = r.submit(Op::Send { handle: sock, skip: 0 }, Some(r.buf(b"late")));
+    assert_eq!(r.wait(ready).result, IoResult::Err(IoError::BadHandle));
+    assert_eq!(r.wait(send).result, IoResult::Err(IoError::BadHandle));
+    assert_eq!(r.wait(recv).result, IoResult::Cancelled);
+    assert_eq!(r.wait(close).result, IoResult::Ok(0));
+}
+
+#[test]
+fn an_accept_that_lands_before_its_cancel_closes_the_connection() {
+    use std::io::Read;
+    let mut r = rig(64);
+    let listen = r.submit(Op::Listen { addr: loopback() }, None);
+    let IoResult::Socket { handle: listener, addr } = r.wait(listen).result else {
+        panic!("listen")
+    };
+    let accept = r.submit(Op::Accept { handle: listener }, None);
+    r.r.park(Duration::ZERO);
+    let mut client = std::net::TcpStream::connect(addr).expect("connect");
+    // the accept's completion waits on the queue, not yet harvested
+    let start = Instant::now();
+    while !r.r.park(Duration::from_millis(10)) {
+        assert!(start.elapsed() < PATIENCE, "the accept never landed");
+    }
+    r.submit(Op::Cancel { target: accept }, None);
+    assert_eq!(r.wait(accept).result, IoResult::Cancelled);
+    client.set_read_timeout(Some(Duration::from_secs(2))).expect("timeout");
+    let mut b = [0u8; 1];
+    assert_eq!(client.read(&mut b).expect("the accepted end was closed"), 0);
+}
+
+#[test]
+fn a_long_path_finds_a_block_after_a_burst_of_short_ones() {
+    let mut r = rig(64);
+    let path = tmp("burst");
+    std::fs::write(&path, b"x").expect("fixture");
+    let bytes = path.as_os_str().as_encoded_bytes().to_vec();
+    let name = Name { off: 0, len: bytes.len() as u32 };
+    let stats: Vec<OpId> =
+        (0..256).map(|_| r.submit_named(Op::Stat { path: name }, None, &bytes)).collect();
+    for c in r.all(&stats) {
+        assert!(matches!(c.result, IoResult::File { len: 1, .. }), "{:?}", c.result);
+    }
+    // the same file by a name past the small block
+    let long = format!("{}{}", "/.".repeat(400), path.display());
+    let name = Name { off: 0, len: long.len() as u32 };
+    let op = r.submit_named(Op::Stat { path: name }, None, long.as_bytes());
+    assert!(matches!(r.wait(op).result, IoResult::File { len: 1, .. }));
+    let op =
+        r.submit_named(Op::Stat { path: Name { off: 0, len: bytes.len() as u32 } }, None, &bytes);
+    assert!(matches!(r.wait(op).result, IoResult::File { len: 1, .. }), "short names still go");
+}

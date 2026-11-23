@@ -173,10 +173,10 @@ impl OsReactor {
         let (_, _, state) = self.grounded(idx);
         let lent = self.slot(on).ok().and_then(|s| s.lent.as_ref());
         let (held, drying) = lent.map_or((0, false), |l| (l.held, l.drying));
-        let result = match (state, c.result()) {
-            (State::Cancelling, _) if drying && held > 0 => return self.restart(idx),
-            (State::Cancelling, _) if drying => IoResult::Err(IoError::Dry),
-            (State::Cancelling, _) | (_, Err(Errno::CANCELED)) => IoResult::Cancelled,
+        let result = match (state.cancelled(), c.result()) {
+            (true, _) if drying && held > 0 => return self.restart(idx),
+            (true, _) if drying => IoResult::Err(IoError::Dry),
+            (true, _) | (_, Err(Errno::CANCELED)) => IoResult::Cancelled,
             // The ring ran dry, or the kernel ended the receive after a buffer. What
             // was lent since goes on being received into.
             (_, Err(Errno::NOBUFS)) | (_, Ok(_)) if held > 0 && (filled.is_some() || c.res < 0) => {
@@ -234,14 +234,15 @@ impl OsReactor {
         let Some(lent) = self.slots[on.slot() as usize].lent.as_mut() else {
             return;
         };
-        let Some(p) = self.ops.get_mut(lent.recv as usize).and_then(Option::as_mut) else {
-            return;
-        };
-        if let (State::Flying, Some(key)) = (p.state, p.key) {
-            p.state = State::Cancelling;
+        let recv = lent.recv;
+        let flying = self
+            .ops
+            .get(recv as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|p| p.state == State::Flying && p.key.is_some());
+        if flying {
             lent.drying = true;
-            self.q.cancel(key);
-            (self.queued, self.urgent) = (true, true);
+            self.ask_cancel(recv);
         }
     }
 

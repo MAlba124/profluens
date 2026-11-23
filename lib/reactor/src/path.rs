@@ -73,7 +73,7 @@ impl OsReactor {
         self.waiting.push_back(idx);
     }
 
-    // Made once and kept.
+    // Made once and kept, a small one grown at the limit.
     #[allow(clippy::disallowed_methods)]
     fn take_block(&mut self, large: bool) -> Option<u32> {
         let size = if large { LARGE } else { SMALL };
@@ -82,11 +82,17 @@ impl OsReactor {
         {
             return Some(self.free_blocks.swap_remove(at));
         }
-        if self.blocks.len() >= MAX_BLOCKS {
-            return None;
+        if self.blocks.len() < MAX_BLOCKS {
+            self.blocks.push(vec![0; size].into_boxed_slice());
+            return Some(self.blocks.len() as u32 - 1);
         }
-        self.blocks.push(vec![0; size].into_boxed_slice());
-        Some(self.blocks.len() as u32 - 1)
+        // Only the other class is free. A large block holds a short name as it is, a small
+        // one is replaced by a large. A free block is no op's, so the kernel holds none.
+        let block = self.free_blocks.pop()?;
+        if large {
+            self.blocks[block as usize] = vec![0; LARGE].into_boxed_slice();
+        }
+        Some(block)
     }
 
     pub(crate) fn free_block(&mut self, block: u32) {

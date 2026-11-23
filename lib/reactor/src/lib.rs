@@ -12,9 +12,12 @@ mod ops;
 mod path;
 mod resolve;
 mod sys;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BinaryHeap, VecDeque};
 use std::io::{self, ErrorKind};
+use std::mem::ManuallyDrop;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -177,12 +180,22 @@ impl Slot {
     }
 }
 
+/// Waiting -> Flying -> CancelOwed -> Cancelling -> landed, CancelOwed skipped when the queue
+/// takes the cancel at once. An owed one is asked again after the queue moves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
     Waiting,
     Flying,
+    CancelOwed,
     Cancelling,
     Lent,
+}
+
+impl State {
+    /// A cancel was wanted, so whatever lands is discarded.
+    fn cancelled(self) -> bool {
+        matches!(self, State::CancelOwed | State::Cancelling)
+    }
 }
 
 struct Pending {
@@ -223,8 +236,8 @@ impl PartialOrd for Timer {
 }
 
 pub struct OsReactor {
-    /// First, so its drop cancels and waits for in-flight ops before the buffers below are freed.
-    q: Queue,
+    /// Dropped by hand once drained, see the drop. Leaked with the kernel's memory otherwise.
+    q: ManuallyDrop<Queue>,
     word: Box<[u8; 8]>,
     bell: Option<Arc<EventBell>>,
     bell_flying: bool,
@@ -246,15 +259,39 @@ pub struct OsReactor {
     tells: bool,
     /// File ops on the queue. They complete on their own, so teardown waits for them.
     file_flying: u32,
+    /// Ops left in [`State::CancelOwed`], an upper bound.
+    cancels_owed: u32,
     hygiene_window: u64,
     reads: Reads,
     enters: Enters,
+    #[cfg(test)]
+    faults: Faults,
 }
+
+/// Failures the tests inject.
+#[cfg(test)]
+#[derive(Default)]
+struct Faults {
+    /// The teardown drain gives up at once.
+    drain_fails: bool,
+    /// Cancel requests the queue refuses next.
+    refuse_cancels: u32,
+}
+
+/// How long teardown waits for the kernel to let go, as long as the queue's own drop would.
+const DRAIN: Duration = Duration::from_secs(2);
 
 impl Drop for OsReactor {
     fn drop(&mut self) {
         SUBMITS.fetch_add(self.enters.submits, Ordering::Relaxed);
         WAITS.fetch_add(self.enters.waits, Ordering::Relaxed);
+        let limit = self.drain();
+        if self.q.quiesce(limit) {
+            // Nothing in flight, the fields below drop as they please.
+            sys::drop_queue(&mut self.q);
+            return;
+        }
+        self.abandon();
     }
 }
 
@@ -284,7 +321,7 @@ impl OsReactor {
         let tells =
             matches!(q.ring_flags(), stein_io::RingFlags::Deferred | stein_io::RingFlags::Coop);
         Ok(Self {
-            q,
+            q: ManuallyDrop::new(q),
             word: Box::new([0; 8]),
             bell: None,
             bell_flying: false,
@@ -304,15 +341,41 @@ impl OsReactor {
             held: 0,
             urgent: false,
             file_flying: 0,
+            cancels_owed: 0,
             hygiene_window: HYGIENE_WINDOW,
             reads: Reads::Auto,
             enters: Enters::default(),
             tells,
+            #[cfg(test)]
+            faults: Faults::default(),
         })
     }
 
     pub fn backend(&self) -> Backend {
         self.q.backend()
+    }
+
+    fn drain(&self) -> Duration {
+        #[cfg(test)]
+        if self.faults.drain_fails {
+            return Duration::ZERO;
+        }
+        DRAIN
+    }
+
+    /// The drain timed out, so the kernel may still read or write what the queue's entries name.
+    /// The queue, the bell's word, the op table with its buffers and path blocks, and the
+    /// provided buffer pages are leaked. Descriptors close, an op holds its own reference.
+    // Teardown, once.
+    #[allow(clippy::disallowed_methods)]
+    fn abandon(&mut self) {
+        let word = std::mem::replace(&mut self.word, Box::new([0; 8]));
+        std::mem::forget(word);
+        std::mem::forget(std::mem::take(&mut self.ops));
+        std::mem::forget(std::mem::take(&mut self.blocks));
+        for s in &mut self.slots {
+            std::mem::forget(s.lent.take());
+        }
     }
 
     pub fn enters(&self) -> Enters {
@@ -443,6 +506,9 @@ impl OsReactor {
     fn pump(&mut self) {
         if !self.bell_flying {
             self.arm_bell();
+        }
+        if self.cancels_owed > 0 {
+            self.ask_owed();
         }
         for _ in 0..self.waiting.len() {
             let Some(idx) = self.waiting.pop_front() else {

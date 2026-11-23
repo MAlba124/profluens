@@ -57,6 +57,8 @@ impl OsReactor {
             return self.start_path(idx);
         }
         let (fd, tag, busy_read, busy_write, ordered) = match self.slot(on) {
+            // A close waits for the slot's flying count to drop, new work would hold it up.
+            Ok(s) if s.closing != NONE => return Started::Done(IoResult::Err(IoError::BadHandle)),
             Ok(s) => (s.raw(), tag(&s.kind), s.busy_read, s.busy_write, s.ordered),
             Err(e) => return Started::Done(IoResult::Err(e)),
         };
@@ -190,9 +192,13 @@ impl OsReactor {
             return self.landed_many(idx, &c, on);
         }
         let (kind, on, state) = self.grounded(idx);
-        if state == State::Cancelling {
+        if state.cancelled() {
             if matches!(kind, Op::Connect { .. }) {
                 self.release(on);
+            }
+            // An accept that won the race made a connection nobody will hear of.
+            if matches!(kind, Op::Accept { .. }) && c.res >= 0 {
+                drop(sys::adopt(c.res as RawFd));
             }
             if is_path(&kind) {
                 self.path_cancelled(idx, &c);
@@ -445,18 +451,62 @@ impl OsReactor {
         }
     }
 
+    /// The queue's cancel, false when it refused the request.
+    fn queue_cancel(&mut self, key: Key) -> bool {
+        #[cfg(test)]
+        if self.faults.refuse_cancels > 0 {
+            self.faults.refuse_cancels -= 1;
+            return false;
+        }
+        self.q.cancel(key)
+    }
+
+    /// Ask the queue to cancel the op at `idx`, flying or owed a cancel. A refusal (no ring
+    /// room, or a completion the queue holds unreaped) leaves it owed, asked again by `pump`.
+    pub(crate) fn ask_cancel(&mut self, idx: u32) {
+        let key = match self.ops[idx as usize].as_ref() {
+            Some(p) if matches!(p.state, State::Flying | State::CancelOwed) => p.key,
+            _ => return,
+        };
+        let Some(key) = key else { return };
+        let asked = self.queue_cancel(key);
+        if let Some(p) = self.ops[idx as usize].as_mut() {
+            p.state = if asked { State::Cancelling } else { State::CancelOwed };
+        }
+        if asked {
+            (self.queued, self.urgent) = (true, true);
+        } else {
+            self.cancels_owed += 1;
+        }
+    }
+
+    /// Ask again for the cancels the queue refused, once it moved.
+    #[cold]
+    pub(crate) fn ask_owed(&mut self) {
+        self.cancels_owed = 0;
+        for i in 0..self.ops.len() as u32 {
+            if self.ops[i as usize].as_ref().is_some_and(|p| p.state == State::CancelOwed) {
+                self.ask_cancel(i);
+            }
+        }
+    }
+
     fn cancel_at(&mut self, idx: u32) {
         let Some(p) = self.ops[idx as usize].as_mut() else {
             return;
         };
+        let many = matches!(p.kind, Op::RecvMany { .. });
         match (p.state, p.key) {
-            (State::Flying, Some(key)) => {
-                p.state = State::Cancelling;
-                self.q.cancel(key);
-                (self.queued, self.urgent) = (true, true);
+            (State::Flying | State::CancelOwed, Some(_)) => {
+                // An explicit cancel ends a drying receive as cancelled, not dry.
+                if many {
+                    let on = p.on;
+                    self.undry(on);
+                }
+                self.ask_cancel(idx);
             }
             (State::Waiting, _) => {
-                let (on, many) = (p.on, matches!(p.kind, Op::RecvMany { .. }));
+                let on = p.on;
                 self.waiting.retain(|w| *w != idx);
                 if many {
                     self.unarm(idx, on);
@@ -464,7 +514,7 @@ impl OsReactor {
                 self.finish(idx, IoResult::Cancelled);
             }
             (State::Lent, _) => self.unlend(idx),
-            (State::Cancelling, _) if matches!(p.kind, Op::RecvMany { .. }) => {
+            (State::Cancelling, _) if many => {
                 let on = p.on;
                 self.undry(on);
             }

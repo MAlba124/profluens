@@ -17,16 +17,40 @@ struct Shared {
     resolved: Mutex<Vec<(ElementId, Completion)>>,
 }
 
+/// A worker's lookup, `Live` until cancelled. Either way it holds its worker's place until the
+/// worker answers, since a cancel cannot stop the blocking resolver.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    Live,
+    Cancelled,
+}
+
+struct Lookup {
+    op: OpId,
+    element: ElementId,
+    user: u64,
+    ask: Ask,
+}
+
 pub(crate) struct Resolver {
     shared: Arc<Shared>,
-    out: Vec<(OpId, ElementId, u64)>,
+    /// One per running worker, so its length is the admission count.
+    out: Vec<Lookup>,
+    /// Holds every worker before it resolves, for tests of a slow resolver.
+    #[cfg(test)]
+    stall: Option<Arc<tests::Stall>>,
 }
 
 impl Resolver {
     // Once per reactor.
     #[allow(clippy::disallowed_methods)]
     pub(crate) fn new() -> Resolver {
-        Resolver { shared: Arc::default(), out: Vec::with_capacity(MAX_RESOLVING) }
+        Resolver {
+            shared: Arc::default(),
+            out: Vec::with_capacity(MAX_RESOLVING),
+            #[cfg(test)]
+            stall: None,
+        }
     }
 
     // One thread and one string per name, off the data path.
@@ -58,7 +82,13 @@ impl Resolver {
         let (shared, waker) = (Arc::clone(&self.shared), waker.cloned());
         let (op, element, user) = (s.op, s.element, s.user);
         let Submission { kind, mut buf, .. } = s;
+        #[cfg(test)]
+        let stall = self.stall.clone();
         let spawned = std::thread::Builder::new().name("pf-reactor-dns".into()).spawn(move || {
+            #[cfg(test)]
+            if let Some(stall) = stall {
+                stall.wait();
+            }
             let result = match kind {
                 Op::Resolve { port, skip, .. } => {
                     let found = (host.as_str(), port)
@@ -80,7 +110,7 @@ impl Resolver {
         });
         match spawned {
             Ok(_) => {
-                self.out.push((op, element, user));
+                self.out.push(Lookup { op, element, user, ask: Ask::Live });
                 None
             }
             Err(e) => Some((
@@ -99,17 +129,21 @@ impl Resolver {
         }
         let mut resolved = self.shared.resolved.lock().unwrap_or_else(|e| e.into_inner());
         for (element, c) in resolved.drain(..) {
-            if let Some(i) = self.out.iter().position(|r| r.0 == c.op) {
-                self.out.swap_remove(i);
+            let Some(i) = self.out.iter().position(|r| r.op == c.op) else {
+                continue;
+            };
+            if self.out.swap_remove(i).ask == Ask::Live {
                 done.push((element, c));
             }
         }
     }
 
+    /// Completes a live lookup as cancelled now. Its worker keeps its place until it answers.
     pub(crate) fn cancel(&mut self, target: OpId) -> Option<(ElementId, Completion)> {
-        let i = self.out.iter().position(|r| r.0 == target)?;
-        let (op, element, user) = self.out.swap_remove(i);
-        Some((element, Completion { op, user, result: IoResult::Cancelled, buf: None }))
+        let r = self.out.iter_mut().find(|r| r.op == target && r.ask == Ask::Live)?;
+        r.ask = Ask::Cancelled;
+        let c = Completion { op: r.op, user: r.user, result: IoResult::Cancelled, buf: None };
+        Some((r.element, c))
     }
 }
 
@@ -123,5 +157,83 @@ fn lookup(host: &str, kind: u16, buf: Option<&mut profluens_core::buffer::Buffer
             IoResult::Record(n)
         }
         None => IoResult::Err(IoError::NoRecord),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    #![allow(clippy::disallowed_methods)]
+
+    use std::sync::Condvar;
+    use std::time::{Duration, Instant};
+
+    use profluens_core::io::Name;
+
+    use super::*;
+
+    /// A gate the workers wait at until a test opens it.
+    #[derive(Default)]
+    pub(crate) struct Stall {
+        open: Mutex<bool>,
+        moved: Condvar,
+    }
+
+    impl Stall {
+        pub(crate) fn wait(&self) {
+            let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+            while !*open {
+                open = self.moved.wait(open).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+
+        fn release(&self) {
+            *self.open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            self.moved.notify_all();
+        }
+    }
+
+    const HOST: &[u8] = b"127.0.0.1";
+
+    fn resolve(op: u64) -> Submission {
+        let host = Name { off: 0, len: HOST.len() as u32 };
+        Submission {
+            op: OpId(op),
+            element: ElementId(1),
+            kind: Op::Resolve { host, port: 80, skip: 0 },
+            buf: None,
+            user: op,
+        }
+    }
+
+    #[test]
+    fn a_cancelled_lookup_holds_its_worker_until_the_worker_answers() {
+        let mut r = Resolver::new();
+        let stall = Arc::new(Stall::default());
+        r.stall = Some(Arc::clone(&stall));
+        for op in 0..MAX_RESOLVING as u64 {
+            assert!(r.start(resolve(op), HOST, None).is_none(), "lookup {op} admitted");
+        }
+        for op in 0..MAX_RESOLVING as u64 {
+            let c = r.cancel(OpId(op)).expect("a cancel completes at once").1;
+            assert_eq!(c.result, IoResult::Cancelled);
+        }
+        assert!(r.cancel(OpId(0)).is_none(), "a second cancel is nothing");
+        let over = r.start(resolve(100), HOST, None).expect("refused");
+        assert_eq!(over.1.result, IoResult::Err(IoError::Full), "every worker still runs");
+
+        stall.release();
+        let (mut done, start) = (Vec::new(), Instant::now());
+        while r.start(resolve(101), HOST, None).is_some() {
+            assert!(start.elapsed() < Duration::from_secs(10), "no worker ever answered");
+            std::thread::sleep(Duration::from_millis(1));
+            r.take(&mut done);
+        }
+        while !done.iter().any(|(_, c)| c.op == OpId(101)) {
+            assert!(start.elapsed() < Duration::from_secs(10), "the new lookup never answered");
+            std::thread::sleep(Duration::from_millis(1));
+            r.take(&mut done);
+        }
+        assert_eq!(done.len(), 1, "a cancelled lookup's answer was delivered");
+        assert_eq!(done[0].1.result, IoResult::Addr(([127, 0, 0, 1], 80).into()));
     }
 }

@@ -122,8 +122,14 @@ pub(crate) fn set_sockopt(fd: RawFd, level: i32, name: i32, value: i32) {
 }
 
 pub(crate) fn word(w: &mut [u8; 8]) -> Mem {
-    // SAFETY: the reactor drops its queue, which ends the read, before the box.
+    // SAFETY: the reactor's drop drains its queue before the box goes, or leaks both.
     unsafe { Mem::raw(w.as_mut_ptr(), 8) }
+}
+
+/// Drop the queue of a reactor whose drop drained it.
+pub(crate) fn drop_queue(q: &mut std::mem::ManuallyDrop<Queue>) {
+    // SAFETY: only the reactor's drop calls this, once, and uses the queue no more.
+    unsafe { std::mem::ManuallyDrop::drop(q) }
 }
 
 /// Class IN (RFC 1035 section 3.2.4).
